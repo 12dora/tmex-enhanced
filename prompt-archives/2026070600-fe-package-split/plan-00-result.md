@@ -59,7 +59,22 @@ lint 不新增（343→319）、Dockerfile 隔离演练、npm pack 核对、buil
   --terminal-shortcut-* 单源化（TS 真源生成 tokens.generated.css）；顺带修复 preset 样式源
   顺序缺陷（dormant 时代变量恒被默认值覆盖，从未真正可激活）。
 
-**遗留（P7–P9 待做）**：terminal-ui 依赖反转、panels/settings 迁移、fe 清残留、HELLO_S2C
-capabilities 落地 site store、/api/capabilities 前端消费、preset 设置页 UI。
+- **P7 @tmex/terminal-ui**（e0811f9、f2537de）：components/terminal 13 文件 + 5 utils +
+  use-keyboard-avoidance 入包；store 访问经 `@tmex/stores/react` context 便捷 hook（缺省即
+  默认 runtime）；Terminal 六路依赖反转（navigate→host.navigate + onOpenFile 回调、
+  toast→notifications、fetchFile→apiClient、registerPaneSink→runtime.paneSinks、
+  fonts→theme）；runtime 补 PaneSinkRouting.registerPaneSink（sink 消费侧反转，register/
+  dispatch 归同一注册表）；去 react-router/sonner 依赖。
+- **P8 @tmex/panels**（c8e7b89、afb2b43）：agent/files/markdown/code-viewer/watch/settings
+  面板 + connection-indicator + device-status-badge 共 46 文件入包，按功能域划子路径出口；
+  内联跨面板引用改相对；i18n 由应用侧包装改 i18next 全局单例；watch-events-init 通知出口
+  改走默认 runtime sink（浏览器通知保留本地降级）；富渲染第三方依赖（react-markdown/mermaid/
+  katex/dnd-kit/qrcode/rehype-*/remark-*）随组件迁移声明，singleton 类库（sonner/react-router/
+  i18next/react-query）置 peerDependencies。settings 桶出口可摇树（设备页仅取两组件不裹入
+  重模态）。
+
+**遗留（P9 待做）**：fe 清残留（外壳化）、HELLO_S2C capabilities 落地 site store、
+/api/capabilities 前端消费、包结构/嵌入使用文档、preset 设置页 UI。
 **已知限制**：bell store 为全局单例（多连接宿主 paneId 理论冲突）；getSiteNameFallback/
-usePaneAgentState 绑定默认 runtime（多实例宿主应经 runtime 取用）。
+usePaneAgentState 绑定默认 runtime（多实例宿主应经 runtime 取用）；panels 保留 sonner/
+react-router peerDep（最外层 UI 面局部 toast/路由，非跨切面通知）。
