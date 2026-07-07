@@ -32,3 +32,34 @@
 - 本环境全量 e2e 存在约 11-13 例随负载漂移的不稳定用例（两侧基线均复现，集中在 mobile 触控、terminal-mouse-recovery、theme×resize 压力类）；单跑/小组合大多通过。建议后续在低负载 CI 环境建立稳定基线，不阻塞分包推进。
 - lint 全仓基线本就有 ~350 个存量错误（多为 shadcn 生成风格与 biome 规则冲突），本次未处理，维持「不新增」原则。
 - P2（ws-client）/P3（api-client）/P4（notifications）可并行，见 plan-00.md。
+
+## P2–P6 实施记录（2026-07-07/08）
+
+按 plan-00.md 串行完成，每阶段「先搬迁（git mv 保 blame）后解耦」分 commit，
+推送前全部通过：tsc + vite build、全包 bun test、全量 e2e 前后对照（零 pass→fail，
+失败候选一律单跑/基点采样排除，证据方法见 docs/testing/2026070800-e2e-known-issues.md）、
+lint 不新增（343→319）、Dockerfile 隔离演练、npm pack 核对、build:artifacts --smoke、
+明暗双模式截图核对。
+
+- **P2 @tmex/ws-client**（d3b0742、973c5c0）：WS 端点构造注入 + updateUrl；PaneSinkRegistry
+  类化（模块级函数保留为默认实例代理）；createGatewayConnection 连接工厂；biome 固化生成
+  产物 ignore。
+- **P3 @tmex/api-client**（9a6eca6、ca6eeef）：ApiClient(baseUrl) + 端点函数尾参双形态；
+  agent/site store 内联 fetch 收敛（404/409 等分支语义逐处保持）；capabilities 常量上移
+  @tmex/shared（REST/WS 同源）；fetchCapabilities + FeatureSet helper。
+- **P4 @tmex/notifications**（0bc0d3f、a107559）：通知文案组装 t 注入；bell store/声音入包；
+  NotificationSink/BellPlayer/BrowserNotifier 语义接口 + no-op 默认；watch 文案纯函数；
+  应用侧 sonner 适配器。
+- **P5 @tmex/stores**（e6d7f7d、b709040）：五 store 工厂化 + createAppRuntime（连接面/REST/
+  通知/宿主服务/storagePrefix 全可注入，默认 client 惰性求值保时序等价）；模块级可变状态
+  收进工厂闭包 + dispose 注销；默认 runtime 原名导出兼容层；/react RuntimeProvider；
+  字体清单先行入 @tmex/theme（依赖方向 theme→stores）。
+- **P6 @tmex/theme**（d405e87、f6ddac8）：themes.css 与应用 token 段入包（CSS 变量名清单即
+  换肤契约）；preset 注册表 + dataset 激活机制（ui store 增 themePreset，默认 null 视觉不变）；
+  --terminal-shortcut-* 单源化（TS 真源生成 tokens.generated.css）；顺带修复 preset 样式源
+  顺序缺陷（dormant 时代变量恒被默认值覆盖，从未真正可激活）。
+
+**遗留（P7–P9 待做）**：terminal-ui 依赖反转、panels/settings 迁移、fe 清残留、HELLO_S2C
+capabilities 落地 site store、/api/capabilities 前端消费、preset 设置页 UI。
+**已知限制**：bell store 为全局单例（多连接宿主 paneId 理论冲突）；getSiteNameFallback/
+usePaneAgentState 绑定默认 runtime（多实例宿主应经 runtime 取用）。
