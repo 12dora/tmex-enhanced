@@ -73,8 +73,13 @@ lint 不新增（343→319）、Dockerfile 隔离演练、npm pack 核对、buil
   i18next/react-query）置 peerDependencies。settings 桶出口可摇树（设备页仅取两组件不裹入
   重模态）。
 
-**遗留（P9 待做）**：fe 清残留（外壳化）、HELLO_S2C capabilities 落地 site store、
-/api/capabilities 前端消费、包结构/嵌入使用文档、preset 设置页 UI。
-**已知限制**：bell store 为全局单例（多连接宿主 paneId 理论冲突）；getSiteNameFallback/
-usePaneAgentState 绑定默认 runtime（多实例宿主应经 runtime 取用）；panels 保留 sonner/
-react-router peerDep（最外层 UI 面局部 toast/路由，非跨切面通知）。
+- **P9 收尾**（capabilities wiring + docs）：fe 已外壳化（components 仅剩 page-layouts +
+  Sidebar/flow-bridges/global-device-provider）；`client.serverCapabilities` 落 HELLO_S2C
+  能力集（按连接）；site store 增 `capabilities: FeatureSet` + `loadCapabilities()`（消费
+  `GET /api/capabilities`），fe 启动即拉取；包结构/嵌入用法文档见 `docs/frontend/packages.md`。
+
+**九包拆分完成**（shared/ui/ws-client/api-client/notifications/theme/stores/terminal-ui/
+panels + apps/fe 外壳）。**已知限制**：bell store 为全局单例（多连接宿主 paneId 理论冲突）；
+getSiteNameFallback/usePaneAgentState 绑定默认 runtime（多实例宿主应经 runtime 取用）；
+panels 保留 sonner/react-router peerDep（最外层 UI 面局部 toast/路由，非跨切面通知）；
+preset 设置页 UI 未做（机制层完备，可编程激活）。
