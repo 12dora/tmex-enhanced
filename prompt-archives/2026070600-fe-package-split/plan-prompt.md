@@ -16,3 +16,9 @@
 ## 后续对话 prompt
 
 （追加于此）
+
+### P2–P9 全量执行轮（2026-07-07）
+
+继续按 plan-00.md 串行完成 P2–P9 全部阶段，验收标准不变：行为零变化、e2e 与基线逐用例对照（pass→fail 即阻塞）、全链绿（tsc/vite build、全包 bun test、e2e、lint 不新增）、分发面不 break（Dockerfile COPY 同步 + 隔离演练、npm pack 核对、build:artifacts --smoke）、明暗双模式视觉核对、组件行为阶段（P7/P8）真实实例交互走查。每阶段「先搬迁（git mv）后解耦」分 commit。
+
+计划微调（现状核实）：settings 实际 25 文件；capabilities 目前在 fe 侧无消费（HELLO_S2C 字段解码后即弃），P9 落地 client.serverCapabilities + site store + /api/capabilities 消费；`--terminal-shortcut-*` 的 hex 值源自 `packages/shared/src/appearance.ts` seoul256 调色板，P6 建 TS 真源时按此对齐；flow-bridges 拆分归属：`lib/flow-bridges.ts`（桥单例）进 stores 包、`components/flow-bridges.tsx`（注册组件）留 fe。
