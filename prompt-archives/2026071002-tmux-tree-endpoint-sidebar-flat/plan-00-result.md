@@ -47,3 +47,16 @@
 
 - 移动端三分区并列时 Agent 输入框需分区内滚动才可见（`min-h-[360px]` 超出小屏分区高度）；若体验反馈不佳，可考虑分区差异化 flex 权重或移动端默认折叠部分分区。
 - `sidebar-section-toggle-*` 折叠交互目前仅一次性目检 spec 覆盖过（agent 折叠→`agent-tab` 卸载），未沉淀常驻 e2e 用例。
+
+## 后续补修：本地 tmux 集成测试迁独立 socket（0214692）
+
+独立验收发现 `apps/gateway/src/tmux-client/local-external-connection.integration.test.ts` 的非隔离用例经文件顶部 `execSync('tmux …')` helper 直接使用默认 tmux socket，违反「测试一律使用独立 socket」纪律，且该文件被 `bun test` 自动发现，导致 gateway 全量测试无法合规复现。
+
+修法：全部用例迁至每用例唯一的 `tmux -L <socket>` server。给 `defaultRun`/`defaultSpawnControlClient` 加 `export`（唯一的非测试改动），测试用 `socketArgs`（仅对 `argv[0]==='tmux'` 插 `-L`，`/bin/sh -c` 的 terminfo 探测原样透传）包装真实实现注入 deps；session 清理改为 kill 整个每用例 server + 删 socket 文件。已隔离的三个用例（capturePaneText/getPaneInfo/splitPane）保持原样。
+
+门禁复跑：
+
+- 单文件 `bun test src/tmux-client/local-external-connection.integration.test.ts`：10 pass / 0 fail（另 5 连跑全绿）；临时 argv 断言确认 control client 均为 `tmux -L tmex-test-local-* -C attach-session`，验证后清理。
+- gateway 全量 `bun run test`：836 pass / 0 fail（多次复跑，其中一次出现 1 个与本文件无关的偶发失败，重跑消失）。
+- P6 门禁 e2e（agent-session、mobile-agent-watch、files-context-menu、sidebar-pane-menu-alignment）：12 passed（1.7m），独立 socket `tmex-e2e` + 独立端口。
+- grep 自检：文件内所有 tmux 调用点均带 `-L`，无遗留默认 socket 调用。
