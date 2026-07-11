@@ -71,3 +71,44 @@ gateway 891、shared 93、stores 36、ws-client 23。
 | diff：全局 pane 并集退回窗口内局部判定 | 1 fail 红 ✓（move-pane 场景） |
 | 推送渠道跳过集合置空 | 3 fail 红 ✓（telegram/weixin/分发三面） |
 | runTmux server-gone 移除 tmuxAvailable 落库 | 1 fail 红 ✓ |
+
+## 第二轮审查修复（2026-07-12）
+
+第二轮审查发现一处关键缺陷与若干次要问题，修复后 gateway 899、shared 93、stores 37 全绿：
+
+1. **device_disconnect 在 error 型断开时被系统性抑制（关键）**：双发抑制守卫
+   原以持久化的 `tmuxAvailable === false` 作「session gone 已发 session_closed」
+   信号，但该状态位被大量无关路径先行写成 false——ssh error handler 对任何
+   网络闪断无条件落库、无记录设备的缺省值即 false、ssh `runTmux` 任意失败也
+   落库——导致错误型断开与新设备连接失败这两类最常见场景的 device_disconnect
+   全部漏报。改为连接实例内显式标志：`ConnectionLifecycleEmitter.sessionClosedEmitted`
+   经 `DeviceSessionRuntime` getter 暴露，supervisor 调用点显式传给桥
+   （`ConnectionAlertInput.sessionClosedEmitted`），桥不再读取任何持久化状态；
+   废弃 `setRuntimeStatusProvider` seam。测试覆盖桥/supervisor 透传/连接类三层，
+   且不再以 mock 短路守卫信号。
+2. **生命周期发射逻辑抽为共享模块**：`emitLifecycleEvent` / `notifySessionClosed` /
+   `emitSnapshotClosures` 三方法原是 local/ssh 两连接类手工同步的同构副本
+   （约 90 行，ssh 侧零测试），抽为 `tmux-client/lifecycle-emitter.ts`
+   （`ConnectionLifecycleEmitter`），与 `snapshot-diff.ts` 同待遇；发射整体
+   try/catch 兜底——事件发射是旁路观测，settings 读取或回调抛错不再可能打断
+   session gone 路径的 shutdown 控制流。ssh 侧补 lifecycle 回归测试
+   （session_created / server-gone once + 标志 / pane close）。
+3. **local 快照并发乱序 stale 写回**：local 快照三命令是无队列并发 spawn，
+   后发先至时过期响应会把已消失的 window/pane 写回 `snapshotWindows`，
+   下一帧 diff 重复报关闭。`requestSnapshotInternal` 加纪元号守卫，过期响应
+   整体丢弃（ssh 侧命令队列天然串行不受影响）。配套挂起-放行式并发测试。
+4. 次要：桥事件的 `tmux.sessionName` 与连接类解析口径对齐（缺省 'tmex'）；
+   stores 宿主接管通知时设备错误 toast 一并让位（`deviceErrors` 状态照写，
+   错误横幅不受影响）；kind.ts 0x08 段注释修正为「站点设置与站点级广播」；
+   ssh 测试 FakeClient.end() 改异步 emit close（对齐真实 ssh2 行为，
+   修复其与 shutdown 的相互递归）。
+
+### 变异验红
+
+| 变异 | 结果 |
+|---|---|
+| 桥守卫改为恒抑制 device_disconnect | 12 fail 红 ✓ |
+| supervisor 透传恒 false | 1 fail 红 ✓（session gone 抑制场景） |
+| 移除快照纪元守卫 | 1 fail 红 ✓（乱序双发场景） |
+| 移除发射器 try/catch 兜底 | 2 fail 红 ✓ |
+| stores 错误 toast 抑制条件移除 | 1 fail 红 ✓ |
