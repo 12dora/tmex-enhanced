@@ -53,3 +53,36 @@ tmux list-panes -s -t <session> -F <pane snapshot format>
 - `%layout-change`、window/pane add/close/rename 等结构通知仍保持完整快照语义；
 - local 与 SSH 实现及测试必须一致；
 - 修复后的 managed 实机必须重新用子进程计数和 CPU 采样验收，不能只凭单测判断。
+
+## `.22` 实机复验与 WebSocket 背压根因
+
+`0.1.2-local.22` 实机将 Gateway 子进程数从约 207/20 秒降到 2/20 秒，剩余两次严格对应
+10 秒完整快照恢复看门狗，证明 title→tmux snapshot 回路已经消除。但 Gateway CPU 仍为
+21%～32%，因此资源 Gate 仍不通过。
+
+正常退出前台 App 后，Gateway CPU 没有下降，且仍有 6 条来自 Companion 的 loopback
+WebSocket。`nettop` 证明其中一条连接发送窗口为 0、存在重传且累计发送量不再前进；另一条
+连接仍持续消费约 10～12 KiB/s。Gateway 的全部发送路径都忽略 Bun
+`ServerWebSocket.send()` 返回值，也没有配置 `backpressureLimit` /
+`closeOnBackpressureLimit` 或 `drain`。本地 Bun 1.3.14 类型和随包文档明确约定：
+
+- `-1`：帧已入队，但连接进入背压；
+- `0`：帧因连接问题被丢弃；
+- 正数：已发送的字节数。
+
+因此慢 Relay/客户端 attach 会让 Gateway 持续编码和尝试投递实时终端帧，既无法保证该
+客户端的无缺口语义，又持续消耗 CPU。
+
+新增语义要求：
+
+- 所有 Gateway WS 发送路径统一检查 send status，包含普通 envelope、chunk、switch
+  barrier 与 Agent/Watch 广播；
+- 首次 `-1` 后暂停该 socket 的后续发送；若 drain 前没有新帧被跳过，可恢复使用；
+- 背压期间若有实时帧被跳过，drain 后必须隔离该 socket，让客户端重连并通过 history
+  恢复，禁止把有缺口的流伪装成连续；
+- 持续 5 秒不 drain 必须强制终止，不能无限保留慢消费者；
+- `0` 视为连接不可用并终止；
+- Bun server 显式设置 1 MiB 背压上限并在达到上限时关闭，不能依赖版本默认值；
+- slow consumer 只牺牲自己的 attach，不能影响同设备其他客户端或 tmux runtime；
+- 写失败测试覆盖暂时背压恢复、有缺口后的 drain 隔离、超时隔离和 chunk 停发，再安装
+  managed 候选复测 CPU、连接数和健康状态。

@@ -20,6 +20,8 @@
    日志速率、健康状态与终端 attach。
 7. 若实机仍存在高频工作，按子进程 argv 继续区分看门狗与事件驱动刷新；pane title
    只更新内存快照并合并广播，禁止触发完整拓扑快照。
+8. 若子进程频率已受控但 CPU 仍高，检查 loopback WS 背压；统一处理 Bun send status，
+   暂停慢 socket、在流出现缺口或持续背压时只隔离该客户端。
 
 ## 验收
 
@@ -29,6 +31,8 @@
 - `/healthz.env` 在 managed 产物中为 `production`；
 - 连续 pane title 更新不启动 tmux 子进程，未知 pane 标题等待下一次结构快照吸收；
 - 标题广播有界，local 与 SSH 语义一致；
+- 慢 WS 消费者不会让 Gateway 持续发送；短暂无缺口背压可恢复，有缺口或超时只断开该
+  socket；
 - 实机稳定终端场景 Gateway CPU 显著下降，且终端输入、输出、resize、断开恢复无回归。
 
 ## 风险
