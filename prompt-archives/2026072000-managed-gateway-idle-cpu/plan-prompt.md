@@ -26,3 +26,30 @@
 - Bun standalone 会按构建进程固化 `process.env.NODE_ENV`；当前产物运行时环境为
   `production`，但 `/healthz` 固定返回 `development`。
 
+## `.21` 实机复验与根因补充
+
+第一轮单飞、10 秒恢复看门狗和 production 构建契约已通过自动化测试并装入
+`0.1.2-local.21`。实机复验确认 `/healthz.env=production`，但 Gateway 仍占用约
+18%～37% 单核 CPU，因此第一轮资源 Gate 不通过。
+
+只读子进程观测在 20 秒内捕获约 207 个 Gateway 子进程，绝大多数为：
+
+```text
+tmux list-panes -s -t <session> -F <pane snapshot format>
+```
+
+频率约为每秒 10 次；`display-message`、`list-windows` 和 `tmux -V` 仅低频出现。代码
+追踪确认控制模式解析每次 OSC pane title 时，local 与 SSH connection 都会把标题写入
+`pendingPaneTitles`，随后调用完整 `requestSnapshot()`。标题是既有 pane 的展示属性，
+不是 session/window/pane 拓扑变化；活跃程序连续设置标题时不应启动 tmux 子进程。
+
+新增语义要求：
+
+- 已知 pane 的标题更新必须直接更新内存快照，只在值实际变化时向订阅方发出合并后的
+  snapshot，不运行完整 tmux snapshot；
+- 短时间内连续标题更新需要合并，不能让广播本身形成高频工作回路；
+- 未知 pane 的标题可暂存在 `pendingPaneTitles`，等待结构通知触发的完整快照吸收，不得
+  仅因标题事件主动探测拓扑；
+- `%layout-change`、window/pane add/close/rename 等结构通知仍保持完整快照语义；
+- local 与 SSH 实现及测试必须一致；
+- 修复后的 managed 实机必须重新用子进程计数和 CPU 采样验收，不能只凭单测判断。
