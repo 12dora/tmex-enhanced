@@ -22,6 +22,8 @@
    只更新内存快照并合并广播，禁止触发完整拓扑快照。
 8. 若子进程频率已受控但 CPU 仍高，检查 loopback WS 背压；统一处理 Bun send status，
    暂停慢 socket、在流出现缺口或持续背压时只隔离该客户端。
+9. 若健康 socket 的活跃终端流仍造成高分配成本，在同一事件循环 tick 内按 device/pane
+   合并输出并复用 payload 编码；批次必须有硬上限且不能改变 switch barrier 顺序。
 
 ## 验收
 
@@ -33,6 +35,8 @@
 - 标题广播有界，local 与 SSH 语义一致；
 - 慢 WS 消费者不会让 Gateway 持续发送；短暂无缺口背压可恢复，有缺口或超时只断开该
   socket；
+- 同一 tick 的 pane 输出按字节顺序合并、单批不超过 64 KiB，连接释放不残留待 flush
+  数据；
 - 实机稳定终端场景 Gateway CPU 显著下降，且终端输入、输出、resize、断开恢复无回归。
 
 ## 风险

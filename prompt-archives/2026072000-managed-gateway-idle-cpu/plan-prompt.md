@@ -86,3 +86,32 @@ WebSocket。`nettop` 证明其中一条连接发送窗口为 0、存在重传且
 - slow consumer 只牺牲自己的 attach，不能影响同设备其他客户端或 tmux runtime；
 - 写失败测试覆盖暂时背压恢复、有缺口后的 drain 隔离、超时隔离和 chunk 停发，再安装
   managed 候选复测 CPU、连接数和健康状态。
+
+## `.23` 实机复验与终端帧分配根因
+
+背压修复进入 `0.1.2-local.23` 后，App、Companion 与 Gateway 均由正常安装生命周期换成
+新进程。App→Relay 和 Companion→Relay 都保持 Connected，本地终端首帧与渲染正常。
+20 秒子进程观察仍只有两次 10 秒恢复快照和一条常驻 control client。
+
+与 `.22` 不同，全部 Gateway loopback TCP 连接均有正常发送窗口、零重传；两个 Relay
+attach 各自持续消费约 10～12 KiB/s。正常退出前台 App 后，本地 attach 被回收，Gateway
+连接从 7 条降到 5 条，但两个活跃 Relay attach 与约 19%～33% CPU 均保持不变。因此：
+
+- 背压缺陷修复有效，但不是当前稳态 CPU 的主因；
+- 前台 App attach 没有泄漏，剩余连接是 Companion 设置 watcher 与 Relay 当前流；
+- 不能通过关闭用户远程客户端或操作默认 tmux session伪造空闲 Gate；
+- `sample` 显示主线程与 JSC 后台分配/回收持续活跃，没有新的 spawn 热回路。
+
+Gateway 当前对 control mode 的每个 `%output` 回调立即逐客户端重新 Borsh 编码和发送。
+同一 stdout read/event-loop task 内的多段输出可以安全合并：使用 microtask 在返回下一项
+I/O 事件前 flush，既不增加跨事件可见延迟，也保证新的 select/barrier 消息不能越过旧
+输出。实现必须：
+
+- 按 device/pane 保序合并同一 tick 的字节，单批硬上限 64 KiB；
+- 超过上限立即 flush，禁止无界积压；
+- connection entry 释放时丢弃尚未 flush 的批次；
+- 同一 pane 的 Borsh payload 每批只编码一次，再为各客户端生成自己的 envelope/seq；
+- switch barrier 仍逐客户端决定 buffer/send，慢客户端隔离语义不变；
+- 测试覆盖合并、字节顺序、64 KiB 上限、释放清理和跨 microtask 的背压缺口；
+- 用 production managed 候选在相同两个活跃 Relay attach 下复测 CPU、吞吐、终端交互与
+  子进程频率，不能只用微基准替代实机 Gate。
