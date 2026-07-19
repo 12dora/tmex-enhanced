@@ -115,3 +115,59 @@ I/O 事件前 flush，既不增加跨事件可见延迟，也保证新的 select
 - 测试覆盖合并、字节顺序、64 KiB 上限、释放清理和跨 microtask 的背压缺口；
 - 用 production managed 候选在相同两个活跃 Relay attach 下复测 CPU、吞吐、终端交互与
   子进程频率，不能只用微基准替代实机 Gate。
+
+## `.25` 符号化 CPU Profile 与跨 I/O tick 批处理
+
+同一微任务批处理进入候选包后，managed Gateway 在真实两个活跃 Relay attach 下仍持续
+占用约 19%～30% 单核 CPU。为避免继续根据 UI 或无符号 macOS sample 猜测，使用仓库内
+独立数据目录、独立端口和独立 tmux socket/session 启动有限时长的 production source
+Gateway，并由 Bun 1.3.14 的 `--cpu-prof-md` 生成符号化 profile。整个测试没有访问默认
+tmux socket，也没有操作名为 `tmex` 的 session。
+
+Profile 的主要累计热点为：
+
+- `TerminalOutputBatcher.flush → sendTerminalOutput`：约 40.2%；
+- WebSocket `send`：约 25.1%；
+- `sendChunked`：约 23.8%；
+- Borsh/Zorsh serialize/write/DataView：约 12%；
+- control stream pull/read/parser：约 20%；
+- 恢复快照 tmux spawn：约 14.7%。
+
+受控 profile 的合成输出频率低于真实工作负载，因此绝对 CPU 只有约 2%～8%，但调用栈
+已经证明剩余稳态成本来自相邻 I/O tick 的终端帧编码和发送。`queueMicrotask` 只合并同一
+JS turn 中的回调；tmux control stream 的相邻 read 会在不同 turn 到达，实际无法合并。
+
+下一轮语义要求：
+
+- 终端输出按 device/pane 延迟至多 8ms 合并，而不是只等当前 microtask；
+- 单批仍以 64 KiB 为硬上限；达到上限立即发送，剩余字节进入新的有界批次；
+- 每个 pane 保持字节顺序，同一 device 多 pane 的显式 flush 保持首次出现顺序；
+- `TMUX_SELECT` 在启动 switch barrier、修改焦点和发送 ACK 前，强制 flush 该 device
+  已排队输出，确保旧 pane 字节不能越过切换事务；
+- `TMUX_SUBSCRIBE_PANES` 在修改订阅集合前强制 flush，确保排队字节按旧路由投递；
+- release/discard 必须取消定时器并丢弃排队输出，不能让已释放 runtime 的数据逸出；
+- 测试使用可注入调度器，不依赖真实 sleep；覆盖跨 tick 合并、8ms 上限、64 KiB 上限、
+  显式 flush 顺序、取消语义和 select/subscribe 路由边界；
+- 修复后重新跑完整 Gateway 测试、有限时长 CPU profile 和 production managed 实机
+  采样；只有 CPU、终端交互、连接状态与顺序语义同时通过才可进入下一 App 候选包。
+
+## 有界时间批处理验证结果
+
+实现采用每个 device/pane 最长 8ms 的有界批次和 64 KiB 硬上限，并在 select 与订阅变更
+前显式 flush。验证结果：
+
+- 定向测试 55/55 通过，包含跨 event-loop turn 合并、pane 首次出现顺序、定时器取消、
+  64 KiB 立即发送、旧 pane 输出先于 `SWITCH_ACK`、订阅替换前按旧路由发送；
+- Gateway 完整测试 953/953 通过；
+- Biome 对四个改动文件检查通过；
+- Gateway 全量 `tsc --noEmit` 仍被仓库既有的 AI SDK、SSH 类型和旧 fixture 等基线错误
+  阻断，本次改动文件未新增错误；
+- 隔离 production source profile 使用 `vibex-gateway-prof-20260720-04` 独立 socket、
+  同名非 `tmex` session、独立数据库和 29886 端口，测试结束后均已清理；
+- 负载为每 2ms 一行终端输出、两个同时选中同一 pane 的 WebSocket 客户端。去掉前三个
+  启动样本后，22 个稳定 CPU 样本平均 5.25%，最大 10.8%；
+- native WebSocket `send` 自耗从上一轮 profile 的 25.1% 降至 9.5%，证明批次已跨越
+  相邻 control stream I/O turn，而不是只合并单个 microtask。
+
+进入 App 候选包前仍需完成 production managed 二进制构建与实机替换复验；实机必须确认
+真实 Relay attach、终端交互、连接状态和持续 CPU 同时健康。
