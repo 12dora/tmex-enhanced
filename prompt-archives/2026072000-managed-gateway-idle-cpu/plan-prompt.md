@@ -413,3 +413,51 @@ loader 且仍使用数据库顺序而按预期失败。实现随后把 order 缓
 本轮刻意没有改变 title 的 100ms 产生频率、250ms snapshot coordinator 或 terminal
 batch deadline。下一步从干净提交构建 `.30`，由 App/launchd 正常 reconcile 后复测同一
 30 秒指标窗口和逐秒 CPU；只有实机数据才能判断 ORM 缓存是否关闭性能 Gate。
+
+## `.30` 实机结果推翻 ORM 主因（2026-07-20）
+
+tmex `fcec4cf` 经 vibex `de12507` 打入 `0.1.2-local.30`。候选通过 production URL、
+Developer ID App/CLI/全部内部组件、4 层 16 项终端资源验证；App 正常退出并备份 `.29`
+后，由新 App 自行把统一 slot reconcile 到 `.30`，没有手工停止或 signal 常驻
+Companion/Gateway。
+
+运行态通过：
+
+- App→Relay connected，RTT 134ms；
+- Local Companion running；
+- Companion→Relay connected，RTT 120ms；
+- system tmux `/opt/homebrew/bin/tmux` 3.7b；
+- 本地终端走 `local_companion`，收到首帧，8 秒采样 Canvas 非空且字体 loaded。
+
+但 Gateway 同一真实负载的 30 个逐秒样本仍平均 25.00%，范围 18.9%～32.4%。同期稳定
+指标仍约为每 30 秒 300 次 title、102 次 snapshot、约 870～920 次 terminal output，
+没有新的 history/event 或入站风暴。相较 `.29` 的 27.15%，该幅度不足以通过 Gate，也
+不能证明 SQLite 缓存是主要成本。因此“每份 snapshot 的同步 ORM 查询主导 25% CPU”
+假设已被实机数据推翻；缓存本身保留为正确的连接生命周期优化。
+
+下一步不再继续改数据库或 batch deadline。使用独立端口、数据库和明确非 `tmex` 的专用
+tmux socket/session，构造与实机一致的 10Hz title churn，并与无 title 对照；通过 Bun
+源码运行和 `--cpu-prof-md` 取得可符号化栈。测试结束后只清理隔离进程和专用 socket，
+不访问默认 tmux socket，不操作常驻 Companion/Gateway。
+
+## 隔离矩阵闭合到 macOS 签名策略（2026-07-20）
+
+专用端口、SQLite 和明确非 `tmex` 的 socket/session 对照结果：
+
+```text
+Bun source + title:               avg 4.136%,  titles=288, snapshots≈102/30s
+Bun source + no title:            avg 3.888%,  titles=0
+compiled test child + title:      avg 4.020%
+release signed managed + title:   avg 22.860%
+JIT-entitled managed + title:     avg 3.996%
+```
+
+最后两组使用同一 fresh managed Gateway 代码和等价业务计数；当前源码 fresh artifact
+与 `.30` 签名前 artifact SHA 相同。`--compile` 测试入口本身没有退化，真正变量是
+macOS Hardened Runtime 签名：发布 Gateway 没有 entitlement；为同一 managed
+standalone 加 `com.apple.security.cs.allow-jit=true` 后 CPU 恢复到源码基线。
+
+因此 tmex 的 title/snapshot、terminal batch 和 device tree cache 不再作为当前 CPU
+主修复面。device tree cache 保留为正确优化；下一步在 vibex 打包层以测试先行修复
+Gateway 专属 entitlement，并用同一隔离负载设置 `-1/0` CPU 安全门。tmex 源码无须为了
+签名退化继续做猜测性改动。
