@@ -288,3 +288,63 @@ tmex `6332699` 经 vibex `785dbe7` 打入 `0.1.2-local.27`。App 正常退出、
 通过。仓库级 `tsc` 仍报告既有 AI SDK、SSH fixture 与 Bun `BufferSource` 基线错误，
 本轮新增模块没有新增错误。该提交只关闭语义和回归 Gate；CPU Gate 必须由下一候选在
 真实 App/Relay attach 下用上述计数和逐秒采样关闭。
+
+## `.28` 指标推翻碎片假设（2026-07-20）
+
+tmex `0ce5366` 经 vibex `91d7c73` 打入 `0.1.2-local.28`，由 App/launchd 正常
+reconcile。连接、system tmux 和本地终端 Gate 全部健康，但 30 秒 CPU 仍平均 26.58%，
+范围 21.4%～30.7%，因此性能 Gate 不通过。
+
+第二个稳定 30 秒指标窗口：
+
+```text
+source_events=869 source_bytes=219979
+dropped_events=0 dropped_bytes=0
+batches=858 batch_bytes=219979
+recipient_deliveries=2574 recipient_bytes=791211
+clients=4 devices=1
+```
+
+这相当于约 29 个 source event/s、7 KiB/s，batch 与 source event 几乎 1:1，三个
+观察者约 86 次 delivery/s；并不存在此前猜测的高频微碎片。`lsof` 证明 Gateway 的
+6 条 loopback TCP 都由 Companion 持有；其中指标可见 4 条已协商、3 条观察同一 pane。
+唯一 tmux control 子进程为 0% CPU。8 秒 macOS sample 中主线程仍有 JSC 活动，三个
+Heap Helper Thread 各出现约 525/4668 个活跃样本，分配/回收仍是显著成本。
+
+下一轮诊断要求：
+
+1. 记录 raw control chunks/bytes 与 parser 输出、title、notification、structure 数量，
+   判断是否有大量被吞掉的控制序列；
+2. 记录 snapshot、terminal history、tmux event 与入站 WS kind，排除 source output
+   指标之外的高频路径；
+3. 记录匿名 `clientImpl` 计数和 pane 观察者数量，判断三路 fanout 是正常多端订阅还是
+   Companion attach 泄漏；
+4. 诊断仍保持 30 秒低频、无 device/pane/content；未定位前不再调整 16ms deadline。
+
+## 分层诊断实现与回归（2026-07-20）
+
+按上述要求增加两组只读、30 秒窗口指标：
+
+- managed control client 记录 raw chunk/bytes、control output/bytes、剥离控制序列后的
+  terminal output/bytes，以及 title、bell、notification、structure change 和 block；
+- Gateway 记录入站消息 kind/bytes、snapshot 实际投递、terminal history 路由尝试、
+  tmux event 路由尝试和匿名客户端类型桶。
+
+日志不包含 device、pane、账号、终端内容或任意 payload；`clientImpl` 只在内存保留最多
+64 字符，输出仅分为 `tmex-fe`、`vibex-companion`、other 和 unnegotiated。无法由当前
+API 确认成功发送的 history/event 明确命名为 `delivery_attempts`，避免把路由尝试误报
+成网络投递成功。control stream 指标只在 externally managed runtime 启用，普通开源
+Gateway 路径不创建 collector。
+
+验证结果：
+
+- 定向回归 135/135 通过；
+- Gateway `apps/gateway/src` 全量回归 967/967，通过 2756 个断言、95 个测试文件；
+- Biome 对 10 个改动文件通过，diff check 待提交前执行；
+- Gateway 全量 `tsc` 仍有仓库既有 AI SDK、SSH fixture、旧测试类型和 Bun
+  `BufferSource` 基线错误；新增 metrics、subscription 文件没有错误，`index.ts`、
+  `codec-borsh.ts` 和 `local-external-connection.ts` 的报告行均为本轮未修改的既有
+  基线位置。
+
+该提交只提供定位证据，不宣称修复 CPU。下一步从干净提交构建 `.29`，只经 App/launchd
+reconcile 后读取三类指标并在同一 30 秒窗口采样 CPU，再依据实际归属设计修复。
