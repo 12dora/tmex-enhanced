@@ -468,3 +468,8 @@ vibex侧签名修复后的真实Developer ID安全门已通过：Gateway携带�
 25个CPU样本平均3.956%，`source_events=859`、`titles=287`、`snapshots=102`。这进一步
 确认tmex managed代码无需为了本次签名退化修改执行语义；下一步只在vibex候选安装后
 复验常驻Gateway。
+
+`0.1.2-local.31` 已由 App/launchd 正常 reconcile 到统一安装 slot。真实 Relay attach、
+system tmux 3.7b、本地终端首帧和非空 Canvas 同时健康；常驻 Gateway 30 个逐秒样本
+平均 2.67%，范围 1.2%～8.1%。该结果关闭本计划的实机 CPU Gate，后续保留现有活动指标
+和回归测试，不再为签名层退化修改 tmex 执行语义。
