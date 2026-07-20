@@ -348,3 +348,68 @@ Gateway 路径不创建 collector。
 
 该提交只提供定位证据，不宣称修复 CPU。下一步从干净提交构建 `.29`，只经 App/launchd
 reconcile 后读取三类指标并在同一 30 秒窗口采样 CPU，再依据实际归属设计修复。
+
+## `.29` 实机诊断结果（2026-07-20）
+
+tmex `1412326` 经 vibex `e4f6cc0` 打入 `0.1.2-local.29`，production URL、Developer ID
+App/CLI/内部组件、4 层 16 项终端资源全部通过。App 自行把统一 slot 从 `.28` reconcile
+到 `.29`，没有手工操作常驻 Companion/Gateway。
+
+稳定窗口实测：
+
+```text
+terminal_output:
+  source_events=912 source_bytes=229690 batches=859
+  recipient_deliveries=2577 clients=4 devices=1
+gateway_activity:
+  inbound_messages=7 inbound_bytes=84
+  snapshots=102 snapshot_bytes=32232 snapshot_deliveries=306
+  histories=0 tmux_events=0
+  client_impls=tmex-fe:3,vibex-companion:1
+control_stream:
+  raw_chunks=1205 raw_bytes=355631
+  control_outputs=1211 terminal_outputs=911
+  titles=300 structure_changes=0 blocks=1
+```
+
+也就是没有业务入站、history 或 tmux event 风暴，但 pane 每 100ms 更新一次 title；
+`PaneTitleSnapshotCoordinator` 的 250ms trailing window 把它变成约 3.4 次/秒完整
+snapshot。`WebSocketServer.encodeSnapshotWithOverlays` 每次 snapshot 都同步调用
+`getDeviceTreeOrder`，而后者每次通过 Drizzle 构造并执行 SQLite 查询。即使没有保存任何
+tree order，也会重复走 ORM 查询与对象分配。
+
+同期 managed Gateway 30 个逐秒样本平均 27.15%，范围 21.1%～33.5%；当 tmex-fe 从
+3 条降为 2 条后，20 个样本仍平均 27.87%，范围 22.2%～32.7%，排除“第三个观察者
+fanout 是主要成本”。10 秒 sample 仍显示主线程加三个 JSC heap helper 持续活跃。
+
+下一步按最佳实践先行：在 `WebSocketServer` 生命周期内缓存 device tree order；所有
+WS/REST 排序写路径本来都经该 server bridge，写后同步更新缓存，连接释放时清除。新增
+测试必须证明连续 snapshot 只加载一次 DB order、window/pane reorder 后立即使用新值，
+并保留 REST/WS 同源语义。先只修这条已定位的同步 ORM 热路径，不同时调整 title 节流或
+terminal batch deadline；由 `.30` 同一实机窗口决定是否继续处理 title 快照频率。
+
+## Device tree order 热路径修复（2026-07-20）
+
+先加入“同一设备连续编码两份 snapshot 只加载一次 order”的回归测试，旧实现因忽略注入
+loader 且仍使用数据库顺序而按预期失败。实现随后把 order 缓存绑定到
+`WebSocketServer` 的设备连接生命周期：
+
+- 首份 snapshot 从 SQLite 加载并复制进内存，后续 snapshot 只读取缓存；
+- window/pane 重排仍先同步持久化，成功后才复制更新缓存；
+- 更新 window 顺序时保留 pane 顺序，更新单个 window 的 pane 顺序时保留 window
+  顺序和其他 pane 顺序；
+- 最后一个客户端释放设备连接时删除缓存，下次连接重新从数据库恢复；
+- WS 和 REST 重排继续共用现有 server bridge，没有新增旁路或第二份写语义。
+
+验证结果：
+
+- 新增三条语义测试覆盖重复读取、两类重排后的立即一致性和连接释放后的重新加载；
+- `index.test.ts` 58/58 通过；
+- Gateway 全量 975/975 通过，共 2782 个断言、97 个测试文件；
+- Biome 和 diff check 通过；
+- Gateway 全量 `tsc` 仍报告既有 AI SDK、SSH fixture 和 Bun `BufferSource` 基线错误；
+  本轮测试最初引入的 nullable fixture 错误已修正，最终没有新增类型错误。
+
+本轮刻意没有改变 title 的 100ms 产生频率、250ms snapshot coordinator 或 terminal
+batch deadline。下一步从干净提交构建 `.30`，由 App/launchd 正常 reconcile 后复测同一
+30 秒指标窗口和逐秒 CPU；只有实机数据才能判断 ORM 缓存是否关闭性能 Gate。
