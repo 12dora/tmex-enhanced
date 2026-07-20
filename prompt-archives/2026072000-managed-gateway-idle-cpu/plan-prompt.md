@@ -171,3 +171,67 @@ JS turn 中的回调；tmux control stream 的相邻 read 会在不同 turn 到�
 
 进入 App 候选包前仍需完成 production managed 二进制构建与实机替换复验；实机必须确认
 真实 Relay attach、终端交互、连接状态和持续 CPU 同时健康。
+
+## `.26` 实机 Gate 失败与第二轮语义（2026-07-20）
+
+`0.1.2-local.26` 由 App 正常启动维护流程安装，未手工停止、重启或 signal
+Companion/Gateway。App→Relay、Companion→Relay、本地 Companion、system tmux `3.7b`
+及本地终端首帧均健康，但 managed Gateway 的 30 个连续样本仍为平均 22.13% CPU，
+范围 12.6%～31.5%，因此 8ms 候选没有通过实机 Gate。
+
+只读取证显示：
+
+- Gateway 有 6～7 条来自 Companion 的 loopback WebSocket；
+- 稳态实际出站约 20～24 KiB/s，其中两个 Relay attach 各约 10～12 KiB/s；
+- macOS `sample` 显示主线程和 JSC heap helper 都持续活跃，没有 spawn 热回路；
+- Gateway 当前会为 control stream 上每个 pane 的输出建立定时批次，直到 flush 时才判断
+  是否存在选中或订阅该 pane 的客户端。未被任何客户端观察的 pane 仍产生 timer、chunk
+  拼接和 GC 工作；
+- 小于单帧上限的实时输出仍逐客户端进入通用 chunk 分支，产生可避免的短命对象。
+
+下一轮按最佳实践先行：
+
+1. 在进入 `TerminalOutputBatcher` 前按当前 selected/subscribed 状态丢弃无人观察的 pane
+   输出；后续 select 仍以 history/barrier 恢复屏幕，不能依赖此前无人消费的实时增量。
+2. 将默认批次窗口对齐一帧，最多 16ms；select/subscription 继续显式 flush，64 KiB
+   上限保持不变。
+3. 小 payload 直接编码 envelope，只有超过协商单帧上限时才创建 chunk stream。
+4. 测试必须证明无人观察输出不会进入 batcher、选中和附加订阅仍收到完整有序字节、
+   select/subscription 边界不变。
+5. 再跑多客户端隔离 production profile，并安装新候选复测相同真实 Relay attach；
+   只有实机 CPU 与终端语义同时通过才关闭本 Gate。
+
+## 第二轮隔离验证结果（2026-07-20）
+
+实现结果：
+
+- `broadcastTerminalOutput` 在创建定时批次前检查当前设备是否至少有一个客户端选中或
+  订阅目标 pane；无人观察的增量直接丢弃，后续选择仍由既有 history/switch barrier
+  恢复屏幕；
+- 默认批次窗口从 8ms 调整为 16ms，64 KiB 硬上限及 select/subscription 前显式 flush
+  保持不变；
+- 小于协商单帧上限的 payload 直接编码普通 envelope，只有超限时才创建 chunk stream；
+- 共享 `clientWantsPaneOutput` 判定，确保进入 batcher 和最终逐客户端投递使用相同语义。
+
+测试与性能证据：
+
+- 新增失败测试先证明旧实现会为无人观察的 pane 入队、默认窗口不是 16ms，且没有单帧
+  fast path；实现后定向测试 58/58 通过；
+- Gateway 完整测试 961/961 通过，共 2746 个断言、94 个测试文件；
+- Biome 对四个改动文件通过；全量 TypeScript 检查仍只有仓库既有 AI SDK、SSH、旧
+  fixture 与 BufferSource 基线错误，本次未增加错误类别；
+- 首次尝试直接运行 `managed-entry.ts` 时被嵌入式迁移资源门禁拒绝，未进入性能阶段；
+  测试端口和专用 tmux socket 均已清理，没有把该结果误记为 profile；
+- 随后用 `build-managed.ts` 编译与发布形态一致的 darwin-arm64 standalone，在独立
+  数据库、29888 端口和 `vibex-gateway-prof-20260720-06` 专用 tmux socket/session
+  下运行；
+- 负载为每 2ms 一行输出、7 个客户端同时选择同一 pane、持续 30 秒；共收到 8239 个
+ 终端帧、1,070,181 字节；
+- managed Gateway 的 25 个逐秒 CPU 样本平均 3.74%，最低 1.9%、最高 9.3%；health
+  同时确认 production 环境和 system tmux `3.7b`；
+- 29888 listener、测试 Gateway、客户端和专用 tmux server 在结束后全部清理，未访问
+  默认 tmux socket、未操作 `tmex` session，也未 signal 常驻 Companion/Gateway。
+
+隔离性能 Gate 已通过。下一步必须把同一源码打入 App 候选，由 App 启动维护和 launchd
+正常 reconcile 后，在真实 Relay attach、终端输入输出和恢复提示同时存在的最终用户
+形态下复验；隔离结果不能替代 installed managed Gate。
