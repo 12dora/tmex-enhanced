@@ -235,3 +235,56 @@ Companion/Gateway。App→Relay、Companion→Relay、本地 Companion、system 
 隔离性能 Gate 已通过。下一步必须把同一源码打入 App 候选，由 App 启动维护和 launchd
 正常 reconcile 后，在真实 Relay attach、终端输入输出和恢复提示同时存在的最终用户
 形态下复验；隔离结果不能替代 installed managed Gate。
+
+## `.27` 实机 Gate 再次失败（2026-07-20）
+
+tmex `6332699` 经 vibex `785dbe7` 打入 `0.1.2-local.27`。App 正常退出、备份式替换后，
+由 App 自行 reconcile 统一安装目录和 launchd；没有手工 signal Companion/Gateway。
+安装 slot、候选 payload 中的 `tmex-gateway` SHA-256 完全一致，均为
+`f6137d7a15de2d917c7252d62b14fbf82a3db5484ffb5abc67ec3bdec3618f36`，因此排除安装了
+旧二进制。
+
+运行态确认 App→Relay、Companion→Relay、本地 Companion、system tmux `3.7b` 和本地
+终端首帧全部健康。但真实 managed Gateway 的 30 个逐秒样本平均 24.64% CPU，范围
+17.3%～32.7%，第二轮仍未通过实机 Gate。同期 `nettop` 显示约 31～40 KiB/s 出站，
+常驻 control-mode tmux 子进程自身为 0% CPU；8 秒 `sample` 仍显示工作集中在 Gateway
+主线程/JSC，而不是 tmux 子进程或新的 spawn 热循环。
+
+隔离与实机的关键差异现在收敛为真实 control stream 的事件碎片形态，而不是总吞吐：
+
+- 受控 profile 每 2ms 产生一条完整输出，约 500 个事件/秒；
+- 真实 TUI 可能以大量很小的 `%output` 片段产生相似字节吞吐；
+- 当前 batcher 对每个片段创建 `subarray` view 并保存到数组，flush 时再分配并拼接；
+- 实机前置兴趣检查还会为每个片段执行 `Array.from(entry.clients)`，产生额外短命数组；
+- 16ms 降低了最终发送频率，但没有限制进入批次前的每事件分配。
+
+下一轮按最佳实践先行：
+
+1. 增加低频、无 pane 内容和无设备标识的终端流量计数，区分 source event/bytes、
+   dropped event/bytes、batch/bytes 和 recipient delivery/bytes；日志只进入 Gateway
+   运维日志，不输出到普通 CLI 文案。
+2. 兴趣检查改为零分配迭代，禁止每个 output 复制客户端集合。
+3. batcher 改为单个按需增长、上限 64 KiB 的连续缓冲区，push 时直接复制字节，禁止
+   为每个碎片保存 `Uint8Array` view；达到上限立即 flush，16ms deadline 和所有路由
+   barrier 保持不变。
+4. 先写失败测试证明输入 buffer 后续修改不能污染批次、超多微小片段只持有一个有界
+   backing buffer，再用碎片化负载 profile，而不是只测完整行。
+5. 新候选实机日志必须先量化事件碎片率，再以同一真实负载复测 CPU；未通过前不得把
+   `.27` 隔离数据当作完成证据。
+
+## 碎片输出分配修复（2026-07-20）
+
+失败测试已经分别证明旧实现会保留调用方的可变输入 view、为 10,000 个单字节片段保留
+10,000 个 view/数组项，并在每个 output event 上调用 `Array.from(entry.clients)`。
+实现改为单个按需增长、上限 64 KiB 的 owned buffer 和 Set 原地早停迭代，同时增加
+30 秒窗口的匿名分层计数：
+
+- source events/bytes；
+- 未被任何 pane 订阅观察到的 dropped events/bytes；
+- 合并后的 batches/bytes；
+- 实际成功进入发送路径的 recipient deliveries/bytes。
+
+目标测试 63/63、Gateway `apps/gateway/src` 全量回归 961/961、Biome 与 diff check
+通过。仓库级 `tsc` 仍报告既有 AI SDK、SSH fixture 与 Bun `BufferSource` 基线错误，
+本轮新增模块没有新增错误。该提交只关闭语义和回归 Gate；CPU Gate 必须由下一候选在
+真实 App/Relay attach 下用上述计数和逐秒采样关闭。
