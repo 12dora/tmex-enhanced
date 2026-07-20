@@ -459,5 +459,12 @@ standalone 加 `com.apple.security.cs.allow-jit=true` 后 CPU 恢复到源码基
 
 因此 tmex 的 title/snapshot、terminal batch 和 device tree cache 不再作为当前 CPU
 主修复面。device tree cache 保留为正确优化；下一步在 vibex 打包层以测试先行修复
-Gateway 专属 entitlement，并用同一隔离负载设置 `-1/0` CPU 安全门。tmex 源码无须为了
-签名退化继续做猜测性改动。
+Gateway 专属 entitlement，并用同一隔离负载设置 CPU 安全门。真实信号测试仍受 vibex
+既有 `pid <= 1` / `-1/0` 全局门禁与容器隔离约束；tmex 源码无须为了签名退化继续做
+猜测性改动。
+
+vibex侧签名修复后的真实Developer ID安全门已通过：Gateway携带精确
+`com.apple.security.cs.allow-jit=true`、Hardened Runtime和安全时间戳；同一隔离负载
+25个CPU样本平均3.956%，`source_events=859`、`titles=287`、`snapshots=102`。这进一步
+确认tmex managed代码无需为了本次签名退化修改执行语义；下一步只在vibex候选安装后
+复验常驻Gateway。
