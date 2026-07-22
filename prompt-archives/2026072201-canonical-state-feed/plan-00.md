@@ -54,7 +54,9 @@ tmex implementation work so it can be executed and reviewed independently.
 
 1. Keep active panes subscribed and retain recently closed panes in a time-, count-, byte-, and
    runtime-bounded hot set.
-2. Store bounded screen state plus sequence-addressed replay history for active and hot panes.
+2. Store bounded screen state plus sequence-addressed live replay for active and hot panes. Use a
+   separate pane/history epoch plus line cursor for paginated scrollback so tmux history movement
+   cannot be mistaken for live replay.
 3. Evict deterministically to cold state; cold panes retain metadata but no terminal byte flow.
 4. Reopen from replay when coverage exists and from a fresh snapshot otherwise.
 5. Expose metrics for hot-set size, bytes, evictions, replay hit rate, rebase count, and queue drops.
