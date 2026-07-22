@@ -28,6 +28,12 @@ and retry states instead of leaving an empty surface under weak-network or resou
   hosts can send control commands through an existing local/relay lane.
 - Added source-route attribution (`gateway`, `local`, `relay`, or `unknown`) without exposing
   endpoint credentials or identifiers.
+- Kept the legacy compatibility snapshot on the exact same canonical metadata revision instead of
+  independently mutating a second WebSocket-owned projection.
+- Fixed remote resize reconciliation so a matching local resize echo clears its pending guard;
+  mismatched remote sizes are retried when the bounded guard expires instead of being discarded
+  forever. Remote layout changes continue to use metadata patches and targeted history recovery,
+  without restoring full snapshot polling.
 - Added bounded terminal generation/rebase handling, cursor-based history pagination, host resource
   preparation, and weak-network retry UI.
 - Added the explicit lightweight `@tmex/terminal-ui/terminal-diagnostics` export.
@@ -38,25 +44,32 @@ and retry states instead of leaving an empty surface under weak-network or resou
 
 ## Verification
 
-- `bun run --filter @tmex/gateway test`: 1031 passed, 0 failed.
+- `bun run --filter @tmex/gateway test`: 1032 passed, 0 failed.
 - `bun run --filter @tmex/ws-client test`: 33 passed, 0 failed.
 - `bun run --filter @tmex/terminal-ui test`: 95 passed, 0 failed.
 - `bun run --filter @tmex/stores test`: 57 passed, 0 failed.
 - `bun run --filter @tmex/panels test`: 5 passed, 0 failed.
 - `bun run --filter @tmex/shared test`: 98 passed, 0 failed.
-- `bunx tsc --noEmit -p packages/terminal-ui/tsconfig.json`: passed.
-- `bunx vite build` from `apps/fe`: passed; terminal settings sheet and panel are emitted as
+- `bunx biome check` on every changed source and test file: passed.
+- `bun run --filter @tmex/fe build`: passed; terminal settings sheet and panel are emitted as
   separate lazy chunks.
+- `terminal-render-regressions.spec.ts --grep bug4 --repeat-each=3`: 3 passed, 0 failed on the
+  isolated `tmex-e2e` socket. Before the fix, the same test failed 3/3 with the terminal stuck at
+  `112x35` after tmux had moved to `92x27`.
+- `theme-propagation.spec.ts --grep "rapid theme toggle.*resize" --repeat-each=3`: 3 passed, 0
+  failed.
 - Public imports for `@tmex/terminal-ui/terminal-diagnostics` and `@tmex/ws-client` were resolved
   from the frontend workspace.
 
-The workspace-wide frontend wrapper still reaches the repository's pre-existing duplicate React 19
-type declarations before Vite starts; direct Vite production compilation passes. The Gateway-wide
-TypeScript baseline also still contains unrelated existing errors, including legacy `BufferSource`
-typing in `apps/gateway/src/ws/index.ts`; focused tests and changed-package checks introduce no new
-failures.
+The full frontend E2E run before this final regression fix completed with 92 passed, 3 skipped, and
+9 failed. The remaining failures reproduce the repository's documented baseline in
+`docs/testing/2026070800-e2e-known-issues.md`. In particular, the old two-pane
+`ws-borsh-theme-resize` case ends at a different viewport size but compares against the starting
+pane width, producing the same fixed 33-column mismatch in 3/3 focused repeats; the single-pane
+theme/resize pressure gate above is green.
 
 ## Safety
 
-All tmux-related verification used unit/integration fakes or repository-local paths. No installed
-tmex service, production directory, default tmux socket, or `tmex` session was accessed or changed.
+All live tmux verification used the repository's isolated `tmex-e2e` socket. No installed tmex
+service, production directory, default tmux socket, or production `tmex` session was accessed or
+changed. The isolated test server was removed after verification.
