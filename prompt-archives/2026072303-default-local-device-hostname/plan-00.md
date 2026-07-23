@@ -1,7 +1,7 @@
 # 默认本地设备 hostname 实施计划
 
 > 日期：2026-07-23
-> 状态：实施中。
+> 状态：已完成（2026-07-24）。
 
 ## 背景
 
@@ -21,4 +21,3 @@ Gateway 已通过 `ensureDefaultLocalDeviceSeeded()` 在真正全新数据库中
 - 空 hostname 有 `local` 安全回退。
 - 重复启动、删除后启动、老库与已有设备行为不变。
 - 定点测试和 Gateway typecheck 通过。
-
