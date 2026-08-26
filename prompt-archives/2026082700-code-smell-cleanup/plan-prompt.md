@@ -24,3 +24,11 @@
 - 工作在 worktree `../tmex-enhanced-wt-smell`（分支 `chore/code-smell-cleanup`，基于 main bb9d84f）。
 - 探索：`codex exec -m gpt-5.6-luna -c model_reasoning_effort=xhigh -s read-only`；后端编码：`grok -m grok-4.6 --effort high`；前端编码：Claude Opus 5 subagent；审查：`codex exec -m gpt-5.6-sol -c model_reasoning_effort=high`。
 - 禁止触碰生产 tmex 服务 / `tmex` tmux session；测试只用 test env。
+
+### User（追加 2）
+
+code smell 修复任务循环运行, 直到你认为无高价值的修复点, 或者达到3轮.
+
+### Execution notes（追加）
+
+- 每轮结束（该轮所有批次 commit + codex 审查处理完毕）后，重新用 codex(luna, xhigh) 对全仓扫描，产出下一轮清单；无高价值项或满 3 轮即停止，最后 push。
