@@ -1,0 +1,9 @@
+1. **高｜连接失败后底层传输泄漏** — `apps/gateway/src/tmux-client/device-session-runtime.ts:216-223`。`connect()` 失败时只标记 runtime 为 `terminated` 并释放投影对象，没有调用底层 `connection.disconnect()`；之后 `disconnect()` 会因 `terminated` 直接返回（`device-session-runtime.ts:228-236`）。SSH 连接在 `connectSshClient()`、命令通道或控制通道阶段失败时，客户端和已创建的 channel 可能持续存活，连接注册表后续释放也无法补救，属于明确的资源泄漏。
+
+2. **高｜模拟器引用计数被强制销毁绕过** — `apps/gateway/src/agent/run-resource-scope.ts:100-111`。释放 run 资源时先调用引用计数的 `release()`，随后无条件调用忽略 `refCount` 的 `destroy()`（`apps/gateway/src/tmux-client/pane-emulator.ts:276-300`）。当多个 Agent session 绑定同一 pane 时，首个 run 结束会直接 dispose 仍被其他 run 使用的共享模拟器，后续 run 会收到已销毁的实例并失败；API 允许创建同一设备/pane 的多个 session，而 supervisor 只按 session ID 去重。
+
+3. **高｜无 SSH Agent 时 supervisor 无限重启 gateway** — `scripts/dev-supervisor.sh:282-302, 347-362`。`start_gateway_with_fresh_agent()` 明确支持没有 SSH Agent 的模式并正常启动 gateway，但 `is_managed_ssh_agent_alive()` 在 socket 为空时必定返回失败（`scripts/dev-supervisor.sh:213-220`），主循环随后把它当作“ssh-agent died”并重启 gateway。没有安装 `ssh-agent` 或仅使用本地 tmux 时，gateway 会每秒被杀掉并重新启动，无法稳定运行。
+
+4. **中高｜安装目录路径未做 shell 转义** — `packages/app/src/lib/install.ts:64-71, 92, 99-102`。`writeRunScript()` 只检查了 `bunPath` 的 shell 元字符，却把由任意 `installDir` 派生的 `envPath`、`feDir`、`drizzleDir` 和 `runtimeServerPath`直接插入双引号 shell 字符串；`resolveInstallDir()` 也只是 `resolve()`（`packages/app/src/lib/install-layout.ts:109-111`）。合法但包含双引号的路径会生成不可执行的 `run.sh`，包含命令替换等字符时还会在服务启动阶段产生非预期 shell 执行。
+
+5. **中｜分拆后的 host 边界仍依赖 `as never`，且保留大量纯转发 facade** — `apps/gateway/src/ws/index.ts:113-118, 327, 531-682, 736`；同类问题还出现在 `apps/gateway/src/tmux-client/external-tmux-core.ts:89-93`。核心对象被整体强转后传给多个 collaborator，之后每个代理方法继续以 `this as never` 调用；这绕过了已有的 `BorshDispatchHost`、`TmuxCommandHost` 等接口检查，使 collaborator 新增或修改依赖时类型系统无法发现耦合错误，同时 `WebSocketServer` 仍承担大量只转发调用的 facade 代码。

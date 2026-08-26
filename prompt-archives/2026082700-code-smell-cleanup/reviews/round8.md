@@ -1,0 +1,3 @@
+1. **低｜高置信｜测试质量** — [snapshot-projector.test.ts:355](/Users/konata/code/tmex-enhanced-wt-smell/apps/gateway/src/tmux-client/external/snapshot-projector.test.ts:355)：测试名称声称验证并行抓取及后续处理顺序，但 fake promise 都立即完成，断言也只检查调用集合和最终状态。将三个查询改为串行，或调整 theme restore、snapshot、closure 的顺序，测试仍会通过，无法捕获远程 tmux 往返串行化或时序回归。可用受控 deferred promise 验证：在前一个查询 resolve 前，断言三个查询均已启动，并记录完整副作用顺序。
+
+2. **低｜高置信｜测试质量** — [ghostty-wasm.retry.test.ts:47](/Users/konata/code/tmex-enhanced-wt-smell/packages/ghostty-terminal/src/ghostty-wasm.retry.test.ts:47)：测试连续断言两次 rejection，但未记录 `WebAssembly.instantiate` 调用次数；旧实现缓存同一个 rejected promise 时也会通过，因此该用例没有验证“持续失败时每次都重试”。将旧的 rejected-promise 缓存逻辑代入即可复现其仍然为绿。应断言 instantiate 被调用两次或两次错误对象不同。

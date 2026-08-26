@@ -1,0 +1,13 @@
+1. **高（9/10）— 删除会话后，在途历史请求仍会回写已删除数据**  
+   [`agent-history-sync.ts:51-84`](/Users/konata/code/tmex-enhanced-wt-smell/packages/stores/src/agent-history-sync.ts:51) 的请求完成后无条件写入 store，而 [`agent-history-sync.ts:108-115`](/Users/konata/code/tmex-enhanced-wt-smell/packages/stores/src/agent-history-sync.ts:108) 只清理定时器，无法取消或失效化在途请求。会话删除流程随后清除对应状态（[`agent-session-actions.ts:231-260`](/Users/konata/code/tmex-enhanced-wt-smell/packages/stores/src/agent-session-actions.ts:231)），但旧请求返回后仍会重新创建 `messages[sessionId]`、`historyLoaded` 和可能的 `inProgress`，导致已删除会话的数据复活。应增加请求代数/失效令牌或可取消请求。
+
+2. **高（8/10）— 缓存的 pane reset 丢失 origin，可能错误触发尺寸上报**  
+   [`pane-sink-registry.ts:30-38`](/Users/konata/code/tmex-enhanced-wt-smell/packages/ws-client/src/pane-sink-registry.ts:30) 只保存 `reset: boolean`，[`pane-sink-registry.ts:124-139`](/Users/konata/code/tmex-enhanced-wt-smell/packages/ws-client/src/pane-sink-registry.ts:124) 接收 `origin` 后将其丢弃，注册时又在 [`pane-sink-registry.ts:95-100`](/Users/konata/code/tmex-enhanced-wt-smell/packages/ws-client/src/pane-sink-registry.ts:95) 固定回放为 `'select'`。因此 `history-refresh` 在终端尚未挂载时会被错误转换为普通选择重置，而 [`usePaneSinkRegistration.ts:47-55`](/Users/konata/code/tmex-enhanced-wt-smell/packages/terminal-ui/src/components/hooks/usePaneSinkRegistration.ts:47) 会据此上报本地尺寸，可能造成远端 resize 后多个客户端互相抢占 tmux 窗口尺寸。
+
+3. **中高（7/10）— WebSocket 工厂同步抛错后客户端永久停在 `WS_CONNECTING`**  
+   [`client.ts:208-247`](/Users/konata/code/tmex-enhanced-wt-smell/packages/ws-client/src/client.ts:208) 在 `socketFactory` 或 `new WebSocket()` 同步抛错时只调用 `handleError`；该方法只通知错误监听器（[`client.ts:326-336`](/Users/konata/code/tmex-enhanced-wt-smell/packages/ws-client/src/client.ts:326)），不会清空 `ws`、切换状态或调度重连。结果是连接状态保持 `WS_CONNECTING`，自动重连链路不会启动，除非外部显式再次调用 `connect()`。
+
+4. **中（5/10）— 终端拆分边界仍依赖 `as any` 绕过真实接口**  
+   [`useTerminalBootSurface.ts:354-360`](/Users/konata/code/tmex-enhanced-wt-smell/packages/terminal-ui/src/components/hooks/useTerminalBootSurface.ts:354) 和 [`useTerminalInput.ts:67-73`](/Users/konata/code/tmex-enhanced-wt-smell/packages/terminal-ui/src/components/hooks/useTerminalInput.ts:67) 通过 `'method' in instance` 后使用 `as any` 调用 `setTheme`、`setDisableStdin`，但 [`ghostty-terminal/types.ts:167-228`](/Users/konata/code/tmex-enhanced-wt-smell/packages/ghostty-terminal/src/types.ts:167) 的兼容接口没有表达这些可选能力；[`useTerminalResize.ts:90-104`](/Users/konata/code/tmex-enhanced-wt-smell/packages/terminal-ui/src/components/useTerminalResize.ts:90) 还重复用 `as any` 访问已存在于接口中的 `_core`。这掩盖了终端实现之间的真实契约，后续接口变更容易变成运行时错误，建议补充可选类型或集中封装兼容能力。
+
+除此之外，较大的 Ghostty WASM、终端控制器和渲染文件仍保持较强内聚性；没有发现值得继续拆分的高价值项目。
