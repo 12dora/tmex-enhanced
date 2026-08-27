@@ -36,10 +36,10 @@ worktree `../tmex-enhanced-wt-hub`，分支 `feat/hub-node`，base `4a14ff2`。�
 ## 遗留
 
 - 真实双机验证（验收 1–3）与 mesh e2e 用例（Playwright virtual authenticator）未做。
-- 多标签页同 sid 时 `GET /api/mesh/connection` 返回 409，直连暂不可用；需后端提供浏览器可用的绑定通道（如 WS URL query 传 connectionId），见 `f3-4-result.md`。
+- 多标签页绑定已通过 WS URL `?cid=` nonce + `GET /api/mesh/connection?cid=` 解决（B2-11 / F3-5）。
 - `rtc-loopback.integration.ts` 需 `TMEX_NATIVE_DIR` 才跑真 native 组。
 - 既有 tsc 基线错误（gateway 23、app 1、api-client 5、stores 1、theme 10）未清理，与本任务无关。
 
 ## 最终基线（commit 前逐包验证）
 
-最后一次全量（commit 8930673）：gateway 1812、shared 283、ws-client 230、stores 123、api-client 91、panels 217、app 175、terminal-ui 205、ui 14、notifications 15、theme 6、fe 206，全部 0 fail；tsc：gateway 23（基线 27）、stores 1、api-client 5、app 1、theme 10（均等于基线），其余 0；standalone e2e 94/7/1（7 个失败为既有基线）。
+最后一次全量：gateway 1823、shared 283、ws-client 235、stores 125、api-client 96、panels 217、app 175、terminal-ui 205、ui 14、notifications 15、theme 6、fe 208，全部 0 fail；tsc：gateway 23（基线 27）、stores 1、api-client 5、app 1、theme 10（均等于基线），其余 0；standalone e2e 94/7/1（7 个失败为既有基线）。
