@@ -59,3 +59,4 @@
 - 追问：admit-node 是什么意思（已解释）。codex sol 的 v3 审查结果存于 `design-review-01.md`，指挥官逐条判断后修订设计为 v3.1。
 - 指挥官按 `design-review-02.md` 修订为 v3.2（admit 绑定 pending、临时钥只登录、TOTP 由 delegation 决定、opaque sid + 7 天上限、本机 reset-root、transcript 排序等）；用户尚未对"7 天绝对上限"表态。
 - 用户：说明各 phase 内容（已答）；**开始 Phase 0，发现记录到文件，后续在新会话继续。**
+- Phase 0 已完成（worktree `../tmex-enhanced-wt-hub`）：`sub/e0-1..4-result.md`、`sub/baseline.md`，摘要与决策在 `phase0-result.md`。下一会话从 Phase 1 开始。

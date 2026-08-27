@@ -51,7 +51,7 @@
 
 ### Phase 5 — CLI 与打包（grok，2 个并行）
 
-- C5-1 `hub user add|passwd|totp`、`enroll`（enroll 密钥对、等待 join 后签 `admit-node`）、`hub join`（仅 HTTPS、join 串解析、生成节点证书、根钥一致性校验、`key.log` 链验签）、`hub leave`、`init --role`、`app.env` 新变量（`TMEX_PEER_PORT`、`TMEX_PUBLIC_URL`）、service 重启接线。
+- C5-1 `hub user add|passwd|totp`、`enroll`（enroll 密钥对、等待 join 后签 `admit-node`）、`hub join`（仅 HTTPS、join 串解析、生成节点证书、根钥一致性校验、`key.log` 链验签）、`hub leave`、`init --role`、`app.env` 新变量（`TMEX_ROLES`、`TMEX_HUB_URL`、`TMEX_PEER_PORT`、`TMEX_HUB_PUBLIC_URL`）、service 重启接线。
 - C5-2 `direct enable|disable`、pinned manifest、libc 探测、integrity 校验、`install-layout.nativeDir`、`upgrade` 重下；`build-runtime` 内联 node-datachannel JS 层与 `hash-wasm` wasm；验证 tarball 体积增量。
 
 ### Phase 6 — 收尾
