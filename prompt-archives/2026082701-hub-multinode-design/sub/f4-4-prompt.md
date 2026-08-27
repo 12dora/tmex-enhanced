@@ -1,0 +1,15 @@
+# Task F4-4 — passkey-signed node management (enroll / admit / revoke) in the Nodes page
+
+You are a senior frontend engineer in the git worktree `/Users/konata/code/tmex-enhanced-wt-hub` (branch `feat/hub-node`). Concurrent: Opus F3-1-fix edits `packages/ws-client/src/{direct/**,carrier-switch.ts,client.ts}` and `apps/fe/src/node/node-runtimes.ts`; grok agents edit `apps/gateway/**`. **Only touch files in your scope. Never run git commands that change state. Do not run `bun install`.** Bun `/Users/konata/.bun/bin/bun`; `cd apps/fe && bun test src/`; `bunx tsc --noEmit -p apps/fe`; `bunx biome check <files>`; i18n via locale JSON + `bun run build:i18n`. Baseline fe 142 / tsc 0.
+
+Context: design §2 "node 注册与节点证书" step 1 and 3 and "用户密钥" (persistent records may be signed by the root key **or** by a passkey assertion; `sk_sess` never). Current state: `sub/f4-fix-result.md` (root-only `withRootSigner`, `selectPasskeyCredential`, `passkeysForOrigin`, `RecordSigner` primitives in `apps/fe/src/auth/key-log-actions.ts` / `account-security-actions.ts`), `sub/f4-3-review.md` Major 4 (enrollment hard-codes `RootKey`), shared auth `sub/b1-3a-fix-result.md` (`createEnrollment(PasskeySigner{credentialId, sign})` produces `signer='passkey'` authorizations; passkey-signed key-log records use Borsh `PasskeyAssertion` as `sig`; `Authorization` needs the current `rootPublicKey` only for root path), backend `sub/b2-5-result.md` (`/api/auth/mode` returns `rootPublicKey`/`rootEpoch`; hub enrollments accept passkey `authorization_sig`).
+
+## Deliverables
+
+1. `apps/fe/src/auth/credential-prompt.ts(x)`: one reusable "confirm with password or passkey" dialog/hook returning a `RecordSigner` (`{kind:'root', rootKey}` | `{kind:'passkey', credentialId, sign(bytes)→PasskeyAssertion bytes}`), reusing `withRootSigner` and the WebAuthn adapter; remembers the signer for 5 minutes (existing mechanism) with explicit wipe; passkey option shown only when `passkeysForOrigin` non-empty and `passkeyAvailable`.
+2. Enrollment: `createEnrollment` accepts either signer (root → 64-byte sig; passkey → assertion bytes + `credential_id` in the authorization); `rootPublicKey`/`rootEpoch` come from `/api/auth/mode`; join token still embeds the root public key and key-log head hash.
+3. Admit and revoke records signed by either signer (`signer`/`credential_id` set on the record; `sig` = Borsh `PasskeyAssertion` for passkeys) — through the same `keylog?hub=sync` path.
+4. Account-security actions that still require the root key only (`rotate-root`) keep the password prompt; everything else offers both.
+5. Tests: passkey-signed enrollment authorization decodes with `signer='passkey'` and verifies via the shared `verifyKeyLogRecord`/`applyKeyLogRecord` with a fake `verifyPasskeyAssertion`; admit/revoke passkey records; root path unchanged; dialog chooses passkey only when allowed.
+
+File scope: `apps/fe/src/auth/**`, `apps/fe/src/node/{enrollment,enrollment-watch}.ts` (+tests), `apps/fe/src/pages/{NodesPage,AccountSecurityPage}.tsx` (+tests), i18n locale JSON. Result: `prompt-archives/2026082701-hub-multinode-design/sub/f4-4-result.md`.
