@@ -1,0 +1,3836 @@
+commit 097248fbe6bb60a345b2fefbd1a0eb925f214f00
+Author: Konata <konata@KonatadeMacBook-Pro.local>
+Date:   Thu Aug 27 12:13:32 2026 +0800
+
+    refactor(fe,panels,ui,stores): split sidebar agent sessions and device-tree dialogs; fix sidebar-adjacent bugs
+    
+    - split sidebar-agent-sessions.tsx into controller hook, row and dialog
+      components; group sessions by pane once; stable session ordering; list
+      sessions whose pane vanished as orphans; proper menu aria-label; gate the
+      provider on features.agentUi; single bootstrap via sessionsLoaded
+    - nav-main renders NavLink through SidebarMenuButton render prop with
+      router-derived active state (no nested <a><button>)
+    - device tree: no agent action for pane-less windows, safe pane param
+      decoding, devices query error state with retry, drag disabled while a
+      reorder is pending, timer-based pending navigation expiry, dialogs split
+      into hooks/components, shared window/pane action builders
+    - agent tab: rebind only within the same device, resync draft to route on
+      pane switch, keep devices loading/error out of the orphan check;
+      files tab shows a roots error state with retry
+    - sidebar collapse state is now controlled by the persisted ui store (Ctrl+B
+      and programmatic open survive refresh), safe localStorage access, drop
+      write-only cookie; newAgentSession shortcut opens the mobile sidebar
+    - tmux store: clear connect dedupe on disconnect so an immediate reconnect
+      re-sends connect-device
+    
+    Claude-Session: https://claude.ai/code/session_01Y3oYTN2vgHrHcmXgStDSC5
+
+diff --git a/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx b/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx
+new file mode 100644
+index 0000000..5a0a6ed
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx
+@@ -0,0 +1,105 @@
++// 会话重命名/删除对话框；挂在设备树根部，状态来自 SidebarAgentSessionsProvider。
++
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogMedia,
++  AlertDialogTitle,
++} from '@tmex/ui/alert-dialog';
++import { Button } from '@tmex/ui/button';
++import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@tmex/ui/dialog';
++import { Input } from '@tmex/ui/input';
++import { X } from 'lucide-react';
++import { useTranslation } from 'react-i18next';
++import { useSidebarAgentSessions } from './use-sidebar-agent-sessions';
++
++export function AgentSessionDialogs() {
++  const { t } = useTranslation();
++  const {
++    sessionRenameCandidate,
++    sessionRenameValue,
++    setSessionRenameValue,
++    closeRenameDialog,
++    confirmRenameSession,
++    sessionDeleteCandidate,
++    closeDeleteDialog,
++    confirmDeleteSession,
++  } = useSidebarAgentSessions();
++
++  return (
++    <>
++      <Dialog
++        open={sessionRenameCandidate !== null}
++        onOpenChange={(open) => !open && closeRenameDialog()}
++      >
++        <DialogContent data-testid="agent-session-rename-dialog">
++          <form
++            onSubmit={(e) => {
++              e.preventDefault();
++              confirmRenameSession();
++            }}
++          >
++            <DialogHeader>
++              <DialogTitle>{t('agent.session.renameTitle')}</DialogTitle>
++            </DialogHeader>
++            <div className="py-4">
++              <Input
++                autoFocus
++                maxLength={120}
++                value={sessionRenameValue}
++                onChange={(e) => setSessionRenameValue(e.target.value)}
++                placeholder={t('agent.session.renamePlaceholder')}
++                data-testid="agent-session-rename-input"
++              />
++            </div>
++            <DialogFooter>
++              <Button type="button" variant="outline" onClick={closeRenameDialog}>
++                {t('agent.session.cancel')}
++              </Button>
++              <Button
++                type="submit"
++                disabled={!sessionRenameValue.trim()}
++                data-testid="agent-session-rename-save"
++              >
++                {t('agent.session.save')}
++              </Button>
++            </DialogFooter>
++          </form>
++        </DialogContent>
++      </Dialog>
++
++      <AlertDialog
++        open={sessionDeleteCandidate !== null}
++        onOpenChange={(open) => !open && closeDeleteDialog()}
++      >
++        <AlertDialogContent>
++          <AlertDialogHeader>
++            <AlertDialogMedia className="bg-destructive/10">
++              <X className="h-5 w-5 text-destructive" />
++            </AlertDialogMedia>
++            <AlertDialogTitle>{t('agent.session.deleteTitle')}</AlertDialogTitle>
++            <AlertDialogDescription>
++              {t('agent.session.deleteDesc', { title: sessionDeleteCandidate?.title ?? '' })}
++            </AlertDialogDescription>
++          </AlertDialogHeader>
++          <AlertDialogFooter>
++            <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
++            <AlertDialogAction
++              variant="destructive"
++              disabled={!sessionDeleteCandidate}
++              onClick={confirmDeleteSession}
++              data-testid="agent-session-delete-confirm"
++            >
++              {t('agent.session.deleteConfirm')}
++            </AlertDialogAction>
++          </AlertDialogFooter>
++        </AlertDialogContent>
++      </AlertDialog>
++    </>
++  );
++}
+diff --git a/apps/fe/src/components/page-layouts/components/agent-session-row.tsx b/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
+new file mode 100644
+index 0000000..41eedb4
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
+@@ -0,0 +1,178 @@
++// 侧边栏 agent 会话行：pane 分支下的紧凑行、孤立会话区的带元信息行，及共用的操作菜单。
++
++import type { AgentSessionDto } from '@tmex/shared';
++import { formatDateTime } from '@tmex/shared';
++import { useSiteStore } from '@tmex/stores';
++import { cn } from '@tmex/ui';
++import { Button } from '@tmex/ui/button';
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuTrigger,
++} from '@tmex/ui/dropdown-menu';
++import { useSidebar } from '@tmex/ui/sidebar';
++import { Bot, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
++import { useTranslation } from 'react-i18next';
++import { useSidebarAgentSessions } from './use-sidebar-agent-sessions';
++
++export function StatusDot({ status }: { status: AgentSessionDto['status'] }) {
++  return (
++    <span
++      className={cn(
++        'size-2 shrink-0 rounded-full',
++        status === 'running'
++          ? 'bg-emerald-500 animate-pulse'
++          : status === 'error'
++            ? 'bg-destructive'
++            : status === 'waiting_confirmation'
++              ? 'bg-amber-500'
++              : 'bg-muted-foreground/40'
++      )}
++    />
++  );
++}
++
++function SessionActionsMenu({
++  session,
++  enlargeOnTouch = false,
++}: {
++  session: AgentSessionDto;
++  enlargeOnTouch?: boolean;
++}) {
++  const { t } = useTranslation();
++  const { isMobile } = useSidebar();
++  const { requestRenameSession, requestDeleteSession } = useSidebarAgentSessions();
++  const enlarged = enlargeOnTouch && isMobile;
++  return (
++    <DropdownMenu>
++      <DropdownMenuTrigger
++        render={
++          <Button
++            variant="ghost"
++            size="icon-sm"
++            data-testid={`agent-session-menu-${session.id}`}
++            aria-label={t('agent.session.menu')}
++            onClick={(e) => e.stopPropagation()}
++            className={cn(
++              'size-5 shrink-0 text-muted-foreground transition-opacity data-popup-open:opacity-100',
++              isMobile
++                ? 'opacity-100'
++                : 'opacity-0 group-hover:opacity-100 [@media(any-pointer:coarse)]:opacity-100',
++              enlarged && 'size-9'
++            )}
++          />
++        }
++      >
++        <MoreHorizontal className={cn('size-3.5', enlarged && 'size-5')} />
++      </DropdownMenuTrigger>
++      <DropdownMenuContent
++        align="end"
++        backdrop
++        className="w-auto min-w-36 [@media(any-pointer:coarse)]:min-w-48"
++      >
++        <DropdownMenuItem
++          data-testid="agent-session-rename"
++          className={cn(
++            '[@media(any-pointer:coarse)]:py-2.5 [@media(any-pointer:coarse)]:px-2',
++            isMobile && 'py-3 px-2.5 text-base gap-2.5'
++          )}
++          onClick={() => requestRenameSession(session)}
++        >
++          <Pencil className={cn('h-4 w-4', isMobile && 'h-5 w-5')} />
++          {t('agent.session.rename')}
++        </DropdownMenuItem>
++        <DropdownMenuItem
++          variant="destructive"
++          data-testid="agent-session-delete"
++          className={cn(
++            '[@media(any-pointer:coarse)]:py-2.5 [@media(any-pointer:coarse)]:px-2',
++            isMobile && 'py-3 px-2.5 text-base gap-2.5'
++          )}
++          onClick={() => requestDeleteSession(session)}
++        >
++          <Trash2 className={cn('h-4 w-4', isMobile && 'h-5 w-5')} />
++          {t('agent.session.delete')}
++        </DropdownMenuItem>
++      </DropdownMenuContent>
++    </DropdownMenu>
++  );
++}
++
++export function PaneSessionRow({
++  session,
++  isActive,
++  onSelect,
++}: {
++  session: AgentSessionDto;
++  isActive: boolean;
++  onSelect: (session: AgentSessionDto) => void;
++}) {
++  const { isMobile } = useSidebar();
++  return (
++    <div className="group relative">
++      <button
++        type="button"
++        data-testid={`agent-session-item-${session.id}`}
++        onClick={() => onSelect(session)}
++        className={cn(
++          'w-full flex items-center gap-1.5 px-2 py-1 pr-7 rounded-md text-left transition-colors [@media(any-pointer:coarse)]:min-h-11 [@media(any-pointer:coarse)]:py-2 [@media(any-pointer:coarse)]:pr-12',
++          isMobile && 'min-h-11 py-2 pr-12',
++          isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30 text-muted-foreground'
++        )}
++      >
++        <Bot className="size-3 shrink-0 opacity-70" />
++        <span className="min-w-0 flex-1 truncate text-[11px]">{session.title}</span>
++        <StatusDot status={session.status} />
++      </button>
++      <div className="absolute right-0.5 top-1/2 -translate-y-1/2">
++        <SessionActionsMenu session={session} enlargeOnTouch />
++      </div>
++    </div>
++  );
++}
++
++export function OrphanSessionRow({
++  session,
++  isActive,
++  onSelect,
++}: {
++  session: AgentSessionDto;
++  isActive: boolean;
++  onSelect: (session: AgentSessionDto) => void;
++}) {
++  const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
++  const meta = [
++    session.originPaneTitle,
++    session.originProcessName,
++    formatDateTime(session.createdAt, language),
++  ].filter((value): value is string => Boolean(value));
++
++  return (
++    <div className="group relative">
++      <button
++        type="button"
++        data-testid={`agent-orphan-session-${session.id}`}
++        onClick={() => onSelect(session)}
++        className={cn(
++          'w-full flex flex-col gap-0.5 px-2 py-1.5 pr-7 rounded-lg text-left transition-colors',
++          isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30'
++        )}
++      >
++        <span className="flex items-center gap-1.5">
++          <Bot className="size-3 shrink-0 opacity-70" />
++          <span className="min-w-0 flex-1 truncate text-[11px]">{session.title}</span>
++          <StatusDot status={session.status} />
++        </span>
++        {meta.length > 0 && (
++          <span className="truncate pl-[18px] text-[10px] text-muted-foreground">
++            {meta.join(' · ')}
++          </span>
++        )}
++      </button>
++      <div className="absolute right-0.5 top-1.5">
++        <SessionActionsMenu session={session} />
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/components/page-layouts/components/nav-main.tsx b/apps/fe/src/components/page-layouts/components/nav-main.tsx
+index cefd53e..9e69c9b 100644
+--- a/apps/fe/src/components/page-layouts/components/nav-main.tsx
++++ b/apps/fe/src/components/page-layouts/components/nav-main.tsx
+@@ -11,8 +11,13 @@ import {
+ } from '@tmex/ui/sidebar';
+ import { ChevronRight, type LucideIcon } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
++import { useLocation } from 'react-router';
+ import { NavLink } from './nav-link';
+ 
++function isPathActive(pathname: string, url: string): boolean {
++  return pathname === url || pathname.startsWith(`${url}/`);
++}
++
+ export function NavMain({
+   items,
+ }: {
+@@ -20,7 +25,6 @@ export function NavMain({
+     title: string;
+     url: string;
+     icon: LucideIcon;
+-    isActive?: boolean;
+     items?: {
+       title: string;
+       url: string;
+@@ -28,42 +32,48 @@ export function NavMain({
+   }[];
+ }) {
+   const { t } = useTranslation();
++  const { pathname } = useLocation();
++
+   return (
+     <SidebarGroup>
+       <SidebarMenu>
+-        {items.map((item) => (
+-          <Collapsible key={item.title} defaultOpen={item.isActive} render={<SidebarMenuItem />}>
+-            <NavLink to={item.url}>
+-              <SidebarMenuButton tooltip={t(item.title)}>
++        {items.map((item) => {
++          const active =
++            isPathActive(pathname, item.url) ||
++            Boolean(item.items?.some((subItem) => isPathActive(pathname, subItem.url)));
++          return (
++            <Collapsible key={item.title} defaultOpen={active} render={<SidebarMenuItem />}>
++              <SidebarMenuButton isActive={active} render={<NavLink to={item.url} />}>
+                 <item.icon />
+                 <span>{t(item.title)}</span>
+               </SidebarMenuButton>
+-            </NavLink>
+-            {item.items?.length ? (
+-              <>
+-                <CollapsibleTrigger
+-                  render={<SidebarMenuAction className="data-[state=open]:rotate-90" />}
+-                >
+-                  <ChevronRight />
+-                  <span className="sr-only">Toggle</span>
+-                </CollapsibleTrigger>
+-                <CollapsibleContent>
+-                  <SidebarMenuSub>
+-                    {item.items?.map((subItem) => (
+-                      <SidebarMenuSubItem key={subItem.title}>
+-                        <NavLink to={subItem.url}>
+-                          <SidebarMenuSubButton>
++              {item.items?.length ? (
++                <>
++                  <CollapsibleTrigger
++                    render={<SidebarMenuAction className="data-[state=open]:rotate-90" />}
++                  >
++                    <ChevronRight />
++                    <span className="sr-only">Toggle</span>
++                  </CollapsibleTrigger>
++                  <CollapsibleContent>
++                    <SidebarMenuSub>
++                      {item.items?.map((subItem) => (
++                        <SidebarMenuSubItem key={subItem.title}>
++                          <SidebarMenuSubButton
++                            isActive={isPathActive(pathname, subItem.url)}
++                            render={<NavLink to={subItem.url} />}
++                          >
+                             <span>{t(subItem.title)}</span>
+                           </SidebarMenuSubButton>
+-                        </NavLink>
+-                      </SidebarMenuSubItem>
+-                    ))}
+-                  </SidebarMenuSub>
+-                </CollapsibleContent>
+-              </>
+-            ) : null}
+-          </Collapsible>
+-        ))}
++                        </SidebarMenuSubItem>
++                      ))}
++                    </SidebarMenuSub>
++                  </CollapsibleContent>
++                </>
++              ) : null}
++            </Collapsible>
++          );
++        })}
+       </SidebarMenu>
+     </SidebarGroup>
+   );
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx b/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+index 3ff31dc..259df17 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+@@ -3,150 +3,25 @@
+ 
+ import type { DeviceTreeNavigation, SidebarAgentAdapter } from '@tmex/panels/device-tree';
+ import type { AgentSessionDto, TmuxPane } from '@tmex/shared';
+-import { formatDateTime } from '@tmex/shared';
+-import { useAgentStore, useSiteStore, useTmuxStore, useUIStore } from '@tmex/stores';
++import { useAgentStore, useTmuxStore, useUIStore } from '@tmex/stores';
+ import { cn } from '@tmex/ui';
+-import {
+-  AlertDialog,
+-  AlertDialogAction,
+-  AlertDialogCancel,
+-  AlertDialogContent,
+-  AlertDialogDescription,
+-  AlertDialogFooter,
+-  AlertDialogHeader,
+-  AlertDialogMedia,
+-  AlertDialogTitle,
+-} from '@tmex/ui/alert-dialog';
+-import { Button } from '@tmex/ui/button';
+ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@tmex/ui/collapsible';
+-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@tmex/ui/dialog';
+-import {
+-  DropdownMenu,
+-  DropdownMenuContent,
+-  DropdownMenuItem,
+-  DropdownMenuTrigger,
+-} from '@tmex/ui/dropdown-menu';
+-import { Input } from '@tmex/ui/input';
+-import { useSidebar } from '@tmex/ui/sidebar';
+-import { Bot, ChevronRight, History, MoreHorizontal, Pencil, Trash2, X } from 'lucide-react';
+-import {
+-  type ReactNode,
+-  createContext,
+-  useCallback,
+-  useContext,
+-  useEffect,
+-  useMemo,
+-  useState,
+-} from 'react';
++import { ChevronRight, History } from 'lucide-react';
++import { type ReactNode, useCallback, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-
+-function StatusDot({ status }: { status: AgentSessionDto['status'] }) {
+-  return (
+-    <span
+-      className={cn(
+-        'size-2 shrink-0 rounded-full',
+-        status === 'running'
+-          ? 'bg-emerald-500 animate-pulse'
+-          : status === 'error'
+-            ? 'bg-destructive'
+-            : status === 'waiting_confirmation'
+-              ? 'bg-amber-500'
+-              : 'bg-muted-foreground/40'
+-      )}
+-    />
+-  );
+-}
+-
+-interface SidebarAgentSessionsContextValue {
+-  sessionRenameCandidate: AgentSessionDto | null;
+-  sessionRenameValue: string;
+-  setSessionRenameValue: (value: string) => void;
+-  closeRenameDialog: () => void;
+-  confirmRenameSession: () => void;
+-  sessionDeleteCandidate: AgentSessionDto | null;
+-  closeDeleteDialog: () => void;
+-  confirmDeleteSession: () => void;
+-  requestRenameSession: (session: AgentSessionDto) => void;
+-  requestDeleteSession: (session: AgentSessionDto) => void;
+-}
+-
+-const SidebarAgentSessionsContext = createContext<SidebarAgentSessionsContextValue | null>(null);
+-
+-function useSidebarAgentSessions(): SidebarAgentSessionsContextValue {
+-  const ctx = useContext(SidebarAgentSessionsContext);
+-  if (!ctx) {
+-    throw new Error('sidebarAgentAdapter must be used within SidebarAgentSessionsProvider');
+-  }
+-  return ctx;
+-}
++import { AgentSessionDialogs } from './agent-session-dialogs';
++import { OrphanSessionRow, PaneSessionRow } from './agent-session-row';
++import {
++  SidebarAgentSessionsContext,
++  collectKnownPaneIds,
++  isSessionAttached,
++  paneKey,
++  useSidebarAgentSessions,
++  useSidebarAgentSessionsController,
++} from './use-sidebar-agent-sessions';
+ 
+ export function SidebarAgentSessionsProvider({ children }: { children: ReactNode }) {
+-  useEffect(() => {
+-    const store = useAgentStore.getState();
+-    store.ensureInitialized();
+-    void store.loadSessions();
+-  }, []);
+-
+-  const [sessionRenameCandidate, setSessionRenameCandidate] = useState<AgentSessionDto | null>(
+-    null
+-  );
+-  const [sessionRenameValue, setSessionRenameValue] = useState('');
+-  const [sessionDeleteCandidate, setSessionDeleteCandidate] = useState<AgentSessionDto | null>(
+-    null
+-  );
+-
+-  const requestRenameSession = useCallback((session: AgentSessionDto) => {
+-    setSessionRenameValue(session.title);
+-    setSessionRenameCandidate(session);
+-  }, []);
+-
+-  const confirmRenameSession = useCallback(() => {
+-    if (!sessionRenameCandidate) return;
+-    const trimmed = sessionRenameValue.trim();
+-    if (!trimmed) return;
+-    void useAgentStore.getState().renameSession(sessionRenameCandidate.id, trimmed);
+-    setSessionRenameCandidate(null);
+-  }, [sessionRenameCandidate, sessionRenameValue]);
+-
+-  const requestDeleteSession = useCallback((session: AgentSessionDto) => {
+-    setSessionDeleteCandidate(session);
+-  }, []);
+-
+-  const confirmDeleteSession = useCallback(() => {
+-    if (!sessionDeleteCandidate) return;
+-    void useAgentStore.getState().deleteSession(sessionDeleteCandidate.id);
+-    setSessionDeleteCandidate(null);
+-  }, [sessionDeleteCandidate]);
+-
+-  const closeRenameDialog = useCallback(() => setSessionRenameCandidate(null), []);
+-  const closeDeleteDialog = useCallback(() => setSessionDeleteCandidate(null), []);
+-
+-  const value = useMemo(
+-    () => ({
+-      sessionRenameCandidate,
+-      sessionRenameValue,
+-      setSessionRenameValue,
+-      closeRenameDialog,
+-      confirmRenameSession,
+-      sessionDeleteCandidate,
+-      closeDeleteDialog,
+-      confirmDeleteSession,
+-      requestRenameSession,
+-      requestDeleteSession,
+-    }),
+-    [
+-      sessionRenameCandidate,
+-      sessionRenameValue,
+-      closeRenameDialog,
+-      confirmRenameSession,
+-      sessionDeleteCandidate,
+-      closeDeleteDialog,
+-      confirmDeleteSession,
+-      requestRenameSession,
+-      requestDeleteSession,
+-    ]
+-  );
+-
++  const value = useSidebarAgentSessionsController();
+   return (
+     <SidebarAgentSessionsContext.Provider value={value}>
+       {children}
+@@ -154,17 +29,6 @@ export function SidebarAgentSessionsProvider({ children }: { children: ReactNode
+   );
+ }
+ 
+-function useOrderedSessions(): AgentSessionDto[] {
+-  const agentSessions = useAgentStore((state) => state.sessions);
+-  return useMemo(
+-    () =>
+-      Object.values(agentSessions)
+-        .filter((session): session is AgentSessionDto => Boolean(session))
+-        .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)),
+-    [agentSessions]
+-  );
+-}
+-
+ // Agent 聊天就在侧边栏内：导航到对应 pane 提供上下文，但移动端保持 Sheet 打开
+ function useSelectSession(nav: DeviceTreeNavigation) {
+   const setSidebarTab = useUIStore((state) => state.setSidebarTab);
+@@ -197,144 +61,53 @@ function createSessionForPane(
+   useUIStore.getState().setSidebarTab('agent');
+ }
+ 
+-function SessionActionsMenu({
+-  session,
+-  onRenameSession,
+-  onDeleteSession,
+-  className,
+-  enlargeOnTouch = false,
+-}: {
+-  session: AgentSessionDto;
+-  onRenameSession: (session: AgentSessionDto) => void;
+-  onDeleteSession: (session: AgentSessionDto) => void;
+-  className?: string;
+-  enlargeOnTouch?: boolean;
+-}) {
+-  const { t } = useTranslation();
+-  const { isMobile } = useSidebar();
+-  const enlarged = enlargeOnTouch && isMobile;
+-  return (
+-    <DropdownMenu>
+-      <DropdownMenuTrigger
+-        render={
+-          <Button
+-            variant="ghost"
+-            size="icon-sm"
+-            data-testid={`agent-session-menu-${session.id}`}
+-            aria-label={t('agent.session.rename')}
+-            onClick={(e) => e.stopPropagation()}
+-            className={cn(
+-              'size-5 shrink-0 text-muted-foreground transition-opacity data-popup-open:opacity-100',
+-              isMobile
+-                ? 'opacity-100'
+-                : 'opacity-0 group-hover:opacity-100 [@media(any-pointer:coarse)]:opacity-100',
+-              enlarged && 'size-9',
+-              className
+-            )}
+-          />
+-        }
+-      >
+-        <MoreHorizontal className={cn('size-3.5', enlarged && 'size-5')} />
+-      </DropdownMenuTrigger>
+-      <DropdownMenuContent
+-        align="end"
+-        backdrop
+-        className="w-auto min-w-36 [@media(any-pointer:coarse)]:min-w-48"
+-      >
+-        <DropdownMenuItem
+-          data-testid="agent-session-rename"
+-          className={cn(
+-            '[@media(any-pointer:coarse)]:py-2.5 [@media(any-pointer:coarse)]:px-2',
+-            isMobile && 'py-3 px-2.5 text-base gap-2.5'
+-          )}
+-          onClick={() => onRenameSession(session)}
+-        >
+-          <Pencil className={cn('h-4 w-4', isMobile && 'h-5 w-5')} />
+-          {t('agent.session.rename')}
+-        </DropdownMenuItem>
+-        <DropdownMenuItem
+-          variant="destructive"
+-          data-testid="agent-session-delete"
+-          className={cn(
+-            '[@media(any-pointer:coarse)]:py-2.5 [@media(any-pointer:coarse)]:px-2',
+-            isMobile && 'py-3 px-2.5 text-base gap-2.5'
+-          )}
+-          onClick={() => onDeleteSession(session)}
+-        >
+-          <Trash2 className={cn('h-4 w-4', isMobile && 'h-5 w-5')} />
+-          {t('agent.session.delete')}
+-        </DropdownMenuItem>
+-      </DropdownMenuContent>
+-    </DropdownMenu>
+-  );
+-}
+-
+-function PaneSessionBranch({
+-  sessions,
+-  activeSessionId,
+-  onSelectSession,
+-  onRenameSession,
+-  onDeleteSession,
++function AgentPaneSessions({
++  nav,
++  deviceId,
++  paneId,
+ }: {
+-  sessions: AgentSessionDto[] | undefined;
+-  activeSessionId: string | null;
+-  onSelectSession: (session: AgentSessionDto) => void;
+-  onRenameSession: (session: AgentSessionDto) => void;
+-  onDeleteSession: (session: AgentSessionDto) => void;
++  nav: DeviceTreeNavigation;
++  deviceId: string;
++  paneId: string;
+ }) {
+-  const { isMobile } = useSidebar();
++  const { sessionsByPane, activeSessionId } = useSidebarAgentSessions();
++  const handleSelectSession = useSelectSession(nav);
++  const sessions = sessionsByPane.get(paneKey(deviceId, paneId));
+   return (
+     <div className="mt-1 space-y-0.5 [@media(any-pointer:coarse)]:space-y-1">
+-      {sessions?.map((session) => {
+-        const isActive = session.id === activeSessionId;
+-        return (
+-          <div key={session.id} className="group relative">
+-            <button
+-              type="button"
+-              data-testid={`agent-session-item-${session.id}`}
+-              onClick={() => onSelectSession(session)}
+-              className={cn(
+-                'w-full flex items-center gap-1.5 px-2 py-1 pr-7 rounded-md text-left transition-colors [@media(any-pointer:coarse)]:min-h-11 [@media(any-pointer:coarse)]:py-2 [@media(any-pointer:coarse)]:pr-12',
+-                isMobile && 'min-h-11 py-2 pr-12',
+-                isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30 text-muted-foreground'
+-              )}
+-            >
+-              <Bot className="size-3 shrink-0 opacity-70" />
+-              <span className="min-w-0 flex-1 truncate text-[11px]">{session.title}</span>
+-              <StatusDot status={session.status} />
+-            </button>
+-            <div className="absolute right-0.5 top-1/2 -translate-y-1/2">
+-              <SessionActionsMenu
+-                session={session}
+-                onRenameSession={onRenameSession}
+-                onDeleteSession={onDeleteSession}
+-                enlargeOnTouch
+-              />
+-            </div>
+-          </div>
+-        );
+-      })}
++      {sessions?.map((session) => (
++        <PaneSessionRow
++          key={session.id}
++          session={session}
++          isActive={session.id === activeSessionId}
++          onSelect={handleSelectSession}
++        />
++      ))}
+     </div>
+   );
+ }
+ 
+-function OrphanSessionsList({
+-  sessions,
+-  activeSessionId,
+-  onSelectSession,
+-  onRenameSession,
+-  onDeleteSession,
++function AgentOrphanSessions({
++  nav,
++  knownDeviceIds,
+ }: {
+-  sessions: AgentSessionDto[];
+-  activeSessionId: string | null;
+-  onSelectSession: (session: AgentSessionDto) => void;
+-  onRenameSession: (session: AgentSessionDto) => void;
+-  onDeleteSession: (session: AgentSessionDto) => void;
++  nav: DeviceTreeNavigation;
++  knownDeviceIds: readonly string[];
+ }) {
+   const { t } = useTranslation();
+   const [open, setOpen] = useState(false);
+-  const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
++  const { orderedSessions, activeSessionId } = useSidebarAgentSessions();
++  const handleSelectSession = useSelectSession(nav);
++  const snapshots = useTmuxStore((state) => state.snapshots);
+ 
++  // 会话按 device:pane 挂到对应 pane 节点；设备缺失或 pane 已关闭的归为孤立
++  const orphanSessions = useMemo(() => {
++    const known = new Set(knownDeviceIds);
++    const panesByDevice = collectKnownPaneIds(snapshots);
++    return orderedSessions.filter((session) => !isSessionAttached(session, known, panesByDevice));
++  }, [orderedSessions, knownDeviceIds, snapshots]);
++
++  if (orphanSessions.length === 0) return null;
+   return (
+     <Collapsible
+       open={open}
+@@ -347,7 +120,7 @@ function OrphanSessionsList({
+       >
+         <History className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+         <span className="flex-1 truncate text-xs font-medium text-muted-foreground">
+-          {t('agent.orphan.title', { count: sessions.length })}
++          {t('agent.orphan.title', { count: orphanSessions.length })}
+         </span>
+         <ChevronRight
+           className={cn(
+@@ -357,195 +130,19 @@ function OrphanSessionsList({
+         />
+       </CollapsibleTrigger>
+       <CollapsibleContent className="space-y-0.5 px-1.5 pb-1.5">
+-        {sessions.map((session) => {
+-          const isActive = session.id === activeSessionId;
+-          const meta = [
+-            session.originPaneTitle,
+-            session.originProcessName,
+-            formatDateTime(session.createdAt, language),
+-          ].filter((value): value is string => Boolean(value));
+-          return (
+-            <div key={session.id} className="group relative">
+-              <button
+-                type="button"
+-                data-testid={`agent-orphan-session-${session.id}`}
+-                onClick={() => onSelectSession(session)}
+-                className={cn(
+-                  'w-full flex flex-col gap-0.5 px-2 py-1.5 pr-7 rounded-lg text-left transition-colors',
+-                  isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30'
+-                )}
+-              >
+-                <span className="flex items-center gap-1.5">
+-                  <Bot className="size-3 shrink-0 opacity-70" />
+-                  <span className="min-w-0 flex-1 truncate text-[11px]">{session.title}</span>
+-                  <StatusDot status={session.status} />
+-                </span>
+-                {meta.length > 0 && (
+-                  <span className="truncate pl-[18px] text-[10px] text-muted-foreground">
+-                    {meta.join(' · ')}
+-                  </span>
+-                )}
+-              </button>
+-              <div className="absolute right-0.5 top-1.5">
+-                <SessionActionsMenu
+-                  session={session}
+-                  onRenameSession={onRenameSession}
+-                  onDeleteSession={onDeleteSession}
+-                />
+-              </div>
+-            </div>
+-          );
+-        })}
++        {orphanSessions.map((session) => (
++          <OrphanSessionRow
++            key={session.id}
++            session={session}
++            isActive={session.id === activeSessionId}
++            onSelect={handleSelectSession}
++          />
++        ))}
+       </CollapsibleContent>
+     </Collapsible>
+   );
+ }
+ 
+-function AgentPaneSessions({
+-  nav,
+-  deviceId,
+-  paneId,
+-}: {
+-  nav: DeviceTreeNavigation;
+-  deviceId: string;
+-  paneId: string;
+-}) {
+-  const ordered = useOrderedSessions();
+-  const activeSessionId = useAgentStore((state) => state.activeSessionId);
+-  const { requestRenameSession, requestDeleteSession } = useSidebarAgentSessions();
+-  const handleSelectSession = useSelectSession(nav);
+-  const sessions = useMemo(
+-    () => ordered.filter((session) => session.deviceId === deviceId && session.paneId === paneId),
+-    [ordered, deviceId, paneId]
+-  );
+-  return (
+-    <PaneSessionBranch
+-      sessions={sessions.length > 0 ? sessions : undefined}
+-      activeSessionId={activeSessionId}
+-      onSelectSession={handleSelectSession}
+-      onRenameSession={requestRenameSession}
+-      onDeleteSession={requestDeleteSession}
+-    />
+-  );
+-}
+-
+-function AgentOrphanSessions({
+-  nav,
+-  knownDeviceIds,
+-}: {
+-  nav: DeviceTreeNavigation;
+-  knownDeviceIds: readonly string[];
+-}) {
+-  const ordered = useOrderedSessions();
+-  const activeSessionId = useAgentStore((state) => state.activeSessionId);
+-  const { requestRenameSession, requestDeleteSession } = useSidebarAgentSessions();
+-  const handleSelectSession = useSelectSession(nav);
+-  // 会话按 device:pane 挂到对应 pane 节点；设备缺失/不在列表的归为孤立
+-  const orphanSessions = useMemo(() => {
+-    const known = new Set(knownDeviceIds);
+-    return ordered.filter(
+-      (session) => !session.deviceId || !session.paneId || !known.has(session.deviceId)
+-    );
+-  }, [ordered, knownDeviceIds]);
+-
+-  if (orphanSessions.length === 0) return null;
+-  return (
+-    <OrphanSessionsList
+-      sessions={orphanSessions}
+-      activeSessionId={activeSessionId}
+-      onSelectSession={handleSelectSession}
+-      onRenameSession={requestRenameSession}
+-      onDeleteSession={requestDeleteSession}
+-    />
+-  );
+-}
+-
+-function AgentSessionDialogs() {
+-  const { t } = useTranslation();
+-  const {
+-    sessionRenameCandidate,
+-    sessionRenameValue,
+-    setSessionRenameValue,
+-    closeRenameDialog,
+-    confirmRenameSession,
+-    sessionDeleteCandidate,
+-    closeDeleteDialog,
+-    confirmDeleteSession,
+-  } = useSidebarAgentSessions();
+-
+-  return (
+-    <>
+-      <Dialog
+-        open={sessionRenameCandidate !== null}
+-        onOpenChange={(open) => !open && closeRenameDialog()}
+-      >
+-        <DialogContent data-testid="agent-session-rename-dialog">
+-          <form
+-            onSubmit={(e) => {
+-              e.preventDefault();
+-              confirmRenameSession();
+-            }}
+-          >
+-            <DialogHeader>
+-              <DialogTitle>{t('agent.session.renameTitle')}</DialogTitle>
+-            </DialogHeader>
+-            <div className="py-4">
+-              <Input
+-                autoFocus
+-                maxLength={120}
+-                value={sessionRenameValue}
+-                onChange={(e) => setSessionRenameValue(e.target.value)}
+-                placeholder={t('agent.session.renamePlaceholder')}
+-                data-testid="agent-session-rename-input"
+-              />
+-            </div>
+-            <DialogFooter>
+-              <Button type="button" variant="outline" onClick={closeRenameDialog}>
+-                {t('agent.session.cancel')}
+-              </Button>
+-              <Button
+-                type="submit"
+-                disabled={!sessionRenameValue.trim()}
+-                data-testid="agent-session-rename-save"
+-              >
+-                {t('agent.session.save')}
+-              </Button>
+-            </DialogFooter>
+-          </form>
+-        </DialogContent>
+-      </Dialog>
+-
+-      <AlertDialog
+-        open={sessionDeleteCandidate !== null}
+-        onOpenChange={(open) => !open && closeDeleteDialog()}
+-      >
+-        <AlertDialogContent>
+-          <AlertDialogHeader>
+-            <AlertDialogMedia className="bg-destructive/10">
+-              <X className="h-5 w-5 text-destructive" />
+-            </AlertDialogMedia>
+-            <AlertDialogTitle>{t('agent.session.deleteTitle')}</AlertDialogTitle>
+-            <AlertDialogDescription>
+-              {t('agent.session.deleteDesc', { title: sessionDeleteCandidate?.title ?? '' })}
+-            </AlertDialogDescription>
+-          </AlertDialogHeader>
+-          <AlertDialogFooter>
+-            <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
+-            <AlertDialogAction
+-              variant="destructive"
+-              disabled={!sessionDeleteCandidate}
+-              onClick={confirmDeleteSession}
+-              data-testid="agent-session-delete-confirm"
+-            >
+-              {t('agent.session.deleteConfirm')}
+-            </AlertDialogAction>
+-          </AlertDialogFooter>
+-        </AlertDialogContent>
+-      </AlertDialog>
+-    </>
+-  );
+-}
+-
+ export const sidebarAgentAdapter: SidebarAgentAdapter = {
+   onCreateSessionForPane: createSessionForPane,
+   PaneSessions: AgentPaneSessions,
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx
+index fa3176b..4e8483c 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx
+@@ -1,16 +1,21 @@
+ import { useGlobalDevice } from '@/components/global-device-provider';
+ import { SideBarDeviceList as DeviceTreeSideBarDeviceList } from '@tmex/panels/device-tree';
++import { useRuntime } from '@tmex/stores/react';
+ import { SidebarAgentSessionsProvider, sidebarAgentAdapter } from './sidebar-agent-sessions';
+ 
+ export function SideBarDeviceList() {
+   const { ensureDeviceSubscribed, connection } = useGlobalDevice();
+-  return (
+-    <SidebarAgentSessionsProvider>
+-      <DeviceTreeSideBarDeviceList
+-        ensureDeviceSubscribed={ensureDeviceSubscribed}
+-        connection={connection}
+-        agent={sidebarAgentAdapter}
+-      />
+-    </SidebarAgentSessionsProvider>
++  const agentUi = useRuntime().features.agentUi;
++
++  const tree = (
++    <DeviceTreeSideBarDeviceList
++      ensureDeviceSubscribed={ensureDeviceSubscribed}
++      connection={connection}
++      agent={agentUi ? sidebarAgentAdapter : undefined}
++    />
+   );
++
++  // agentUi 关断时设备树不渲染任何 agent 面，provider 一并跳过（省掉会话列表 bootstrap）
++  if (!agentUi) return tree;
++  return <SidebarAgentSessionsProvider>{tree}</SidebarAgentSessionsProvider>;
+ }
+diff --git a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
+new file mode 100644
+index 0000000..628519f
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
+@@ -0,0 +1,194 @@
++import { describe, expect, test } from 'bun:test';
++import type { AgentSessionDto, StateSnapshotPayload, TmuxPane, TmuxWindow } from '@tmex/shared';
++import {
++  collectKnownPaneIds,
++  compareSessions,
++  groupSessionsByPane,
++  isSessionAttached,
++  orderSessions,
++  paneKey,
++} from './use-sidebar-agent-sessions';
++
++function session(partial: Partial<AgentSessionDto> & { id: string }): AgentSessionDto {
++  return {
++    title: partial.id,
++    deviceId: null,
++    paneId: null,
++    providerId: null,
++    modelId: 'm',
++    systemPrompt: null,
++    writeMode: 'confirm',
++    useProviderWebSearch: false,
++    providerHostedTools: [],
++    allowControlChars: false,
++    originPaneTitle: null,
++    originProcessName: null,
++    status: 'idle',
++    lastError: null,
++    maxStepsPerTurn: 10,
++    createdAt: '2026-01-01T00:00:00.000Z',
++    updatedAt: '2026-01-01T00:00:00.000Z',
++    ...partial,
++  };
++}
++
++function toRecord(list: AgentSessionDto[]): Record<string, AgentSessionDto> {
++  return Object.fromEntries(list.map((item) => [item.id, item]));
++}
++
++function pane(id: string): TmuxPane {
++  return { id, windowId: '@0', index: 0, active: true, width: 80, height: 24 };
++}
++
++function snapshot(deviceId: string, paneIds: string[]): StateSnapshotPayload {
++  const window: TmuxWindow = {
++    id: '@0',
++    name: 'w',
++    index: 0,
++    active: true,
++    panes: paneIds.map(pane),
++  };
++  return { deviceId, session: { id: '$0', name: 's', windows: [window] } };
++}
++
++describe('compareSessions', () => {
++  test('sorts by updatedAt descending', () => {
++    const older = session({ id: 'a', updatedAt: '2026-01-01T00:00:00.000Z' });
++    const newer = session({ id: 'b', updatedAt: '2026-01-02T00:00:00.000Z' });
++    expect(compareSessions(newer, older)).toBeLessThan(0);
++    expect(compareSessions(older, newer)).toBeGreaterThan(0);
++  });
++
++  test('is antisymmetric on updatedAt ties (id tie-breaker)', () => {
++    const a = session({ id: 'a' });
++    const b = session({ id: 'b' });
++    expect(compareSessions(a, b)).toBeLessThan(0);
++    expect(compareSessions(b, a)).toBeGreaterThan(0);
++    expect(compareSessions(a, a)).toBe(0);
++  });
++
++  test('produces a stable order regardless of input order', () => {
++    const list = [session({ id: 'a' }), session({ id: 'b' }), session({ id: 'c' })];
++    const forward = [...list].sort(compareSessions).map((item) => item.id);
++    const reversed = [...list]
++      .reverse()
++      .sort(compareSessions)
++      .map((item) => item.id);
++    expect(forward).toEqual(['a', 'b', 'c']);
++    expect(reversed).toEqual(forward);
++  });
++});
++
++describe('orderSessions', () => {
++  test('follows the store sessionOrder', () => {
++    const list = [session({ id: 'a' }), session({ id: 'b' }), session({ id: 'c' })];
++    expect(orderSessions(toRecord(list), ['c', 'a', 'b']).map((item) => item.id)).toEqual([
++      'c',
++      'a',
++      'b',
++    ]);
++  });
++
++  test('skips ids missing from the session map', () => {
++    const list = [session({ id: 'a' })];
++    expect(orderSessions(toRecord(list), ['gone', 'a']).map((item) => item.id)).toEqual(['a']);
++  });
++
++  test('appends sessions missing from sessionOrder using the comparator', () => {
++    const list = [
++      session({ id: 'a' }),
++      session({ id: 'b', updatedAt: '2026-01-05T00:00:00.000Z' }),
++      session({ id: 'c' }),
++    ];
++    expect(orderSessions(toRecord(list), ['a']).map((item) => item.id)).toEqual(['a', 'b', 'c']);
++  });
++
++  test('ignores undefined entries and prototype keys', () => {
++    const sessions: Record<string, AgentSessionDto | undefined> = {
++      a: session({ id: 'a' }),
++      b: undefined,
++    };
++    expect(orderSessions(sessions, ['a', 'b', 'toString', '__proto__']).map((s) => s.id)).toEqual([
++      'a',
++    ]);
++  });
++});
++
++describe('groupSessionsByPane', () => {
++  test('groups by device+pane preserving input order', () => {
++    const first = session({ id: 'a', deviceId: 'd1', paneId: '%1' });
++    const second = session({ id: 'b', deviceId: 'd1', paneId: '%1' });
++    const other = session({ id: 'c', deviceId: 'd2', paneId: '%1' });
++    const grouped = groupSessionsByPane([first, second, other]);
++    expect(grouped.get(paneKey('d1', '%1'))?.map((item) => item.id)).toEqual(['a', 'b']);
++    expect(grouped.get(paneKey('d2', '%1'))?.map((item) => item.id)).toEqual(['c']);
++  });
++
++  test('does not collide when ids concatenate ambiguously', () => {
++    const left = session({ id: 'a', deviceId: 'd', paneId: '1%1' });
++    const right = session({ id: 'b', deviceId: 'd1', paneId: '%1' });
++    const grouped = groupSessionsByPane([left, right]);
++    expect(grouped.size).toBe(2);
++  });
++
++  test('drops sessions without device or pane', () => {
++    const grouped = groupSessionsByPane([
++      session({ id: 'a' }),
++      session({ id: 'b', deviceId: 'd1' }),
++      session({ id: 'c', paneId: '%1' }),
++    ]);
++    expect(grouped.size).toBe(0);
++  });
++});
++
++describe('collectKnownPaneIds', () => {
++  test('collects pane ids per device', () => {
++    const panes = collectKnownPaneIds({
++      d1: snapshot('d1', ['%1', '%2']),
++      d2: snapshot('d2', ['%3']),
++    });
++    expect([...(panes.get('d1') ?? [])]).toEqual(['%1', '%2']);
++    expect([...(panes.get('d2') ?? [])]).toEqual(['%3']);
++  });
++
++  test('skips devices without a loaded session snapshot', () => {
++    const panes = collectKnownPaneIds({
++      d1: { deviceId: 'd1', session: null },
++      d2: undefined,
++    });
++    expect(panes.has('d1')).toBe(false);
++    expect(panes.has('d2')).toBe(false);
++  });
++});
++
++describe('isSessionAttached', () => {
++  const known = new Set(['d1']);
++  const panesByDevice = collectKnownPaneIds({ d1: snapshot('d1', ['%1']) });
++
++  test('attached when the pane still exists', () => {
++    const item = session({ id: 'a', deviceId: 'd1', paneId: '%1' });
++    expect(isSessionAttached(item, known, panesByDevice)).toBe(true);
++  });
++
++  test('detached when the device still exists but the pane is gone', () => {
++    const item = session({ id: 'a', deviceId: 'd1', paneId: '%9' });
++    expect(isSessionAttached(item, known, panesByDevice)).toBe(false);
++  });
++
++  test('detached when the device is unknown', () => {
++    const item = session({ id: 'a', deviceId: 'gone', paneId: '%1' });
++    expect(isSessionAttached(item, known, panesByDevice)).toBe(false);
++  });
++
++  test('detached when the session has no pane binding', () => {
++    expect(isSessionAttached(session({ id: 'a' }), known, panesByDevice)).toBe(false);
++    expect(isSessionAttached(session({ id: 'b', deviceId: 'd1' }), known, panesByDevice)).toBe(
++      false
++    );
++  });
++
++  test('treated as attached while the device snapshot has not loaded yet', () => {
++    const item = session({ id: 'a', deviceId: 'd1', paneId: '%1' });
++    expect(isSessionAttached(item, known, new Map())).toBe(true);
++  });
++});
+diff --git a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
+new file mode 100644
+index 0000000..60ba104
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
+@@ -0,0 +1,204 @@
++// 侧边栏 agent 会话装饰的控制器：bootstrap、排序/分组派生、重命名与删除对话框状态。
++
++import type { AgentSessionDto, StateSnapshotPayload } from '@tmex/shared';
++import { useAgentStore } from '@tmex/stores';
++import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
++
++const PANE_KEY_SEPARATOR = '\u0000';
++
++export function paneKey(deviceId: string, paneId: string): string {
++  return `${deviceId}${PANE_KEY_SEPARATOR}${paneId}`;
++}
++
++/** updatedAt 倒序；同一时间戳按 id 升序兜底，保证比较函数反对称与排序稳定 */
++export function compareSessions(a: AgentSessionDto, b: AgentSessionDto): number {
++  if (a.updatedAt !== b.updatedAt) {
++    return a.updatedAt < b.updatedAt ? 1 : -1;
++  }
++  if (a.id === b.id) return 0;
++  return a.id < b.id ? -1 : 1;
++}
++
++/** store 的 sessionOrder 是排序真相源；不在其中的会话按同一规则排序后补在末尾 */
++export function orderSessions(
++  sessions: Record<string, AgentSessionDto | undefined>,
++  sessionOrder: readonly string[]
++): AgentSessionDto[] {
++  const remaining = new Map<string, AgentSessionDto>();
++  for (const [id, session] of Object.entries(sessions)) {
++    if (session) remaining.set(id, session);
++  }
++  const ordered: AgentSessionDto[] = [];
++  for (const id of sessionOrder) {
++    const session = remaining.get(id);
++    if (!session) continue;
++    remaining.delete(id);
++    ordered.push(session);
++  }
++  if (remaining.size > 0) {
++    ordered.push(...[...remaining.values()].sort(compareSessions));
++  }
++  return ordered;
++}
++
++export function groupSessionsByPane(
++  ordered: readonly AgentSessionDto[]
++): Map<string, AgentSessionDto[]> {
++  const grouped = new Map<string, AgentSessionDto[]>();
++  for (const session of ordered) {
++    if (!session.deviceId || !session.paneId) continue;
++    const key = paneKey(session.deviceId, session.paneId);
++    const list = grouped.get(key);
++    if (list) {
++      list.push(session);
++    } else {
++      grouped.set(key, [session]);
++    }
++  }
++  return grouped;
++}
++
++export function collectKnownPaneIds(
++  snapshots: Record<string, StateSnapshotPayload | undefined>
++): Map<string, Set<string>> {
++  const byDevice = new Map<string, Set<string>>();
++  for (const [deviceId, snapshot] of Object.entries(snapshots)) {
++    const windows = snapshot?.session?.windows;
++    if (!windows) continue;
++    const paneIds = new Set<string>();
++    for (const window of windows) {
++      for (const pane of window.panes) paneIds.add(pane.id);
++    }
++    byDevice.set(deviceId, paneIds);
++  }
++  return byDevice;
++}
++
++/**
++ * 会话是否仍挂在某个存活 pane 上；否则归入孤立会话区，避免 pane 被关掉后会话从侧边栏消失。
++ * 设备快照尚未加载（设备离线/未订阅）时按「仍挂载」处理，防止快照到达前后在孤立区闪现。
++ */
++export function isSessionAttached(
++  session: AgentSessionDto,
++  knownDeviceIds: ReadonlySet<string>,
++  panesByDevice: ReadonlyMap<string, ReadonlySet<string>>
++): boolean {
++  if (!session.deviceId || !session.paneId) return false;
++  if (!knownDeviceIds.has(session.deviceId)) return false;
++  const panes = panesByDevice.get(session.deviceId);
++  if (!panes) return true;
++  return panes.has(session.paneId);
++}
++
++export interface SidebarAgentSessionsContextValue {
++  orderedSessions: AgentSessionDto[];
++  sessionsByPane: ReadonlyMap<string, AgentSessionDto[]>;
++  activeSessionId: string | null;
++  sessionRenameCandidate: AgentSessionDto | null;
++  sessionRenameValue: string;
++  setSessionRenameValue: (value: string) => void;
++  closeRenameDialog: () => void;
++  confirmRenameSession: () => void;
++  sessionDeleteCandidate: AgentSessionDto | null;
++  closeDeleteDialog: () => void;
++  confirmDeleteSession: () => void;
++  requestRenameSession: (session: AgentSessionDto) => void;
++  requestDeleteSession: (session: AgentSessionDto) => void;
++}
++
++export const SidebarAgentSessionsContext = createContext<SidebarAgentSessionsContextValue | null>(
++  null
++);
++
++export function useSidebarAgentSessions(): SidebarAgentSessionsContextValue {
++  const ctx = useContext(SidebarAgentSessionsContext);
++  if (!ctx) {
++    throw new Error('sidebarAgentAdapter must be used within SidebarAgentSessionsProvider');
++  }
++  return ctx;
++}
++
++export function useSidebarAgentSessionsController(): SidebarAgentSessionsContextValue {
++  // AgentTab 挂载时也会拉列表，这里只在列表尚未加载过时兜底，避免切换侧边栏 tab 反复全量拉取
++  useEffect(() => {
++    const store = useAgentStore.getState();
++    store.ensureInitialized();
++    if (!store.sessionsLoaded) void store.loadSessions();
++  }, []);
++
++  const sessions = useAgentStore((state) => state.sessions);
++  const sessionOrder = useAgentStore((state) => state.sessionOrder);
++  const activeSessionId = useAgentStore((state) => state.activeSessionId);
++
++  const orderedSessions = useMemo(
++    () => orderSessions(sessions, sessionOrder),
++    [sessions, sessionOrder]
++  );
++  const sessionsByPane = useMemo(() => groupSessionsByPane(orderedSessions), [orderedSessions]);
++
++  const [sessionRenameCandidate, setSessionRenameCandidate] = useState<AgentSessionDto | null>(
++    null
++  );
++  const [sessionRenameValue, setSessionRenameValue] = useState('');
++  const [sessionDeleteCandidate, setSessionDeleteCandidate] = useState<AgentSessionDto | null>(
++    null
++  );
++
++  const requestRenameSession = useCallback((session: AgentSessionDto) => {
++    setSessionRenameValue(session.title);
++    setSessionRenameCandidate(session);
++  }, []);
++
++  const confirmRenameSession = useCallback(() => {
++    if (!sessionRenameCandidate) return;
++    const trimmed = sessionRenameValue.trim();
++    if (!trimmed) return;
++    void useAgentStore.getState().renameSession(sessionRenameCandidate.id, trimmed);
++    setSessionRenameCandidate(null);
++  }, [sessionRenameCandidate, sessionRenameValue]);
++
++  const requestDeleteSession = useCallback((session: AgentSessionDto) => {
++    setSessionDeleteCandidate(session);
++  }, []);
++
++  const confirmDeleteSession = useCallback(() => {
++    if (!sessionDeleteCandidate) return;
++    void useAgentStore.getState().deleteSession(sessionDeleteCandidate.id);
++    setSessionDeleteCandidate(null);
++  }, [sessionDeleteCandidate]);
++
++  const closeRenameDialog = useCallback(() => setSessionRenameCandidate(null), []);
++  const closeDeleteDialog = useCallback(() => setSessionDeleteCandidate(null), []);
++
++  return useMemo(
++    () => ({
++      orderedSessions,
++      sessionsByPane,
++      activeSessionId,
++      sessionRenameCandidate,
++      sessionRenameValue,
++      setSessionRenameValue,
++      closeRenameDialog,
++      confirmRenameSession,
++      sessionDeleteCandidate,
++      closeDeleteDialog,
++      confirmDeleteSession,
++      requestRenameSession,
++      requestDeleteSession,
++    }),
++    [
++      orderedSessions,
++      sessionsByPane,
++      activeSessionId,
++      sessionRenameCandidate,
++      sessionRenameValue,
++      closeRenameDialog,
++      confirmRenameSession,
++      sessionDeleteCandidate,
++      closeDeleteDialog,
++      confirmDeleteSession,
++      requestRenameSession,
++      requestDeleteSession,
++    ]
++  );
++}
+diff --git a/apps/fe/src/main.tsx b/apps/fe/src/main.tsx
+index 8f74edc..a849b9b 100644
+--- a/apps/fe/src/main.tsx
++++ b/apps/fe/src/main.tsx
+@@ -130,10 +130,13 @@ function RootLayout() {
+   useEffect(() => {
+     void loadCapabilities();
+   }, [loadCapabilities]);
++  // 桌面端展开/折叠受控于持久化的 ui store，刷新后保留，且 setSidebarCollapsed 能真正开合侧栏
++  const sidebarCollapsed = useUIStore((state) => state.sidebarCollapsed);
++  const setSidebarCollapsed = useUIStore((state) => state.setSidebarCollapsed);
+   return (
+     <GlobalDeviceProvider>
+       <WatchEventsInit />
+-      <SidebarProvider>
++      <SidebarProvider open={!sidebarCollapsed} onOpenChange={(open) => setSidebarCollapsed(!open)}>
+         <StatusBarSync />
+         <FlowBridges />
+         <AppSidebar />
+diff --git a/packages/panels/src/agent/agent-route-sync.test.ts b/packages/panels/src/agent/agent-route-sync.test.ts
+new file mode 100644
+index 0000000..2adbff2
+--- /dev/null
++++ b/packages/panels/src/agent/agent-route-sync.test.ts
+@@ -0,0 +1,54 @@
++import { describe, expect, test } from 'bun:test';
++
++import { canRebindToRoute, shouldRedraftForRoute } from './agent-route-sync';
++
++describe('canRebindToRoute', () => {
++  const session = { deviceId: 'd1', paneId: '%1' };
++
++  test('allows rebinding to another pane on the same device', () => {
++    expect(canRebindToRoute(session, { deviceId: 'd1', paneId: '%2' })).toBe(true);
++  });
++
++  test('refuses a route pane on another device', () => {
++    expect(canRebindToRoute(session, { deviceId: 'd2', paneId: '%2' })).toBe(false);
++  });
++
++  test('refuses when the route already matches the session pane', () => {
++    expect(canRebindToRoute(session, { deviceId: 'd1', paneId: '%1' })).toBe(false);
++  });
++
++  test('refuses without a session or an incomplete route', () => {
++    expect(canRebindToRoute(undefined, { deviceId: 'd1', paneId: '%2' })).toBe(false);
++    expect(
++      canRebindToRoute({ deviceId: null, paneId: null }, { deviceId: 'd1', paneId: '%2' })
++    ).toBe(false);
++    expect(canRebindToRoute(session, { deviceId: 'd1', paneId: null })).toBe(false);
++    expect(canRebindToRoute(session, { deviceId: null, paneId: '%2' })).toBe(false);
++  });
++});
++
++describe('shouldRedraftForRoute', () => {
++  const draft = { deviceId: 'd1', paneId: '%1' };
++
++  test('redrafts when the route pane changed', () => {
++    expect(shouldRedraftForRoute(draft, { deviceId: 'd1', paneId: '%2' }, false)).toBe(true);
++  });
++
++  test('redrafts when the route device changed', () => {
++    expect(shouldRedraftForRoute(draft, { deviceId: 'd2', paneId: '%1' }, false)).toBe(true);
++  });
++
++  test('keeps the draft while it matches the route', () => {
++    expect(shouldRedraftForRoute(draft, { deviceId: 'd1', paneId: '%1' }, false)).toBe(false);
++  });
++
++  test('keeps the draft when the route has no pane', () => {
++    expect(shouldRedraftForRoute(draft, { deviceId: 'd1', paneId: null }, false)).toBe(false);
++    expect(shouldRedraftForRoute(draft, { deviceId: null, paneId: null }, false)).toBe(false);
++  });
++
++  test('does nothing without a draft or with an active session', () => {
++    expect(shouldRedraftForRoute(null, { deviceId: 'd1', paneId: '%2' }, false)).toBe(false);
++    expect(shouldRedraftForRoute(draft, { deviceId: 'd1', paneId: '%2' }, true)).toBe(false);
++  });
++});
+diff --git a/packages/panels/src/agent/agent-route-sync.ts b/packages/panels/src/agent/agent-route-sync.ts
+new file mode 100644
+index 0000000..f18f03a
+--- /dev/null
++++ b/packages/panels/src/agent/agent-route-sync.ts
+@@ -0,0 +1,32 @@
++// 路由 pane 与会话/草稿的一致性判定：纯函数，供 state 层与派生态共用。
++
++export interface RouteTarget {
++  deviceId: string | null;
++  paneId: string | null;
++}
++
++export interface PaneBound {
++  deviceId: string | null;
++  paneId: string | null;
++}
++
++/** 改绑只能改 paneId（后端 PATCH 不接受 deviceId），跨设备的路由 pane 不可绑定 */
++export function canRebindToRoute(
++  session: PaneBound | undefined | null,
++  route: RouteTarget
++): boolean {
++  if (!session?.deviceId || !route.deviceId || !route.paneId) return false;
++  if (session.deviceId !== route.deviceId) return false;
++  return session.paneId !== route.paneId;
++}
++
++/** 草稿仍绑在旧 pane 上（路由已切走）：需要按当前路由重新起草，否则发送会落到上一个 pane */
++export function shouldRedraftForRoute(
++  draft: PaneBound | null,
++  route: RouteTarget,
++  hasActiveSession: boolean
++): boolean {
++  if (!draft || hasActiveSession) return false;
++  if (!route.deviceId || !route.paneId) return false;
++  return draft.deviceId !== route.deviceId || draft.paneId !== route.paneId;
++}
+diff --git a/packages/panels/src/agent/agent-tab-view.test.ts b/packages/panels/src/agent/agent-tab-view.test.ts
+new file mode 100644
+index 0000000..faf75ac
+--- /dev/null
++++ b/packages/panels/src/agent/agent-tab-view.test.ts
+@@ -0,0 +1,118 @@
++import { describe, expect, test } from 'bun:test';
++
++import type { AgentSessionDto, Device, StateSnapshotPayload } from '@tmex/shared';
++
++import { deriveAgentTabView } from './agent-tab-view';
++import type { AgentStoreHandle, AgentTabState } from './use-agent-tab-state';
++
++const devices: Device[] = [{ id: 'd1', name: 'laptop' } as Device];
++
++function snapshots(paneId: string): Record<string, StateSnapshotPayload | undefined> {
++  return {
++    d1: {
++      session: {
++        windows: [
++          {
++            id: '@1',
++            name: 'shell',
++            customName: null,
++            panes: [{ id: paneId, title: 'vim', customName: null }],
++          },
++        ],
++      },
++    } as unknown as StateSnapshotPayload,
++  };
++}
++
++function session(overrides: Partial<AgentSessionDto> = {}): AgentSessionDto {
++  return {
++    id: 's1',
++    title: 'session',
++    deviceId: 'd1',
++    paneId: '%1',
++    providerId: null,
++    modelId: 'm1',
++    systemPrompt: null,
++    writeMode: 'confirm',
++    useProviderWebSearch: false,
++    providerHostedTools: [],
++    allowControlChars: false,
++    originPaneTitle: null,
++    originProcessName: null,
++    status: 'idle',
++    lastError: null,
++    maxStepsPerTurn: 10,
++    createdAt: '',
++    updatedAt: '',
++    ...overrides,
++  } as AgentSessionDto;
++}
++
++function state(overrides: Partial<AgentTabState> = {}): AgentTabState {
++  return {
++    agentStore: {} as AgentStoreHandle,
++    snapshots: snapshots('%1'),
++    devices,
++    devicesLoading: false,
++    devicesError: false,
++    routeDeviceId: 'd1',
++    routePaneId: '%1',
++    routePaneTitle: 'vim',
++    activeSessionId: 's1',
++    activeSession: session(),
++    draft: null,
++    messages: [],
++    inProgress: undefined,
++    pendingConfirmations: undefined,
++    sending: false,
++    materializingDraft: false,
++    queued: undefined,
++    defaultWriteMode: 'confirm',
++    ...overrides,
++  };
++}
++
++describe('deriveAgentTabView orphan classification', () => {
++  test('does not classify as orphan while devices are loading', () => {
++    const view = deriveAgentTabView(
++      state({ devices: undefined, devicesLoading: true, devicesError: false })
++    );
++    expect(view.isOrphan).toBe(false);
++    expect(view.inputDisabled).toBe(false);
++  });
++
++  test('does not classify as orphan when the devices query failed', () => {
++    const view = deriveAgentTabView(
++      state({ devices: undefined, devicesLoading: false, devicesError: true })
++    );
++    expect(view.isOrphan).toBe(false);
++    expect(view.inputDisabled).toBe(false);
++  });
++
++  test('classifies as orphan once a successful list omits the device', () => {
++    const view = deriveAgentTabView(state({ devices: [{ id: 'other', name: 'x' } as Device] }));
++    expect(view.isOrphan).toBe(true);
++    expect(view.inputDisabled).toBe(true);
++  });
++
++  test('classifies as orphan when the bound pane vanished', () => {
++    const view = deriveAgentTabView(state({ snapshots: snapshots('%9') }));
++    expect(view.isOrphan).toBe(true);
++  });
++});
++
++describe('deriveAgentTabView rebind eligibility', () => {
++  test('offers rebind for another pane on the same device', () => {
++    const view = deriveAgentTabView(
++      state({ routePaneId: '%2', snapshots: snapshots('%1'), routePaneTitle: null })
++    );
++    expect(view.showPaneMismatch).toBe(true);
++    expect(view.canRebind).toBe(true);
++  });
++
++  test('hides rebind when the route points at another device', () => {
++    const view = deriveAgentTabView(state({ routeDeviceId: 'd2', routePaneId: '%2' }));
++    expect(view.showPaneMismatch).toBe(true);
++    expect(view.canRebind).toBe(false);
++  });
++});
+diff --git a/packages/panels/src/agent/agent-tab-view.ts b/packages/panels/src/agent/agent-tab-view.ts
+index 5aa2e1a..45b8533 100644
+--- a/packages/panels/src/agent/agent-tab-view.ts
++++ b/packages/panels/src/agent/agent-tab-view.ts
+@@ -5,6 +5,7 @@ import type { DraftSession } from '@tmex/stores';
+ import { lastUserMessageText } from '@tmex/stores';
+ 
+ import { type BindingInfo, resolveBinding } from './agent-binding';
++import { canRebindToRoute } from './agent-route-sync';
+ import type { AgentTabState } from './use-agent-tab-state';
+ 
+ export interface AgentTabView {
+@@ -41,13 +42,13 @@ function deriveBinding(state: AgentTabState): BindingInfo | null {
+ 
+ /** 孤立会话：设备缺失 / 不在列表 / pane 在快照中已不存在 → 仅可只读查看 */
+ function isOrphanSession(state: AgentTabState, binding: BindingInfo | null): boolean {
+-  const { activeSession, devices } = state;
++  const { activeSession, devices, devicesLoading, devicesError } = state;
+   if (!activeSession) return false;
+-  return (
+-    !activeSession.deviceId ||
+-    !devices?.some((device) => device.id === activeSession.deviceId) ||
+-    binding?.state === 'invalid'
+-  );
++  if (!activeSession.deviceId) return true;
++  if (binding?.state === 'invalid') return true;
++  // devices 未加载完成或加载失败时列表不可信，不能据此判定孤立（否则会误禁用输入）
++  if (devicesLoading || devicesError || !devices) return false;
++  return !devices.some((device) => device.id === activeSession.deviceId);
+ }
+ 
+ function hasPaneMismatch(state: AgentTabState): boolean {
+@@ -83,7 +84,7 @@ function deriveStatusView(state: AgentTabState, isOrphan: boolean) {
+     showNewSession: Boolean(activeSession && (messages?.length ?? 0) > 0),
+     newSessionDisabled: !routeDeviceId || !routePaneId,
+     showPaneMismatch: Boolean(activeSession && !isOrphan && hasPaneMismatch(state)),
+-    canRebind: Boolean(routePaneId),
++    canRebind: canRebindToRoute(activeSession, { deviceId: routeDeviceId, paneId: routePaneId }),
+     errorText: activeSession?.status === 'error' ? activeSession.lastError : null,
+     retryText: lastUserMessageText(messages),
+   };
+diff --git a/packages/panels/src/agent/use-agent-tab-actions.ts b/packages/panels/src/agent/use-agent-tab-actions.ts
+index 085ecb9..b02ee2d 100644
+--- a/packages/panels/src/agent/use-agent-tab-actions.ts
++++ b/packages/panels/src/agent/use-agent-tab-actions.ts
+@@ -7,6 +7,7 @@ import type { AgentSessionDto, AgentWriteMode } from '@tmex/shared';
+ import { useUIStore } from '@tmex/stores/react';
+ 
+ import type { BindingInfo } from './agent-binding';
++import { canRebindToRoute } from './agent-route-sync';
+ import type { AgentTabView } from './agent-tab-view';
+ import type { AgentStoreHandle, AgentTabState } from './use-agent-tab-state';
+ 
+@@ -66,7 +67,10 @@ function createSessionActions(state: AgentTabState, view: AgentTabView) {
+       void agentStore.getState().sendMessage(activeSession.id, view.retryText);
+     },
+     onRebind: () => {
++      // 后端只接受 paneId：跨设备的路由 pane 不能改绑，否则会把别的设备的 pane id 写进本会话
+       if (!activeSession || !routePaneId) return;
++      if (!canRebindToRoute(activeSession, { deviceId: routeDeviceId, paneId: routePaneId }))
++        return;
+       void agentStore.getState().rebindPane(activeSession.id, routePaneId);
+     },
+     onModelChange: (providerId: string | null, modelId: string) => {
+diff --git a/packages/panels/src/agent/use-agent-tab-state.ts b/packages/panels/src/agent/use-agent-tab-state.ts
+index c71290a..c2dba08 100644
+--- a/packages/panels/src/agent/use-agent-tab-state.ts
++++ b/packages/panels/src/agent/use-agent-tab-state.ts
+@@ -21,6 +21,7 @@ import type {
+ import { useAgentStore, useRuntime, useTmuxStore } from '@tmex/stores/react';
+ 
+ import { type SnapshotMap, findPaneTitle } from './agent-binding';
++import { shouldRedraftForRoute } from './agent-route-sync';
+ 
+ export type AgentStoreHandle = AppRuntime['stores']['agent'];
+ 
+@@ -44,10 +45,17 @@ interface AgentSessionSlice {
+   defaultWriteMode: AgentWriteMode;
+ }
+ 
+-export interface AgentTabState extends RoutePane, AgentSessionSlice {
++interface DevicesSlice {
++  devices: Device[] | undefined;
++  /** devices 查询尚未拿到结果（首个 pending 或重试中） */
++  devicesLoading: boolean;
++  /** devices 查询失败：设备列表不可信，不能据此判定会话孤立 */
++  devicesError: boolean;
++}
++
++export interface AgentTabState extends RoutePane, AgentSessionSlice, DevicesSlice {
+   agentStore: AgentStoreHandle;
+   snapshots: SnapshotMap;
+-  devices: Device[] | undefined;
+ }
+ 
+ function useRoutePane(snapshots: SnapshotMap): RoutePane {
+@@ -97,13 +105,13 @@ function useAgentSessionSlice(): AgentSessionSlice {
+   };
+ }
+ 
+-function useDevices(runtime: AppRuntime): Device[] | undefined {
+-  const { data } = useQuery({
++function useDevices(runtime: AppRuntime): DevicesSlice {
++  const { data, isPending, isError } = useQuery({
+     queryKey: ['devices'],
+     queryFn: () => fetchDevices(runtime.apiClient),
+     throwOnError: false,
+   });
+-  return data?.devices;
++  return { devices: data?.devices, devicesLoading: isPending, devicesError: isError };
+ }
+ 
+ function useSessionsBootstrap(agentStore: AgentStoreHandle): void {
+@@ -129,6 +137,31 @@ function useAutoDraft(
+   }, [activeSession, draft, routeDeviceId, routePaneId, routePaneTitle, agentStore]);
+ }
+ 
++/**
++ * 路由 pane 切换后草稿仍绑在旧 pane：按当前路由重新起草，
++ * 否则发送会物化到上一个 pane。未发送的预填 prompt 一并带到新草稿。
++ */
++function useSyncDraftToRoute(
++  agentStore: AgentStoreHandle,
++  activeSession: AgentSessionDto | undefined,
++  draft: DraftSession | null,
++  route: RoutePane
++): void {
++  const { routeDeviceId, routePaneId, routePaneTitle } = route;
++  useEffect(() => {
++    if (!routeDeviceId || !routePaneId) return;
++    const redraft = shouldRedraftForRoute(
++      draft,
++      { deviceId: routeDeviceId, paneId: routePaneId },
++      Boolean(activeSession)
++    );
++    if (!redraft) return;
++    agentStore
++      .getState()
++      .startDraft(routeDeviceId, routePaneId, routePaneTitle, draft?.prompt ?? null);
++  }, [activeSession, draft, routeDeviceId, routePaneId, routePaneTitle, agentStore]);
++}
++
+ export function useAgentTabState(): AgentTabState {
+   const runtime = useRuntime();
+   const agentStore = runtime.stores.agent;
+@@ -139,6 +172,7 @@ export function useAgentTabState(): AgentTabState {
+ 
+   useSessionsBootstrap(agentStore);
+   useAutoDraft(agentStore, session.activeSession, session.draft, route);
++  useSyncDraftToRoute(agentStore, session.activeSession, session.draft, route);
+ 
+-  return { agentStore, snapshots, devices, ...route, ...session };
++  return { agentStore, snapshots, ...devices, ...route, ...session };
+ }
+diff --git a/packages/panels/src/device-console/use-terminal-shortcut-actions.ts b/packages/panels/src/device-console/use-terminal-shortcut-actions.ts
+index e9e835e..5698f3f 100644
+--- a/packages/panels/src/device-console/use-terminal-shortcut-actions.ts
++++ b/packages/panels/src/device-console/use-terminal-shortcut-actions.ts
+@@ -2,7 +2,7 @@
+ // send 与 paste / newAgentSession 才需要有效设备与 pane。
+ 
+ import type { TerminalShortcutAction, TerminalShortcutItem } from '@tmex/shared';
+-import type { AppRuntime } from '@tmex/stores';
++import { type AppRuntime, bridgeOpenMobileSidebar } from '@tmex/stores';
+ import { useRuntime } from '@tmex/stores/react';
+ import type { TerminalRef } from '@tmex/terminal-ui';
+ import { type RefObject, useCallback } from 'react';
+@@ -90,6 +90,7 @@ export function useTerminalShortcutActions({
+       if (item.action === 'newAgentSession' && runtime.features.agentUi) {
+         runtime.stores.agent.getState().startDraft(deviceId, resolvedPaneId, null);
+         runtime.stores.ui.getState().setSidebarCollapsed(false);
++        bridgeOpenMobileSidebar();
+         runtime.stores.ui.getState().setSidebarTab('agent');
+       }
+     },
+diff --git a/packages/panels/src/device-tree/close-confirm-dialog.tsx b/packages/panels/src/device-tree/close-confirm-dialog.tsx
+new file mode 100644
+index 0000000..7c4b3dd
+--- /dev/null
++++ b/packages/panels/src/device-tree/close-confirm-dialog.tsx
+@@ -0,0 +1,45 @@
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogMedia,
++  AlertDialogTitle,
++} from '@tmex/ui/alert-dialog';
++import { X } from 'lucide-react';
++import { useTranslation } from 'react-i18next';
++import type { CloseDialogState } from './use-close-dialog';
++
++export function CloseConfirmDialog({ state }: { state: CloseDialogState }) {
++  const { t } = useTranslation();
++  const { candidate, confirm, dismiss } = state;
++
++  return (
++    <AlertDialog open={candidate !== null} onOpenChange={(open) => !open && dismiss()}>
++      <AlertDialogContent>
++        <AlertDialogHeader>
++          <AlertDialogMedia className="bg-destructive/10">
++            <X className="h-5 w-5 text-destructive" />
++          </AlertDialogMedia>
++          <AlertDialogTitle>
++            {candidate?.kind === 'pane'
++              ? t('window.closePaneConfirmTitle')
++              : t('window.closeConfirmTitle')}
++          </AlertDialogTitle>
++          <AlertDialogDescription>
++            {t('window.closeConfirmDesc', { name: candidate?.name ?? '' })}
++          </AlertDialogDescription>
++        </AlertDialogHeader>
++        <AlertDialogFooter>
++          <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
++          <AlertDialogAction variant="destructive" disabled={!candidate} onClick={confirm}>
++            {t('common.close')}
++          </AlertDialogAction>
++        </AlertDialogFooter>
++      </AlertDialogContent>
++    </AlertDialog>
++  );
++}
+diff --git a/packages/panels/src/device-tree/device-tree-actions.test.ts b/packages/panels/src/device-tree/device-tree-actions.test.ts
+new file mode 100644
+index 0000000..cdebc0b
+--- /dev/null
++++ b/packages/panels/src/device-tree/device-tree-actions.test.ts
+@@ -0,0 +1,172 @@
++import { describe, expect, test } from 'bun:test';
++import type { TmuxPane, TmuxWindow } from '@tmex/shared';
++import { buildPaneActions, buildWindowActions } from './device-tree-actions';
++
++const t = (key: string) => key;
++
++function pane(overrides: Partial<TmuxPane> = {}): TmuxPane {
++  return {
++    id: '%1',
++    windowId: '@1',
++    index: 0,
++    active: true,
++    width: 80,
++    height: 24,
++    ...overrides,
++  };
++}
++
++function tmuxWindow(panes: TmuxPane[]): TmuxWindow {
++  return { id: '@1', name: 'one', index: 0, active: true, panes };
++}
++
++const noopHandlers = {
++  onRename: () => {},
++  onCreateWindowInCwd: () => {},
++  onSplit: () => {},
++  onWatch: () => {},
++  onClose: () => {},
++};
++
++const keysOf = (items: { key: string }[]) => items.map((item) => item.key);
++
++describe('buildWindowActions', () => {
++  test('renders the full menu for a window with an active pane', () => {
++    const items = buildWindowActions({
++      t,
++      tmuxWindow: tmuxWindow([pane({ currentPath: '/srv' })]),
++      watchUi: true,
++      ...noopHandlers,
++      onCreateSession: () => {},
++    });
++    expect(keysOf(items)).toEqual([
++      'rename',
++      'new-session',
++      'new-in-cwd',
++      'split-right',
++      'split-down',
++      'watch',
++      'close',
++    ]);
++    expect(items.map((item) => item.testId)).toEqual([
++      'window-menu-rename-@1',
++      'window-menu-new-session-@1',
++      undefined,
++      'window-menu-split-right-@1',
++      'window-menu-split-down-@1',
++      'window-menu-watch-@1',
++      'window-menu-close-@1',
++    ]);
++  });
++
++  test('drops split/watch and keeps rename/close for a window with zero panes', () => {
++    const items = buildWindowActions({
++      t,
++      tmuxWindow: tmuxWindow([]),
++      watchUi: true,
++      ...noopHandlers,
++      onCreateSession: undefined,
++    });
++    expect(keysOf(items)).toEqual(['rename', 'close']);
++  });
++
++  test('omits the agent session item when no session target exists', () => {
++    const withAgent = buildWindowActions({
++      t,
++      tmuxWindow: tmuxWindow([pane()]),
++      watchUi: false,
++      ...noopHandlers,
++      onCreateSession: () => {},
++    });
++    expect(keysOf(withAgent)).toContain('new-session');
++
++    const withoutAgent = buildWindowActions({
++      t,
++      tmuxWindow: tmuxWindow([pane()]),
++      watchUi: false,
++      ...noopHandlers,
++    });
++    expect(keysOf(withoutAgent)).not.toContain('new-session');
++  });
++
++  test('omits new-in-cwd when the active pane has no cwd and hides watch without the feature', () => {
++    const items = buildWindowActions({
++      t,
++      tmuxWindow: tmuxWindow([pane()]),
++      watchUi: false,
++      ...noopHandlers,
++    });
++    expect(keysOf(items)).toEqual(['rename', 'split-right', 'split-down', 'close']);
++  });
++
++  test('splits from the active pane, not the first one', () => {
++    const calls: string[] = [];
++    const items = buildWindowActions({
++      t,
++      tmuxWindow: tmuxWindow([
++        pane({ id: '%1', active: false }),
++        pane({ id: '%2', active: true, currentPath: '/tmp' }),
++      ]),
++      watchUi: true,
++      ...noopHandlers,
++      onSplit: (paneId, direction, cwd) => calls.push(`${paneId}:${direction}:${cwd}`),
++      onWatch: (paneId) => calls.push(`watch:${paneId}`),
++    });
++    for (const item of items) item.onSelect();
++    expect(calls).toEqual(['%2:right:/tmp', '%2:down:/tmp', 'watch:%2']);
++  });
++});
++
++describe('buildPaneActions', () => {
++  test('renders the full menu with pane-scoped test ids', () => {
++    const items = buildPaneActions({
++      t,
++      pane: pane({ id: '%7', currentPath: '/home' }),
++      watchUi: true,
++      ...noopHandlers,
++      onCreateSession: () => {},
++    });
++    expect(keysOf(items)).toEqual([
++      'rename',
++      'new-session',
++      'new-in-cwd',
++      'split-right',
++      'split-down',
++      'watch',
++      'close',
++    ]);
++    expect(items.map((item) => item.testId)).toEqual([
++      'pane-menu-rename-%7',
++      'pane-menu-new-session-%7',
++      undefined,
++      'pane-split-right-%7',
++      'pane-split-down-%7',
++      'pane-watch-%7',
++      'pane-menu-close-%7',
++    ]);
++  });
++
++  test('always keeps split available even without a cwd', () => {
++    const items = buildPaneActions({
++      t,
++      pane: pane({ id: '%7' }),
++      watchUi: false,
++      ...noopHandlers,
++    });
++    expect(keysOf(items)).toEqual(['rename', 'split-right', 'split-down', 'close']);
++  });
++
++  test('forwards the pane cwd to new-in-cwd and split', () => {
++    const calls: string[] = [];
++    const items = buildPaneActions({
++      t,
++      pane: pane({ id: '%7', currentPath: '/var' }),
++      watchUi: false,
++      ...noopHandlers,
++      onCreateWindowInCwd: (cwd) => calls.push(`cwd:${cwd}`),
++      onSplit: (paneId, direction, cwd) => calls.push(`${paneId}:${direction}:${cwd}`),
++    });
++    for (const item of items) item.onSelect();
++    expect(calls).toEqual(['cwd:/var', '%7:right:/var', '%7:down:/var']);
++  });
++});
+diff --git a/packages/panels/src/device-tree/device-tree-actions.ts b/packages/panels/src/device-tree/device-tree-actions.ts
+new file mode 100644
+index 0000000..4ae90d8
+--- /dev/null
++++ b/packages/panels/src/device-tree/device-tree-actions.ts
+@@ -0,0 +1,199 @@
++import type { TmuxPane, TmuxWindow } from '@tmex/shared';
++import {
++  FolderOpen,
++  Pencil,
++  Plus,
++  Radar,
++  SquareSplitHorizontal,
++  SquareSplitVertical,
++  X,
++} from 'lucide-react';
++import type { DeviceActionItem } from './device-actions-menu';
++import { pickActivePane } from './device-tree-navigation';
++
++export type SplitDirection = 'right' | 'down';
++
++/** 只取 i18n 的字符串取值面，避免行组件把整个 TFunction 泄进纯函数 */
++export type TranslateFn = (key: string) => string;
++
++export interface DeviceTreeActionHandlers {
++  onRename: () => void;
++  /** pane 为空的窗口没有可挂载的目标，调用方传 undefined 让该项整条消失 */
++  onCreateSession?: () => void;
++  onCreateWindowInCwd: (cwd: string) => void;
++  onSplit: (paneId: string, direction: SplitDirection, cwd?: string) => void;
++  onWatch: (paneId: string) => void;
++  onClose: () => void;
++}
++
++export interface WindowActionsInput extends DeviceTreeActionHandlers {
++  t: TranslateFn;
++  tmuxWindow: TmuxWindow;
++  watchUi: boolean;
++}
++
++export interface PaneActionsInput extends DeviceTreeActionHandlers {
++  t: TranslateFn;
++  pane: TmuxPane;
++  watchUi: boolean;
++}
++
++function splitItems(
++  t: TranslateFn,
++  testId: (key: 'split-right' | 'split-down') => string,
++  pane: TmuxPane,
++  onSplit: DeviceTreeActionHandlers['onSplit']
++): DeviceActionItem[] {
++  return [
++    {
++      key: 'split-right',
++      testId: testId('split-right'),
++      icon: SquareSplitHorizontal,
++      label: t('window.splitRight'),
++      onSelect: () => onSplit(pane.id, 'right', pane.currentPath),
++    },
++    {
++      key: 'split-down',
++      testId: testId('split-down'),
++      icon: SquareSplitVertical,
++      label: t('window.splitDown'),
++      onSelect: () => onSplit(pane.id, 'down', pane.currentPath),
++    },
++  ];
++}
++
++export function buildWindowActions({
++  t,
++  tmuxWindow,
++  watchUi,
++  onRename,
++  onCreateSession,
++  onCreateWindowInCwd,
++  onSplit,
++  onWatch,
++  onClose,
++}: WindowActionsInput): DeviceActionItem[] {
++  const activePane = pickActivePane(tmuxWindow.panes);
++  const activePaneCwd = activePane?.currentPath;
++
++  const items: DeviceActionItem[] = [
++    {
++      key: 'rename',
++      testId: `window-menu-rename-${tmuxWindow.id}`,
++      icon: Pencil,
++      label: t('window.rename'),
++      onSelect: onRename,
++    },
++  ];
++
++  if (onCreateSession) {
++    items.push({
++      key: 'new-session',
++      testId: `window-menu-new-session-${tmuxWindow.id}`,
++      icon: Plus,
++      label: t('agent.session.new'),
++      onSelect: onCreateSession,
++    });
++  }
++
++  if (activePaneCwd) {
++    items.push({
++      key: 'new-in-cwd',
++      icon: FolderOpen,
++      label: t('window.newInCwd'),
++      onSelect: () => onCreateWindowInCwd(activePaneCwd),
++    });
++  }
++
++  if (activePane) {
++    // 窗口菜单的 split/watch 沿用窗口 id 做 testId，与 pane 行的同名条目区分
++    items.push(
++      ...splitItems(t, (key) => `window-menu-${key}-${tmuxWindow.id}`, activePane, onSplit)
++    );
++    if (watchUi) {
++      items.push({
++        key: 'watch',
++        testId: `window-menu-watch-${tmuxWindow.id}`,
++        icon: Radar,
++        label: t('watch.openMonitor'),
++        onSelect: () => onWatch(activePane.id),
++      });
++    }
++  }
++
++  items.push({
++    key: 'close',
++    testId: `window-menu-close-${tmuxWindow.id}`,
++    icon: X,
++    label: t('window.close'),
++    destructive: true,
++    onSelect: onClose,
++  });
++
++  return items;
++}
++
++export function buildPaneActions({
++  t,
++  pane,
++  watchUi,
++  onRename,
++  onCreateSession,
++  onCreateWindowInCwd,
++  onSplit,
++  onWatch,
++  onClose,
++}: PaneActionsInput): DeviceActionItem[] {
++  const items: DeviceActionItem[] = [
++    {
++      key: 'rename',
++      testId: `pane-menu-rename-${pane.id}`,
++      icon: Pencil,
++      label: t('window.rename'),
++      onSelect: onRename,
++    },
++  ];
++
++  if (onCreateSession) {
++    items.push({
++      key: 'new-session',
++      testId: `pane-menu-new-session-${pane.id}`,
++      icon: Plus,
++      label: t('agent.session.new'),
++      onSelect: onCreateSession,
++    });
++  }
++
++  if (pane.currentPath) {
++    const cwd = pane.currentPath;
++    items.push({
++      key: 'new-in-cwd',
++      icon: FolderOpen,
++      label: t('window.newInCwd'),
++      onSelect: () => onCreateWindowInCwd(cwd),
++    });
++  }
++
++  items.push(...splitItems(t, (key) => `pane-${key}-${pane.id}`, pane, onSplit));
++
++  if (watchUi) {
++    items.push({
++      key: 'watch',
++      testId: `pane-watch-${pane.id}`,
++      icon: Radar,
++      label: t('watch.openMonitor'),
++      onSelect: () => onWatch(pane.id),
++    });
++  }
++
++  items.push({
++    key: 'close',
++    testId: `pane-menu-close-${pane.id}`,
++    icon: X,
++    label: t('window.closePane'),
++    destructive: true,
++    onSelect: onClose,
++  });
++
++  return items;
++}
+diff --git a/packages/panels/src/device-tree/device-tree-dialogs.tsx b/packages/panels/src/device-tree/device-tree-dialogs.tsx
+index c1a6cf6..19e7204 100644
+--- a/packages/panels/src/device-tree/device-tree-dialogs.tsx
++++ b/packages/panels/src/device-tree/device-tree-dialogs.tsx
+@@ -1,43 +1,12 @@
+-import { buildWindowDisplayName, buildWindowTitleParts } from '@tmex/stores';
+-import { useRuntime, useTmuxStore } from '@tmex/stores/react';
+-import {
+-  AlertDialog,
+-  AlertDialogAction,
+-  AlertDialogCancel,
+-  AlertDialogContent,
+-  AlertDialogDescription,
+-  AlertDialogFooter,
+-  AlertDialogHeader,
+-  AlertDialogMedia,
+-  AlertDialogTitle,
+-} from '@tmex/ui/alert-dialog';
+-import { Button } from '@tmex/ui/button';
+-import {
+-  Dialog,
+-  DialogContent,
+-  DialogDescription,
+-  DialogFooter,
+-  DialogHeader,
+-  DialogTitle,
+-} from '@tmex/ui/dialog';
+-import { Input } from '@tmex/ui/input';
+-import { X } from 'lucide-react';
++import { useRuntime } from '@tmex/stores/react';
+ import { type ReactNode, useCallback, useState } from 'react';
+-import { useTranslation } from 'react-i18next';
+ import { WatchDialog } from '../watch/watch-dialog';
++import { CloseConfirmDialog } from './close-confirm-dialog';
++import { RenameDialog } from './rename-dialog';
++import { type UseCloseDialogOptions, useCloseDialog } from './use-close-dialog';
++import { useRenameDialog } from './use-rename-dialog';
+ 
+-type CloseCandidate =
+-  | { kind: 'window'; deviceId: string; windowId: string; name: string }
+-  | { kind: 'pane'; deviceId: string; paneId: string; name: string };
+-
+-type RenameCandidate =
+-  | { kind: 'window'; deviceId: string; windowId: string; hasCustomName: boolean }
+-  | { kind: 'pane'; deviceId: string; paneId: string; hasCustomName: boolean };
+-
+-export interface DeviceTreeDialogsOptions {
+-  /** 确认关闭窗口时执行；由设备树根负责关闭前的路由回退 */
+-  onCloseWindow: (deviceId: string, windowId: string) => void;
+-}
++export type DeviceTreeDialogsOptions = UseCloseDialogOptions;
+ 
+ export interface DeviceTreeDialogsController {
+   requestCloseWindow: (deviceId: string, windowId: string) => void;
+@@ -52,194 +21,19 @@ export interface DeviceTreeDialogsController {
+ export function useDeviceTreeDialogs({
+   onCloseWindow,
+ }: DeviceTreeDialogsOptions): DeviceTreeDialogsController {
+-  const { t } = useTranslation();
+   const runtime = useRuntime();
+-  const closePane = useTmuxStore((state) => state.closePane);
+-  const renameWindow = useTmuxStore((state) => state.renameWindow);
+-  const renamePane = useTmuxStore((state) => state.renamePane);
++  const close = useCloseDialog({ onCloseWindow });
++  const rename = useRenameDialog();
+ 
+-  const [closeCandidate, setCloseCandidate] = useState<CloseCandidate | null>(null);
+-  const [renameCandidate, setRenameCandidate] = useState<RenameCandidate | null>(null);
+-  const [renameValue, setRenameValue] = useState('');
+   const [watchTarget, setWatchTarget] = useState<{ deviceId: string; paneId: string } | null>(null);
+-
+-  const requestCloseWindow = useCallback(
+-    (deviceId: string, windowId: string) => {
+-      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
+-      const target = windows?.find((w) => w.id === windowId);
+-      setCloseCandidate({
+-        kind: 'window',
+-        deviceId,
+-        windowId,
+-        name: target ? buildWindowDisplayName(target) : '',
+-      });
+-    },
+-    [runtime]
+-  );
+-
+-  const requestClosePane = useCallback(
+-    (deviceId: string, windowId: string, paneId: string) => {
+-      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
+-      const pane = windows?.find((w) => w.id === windowId)?.panes?.find((p) => p.id === paneId);
+-      setCloseCandidate({
+-        kind: 'pane',
+-        deviceId,
+-        paneId,
+-        name: pane?.title || `Pane ${pane?.index ?? ''}`,
+-      });
+-    },
+-    [runtime]
+-  );
+-
+-  const confirmClose = useCallback(() => {
+-    if (!closeCandidate) return;
+-    if (closeCandidate.kind === 'window') {
+-      onCloseWindow(closeCandidate.deviceId, closeCandidate.windowId);
+-    } else {
+-      closePane(closeCandidate.deviceId, closeCandidate.paneId);
+-    }
+-    setCloseCandidate(null);
+-  }, [closeCandidate, onCloseWindow, closePane]);
+-
+-  const requestRenameWindow = useCallback(
+-    (deviceId: string, windowId: string) => {
+-      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
+-      const target = windows?.find((w) => w.id === windowId);
+-      if (!target) return;
+-      setRenameValue(target.customName ?? buildWindowTitleParts(target).title);
+-      setRenameCandidate({
+-        kind: 'window',
+-        deviceId,
+-        windowId,
+-        hasCustomName: Boolean(target.customName),
+-      });
+-    },
+-    [runtime]
+-  );
+-
+-  const requestRenamePane = useCallback(
+-    (deviceId: string, paneId: string) => {
+-      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
+-      const target = windows?.flatMap((w) => w.panes).find((p) => p.id === paneId);
+-      if (!target) return;
+-      setRenameValue(target.customName ?? target.title ?? '');
+-      setRenameCandidate({
+-        kind: 'pane',
+-        deviceId,
+-        paneId,
+-        hasCustomName: Boolean(target.customName),
+-      });
+-    },
+-    [runtime]
+-  );
+-
+-  const applyRename = useCallback(
+-    (name: string) => {
+-      if (!renameCandidate) return;
+-      if (renameCandidate.kind === 'window') {
+-        renameWindow(renameCandidate.deviceId, renameCandidate.windowId, name);
+-      } else {
+-        renamePane(renameCandidate.deviceId, renameCandidate.paneId, name);
+-      }
+-      setRenameCandidate(null);
+-    },
+-    [renameCandidate, renameWindow, renamePane]
+-  );
+-
+-  const confirmRename = useCallback(() => {
+-    const trimmed = renameValue.trim();
+-    if (!trimmed) return;
+-    applyRename(trimmed);
+-  }, [applyRename, renameValue]);
+-
+-  const resetRename = useCallback(() => {
+-    applyRename('');
+-  }, [applyRename]);
+-
+   const requestWatchPane = useCallback((deviceId: string, paneId: string) => {
+     setWatchTarget({ deviceId, paneId });
+   }, []);
+ 
+   const dialogs = (
+     <>
+-      <AlertDialog
+-        open={closeCandidate !== null}
+-        onOpenChange={(open) => !open && setCloseCandidate(null)}
+-      >
+-        <AlertDialogContent>
+-          <AlertDialogHeader>
+-            <AlertDialogMedia className="bg-destructive/10">
+-              <X className="h-5 w-5 text-destructive" />
+-            </AlertDialogMedia>
+-            <AlertDialogTitle>
+-              {closeCandidate?.kind === 'pane'
+-                ? t('window.closePaneConfirmTitle')
+-                : t('window.closeConfirmTitle')}
+-            </AlertDialogTitle>
+-            <AlertDialogDescription>
+-              {t('window.closeConfirmDesc', { name: closeCandidate?.name ?? '' })}
+-            </AlertDialogDescription>
+-          </AlertDialogHeader>
+-          <AlertDialogFooter>
+-            <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
+-            <AlertDialogAction
+-              variant="destructive"
+-              disabled={!closeCandidate}
+-              onClick={confirmClose}
+-            >
+-              {t('common.close')}
+-            </AlertDialogAction>
+-          </AlertDialogFooter>
+-        </AlertDialogContent>
+-      </AlertDialog>
+-
+-      <Dialog
+-        open={renameCandidate !== null}
+-        onOpenChange={(open) => !open && setRenameCandidate(null)}
+-      >
+-        <DialogContent data-testid="window-rename-dialog">
+-          <form
+-            onSubmit={(e) => {
+-              e.preventDefault();
+-              confirmRename();
+-            }}
+-          >
+-            <DialogHeader>
+-              <DialogTitle>{t('window.rename')}</DialogTitle>
+-              <DialogDescription>{t('window.renameDesc')}</DialogDescription>
+-            </DialogHeader>
+-            <div className="py-4">
+-              <Input
+-                autoFocus
+-                maxLength={64}
+-                value={renameValue}
+-                onChange={(e) => setRenameValue(e.target.value)}
+-                placeholder={t('window.renamePlaceholder')}
+-                data-testid="window-rename-input"
+-              />
+-            </div>
+-            <DialogFooter>
+-              {renameCandidate?.hasCustomName && (
+-                <Button
+-                  type="button"
+-                  variant="ghost"
+-                  onClick={resetRename}
+-                  data-testid="window-rename-reset"
+-                >
+-                  {t('window.renameReset')}
+-                </Button>
+-              )}
+-              <Button type="button" variant="outline" onClick={() => setRenameCandidate(null)}>
+-                {t('common.cancel')}
+-              </Button>
+-              <Button type="submit" disabled={!renameValue.trim()} data-testid="window-rename-save">
+-                {t('common.save')}
+-              </Button>
+-            </DialogFooter>
+-          </form>
+-        </DialogContent>
+-      </Dialog>
+-
++      <CloseConfirmDialog state={close} />
++      <RenameDialog state={rename} />
+       {runtime.features.watchUi && watchTarget && (
+         <WatchDialog
+           open
+@@ -252,10 +46,10 @@ export function useDeviceTreeDialogs({
+   );
+ 
+   return {
+-    requestCloseWindow,
+-    requestClosePane,
+-    requestRenameWindow,
+-    requestRenamePane,
++    requestCloseWindow: close.requestCloseWindow,
++    requestClosePane: close.requestClosePane,
++    requestRenameWindow: rename.requestRenameWindow,
++    requestRenamePane: rename.requestRenamePane,
+     requestWatchPane,
+     dialogs,
+   };
+diff --git a/packages/panels/src/device-tree/device-tree-dnd.tsx b/packages/panels/src/device-tree/device-tree-dnd.tsx
+index 815a46e..298f30a 100644
+--- a/packages/panels/src/device-tree/device-tree-dnd.tsx
++++ b/packages/panels/src/device-tree/device-tree-dnd.tsx
+@@ -44,22 +44,30 @@ export function reorderIdsByDragEnd(ids: readonly string[], event: DragEndEvent)
+ export interface SortableVerticalListProps {
+   ids: string[];
+   onReorder: (nextIds: string[]) => void;
++  /** 上一次重排还在飞时置真：并发的重排请求会让先发后到的旧顺序覆盖新顺序 */
++  disabled?: boolean;
+   children: ReactNode;
+ }
+ 
+ /** 设备树三层共用的竖向排序容器；自身不产生 DOM 节点 */
+-export function SortableVerticalList({ ids, onReorder, children }: SortableVerticalListProps) {
++export function SortableVerticalList({
++  ids,
++  onReorder,
++  disabled = false,
++  children,
++}: SortableVerticalListProps) {
+   const sensors = useDeviceTreeSensors();
+   return (
+     <DndContext
+       sensors={sensors}
+       collisionDetection={closestCenter}
+       onDragEnd={(event) => {
++        if (disabled) return;
+         const nextIds = reorderIdsByDragEnd(ids, event);
+         if (nextIds) onReorder(nextIds);
+       }}
+     >
+-      <SortableContext items={ids} strategy={verticalListSortingStrategy}>
++      <SortableContext items={ids} strategy={verticalListSortingStrategy} disabled={disabled}>
+         {children}
+       </SortableContext>
+     </DndContext>
+diff --git a/packages/panels/src/device-tree/device-tree-navigation.test.ts b/packages/panels/src/device-tree/device-tree-navigation.test.ts
+index 3d9d265..d2693e0 100644
+--- a/packages/panels/src/device-tree/device-tree-navigation.test.ts
++++ b/packages/panels/src/device-tree/device-tree-navigation.test.ts
+@@ -6,10 +6,12 @@ import {
+   PANE_ROUTE_PATH,
+   PENDING_NAVIGATION_TTL_MS,
+   buildPaneRoutePath,
++  createPendingNavigationSlot,
+   deviceTreeRoutePatterns,
+   parseDeviceTreeSelection,
+   pickActivePane,
+   resolvePendingNavigation,
++  safeDecodePaneParam,
+ } from './device-tree-navigation';
+ 
+ const identityHost = {} as HostServices;
+@@ -41,6 +43,17 @@ describe('parseDeviceTreeSelection', () => {
+     });
+   });
+ 
++  test('survives a malformed percent escape in the pane segment', () => {
++    expect(parseDeviceTreeSelection('/devices/dev-1/windows/@3/panes/%zz', patterns)).toEqual({
++      selectedDeviceId: 'dev-1',
++      selectedWindowId: '@3',
++      selectedPaneId: '%zz',
++    });
++    expect(
++      parseDeviceTreeSelection('/devices/dev-1/windows/@3/panes/%E0%A4%A', patterns).selectedPaneId
++    ).toBe('%E0%A4%A');
++  });
++
+   test('returns an empty selection outside the device tree', () => {
+     expect(parseDeviceTreeSelection('/settings/llm', patterns)).toEqual({
+       selectedDeviceId: undefined,
+@@ -64,6 +77,23 @@ describe('parseDeviceTreeSelection', () => {
+   });
+ });
+ 
++describe('safeDecodePaneParam', () => {
++  test('decodes a well-formed escape once', () => {
++    expect(safeDecodePaneParam('%254')).toBe('%4');
++  });
++
++  test('returns the raw value for malformed escapes instead of throwing', () => {
++    expect(safeDecodePaneParam('%zz')).toBe('%zz');
++    expect(safeDecodePaneParam('%')).toBe('%');
++    expect(safeDecodePaneParam('%E0%A4%A')).toBe('%E0%A4%A');
++  });
++
++  test('normalises missing and empty params to an empty selection', () => {
++    expect(safeDecodePaneParam(undefined)).toBeUndefined();
++    expect(safeDecodePaneParam('')).toBeUndefined();
++  });
++});
++
+ describe('buildPaneRoutePath', () => {
+   test('percent-encodes the pane id', () => {
+     expect(buildPaneRoutePath(identityHost, 'dev-1', '@3', '%4')).toBe(
+@@ -169,3 +199,87 @@ describe('resolvePendingNavigation', () => {
+     ).toBe('ready');
+   });
+ });
++
++describe('createPendingNavigationSlot', () => {
++  function fakeTimers() {
++    const scheduled = new Map<number, { fn: () => void; ms: number }>();
++    let nextHandle = 1;
++    return {
++      scheduled,
++      timers: {
++        setTimer: (fn: () => void, ms: number) => {
++          const handle = nextHandle++;
++          scheduled.set(handle, { fn, ms });
++          return handle;
++        },
++        clearTimer: (handle: unknown) => {
++          scheduled.delete(handle as number);
++        },
++      },
++      fire: (handle: number) => {
++        const entry = scheduled.get(handle);
++        scheduled.delete(handle);
++        entry?.fn();
++      },
++    };
++  }
++
++  const pending = { deviceId: 'dev-1', windowId: '@2', at: 0 };
++
++  test('starts empty', () => {
++    expect(createPendingNavigationSlot().get()).toBeNull();
++  });
++
++  test('arms a ttl timer on write and expires without any snapshot change', () => {
++    const { timers, scheduled, fire } = fakeTimers();
++    const slot = createPendingNavigationSlot({ timers });
++
++    slot.set(pending);
++    expect(slot.get()).toEqual(pending);
++    expect([...scheduled.values()][0]?.ms).toBe(PENDING_NAVIGATION_TTL_MS);
++
++    fire(1);
++    expect(slot.get()).toBeNull();
++  });
++
++  test('honours a custom ttl', () => {
++    const { timers, scheduled } = fakeTimers();
++    createPendingNavigationSlot({ timers, ttlMs: 42 }).set(pending);
++    expect([...scheduled.values()][0]?.ms).toBe(42);
++  });
++
++  test('clear drops both the value and the timer', () => {
++    const { timers, scheduled } = fakeTimers();
++    const slot = createPendingNavigationSlot({ timers });
++
++    slot.set(pending);
++    slot.clear();
++    expect(slot.get()).toBeNull();
++    expect(scheduled.size).toBe(0);
++  });
++
++  test('re-writing replaces the previous timer so the ttl restarts', () => {
++    const { timers, scheduled, fire } = fakeTimers();
++    const slot = createPendingNavigationSlot({ timers });
++
++    slot.set(pending);
++    const next = { deviceId: 'dev-2', windowId: '@5', at: 1 };
++    slot.set(next);
++    expect(scheduled.size).toBe(1);
++
++    fire(1);
++    expect(slot.get()).toEqual(next);
++    fire(2);
++    expect(slot.get()).toBeNull();
++  });
++
++  test('dispose clears the timer so an unmounted tree never fires', () => {
++    const { timers, scheduled } = fakeTimers();
++    const slot = createPendingNavigationSlot({ timers });
++
++    slot.set(pending);
++    slot.dispose();
++    expect(scheduled.size).toBe(0);
++    expect(slot.get()).toBeNull();
++  });
++});
+diff --git a/packages/panels/src/device-tree/device-tree-navigation.ts b/packages/panels/src/device-tree/device-tree-navigation.ts
+index 31624e0..8dcbc27 100644
+--- a/packages/panels/src/device-tree/device-tree-navigation.ts
++++ b/packages/panels/src/device-tree/device-tree-navigation.ts
+@@ -55,6 +55,21 @@ export function buildPaneRoutePath(
+   );
+ }
+ 
++/**
++ * matchPath 接收的是 location.pathname，其中 paneId 仍保留 URL 编码；只在这里解码一次，
++ * 再交给 tmux URL 工具保持与 useParams 路径一致。
++ * 手工敲坏的 `%` 序列（如 `/panes/%zz`）会让 decodeURIComponent 抛 URIError 并整棵侧边栏白屏，
++ * 这里降级成原样返回，让选择落空而不是崩溃。
++ */
++export function safeDecodePaneParam(value: string | undefined): string | undefined {
++  if (!value) return undefined;
++  try {
++    return decodeURIComponent(value);
++  } catch {
++    return value;
++  }
++}
++
+ export function parseDeviceTreeSelection(
+   pathname: string,
+   patterns: DeviceTreeRoutePatterns
+@@ -64,11 +79,7 @@ export function parseDeviceTreeSelection(
+   return {
+     selectedDeviceId: paneMatch?.params.deviceId ?? deviceMatch?.params.deviceId,
+     selectedWindowId: paneMatch?.params.windowId,
+-    // matchPath 接收的是 location.pathname，其中 paneId 仍保留 URL 编码；只在这里解码一次，
+-    // 再交给 tmux URL 工具保持与 useParams 路径一致。
+-    selectedPaneId: decodePaneIdFromUrlParam(
+-      paneMatch?.params.paneId ? decodeURIComponent(paneMatch.params.paneId) : undefined
+-    ),
++    selectedPaneId: decodePaneIdFromUrlParam(safeDecodePaneParam(paneMatch?.params.paneId)),
+   };
+ }
+ 
+@@ -103,6 +114,79 @@ export function resolvePendingNavigation(
+   };
+ }
+ 
++export interface PendingNavigationTimers {
++  setTimer: (fn: () => void, ms: number) => unknown;
++  clearTimer: (handle: unknown) => void;
++}
++
++export interface PendingNavigationSlotOptions {
++  ttlMs?: number;
++  timers?: PendingNavigationTimers;
++}
++
++/**
++ * pending 导航的单槽存储：写入即挂 TTL 定时器，到期自行清空。
++ * 只靠 snapshots 变化去判过期的话，目标设备一直不推快照时这条 pending 会无限存活，
++ * 之后突然到货就会抢走用户早已改过的选择。
++ */
++export interface PendingNavigationSlot {
++  get(): PendingNavigation | null;
++  set(pending: PendingNavigation): void;
++  clear(): void;
++  dispose(): void;
++}
++
++const defaultTimers: PendingNavigationTimers = {
++  setTimer: (fn, ms) => setTimeout(fn, ms),
++  clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
++};
++
++export function createPendingNavigationSlot(
++  options: PendingNavigationSlotOptions = {}
++): PendingNavigationSlot {
++  const ttlMs = options.ttlMs ?? PENDING_NAVIGATION_TTL_MS;
++  const timers = options.timers ?? defaultTimers;
++
++  let pending: PendingNavigation | null = null;
++  let handle: unknown = null;
++
++  const cancelTimer = () => {
++    if (handle === null) return;
++    timers.clearTimer(handle);
++    handle = null;
++  };
++
++  return {
++    get: () => pending,
++    set: (next) => {
++      cancelTimer();
++      pending = next;
++      handle = timers.setTimer(() => {
++        handle = null;
++        pending = null;
++      }, ttlMs);
++    },
++    clear: () => {
++      cancelTimer();
++      pending = null;
++    },
++    dispose: () => {
++      cancelTimer();
++      pending = null;
++    },
++  };
++}
++
++function usePendingNavigationSlot(): PendingNavigationSlot {
++  const slotRef = useRef<PendingNavigationSlot | null>(null);
++  if (slotRef.current === null) slotRef.current = createPendingNavigationSlot();
++  const slot = slotRef.current;
++
++  useEffect(() => () => slot.dispose(), [slot]);
++
++  return slot;
++}
++
+ export function useDeviceTreeSelection(): DeviceTreeSelection {
+   const { host } = useRuntime();
+   const { pathname } = useLocation();
+@@ -131,7 +215,7 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+   const selectWindow = useTmuxStore((state) => state.selectWindow);
+   const snapshots = useTmuxStore((state) => state.snapshots);
+ 
+-  const pendingNavigationRef = useRef<PendingNavigation | null>(null);
++  const pendingNavigation = usePendingNavigationSlot();
+ 
+   const handleNavigate = useCallback(
+     (to: string, options?: NavigateOptions) => {
+@@ -148,7 +232,7 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+       paneId: string,
+       options?: { keepSidebarOpen?: boolean }
+     ) => {
+-      pendingNavigationRef.current = null;
++      pendingNavigation.clear();
+ 
+       window.dispatchEvent(
+         new CustomEvent('tmex:user-initiated-selection', {
+@@ -159,23 +243,23 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+         keepSidebarOpen: options?.keepSidebarOpen,
+       });
+     },
+-    [handleNavigate, host]
++    [handleNavigate, host, pendingNavigation]
+   );
+ 
+   useEffect(() => {
+     const outcome = resolvePendingNavigation(
+-      pendingNavigationRef.current,
++      pendingNavigation.get(),
+       (deviceId) => snapshots[deviceId]?.session?.windows,
+       Date.now()
+     );
+     if (outcome.status === 'expired') {
+-      pendingNavigationRef.current = null;
++      pendingNavigation.clear();
+       return;
+     }
+     if (outcome.status !== 'ready') return;
+-    pendingNavigationRef.current = null;
++    pendingNavigation.clear();
+     navigateToPane(outcome.deviceId, outcome.windowId, outcome.paneId);
+-  }, [snapshots, navigateToPane]);
++  }, [snapshots, navigateToPane, pendingNavigation]);
+ 
+   const navigateToWindow = useCallback(
+     (deviceId: string, windowId: string, panes: TmuxPane[]) => {
+@@ -184,12 +268,12 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+       const activePane = pickActivePane(panes);
+       if (activePane) {
+         navigateToPane(deviceId, windowId, activePane.id);
+-        pendingNavigationRef.current = null;
++        pendingNavigation.clear();
+       } else {
+-        pendingNavigationRef.current = { deviceId, windowId, at: Date.now() };
++        pendingNavigation.set({ deviceId, windowId, at: Date.now() });
+       }
+     },
+-    [navigateToPane, selectWindow]
++    [navigateToPane, selectWindow, pendingNavigation]
+   );
+ 
+   const nav = useMemo<DeviceTreeNavigation>(() => ({ navigateToPane }), [navigateToPane]);
+diff --git a/packages/panels/src/device-tree/pane-row.tsx b/packages/panels/src/device-tree/pane-row.tsx
+index 74a701a..7378403 100644
+--- a/packages/panels/src/device-tree/pane-row.tsx
++++ b/packages/panels/src/device-tree/pane-row.tsx
+@@ -2,20 +2,13 @@ import { useBellStore } from '@tmex/notifications';
+ import type { TmuxPane } from '@tmex/shared';
+ import { useRuntime } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+-import {
+-  FolderOpen,
+-  GripVertical,
+-  Pencil,
+-  Plus,
+-  Radar,
+-  SquareSplitHorizontal,
+-  SquareSplitVertical,
+-  X,
+-} from 'lucide-react';
++import { GripVertical } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import type { DeviceTreeNavigation, SidebarAgentAdapter } from './agent-adapter';
+-import { type DeviceActionItem, DeviceActionsMenu } from './device-actions-menu';
++import { DeviceActionsMenu } from './device-actions-menu';
++import { buildPaneActions } from './device-tree-actions';
+ import { useSortableRow } from './device-tree-dnd';
++import { RowLabel, processSubtitle } from './row-label';
+ 
+ function PaneBellIcon({ paneId }: { paneId: string }) {
+   const ringing = useBellStore((state) => Boolean(state.ringingPanes[paneId]));
+@@ -56,65 +49,19 @@ export function PaneRow({
+     pane.id
+   );
+ 
+-  const items: DeviceActionItem[] = [
+-    {
+-      key: 'rename',
+-      testId: `pane-menu-rename-${pane.id}`,
+-      icon: Pencil,
+-      label: t('window.rename'),
+-      onSelect: () => onRenamePane(deviceId, pane.id),
+-    },
+-  ];
+-  if (agent) {
+-    items.push({
+-      key: 'new-session',
+-      testId: `pane-menu-new-session-${pane.id}`,
+-      icon: Plus,
+-      label: t('agent.session.new'),
+-      onSelect: () => agent.onCreateSessionForPane(nav, deviceId, windowId, pane),
+-    });
+-  }
+-  if (pane.currentPath) {
+-    items.push({
+-      key: 'new-in-cwd',
+-      icon: FolderOpen,
+-      label: t('window.newInCwd'),
+-      onSelect: () => stores.tmux.getState().createWindow(deviceId, undefined, pane.currentPath),
+-    });
+-  }
+-  items.push(
+-    {
+-      key: 'split-right',
+-      testId: `pane-split-right-${pane.id}`,
+-      icon: SquareSplitHorizontal,
+-      label: t('window.splitRight'),
+-      onSelect: () =>
+-        stores.tmux.getState().splitPane(deviceId, pane.id, 'right', pane.currentPath),
+-    },
+-    {
+-      key: 'split-down',
+-      testId: `pane-split-down-${pane.id}`,
+-      icon: SquareSplitVertical,
+-      label: t('window.splitDown'),
+-      onSelect: () => stores.tmux.getState().splitPane(deviceId, pane.id, 'down', pane.currentPath),
+-    }
+-  );
+-  if (features.watchUi) {
+-    items.push({
+-      key: 'watch',
+-      testId: `pane-watch-${pane.id}`,
+-      icon: Radar,
+-      label: t('watch.openMonitor'),
+-      onSelect: () => onWatchPane(deviceId, pane.id),
+-    });
+-  }
+-  items.push({
+-    key: 'close',
+-    testId: `pane-menu-close-${pane.id}`,
+-    icon: X,
+-    label: t('window.closePane'),
+-    destructive: true,
+-    onSelect: () => onClosePane(deviceId, windowId, pane.id),
++  const items = buildPaneActions({
++    t,
++    pane,
++    watchUi: features.watchUi,
++    onRename: () => onRenamePane(deviceId, pane.id),
++    onCreateSession: agent
++      ? () => agent.onCreateSessionForPane(nav, deviceId, windowId, pane)
++      : undefined,
++    onCreateWindowInCwd: (cwd) => stores.tmux.getState().createWindow(deviceId, undefined, cwd),
++    onSplit: (paneId, direction, cwd) =>
++      stores.tmux.getState().splitPane(deviceId, paneId, direction, cwd),
++    onWatch: (paneId) => onWatchPane(deviceId, paneId),
++    onClose: () => onClosePane(deviceId, windowId, pane.id),
+   });
+ 
+   return (
+@@ -150,18 +97,10 @@ export function PaneRow({
+         >
+           <PaneBellIcon paneId={pane.id} />
+           {/* 多 pane 窗口的窗口行不再展示细节，pane 行呈现完整的标题 + 进程@路径 */}
+-          <span className="flex-1 min-w-0">
+-            <span className="font-mono text-[11px] leading-tight font-medium line-clamp-2 [overflow-wrap:break-word]">
+-              {pane.customName || pane.title || t('window.pane')}
+-            </span>
+-            {pane.currentCommand && (
+-              <span className="font-mono text-[10.5px] leading-tight text-muted-foreground line-clamp-1 break-all">
+-                {pane.currentPath
+-                  ? `${pane.currentCommand}@${pane.currentPath}`
+-                  : pane.currentCommand}
+-              </span>
+-            )}
+-          </span>
++          <RowLabel
++            title={pane.customName || pane.title || t('window.pane')}
++            subtitle={processSubtitle(pane.currentCommand, pane.currentPath)}
++          />
+         </button>
+ 
+         <DeviceActionsMenu
+diff --git a/packages/panels/src/device-tree/rename-dialog.tsx b/packages/panels/src/device-tree/rename-dialog.tsx
+new file mode 100644
+index 0000000..a53fd37
+--- /dev/null
++++ b/packages/panels/src/device-tree/rename-dialog.tsx
+@@ -0,0 +1,63 @@
++import { Button } from '@tmex/ui/button';
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from '@tmex/ui/dialog';
++import { Input } from '@tmex/ui/input';
++import { useTranslation } from 'react-i18next';
++import type { RenameDialogState } from './use-rename-dialog';
++
++export function RenameDialog({ state }: { state: RenameDialogState }) {
++  const { t } = useTranslation();
++  const { candidate, value, setValue, confirm, resetName, dismiss } = state;
++
++  return (
++    <Dialog open={candidate !== null} onOpenChange={(open) => !open && dismiss()}>
++      <DialogContent data-testid="window-rename-dialog">
++        <form
++          onSubmit={(e) => {
++            e.preventDefault();
++            confirm();
++          }}
++        >
++          <DialogHeader>
++            <DialogTitle>{t('window.rename')}</DialogTitle>
++            <DialogDescription>{t('window.renameDesc')}</DialogDescription>
++          </DialogHeader>
++          <div className="py-4">
++            <Input
++              autoFocus
++              maxLength={64}
++              value={value}
++              onChange={(e) => setValue(e.target.value)}
++              placeholder={t('window.renamePlaceholder')}
++              data-testid="window-rename-input"
++            />
++          </div>
++          <DialogFooter>
++            {candidate?.hasCustomName && (
++              <Button
++                type="button"
++                variant="ghost"
++                onClick={resetName}
++                data-testid="window-rename-reset"
++              >
++                {t('window.renameReset')}
++              </Button>
++            )}
++            <Button type="button" variant="outline" onClick={dismiss}>
++              {t('common.cancel')}
++            </Button>
++            <Button type="submit" disabled={!value.trim()} data-testid="window-rename-save">
++              {t('common.save')}
++            </Button>
++          </DialogFooter>
++        </form>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/packages/panels/src/device-tree/row-label.tsx b/packages/panels/src/device-tree/row-label.tsx
+new file mode 100644
+index 0000000..b8e5758
+--- /dev/null
++++ b/packages/panels/src/device-tree/row-label.tsx
+@@ -0,0 +1,29 @@
++import type { ReactNode } from 'react';
++
++export interface RowLabelProps {
++  title: ReactNode;
++  /** 进程名（可选拼上 cwd）；缺省时只渲染标题行 */
++  subtitle?: ReactNode;
++}
++
++/** 窗口行与 pane 行共用的两行文本：标题 + 进程@路径 */
++export function RowLabel({ title, subtitle }: RowLabelProps) {
++  return (
++    <span className="flex-1 min-w-0">
++      <span className="font-mono text-[11px] leading-tight font-medium line-clamp-2 [overflow-wrap:break-word]">
++        {title}
++      </span>
++      {subtitle && (
++        <span className="font-mono text-[10.5px] leading-tight text-muted-foreground line-clamp-1 break-all">
++          {subtitle}
++        </span>
++      )}
++    </span>
++  );
++}
++
++/** `process@cwd`；无 cwd 时退化成裸进程名，无进程名时不渲染副标题 */
++export function processSubtitle(process?: string | null, cwd?: string | null): string | undefined {
++  if (!process) return undefined;
++  return cwd ? `${process}@${cwd}` : process;
++}
+diff --git a/packages/panels/src/device-tree/sidebar-device-list.tsx b/packages/panels/src/device-tree/sidebar-device-list.tsx
+index fb1a2f2..f96c2c2 100644
+--- a/packages/panels/src/device-tree/sidebar-device-list.tsx
++++ b/packages/panels/src/device-tree/sidebar-device-list.tsx
+@@ -8,6 +8,7 @@ import type { Device } from '@tmex/shared';
+ import { toBCP47 } from '@tmex/shared';
+ import { hostAppPath } from '@tmex/stores';
+ import { useRuntime, useSiteStore, useTmuxStore, useUIStore } from '@tmex/stores/react';
++import { Button } from '@tmex/ui/button';
+ import { ScrollArea } from '@tmex/ui/scroll-area';
+ import { SidebarGroup } from '@tmex/ui/sidebar';
+ import { useCallback, useEffect, useMemo, useRef } from 'react';
+@@ -67,11 +68,12 @@ export function SideBarDeviceList({
+   const closeWindow = useTmuxStore((state) => state.closeWindow);
+   const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
+ 
+-  const { data: devicesData } = useQuery({
++  const devicesQuery = useQuery({
+     queryKey,
+     queryFn: () => fetchDevices(runtime.apiClient),
+     throwOnError: false,
+   });
++  const devicesData = devicesQuery.data;
+ 
+   const hydrateDeviceErrors = useTmuxStore((state) => state.hydrateDeviceErrors);
+ 
+@@ -210,6 +212,7 @@ export function SideBarDeviceList({
+         <div className="space-y-1.5 pb-2 pt-1 select-none [-webkit-user-select:none] [-webkit-touch-callout:none]">
+           <SortableVerticalList
+             ids={sortedDevices.map((d) => d.id)}
++            disabled={reorderDevicesMutation.isPending}
+             onReorder={(nextIds) => reorderDevicesMutation.mutate(nextIds)}
+           >
+             {sortedDevices.map((device) => (
+@@ -241,11 +244,29 @@ export function SideBarDeviceList({
+               />
+             ))}
+           </SortableVerticalList>
+-          {sortedDevices.length === 0 && (
+-            <div className="text-center text-sm text-muted-foreground py-4">
+-              {t('sidebar.noDevices')}
+-            </div>
+-          )}
++          {sortedDevices.length === 0 &&
++            (devicesQuery.isError ? (
++              <div
++                data-testid="sidebar-devices-error"
++                className="flex flex-col items-center gap-2 py-4 text-center"
++              >
++                <span className="text-sm text-muted-foreground">{t('device.loadFailed')}</span>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  data-testid="sidebar-devices-retry"
++                  disabled={devicesQuery.isFetching}
++                  onClick={() => void devicesQuery.refetch()}
++                >
++                  {t('common.retry')}
++                </Button>
++              </div>
++            ) : (
++              <div className="text-center text-sm text-muted-foreground py-4">
++                {t('sidebar.noDevices')}
++              </div>
++            ))}
+ 
+           {agentAdapter && (
+             <agentAdapter.OrphanSessions nav={nav} knownDeviceIds={knownDeviceIds} />
+diff --git a/packages/panels/src/device-tree/use-close-dialog.ts b/packages/panels/src/device-tree/use-close-dialog.ts
+new file mode 100644
+index 0000000..8a95876
+--- /dev/null
++++ b/packages/panels/src/device-tree/use-close-dialog.ts
+@@ -0,0 +1,68 @@
++import { buildWindowDisplayName } from '@tmex/stores';
++import { useRuntime, useTmuxStore } from '@tmex/stores/react';
++import { useCallback, useState } from 'react';
++
++export type CloseCandidate =
++  | { kind: 'window'; deviceId: string; windowId: string; name: string }
++  | { kind: 'pane'; deviceId: string; paneId: string; name: string };
++
++export interface CloseDialogState {
++  candidate: CloseCandidate | null;
++  requestCloseWindow: (deviceId: string, windowId: string) => void;
++  requestClosePane: (deviceId: string, windowId: string, paneId: string) => void;
++  confirm: () => void;
++  dismiss: () => void;
++}
++
++export interface UseCloseDialogOptions {
++  /** 确认关闭窗口时执行；由设备树根负责关闭前的路由回退 */
++  onCloseWindow: (deviceId: string, windowId: string) => void;
++}
++
++export function useCloseDialog({ onCloseWindow }: UseCloseDialogOptions): CloseDialogState {
++  const runtime = useRuntime();
++  const closePane = useTmuxStore((state) => state.closePane);
++  const [candidate, setCandidate] = useState<CloseCandidate | null>(null);
++
++  const requestCloseWindow = useCallback(
++    (deviceId: string, windowId: string) => {
++      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
++      const target = windows?.find((w) => w.id === windowId);
++      setCandidate({
++        kind: 'window',
++        deviceId,
++        windowId,
++        name: target ? buildWindowDisplayName(target) : '',
++      });
++    },
++    [runtime]
++  );
++
++  const requestClosePane = useCallback(
++    (deviceId: string, windowId: string, paneId: string) => {
++      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
++      const pane = windows?.find((w) => w.id === windowId)?.panes?.find((p) => p.id === paneId);
++      setCandidate({
++        kind: 'pane',
++        deviceId,
++        paneId,
++        name: pane?.title || `Pane ${pane?.index ?? ''}`,
++      });
++    },
++    [runtime]
++  );
++
++  const confirm = useCallback(() => {
++    if (!candidate) return;
++    if (candidate.kind === 'window') {
++      onCloseWindow(candidate.deviceId, candidate.windowId);
++    } else {
++      closePane(candidate.deviceId, candidate.paneId);
++    }
++    setCandidate(null);
++  }, [candidate, onCloseWindow, closePane]);
++
++  const dismiss = useCallback(() => setCandidate(null), []);
++
++  return { candidate, requestCloseWindow, requestClosePane, confirm, dismiss };
++}
+diff --git a/packages/panels/src/device-tree/use-rename-dialog.ts b/packages/panels/src/device-tree/use-rename-dialog.ts
+new file mode 100644
+index 0000000..c83a309
+--- /dev/null
++++ b/packages/panels/src/device-tree/use-rename-dialog.ts
+@@ -0,0 +1,89 @@
++import { buildWindowTitleParts } from '@tmex/stores';
++import { useRuntime, useTmuxStore } from '@tmex/stores/react';
++import { useCallback, useState } from 'react';
++
++export type RenameCandidate =
++  | { kind: 'window'; deviceId: string; windowId: string; hasCustomName: boolean }
++  | { kind: 'pane'; deviceId: string; paneId: string; hasCustomName: boolean };
++
++export interface RenameDialogState {
++  candidate: RenameCandidate | null;
++  value: string;
++  setValue: (value: string) => void;
++  requestRenameWindow: (deviceId: string, windowId: string) => void;
++  requestRenamePane: (deviceId: string, paneId: string) => void;
++  confirm: () => void;
++  /** 清空自定义名，回落到 tmux 原生标题 */
++  resetName: () => void;
++  dismiss: () => void;
++}
++
++export function useRenameDialog(): RenameDialogState {
++  const runtime = useRuntime();
++  const renameWindow = useTmuxStore((state) => state.renameWindow);
++  const renamePane = useTmuxStore((state) => state.renamePane);
++
++  const [candidate, setCandidate] = useState<RenameCandidate | null>(null);
++  const [value, setValue] = useState('');
++
++  const requestRenameWindow = useCallback(
++    (deviceId: string, windowId: string) => {
++      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
++      const target = windows?.find((w) => w.id === windowId);
++      if (!target) return;
++      setValue(target.customName ?? buildWindowTitleParts(target).title);
++      setCandidate({
++        kind: 'window',
++        deviceId,
++        windowId,
++        hasCustomName: Boolean(target.customName),
++      });
++    },
++    [runtime]
++  );
++
++  const requestRenamePane = useCallback(
++    (deviceId: string, paneId: string) => {
++      const windows = runtime.stores.tmux.getState().snapshots[deviceId]?.session?.windows;
++      const target = windows?.flatMap((w) => w.panes).find((p) => p.id === paneId);
++      if (!target) return;
++      setValue(target.customName ?? target.title ?? '');
++      setCandidate({ kind: 'pane', deviceId, paneId, hasCustomName: Boolean(target.customName) });
++    },
++    [runtime]
++  );
++
++  const applyRename = useCallback(
++    (name: string) => {
++      if (!candidate) return;
++      if (candidate.kind === 'window') {
++        renameWindow(candidate.deviceId, candidate.windowId, name);
++      } else {
++        renamePane(candidate.deviceId, candidate.paneId, name);
++      }
++      setCandidate(null);
++    },
++    [candidate, renameWindow, renamePane]
++  );
++
++  const confirm = useCallback(() => {
++    const trimmed = value.trim();
++    if (!trimmed) return;
++    applyRename(trimmed);
++  }, [applyRename, value]);
++
++  const resetName = useCallback(() => applyRename(''), [applyRename]);
++
++  const dismiss = useCallback(() => setCandidate(null), []);
++
++  return {
++    candidate,
++    value,
++    setValue,
++    requestRenameWindow,
++    requestRenamePane,
++    confirm,
++    resetName,
++    dismiss,
++  };
++}
+diff --git a/packages/panels/src/device-tree/window-row.tsx b/packages/panels/src/device-tree/window-row.tsx
+index 5b970c8..aa1c38d 100644
+--- a/packages/panels/src/device-tree/window-row.tsx
++++ b/packages/panels/src/device-tree/window-row.tsx
+@@ -4,22 +4,15 @@ import { buildWindowTitleParts } from '@tmex/stores';
+ import { useRuntime } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import { useSidebar } from '@tmex/ui/sidebar';
+-import {
+-  FolderOpen,
+-  GripVertical,
+-  Pencil,
+-  Plus,
+-  Radar,
+-  SquareSplitHorizontal,
+-  SquareSplitVertical,
+-  X,
+-} from 'lucide-react';
++import { GripVertical } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import type { DeviceTreeNavigation, SidebarAgentAdapter } from './agent-adapter';
+-import { type DeviceActionItem, DeviceActionsMenu } from './device-actions-menu';
++import { DeviceActionsMenu } from './device-actions-menu';
++import { buildWindowActions } from './device-tree-actions';
+ import { SortableVerticalList, useSortableRow } from './device-tree-dnd';
+ import { pickActivePane } from './device-tree-navigation';
+ import { PaneRow } from './pane-row';
++import { RowLabel, processSubtitle } from './row-label';
+ 
+ function WindowBellIcon({ paneIds }: { paneIds: string[] }) {
+   const ringing = useBellStore((state) => paneIds.some((id) => state.ringingPanes[id]));
+@@ -66,7 +59,6 @@ export function WindowRow({
+   const hasMultiplePanes = tmuxWindow.panes.length > 1;
+   const titleParts = buildWindowTitleParts(tmuxWindow);
+   const activePane = pickActivePane(tmuxWindow.panes);
+-  const activePaneCwd = activePane?.currentPath;
+ 
+   const selectedPaneInWindow = tmuxWindow.panes.find((pane) => pane.id === selectedPaneId);
+   const isPaneSelected =
+@@ -76,76 +68,22 @@ export function WindowRow({
+     tmuxWindow.id
+   );
+ 
+-  const items: DeviceActionItem[] = [
+-    {
+-      key: 'rename',
+-      testId: `window-menu-rename-${tmuxWindow.id}`,
+-      icon: Pencil,
+-      label: t('window.rename'),
+-      onSelect: () => onRenameWindow(deviceId, tmuxWindow.id),
+-    },
+-  ];
+-  if (agent) {
+-    items.push({
+-      key: 'new-session',
+-      testId: `window-menu-new-session-${tmuxWindow.id}`,
+-      icon: Plus,
+-      label: t('agent.session.new'),
+-      onSelect: () =>
+-        agent.onCreateSessionForPane(
+-          nav,
+-          deviceId,
+-          tmuxWindow.id,
+-          selectedPaneInWindow || tmuxWindow.panes[0]
+-        ),
+-    });
+-  }
+-  if (activePaneCwd) {
+-    items.push({
+-      key: 'new-in-cwd',
+-      icon: FolderOpen,
+-      label: t('window.newInCwd'),
+-      onSelect: () => stores.tmux.getState().createWindow(deviceId, undefined, activePaneCwd),
+-    });
+-  }
+-  if (activePane) {
+-    items.push(
+-      {
+-        key: 'split-right',
+-        testId: `window-menu-split-right-${tmuxWindow.id}`,
+-        icon: SquareSplitHorizontal,
+-        label: t('window.splitRight'),
+-        onSelect: () =>
+-          stores.tmux
+-            .getState()
+-            .splitPane(deviceId, activePane.id, 'right', activePane.currentPath),
+-      },
+-      {
+-        key: 'split-down',
+-        testId: `window-menu-split-down-${tmuxWindow.id}`,
+-        icon: SquareSplitVertical,
+-        label: t('window.splitDown'),
+-        onSelect: () =>
+-          stores.tmux.getState().splitPane(deviceId, activePane.id, 'down', activePane.currentPath),
+-      }
+-    );
+-    if (features.watchUi) {
+-      items.push({
+-        key: 'watch',
+-        testId: `window-menu-watch-${tmuxWindow.id}`,
+-        icon: Radar,
+-        label: t('watch.openMonitor'),
+-        onSelect: () => onWatchPane(deviceId, activePane.id),
+-      });
+-    }
+-  }
+-  items.push({
+-    key: 'close',
+-    testId: `window-menu-close-${tmuxWindow.id}`,
+-    icon: X,
+-    label: t('window.close'),
+-    destructive: true,
+-    onSelect: () => onCloseWindow(deviceId, tmuxWindow.id),
++  // 零 pane 的窗口（快照到达前的中间态）没有可挂 agent 会话的目标，菜单项必须整条消失
++  const sessionTargetPane = selectedPaneInWindow ?? tmuxWindow.panes[0];
++  const items = buildWindowActions({
++    t,
++    tmuxWindow,
++    watchUi: features.watchUi,
++    onRename: () => onRenameWindow(deviceId, tmuxWindow.id),
++    onCreateSession:
++      agent && sessionTargetPane
++        ? () => agent.onCreateSessionForPane(nav, deviceId, tmuxWindow.id, sessionTargetPane)
++        : undefined,
++    onCreateWindowInCwd: (cwd) => stores.tmux.getState().createWindow(deviceId, undefined, cwd),
++    onSplit: (paneId, direction, cwd) =>
++      stores.tmux.getState().splitPane(deviceId, paneId, direction, cwd),
++    onWatch: (paneId) => onWatchPane(deviceId, paneId),
++    onClose: () => onCloseWindow(deviceId, tmuxWindow.id),
+   });
+ 
+   return (
+@@ -186,18 +124,10 @@ export function WindowRow({
+               {t('window.paneCount', { count: tmuxWindow.panes.length })}
+             </span>
+           ) : (
+-            <span className="flex-1 min-w-0">
+-              <span className="font-mono text-[11px] leading-tight font-medium line-clamp-2 [overflow-wrap:break-word]">
+-                {titleParts.title}
+-              </span>
+-              {titleParts.processName && (
+-                <span className="font-mono text-[10.5px] leading-tight text-muted-foreground line-clamp-1 break-all">
+-                  {activePaneCwd
+-                    ? `${titleParts.processName}@${activePaneCwd}`
+-                    : titleParts.processName}
+-                </span>
+-              )}
+-            </span>
++            <RowLabel
++              title={titleParts.title}
++              subtitle={processSubtitle(titleParts.processName, activePane?.currentPath)}
++            />
+           )}
+         </button>
+ 
+diff --git a/packages/panels/src/files/files-tab.tsx b/packages/panels/src/files/files-tab.tsx
+index 1c4435b..dd57b40 100644
+--- a/packages/panels/src/files/files-tab.tsx
++++ b/packages/panels/src/files/files-tab.tsx
+@@ -1,6 +1,6 @@
+ import { useIsFetching, useQuery, useQueryClient } from '@tanstack/react-query';
+ import type { FileEntryDto, FileRootDto, SystemInfo } from '@tmex/shared';
+-import { Loader2, RotateCw } from 'lucide-react';
++import { Loader2, RotateCw, TriangleAlert } from 'lucide-react';
+ import { useEffect, useMemo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { matchPath, useLocation, useNavigate } from 'react-router';
+@@ -147,7 +147,27 @@ function FilesTabInner({ hideHeader }: FilesTabProps) {
+               {t('common.loading')}
+             </div>
+           )}
+-          {!rootsQuery.isLoading && roots.length === 0 && (
++          {/* 加载失败与「没有可访问目录」是两种状态：失败时给重试，不能显示成空态 */}
++          {rootsQuery.isError && (
++            <div
++              data-testid="files-roots-error"
++              className="flex flex-col items-center gap-2 px-3 py-6 text-center"
++            >
++              <span className="flex items-center gap-1.5 text-xs text-destructive/80">
++                <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
++                {t('files.error.unknown')}
++              </span>
++              <Button
++                variant="outline"
++                size="xs"
++                data-testid="files-roots-retry"
++                onClick={() => void rootsQuery.refetch()}
++              >
++                {t('common.retry')}
++              </Button>
++            </div>
++          )}
++          {!rootsQuery.isLoading && !rootsQuery.isError && roots.length === 0 && (
+             <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+               {t('files.noRoots')}
+             </div>
+diff --git a/packages/stores/src/tmux-reselect-retry.test.ts b/packages/stores/src/tmux-reselect-retry.test.ts
+index c772e4d..9836881 100644
+--- a/packages/stores/src/tmux-reselect-retry.test.ts
++++ b/packages/stores/src/tmux-reselect-retry.test.ts
+@@ -182,4 +182,18 @@ describe('tmux store reselect retry', () => {
+     expect(state.deviceConnected['device-a']).toBe(false);
+     expect(state.deviceReconnecting['device-a']).toBeUndefined();
+   });
++
++  test('connect → disconnect → 立即 connect 会再次下发 connect-device', () => {
++    const harness = createHarness();
++
++    harness.store.getState().connectDevice('device-b');
++    harness.store.getState().disconnectDevice('device-b');
++    harness.store.getState().connectDevice('device-b');
++
++    expect(harness.commands.map((command) => command.type)).toEqual([
++      'connect-device',
++      'disconnect-device',
++      'connect-device',
++    ]);
++  });
+ });
+diff --git a/packages/stores/src/tmux.ts b/packages/stores/src/tmux.ts
+index 93a9310..0a19b28 100644
+--- a/packages/stores/src/tmux.ts
++++ b/packages/stores/src/tmux.ts
+@@ -177,6 +177,7 @@ export function createTmuxStore(
+           };
+         });
+ 
++        lastConnectSentAt.delete(deviceId);
+         core.selectMachine().cleanup(deviceId);
+         selection.cancelReselect(deviceId);
+         paneSubscriptions.clearDevice(deviceId);
+diff --git a/packages/stores/src/ui.test.ts b/packages/stores/src/ui.test.ts
+index 664fcc3..fc31e0d 100644
+--- a/packages/stores/src/ui.test.ts
++++ b/packages/stores/src/ui.test.ts
+@@ -100,3 +100,27 @@ describe('sidebar tab state', () => {
+     expect(store.getState().sidebarDeviceExpanded).toEqual({});
+   });
+ });
++
++describe('sidebar collapse state', () => {
++  beforeEach(() => {
++    storage.clear();
++  });
++
++  test('defaults to expanded', () => {
++    expect(createStore().getState().sidebarCollapsed).toBe(false);
++  });
++
++  test('persists collapse across store instances', () => {
++    const prefix = `ui-sidebar-collapsed-${Date.now()}-`;
++    const store = createUIStore({ storagePrefix: prefix });
++
++    store.getState().setSidebarCollapsed(true);
++
++    const persisted = JSON.parse(storage.getItem(`${prefix}tmex-ui`) ?? '{}') as {
++      state?: { sidebarCollapsed?: boolean };
++    };
++    expect(persisted.state?.sidebarCollapsed).toBe(true);
++
++    expect(createUIStore({ storagePrefix: prefix }).getState().sidebarCollapsed).toBe(true);
++  });
++});
+diff --git a/packages/ui/src/components/sidebar/constants.ts b/packages/ui/src/components/sidebar/constants.ts
+index 942919b..237544a 100644
+--- a/packages/ui/src/components/sidebar/constants.ts
++++ b/packages/ui/src/components/sidebar/constants.ts
+@@ -1,5 +1,3 @@
+-export const SIDEBAR_COOKIE_NAME = 'sidebar_state';
+-export const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
+ export const SIDEBAR_WIDTH_MOBILE = '100vw';
+ export const SIDEBAR_WIDTH_ICON = '3rem';
+ export const SIDEBAR_KEYBOARD_SHORTCUT = 'b';
+diff --git a/packages/ui/src/components/sidebar/sidebar-provider.tsx b/packages/ui/src/components/sidebar/sidebar-provider.tsx
+index 392304c..93f4b6a 100644
+--- a/packages/ui/src/components/sidebar/sidebar-provider.tsx
++++ b/packages/ui/src/components/sidebar/sidebar-provider.tsx
+@@ -3,14 +3,13 @@ import * as React from 'react';
+ import { useIsMobile } from '../../hooks/use-mobile';
+ import { cn } from '../../utils';
+ import {
+-  SIDEBAR_COOKIE_MAX_AGE,
+-  SIDEBAR_COOKIE_NAME,
+   SIDEBAR_KEYBOARD_SHORTCUT,
+   SIDEBAR_WIDTH_DEFAULT_PX,
+   SIDEBAR_WIDTH_ICON,
+   SIDEBAR_WIDTH_STORAGE_KEY,
+ } from './constants';
+ import { SidebarContext, type SidebarContextProps } from './context';
++import { readSidebarStorage, removeSidebarStorage, writeSidebarStorage } from './storage';
+ import {
+   clampSidebarWidth,
+   parseStoredSidebarWidth,
+@@ -39,9 +38,7 @@ export function SidebarProvider({
+   const preferredWidthRef = React.useRef<number>(SIDEBAR_WIDTH_DEFAULT_PX);
+   const [width, _setWidth] = React.useState<number>(() => {
+     if (typeof window === 'undefined') return SIDEBAR_WIDTH_DEFAULT_PX;
+-    const preferred = parseStoredSidebarWidth(
+-      window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)
+-    );
++    const preferred = parseStoredSidebarWidth(readSidebarStorage(SIDEBAR_WIDTH_STORAGE_KEY));
+     preferredWidthRef.current = preferred;
+     return clampSidebarWidth(preferred, viewportWidth());
+   });
+@@ -51,13 +48,13 @@ export function SidebarProvider({
+     const preferred = preferredSidebarWidth(value);
+     preferredWidthRef.current = preferred;
+     _setWidth(clampSidebarWidth(preferred, viewportWidth()));
+-    window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(preferred));
++    writeSidebarStorage(SIDEBAR_WIDTH_STORAGE_KEY, String(preferred));
+   }, []);
+ 
+   const resetWidth = React.useCallback(() => {
+     preferredWidthRef.current = SIDEBAR_WIDTH_DEFAULT_PX;
+     _setWidth(clampSidebarWidth(SIDEBAR_WIDTH_DEFAULT_PX, viewportWidth()));
+-    window.localStorage.removeItem(SIDEBAR_WIDTH_STORAGE_KEY);
++    removeSidebarStorage(SIDEBAR_WIDTH_STORAGE_KEY);
+   }, []);
+ 
+   React.useEffect(() => {
+@@ -68,8 +65,7 @@ export function SidebarProvider({
+     return () => window.removeEventListener('resize', onResize);
+   }, []);
+ 
+-  // This is the internal state of the sidebar.
+-  // We use openProp and setOpenProp for control from outside the component.
++  // 桌面端展开状态：受控时以 openProp 为准（持久化交给调用方），否则退回内部 state。
+   const [_open, _setOpen] = React.useState(defaultOpen);
+   const open = openProp ?? _open;
+   const setOpen = React.useCallback(
+@@ -80,9 +76,6 @@ export function SidebarProvider({
+       } else {
+         _setOpen(openState);
+       }
+-
+-      // This sets the cookie to keep the sidebar state.
+-      document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`;
+     },
+     [setOpenProp, open]
+   );
+diff --git a/packages/ui/src/components/sidebar/storage.test.ts b/packages/ui/src/components/sidebar/storage.test.ts
+new file mode 100644
+index 0000000..42fcdab
+--- /dev/null
++++ b/packages/ui/src/components/sidebar/storage.test.ts
+@@ -0,0 +1,54 @@
++import { afterEach, describe, expect, it } from 'bun:test';
++import { readSidebarStorage, removeSidebarStorage, writeSidebarStorage } from './storage';
++
++const globals = globalThis as { window?: unknown };
++const originalWindow = globals.window;
++
++function installStorage(storage: unknown): void {
++  globals.window = { localStorage: storage };
++}
++
++function throwingStorage(): Storage {
++  const deny = () => {
++    throw new DOMException('denied', 'SecurityError');
++  };
++  return {
++    get length(): number {
++      return deny();
++    },
++    clear: deny,
++    getItem: deny,
++    key: deny,
++    removeItem: deny,
++    setItem: deny,
++  } as unknown as Storage;
++}
++
++afterEach(() => {
++  globals.window = originalWindow;
++});
++
++describe('sidebar storage helpers', () => {
++  it('读写正常时透传', () => {
++    const values = new Map<string, string>([['a', '1']]);
++    installStorage({
++      getItem: (key: string) => values.get(key) ?? null,
++      setItem: (key: string, value: string) => values.set(key, value),
++      removeItem: (key: string) => values.delete(key),
++    });
++
++    expect(readSidebarStorage('a')).toBe('1');
++    writeSidebarStorage('a', '2');
++    expect(readSidebarStorage('a')).toBe('2');
++    removeSidebarStorage('a');
++    expect(readSidebarStorage('a')).toBeNull();
++  });
++
++  it('storage 抛 SecurityError 时降级而不抛出', () => {
++    installStorage(throwingStorage());
++
++    expect(readSidebarStorage('a')).toBeNull();
++    expect(() => writeSidebarStorage('a', '1')).not.toThrow();
++    expect(() => removeSidebarStorage('a')).not.toThrow();
++  });
++});
+diff --git a/packages/ui/src/components/sidebar/storage.ts b/packages/ui/src/components/sidebar/storage.ts
+new file mode 100644
+index 0000000..92c7b98
+--- /dev/null
++++ b/packages/ui/src/components/sidebar/storage.ts
+@@ -0,0 +1,25 @@
++// 沙箱 iframe / 隐私模式下访问 localStorage 会抛 SecurityError，一律降级为无操作，
++// 否则侧栏宽度的初始化读取会直接打断整个 Provider 的首次渲染。
++export function readSidebarStorage(key: string): string | null {
++  try {
++    return window.localStorage.getItem(key);
++  } catch {
++    return null;
++  }
++}
++
++export function writeSidebarStorage(key: string, value: string): void {
++  try {
++    window.localStorage.setItem(key, value);
++  } catch {
++    return;
++  }
++}
++
++export function removeSidebarStorage(key: string): void {
++  try {
++    window.localStorage.removeItem(key);
++  } catch {
++    return;
++  }
++}

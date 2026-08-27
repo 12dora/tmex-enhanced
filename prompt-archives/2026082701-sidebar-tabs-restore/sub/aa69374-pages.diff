@@ -1,0 +1,437 @@
+commit aa693743d044f935b2d4a2b438b6e0f2d9935baa
+Author: krhougs <_@xn--6g8h.st>
+Date:   Fri Jul 10 20:04:19 2026 +0800
+
+    feat(fe): simplify device sidebar management
+
+diff --git a/apps/fe/src/components/global-device-provider.tsx b/apps/fe/src/components/global-device-provider.tsx
+index 13825bc..3e0d8ae 100644
+--- a/apps/fe/src/components/global-device-provider.tsx
++++ b/apps/fe/src/components/global-device-provider.tsx
+@@ -1,18 +1,23 @@
++import { useQuery } from '@tanstack/react-query';
+ import { useTmuxStore } from '@tmex/stores';
+-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
++import { createContext, useCallback, useContext, useEffect, useMemo } from 'react';
+ import { useLocation } from 'react-router';
+ 
+-const STORAGE_KEY = 'tmex:connectedDevices';
+-
+ interface GlobalDeviceContextValue {
+-  persistedDevices: Set<string>;
+-  connectDevice: (deviceId: string) => void;
+-  disconnectDevice: (deviceId: string) => void;
+-  toggleDevice: (deviceId: string, isConnected: boolean) => void;
++  ensureDeviceSubscribed: (deviceId: string) => void;
+ }
+ 
+ const GlobalDeviceContext = createContext<GlobalDeviceContextValue | null>(null);
+ 
++export function shouldEnsureRouteDeviceSubscription(
++  deviceId: string | undefined,
++  devicesData: { devices: Array<{ id: string }> } | undefined
++): deviceId is string {
++  return Boolean(
++    deviceId && (!devicesData || devicesData.devices.some((device) => device.id === deviceId))
++  );
++}
++
+ export function useGlobalDevice(): GlobalDeviceContextValue {
+   const ctx = useContext(GlobalDeviceContext);
+   if (!ctx) {
+@@ -27,92 +32,47 @@ interface GlobalDeviceProviderProps {
+ 
+ export function GlobalDeviceProvider({ children }: GlobalDeviceProviderProps) {
+   const location = useLocation();
+-  const [persistedDevices, setPersistedDevices] = useState<Set<string>>(() => {
+-    try {
+-      const stored = localStorage.getItem(STORAGE_KEY);
+-      if (stored) {
+-        const parsed = JSON.parse(stored) as string[];
+-        return new Set(parsed);
+-      }
+-    } catch {
+-      // 忽略 localStorage 错误
+-    }
+-    return new Set<string>();
+-  });
+-
+   const connectTmuxDevice = useTmuxStore((state) => state.connectDevice);
+   const disconnectTmuxDevice = useTmuxStore((state) => state.disconnectDevice);
+   const connectedDevices = useTmuxStore((state) => state.connectedDevices);
+ 
+-  // 持久化到 localStorage
+-  useEffect(() => {
+-    try {
+-      localStorage.setItem(STORAGE_KEY, JSON.stringify([...persistedDevices]));
+-    } catch {
+-      // 忽略 localStorage 错误
+-    }
+-  }, [persistedDevices]);
+-
+-  // 监听路由变化，自动连接当前设备
+-  useEffect(() => {
+-    const match = location.pathname.match(/^\/devices\/([^/]+)/);
+-    const currentDeviceId = match?.[1];
+-
+-    if (currentDeviceId && !connectedDevices.has(currentDeviceId)) {
+-      connectTmuxDevice(currentDeviceId);
+-    }
+-  }, [location.pathname, connectedDevices, connectTmuxDevice]);
++  const { data: devicesData } = useQuery({
++    queryKey: ['devices'],
++    queryFn: async () => {
++      const res = await fetch('/api/devices');
++      if (!res.ok) throw new Error('Failed to fetch devices');
++      return res.json() as Promise<{ devices: Array<{ id: string }> }>;
++    },
++    throwOnError: false,
++  });
+ 
+-  const connectDevice = useCallback(
++  const ensureDeviceSubscribed = useCallback(
+     (deviceId: string) => {
+-      setPersistedDevices((prev) => {
+-        const next = new Set(prev);
+-        next.add(deviceId);
+-        return next;
+-      });
+-
+-      if (!connectedDevices.has(deviceId)) {
++      if (deviceId && !connectedDevices.has(deviceId)) {
+         connectTmuxDevice(deviceId);
+       }
+     },
+     [connectedDevices, connectTmuxDevice]
+   );
+ 
+-  const disconnectDevice = useCallback(
+-    (deviceId: string) => {
+-      setPersistedDevices((prev) => {
+-        const next = new Set(prev);
+-        next.delete(deviceId);
+-        return next;
+-      });
++  useEffect(() => {
++    const currentDeviceId = location.pathname.match(/^\/devices\/([^/]+)/)?.[1];
++    if (shouldEnsureRouteDeviceSubscription(currentDeviceId, devicesData)) {
++      ensureDeviceSubscribed(currentDeviceId);
++    }
++  }, [location.pathname, devicesData, ensureDeviceSubscribed]);
+ 
+-      if (connectedDevices.has(deviceId)) {
++  useEffect(() => {
++    if (!devicesData) return;
++    const knownDeviceIds = new Set(devicesData.devices.map((device) => device.id));
++    for (const deviceId of connectedDevices) {
++      if (!knownDeviceIds.has(deviceId)) {
+         disconnectTmuxDevice(deviceId);
+       }
+-    },
+-    [connectedDevices, disconnectTmuxDevice]
+-  );
+-
+-  const toggleDevice = useCallback(
+-    (deviceId: string, isConnected: boolean) => {
+-      if (isConnected) {
+-        disconnectDevice(deviceId);
+-      } else {
+-        connectDevice(deviceId);
+-      }
+-    },
+-    [connectDevice, disconnectDevice]
+-  );
++    }
++  }, [devicesData, connectedDevices, disconnectTmuxDevice]);
+ 
+-  const value = useMemo(
+-    () => ({
+-      persistedDevices,
+-      connectDevice,
+-      disconnectDevice,
+-      toggleDevice,
+-    }),
+-    [persistedDevices, connectDevice, disconnectDevice, toggleDevice]
+-  );
++  const value = useMemo(() => ({ ensureDeviceSubscribed }), [ensureDeviceSubscribed]);
+ 
+   return <GlobalDeviceContext.Provider value={value}>{children}</GlobalDeviceContext.Provider>;
+ }
+diff --git a/apps/fe/src/pages/DevicePage.tsx b/apps/fe/src/pages/DevicePage.tsx
+index 6a195e5..f0ef647 100644
+--- a/apps/fe/src/pages/DevicePage.tsx
++++ b/apps/fe/src/pages/DevicePage.tsx
+@@ -1,11 +1,11 @@
+-import { DeviceStatusBadge } from '@tmex/panels';
+-import { ShortcutButtonRow } from '@tmex/panels/settings';
+-import { TerminalSettingsSheet } from '@tmex/panels/settings';
+-import { WatchDialog } from '@tmex/panels/watch';
+ import { useQuery } from '@tanstack/react-query';
+ import { fetchTerminalShortcuts, terminalShortcutsQueryKey } from '@tmex/api-client';
+ import { fetchWatchRules, watchRulesQueryKey } from '@tmex/api-client';
+ import { useBellStore } from '@tmex/notifications';
++import { DeviceStatusBadge } from '@tmex/panels';
++import { ShortcutButtonRow } from '@tmex/panels/settings';
++import { TerminalSettingsSheet } from '@tmex/panels/settings';
++import { WatchDialog } from '@tmex/panels/watch';
+ import type { Device, TerminalShortcutItem } from '@tmex/shared';
+ import { useAgentStore } from '@tmex/stores';
+ import { useSiteStore } from '@tmex/stores';
+@@ -118,10 +118,6 @@ export default function DevicePage() {
+     deviceId ? state.deviceReconnecting?.[deviceId] : undefined
+   );
+   const isReconnecting = Boolean(deviceReconnecting);
+-  // 连接意图：connectDevice 入集、disconnectDevice 出集——用于区分「初次连接中」与「已断开」。
+-  const hasConnectIntent = useTmuxStore((state) =>
+-    deviceId ? state.connectedDevices.has(deviceId) : false
+-  );
+   const siteName = useSiteStore((state) => state.settings?.siteName ?? 'tmex');
+ 
+   const resolvedPaneId = useMemo(() => decodePaneIdFromUrlParam(paneId), [paneId]);
+@@ -1073,15 +1069,13 @@ export default function DevicePage() {
+   // 已连接、URL 指定了 pane，但 snapshot 尚未解析出它（且不是 not-found）→ 仍在加载，内容本就空白。
+   const isResolvingSnapshot =
+     deviceConnected && Boolean(resolvedPaneId) && !isSelectionInvalid && !selectedPane;
+-  // 有连接意图但尚未 ack、无错误、非重连 → 初次连接中，显示 loading 而非误导性的「已断开」。
+-  const isConnecting = hasConnectIntent && !deviceConnected && !deviceError && !isReconnecting;
+ 
+-  const connectingPlaceholder = (
++  const loadingPlaceholder = (
+     <>
+       <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mx-auto">
+         <Loader2 className="h-6 w-6 text-muted-foreground animate-spin" />
+       </div>
+-      <h3 className="text-lg font-medium">{t('terminal.connecting')}</h3>
++      <h3 className="text-lg font-medium">{t('common.loading')}</h3>
+     </>
+   );
+ 
+@@ -1182,16 +1176,8 @@ export default function DevicePage() {
+           ) : (
+             <div className="absolute inset-0 flex flex-col items-center justify-center p-8 text-center">
+               <div className="max-w-sm space-y-4">
+-                {isConnecting ? (
+-                  connectingPlaceholder
+-                ) : !deviceConnected && !isReconnecting ? (
+-                  <>
+-                    <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mx-auto">
+-                      <span className="text-2xl text-muted-foreground">🔌</span>
+-                    </div>
+-                    <h3 className="text-lg font-medium">{t('device.disconnected')}</h3>
+-                    <p className="text-sm text-muted-foreground">{t('device.connectToStart')}</p>
+-                  </>
++                {!deviceConnected || isReconnecting ? (
++                  loadingPlaceholder
+                 ) : !windowId ? (
+                   <>
+                     <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mx-auto">
+@@ -1203,7 +1189,7 @@ export default function DevicePage() {
+                     </p>
+                   </>
+                 ) : (
+-                  connectingPlaceholder
++                  loadingPlaceholder
+                 )}
+               </div>
+             </div>
+diff --git a/apps/fe/src/pages/DevicesPage.tsx b/apps/fe/src/pages/DevicesPage.tsx
+index 3c180bc..53d18a8 100644
+--- a/apps/fe/src/pages/DevicesPage.tsx
++++ b/apps/fe/src/pages/DevicesPage.tsx
+@@ -1,5 +1,5 @@
+-import { DeviceStatusBadge } from '@tmex/panels';
+ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
++import { DeviceStatusBadge } from '@tmex/panels';
+ import type { CreateDeviceRequest, Device, UpdateDeviceRequest } from '@tmex/shared';
+ import { toBCP47 } from '@tmex/shared';
+ import { useSiteStore } from '@tmex/stores';
+@@ -21,7 +21,7 @@ import {
+   AlertDialogTitle,
+ } from '@tmex/ui/alert-dialog';
+ import { Badge } from '@tmex/ui/badge';
+-import { Button, buttonVariants } from '@tmex/ui/button';
++import { Button } from '@tmex/ui/button';
+ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@tmex/ui/card';
+ import {
+   Dialog,
+@@ -40,12 +40,10 @@ import {
+ } from '@tmex/ui/dropdown-menu';
+ import { Input } from '@tmex/ui/input';
+ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@tmex/ui/select';
+-import { Separator } from '@tmex/ui/separator';
+ import { Textarea } from '@tmex/ui/textarea';
+ import { Globe, Monitor, MoreHorizontal, Pencil, Plus, Trash2, Zap } from 'lucide-react';
+ import { type FormEvent, useEffect, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { Link } from 'react-router';
+ import { toast } from 'sonner';
+ 
+ type DeviceFormValues = {
+@@ -489,19 +487,6 @@ function DeviceCard({ device, onEdit, onDelete }: DeviceCardProps) {
+           <DeviceStatusBadge deviceId={device.id} />
+         </div>
+       </CardHeader>
+-
+-      <CardContent className="pt-0">
+-        <Separator className="mb-2" />
+-        <div className="flex items-center justify-end">
+-          <Link
+-            to={`/devices/${device.id}`}
+-            data-testid={`device-card-connect-${device.id}`}
+-            className={buttonVariants({ variant: 'outline', size: 'sm' })}
+-          >
+-            {t('device.connect')}
+-          </Link>
+-        </div>
+-      </CardContent>
+     </Card>
+   );
+ }
+diff --git a/packages/stores/src/ui.ts b/packages/stores/src/ui.ts
+index 2e28c00..c9be053 100644
+--- a/packages/stores/src/ui.ts
++++ b/packages/stores/src/ui.ts
+@@ -5,6 +5,55 @@ import type { RuntimeCore } from './runtime';
+ 
+ export type SidebarSection = 'panes' | 'agent' | 'files';
+ 
++const DEFAULT_SIDEBAR_SECTIONS: Record<SidebarSection, boolean> = {
++  panes: true,
++  agent: false,
++  files: true,
++};
++
++function normalizeSidebarSections(value: unknown): Record<SidebarSection, boolean> {
++  const sections =
++    value && typeof value === 'object' ? (value as Partial<Record<SidebarSection, unknown>>) : {};
++  const panes =
++    typeof sections.panes === 'boolean' ? sections.panes : DEFAULT_SIDEBAR_SECTIONS.panes;
++  const agent =
++    typeof sections.agent === 'boolean' ? sections.agent : DEFAULT_SIDEBAR_SECTIONS.agent;
++  const files =
++    typeof sections.files === 'boolean' ? sections.files : DEFAULT_SIDEBAR_SECTIONS.files;
++
++  return agent ? { panes: false, agent: true, files: false } : { panes, agent: false, files };
++}
++
++function normalizeSidebarDeviceExpanded(value: unknown): Record<string, boolean> {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) {
++    return {};
++  }
++
++  const deviceExpanded: Record<string, boolean> = {};
++  for (const [deviceId, expanded] of Object.entries(value)) {
++    if (typeof expanded === 'boolean') {
++      deviceExpanded[deviceId] = expanded;
++    }
++  }
++  return deviceExpanded;
++}
++
++function updateSidebarSections(
++  sections: Record<SidebarSection, boolean>,
++  section: SidebarSection,
++  open: boolean
++): Record<SidebarSection, boolean> {
++  if (!open) {
++    return { ...sections, [section]: false };
++  }
++
++  if (section === 'agent') {
++    return { panes: false, agent: true, files: false };
++  }
++
++  return { ...sections, agent: false, [section]: true };
++}
++
+ // 终端字体设置默认值（与 ghostty-terminal 内置默认保持一致）。
+ const DEFAULT_TERMINAL_FONT_SIZE = 13;
+ const DEFAULT_TERMINAL_LINE_HEIGHT = 1.2;
+@@ -18,6 +67,7 @@ export type KeyboardBehaviorMode = 'lift' | 'resize' | 'follow';
+ export interface UIState {
+   sidebarCollapsed: boolean;
+   sidebarSections: Record<SidebarSection, boolean>;
++  sidebarDeviceExpanded: Record<string, boolean>;
+   inputMode: 'direct' | 'editor';
+   editorSendWithEnter: boolean;
+   theme: 'light' | 'dark';
+@@ -32,6 +82,7 @@ export interface UIState {
+   setSidebarCollapsed: (collapsed: boolean) => void;
+   setSidebarSectionOpen: (section: SidebarSection, open: boolean) => void;
+   expandSidebarSection: (section: SidebarSection) => void;
++  setSidebarDeviceExpanded: (deviceId: string, expanded: boolean) => void;
+   setInputMode: (mode: 'direct' | 'editor') => void;
+   setKeyboardBehaviorMode: (mode: KeyboardBehaviorMode) => void;
+   setEditorSendWithEnter: (enabled: boolean) => void;
+@@ -50,7 +101,8 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+     persist(
+       (set) => ({
+         sidebarCollapsed: false,
+-        sidebarSections: { panes: true, agent: true, files: true },
++        sidebarSections: DEFAULT_SIDEBAR_SECTIONS,
++        sidebarDeviceExpanded: {},
+         inputMode: 'direct',
+         editorSendWithEnter: true,
+         theme: 'dark',
+@@ -64,13 +116,17 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+ 
+         setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
+         setSidebarSectionOpen: (section, open) =>
+-          set((state) => ({ sidebarSections: { ...state.sidebarSections, [section]: open } })),
++          set((state) => ({
++            sidebarSections: updateSidebarSections(state.sidebarSections, section, open),
++          })),
+         expandSidebarSection: (section) =>
+-          set((state) =>
+-            state.sidebarSections[section]
+-              ? state
+-              : { sidebarSections: { ...state.sidebarSections, [section]: true } }
+-          ),
++          set((state) => ({
++            sidebarSections: updateSidebarSections(state.sidebarSections, section, true),
++          })),
++        setSidebarDeviceExpanded: (deviceId, expanded) =>
++          set((state) => ({
++            sidebarDeviceExpanded: { ...state.sidebarDeviceExpanded, [deviceId]: expanded },
++          })),
+         setInputMode: (mode) => set({ inputMode: mode }),
+         setKeyboardBehaviorMode: (mode) => set({ keyboardBehaviorMode: mode }),
+         setEditorSendWithEnter: (enabled) => set({ editorSendWithEnter: enabled }),
+@@ -105,9 +161,10 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+       }),
+       {
+         name: `${core.storagePrefix}tmex-ui`,
+-        // sidebarSections 不持久化：每次加载三个分区都回到默认全展开。
+         partialize: (state) => ({
+           sidebarCollapsed: state.sidebarCollapsed,
++          sidebarSections: state.sidebarSections,
++          sidebarDeviceExpanded: state.sidebarDeviceExpanded,
+           inputMode: state.inputMode,
+           editorSendWithEnter: state.editorSendWithEnter,
+           theme: state.theme,
+@@ -119,14 +176,21 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+           terminalLineHeight: state.terminalLineHeight,
+           terminalFontId: state.terminalFontId,
+         }),
+-        // 丢弃旧版本 localStorage 里残留的 sidebarTab/sidebarSections，避免被默认 merge 带回。
+         merge: (persisted, current) => {
+           const {
+             sidebarTab: _legacyTab,
+-            sidebarSections: _ignored,
++            sidebarSections,
++            sidebarDeviceExpanded,
+             ...rest
+-          } = (persisted ?? {}) as Partial<UIState> & { sidebarTab?: string };
+-          return { ...current, ...rest };
++          } = (persisted ?? {}) as Partial<UIState> & {
++            sidebarTab?: string;
++          };
++          return {
++            ...current,
++            ...rest,
++            sidebarSections: normalizeSidebarSections(sidebarSections),
++            sidebarDeviceExpanded: normalizeSidebarDeviceExpanded(sidebarDeviceExpanded),
++          };
+         },
+       }
+     )
