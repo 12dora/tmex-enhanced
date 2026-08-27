@@ -1,0 +1,12 @@
+# Task B2-11 — close the remaining direct-path session-lifecycle gaps (B2-10 review)
+
+Context: `sub/b2-10-result.md`, review `sub/b2-10-review.md` — coordinator: ALL items valid. Also `sub/f3-4-result.md` (browser can only pass a connection id via the WS URL; it currently uses `GET /api/mesh/connection`, which returns 409 with multiple tabs).
+
+1. **connectionId (blocker)**: server-generated only (32 random bytes b64url) per accepted gateway WS/stream session; registry keyed by it, scoped to `{sid, via}`; a duplicate registration is rejected (never silently `drop(prev)`); the id is returned to the browser as a WS URL contract: the browser opens `/ws?cid=<client-nonce>` (and `/n/:id/ws?cid=`), the node maps that client nonce to its server connectionId and `GET /api/mesh/connection?cid=<nonce>` returns the matching server id (404 if unknown); `Forwarder.handleRemoteWs` passes `cid` through `openWsStream(link, auth, cid)`; `/api/rtc/authorize` takes the server connectionId. Document the exact browser contract in the report (F3-5 will implement: append `cid` to the WS URL and query `/api/mesh/connection?cid=`).
+2. Re-verify `{sid, via}` via `NodeSessionStore.verify` immediately before `attachDirect`, and expose a verify callback into `CarrierSwitchController` so frames entering the barrier buffer (pre-ACK) are also gated; failure → full teardown (session, PC, bulk).
+3. `bulk.ts`: download path verifies before every data frame/EOF (throttled by the store), cancel reader + teardown on failure.
+4. `signaling.ts`: authorization/target/source checks run before listener lookup for every signal; reject otherwise.
+5. `peer-manager.ts`: `RtcSignaling.onMessage()` returns an unsubscribe; called in `finally` on failure/timeout/PC close/stop; inbox cleared.
+6. Tests: real upload with `{ok:true}`; expired session and wrong via cannot attach; duplicate connectionId rejected and the old session stays intact; download after hard expiry aborts; injected foreign signal during handshake rejected; listener count stable across repeated failed DC attempts.
+
+File scope: `apps/gateway/src/mesh/**`, `apps/gateway/src/ws/index.ts`, `packages/app/src/runtime/assemble.ts` (+tests). Acceptance: `cd apps/gateway && bun test` green (baseline 1812), app runtime tests green, tsc ≤ 23, biome clean. Result: `prompt-archives/2026082701-hub-multinode-design/sub/b2-11-result.md` with the browser contract.
