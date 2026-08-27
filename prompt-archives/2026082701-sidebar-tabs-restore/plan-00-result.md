@@ -29,3 +29,8 @@
 
 - 坏味道扫描中跳过：嵌入宿主 `hostAppPath` 路由（仅影响内嵌宿主）、`withdrawQueuedMessage` 失败重复排队（需后端原子接口）、`DeviceTreeContext` 替代 prop drilling（L，风险大）。
 - 完整清单：`sub/explore-smells-result.md`。
+
+## 补充（2026-08-27 晚）
+
+- 用户确认"上线 docker"是笔误：已 `docker compose down -v --rmi local` 清掉容器/卷/网络/镜像与 `.env`，并从分支删除 `docker-compose.yml`、两个 Dockerfile、`nginx.conf`、`.dockerignore` 及过时的 `deployment.md`（Docker 指南 + 早期开发部署说明，端口/命令均已失效）。
+- 本机 launchd tmex 已用本分支构建替换（tarball + `upgrade --apply-current-package`），9883 健康。
