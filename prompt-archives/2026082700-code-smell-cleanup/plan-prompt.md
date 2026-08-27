@@ -55,3 +55,12 @@ code smell 修复任务循环运行, 直到你认为无高价值的修复点, �
 - 继续在 worktree `../tmex-enhanced-wt-smell`（分支 `chore/code-smell-cleanup`）上工作，探索报告为 `research4-*.md`。
 - 新增关注点：重复代码、腐朽/低价值测试、可删除代码（dead export / 未使用模块 / 冗余抽象）。
 - round-11 审查遗留项 #1（pane_lost 时 idle 状态的 stale run 复活队列）纳入本阶段修复。
+
+### User（追加 3）
+
+合并到main并发版,然后把本机安装的tmex替换成这个优化版
+
+### Execution notes（追加 3）
+
+- 主仓 `main` 快进合并 `chore/code-smell-cleanup`，按 `docs/release/2026061406-release-changelog-flow.md` 发 `tmex-cli 1.1.0`（大量重构 + 16 个 bug 修复，minor bump）。
+- 本机生产实例升级只走 `npx tmex-cli@1.1.0 upgrade`（用户本次明确授权执行）。
