@@ -13,5 +13,6 @@ Fix each with a regression test:
 6. Shell-quote the join command URL with the existing `shellQuote()` after validating it is an https URL.
 7. Polling path emits `unknown` outcomes like the push path (warning toast).
 8. Register `disposeNodeQueryClient(nodeId)` on the real manager instance's dispose callback.
+9. Fix `apps/fe/src/node/mesh-events.test.ts` "ENROLL_REDEEMED 缺证书 / 签名长度不对时作废" to match the tightened `EnrollRedeemedSchema` (`certSig` fixed 64 bytes, `enrollPk` 32) — decoder must return null for malformed frames; add the i18n key used by `node-runtimes.ts` direct-disconnect toast (currently `defaultValue`).
 
 File scope: `apps/fe/src/auth/**`, `apps/fe/src/node/{enrollment,enrollment-watch,node-runtimes}*.ts` (node-runtimes only if F3-1-fix is finished), `apps/fe/src/pages/NodesPage*`, `packages/stores/src/node-connection-manager*.ts`, i18n locale JSON. Result: `prompt-archives/2026082701-hub-multinode-design/sub/f4-5-result.md`.
