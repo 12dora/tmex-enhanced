@@ -1,1 +1,0 @@
-- [packages/stores/src/ui.ts:137](/Users/konata/code/tmex-enhanced-wt-tabs/packages/stores/src/ui.ts:137) — **low**：`merge` 只会从内存状态忽略旧 `sidebarTab` / `sidebarSections`，Zustand hydration 不会因此重写 localStorage；旧键会一直保留到后续任意 store 更新，未满足“legacy localStorage keys must be dropped”。应提升 persist `version` 并通过 `migrate` 删除旧键，使迁移后触发 `setItem`；同时在测试中断言 hydration 后存储内容已不含这两个键。

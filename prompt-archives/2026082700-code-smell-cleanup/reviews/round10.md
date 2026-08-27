@@ -1,5 +1,0 @@
-## Findings
-
-1. **Severity: medium · Confidence: confident** — [`borsh-dispatcher.ts:316`](/Users/konata/code/tmex-enhanced-wt-smell/apps/gateway/src/ws/borsh-dispatcher.ts:316) 的异常包装与原 `decodePayload` 不一致。新代码在捕获到已有 `WsBorshError` 时直接重新抛出；而 [`codec.ts:82`](/Users/konata/code/tmex-enhanced-wt-smell/packages/shared/src/ws-borsh/codec.ts:82) 会捕获所有异常，并统一转换为 `ERROR_PAYLOAD_DECODE_FAILED`、`retryable=false`。因此 schema 若抛出 `WsBorshError(4242, true, "sentinel")`，旧逻辑发送 `code=1004/retryable=false`，新逻辑发送 `code=4242/retryable=true`。最小复现已确认这一差异。[`borsh-dispatcher.test.ts:61`](/Users/konata/code/tmex-enhanced-wt-smell/apps/gateway/src/ws/borsh-dispatcher.test.ts:61) 只断言异常是 `WsBorshError`，两种行为都会通过；应同时断言 `code`、`retryable`，并覆盖 schema 原本就抛出 `WsBorshError` 的情况。
-
-2. **Severity: low · Confidence: confident** — [`host-interfaces.test.ts:26`](/Users/konata/code/tmex-enhanced-wt-smell/apps/gateway/src/ws/host-interfaces.test.ts:26) 无法验证测试名称声称的完整 `BorshDispatchHost` 接口实现。Bun 测试会擦除 TypeScript 类型，而该测试只分发 unknown kind，运行时仅调用 `sendError`；即使 `WebSocketServer` 缺少或错误实现其他所有 host 方法，该测试仍会通过。可通过临时改变 `handleDeviceConnect` 等方法签名验证这一点。该契约需要由实际执行的 TypeScript 类型检查或专门的编译测试保障。

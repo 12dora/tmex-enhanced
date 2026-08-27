@@ -1,9 +1,0 @@
-- [use-sidebar-agent-sessions.ts:24](/Users/konata/code/tmex-enhanced-wt-tabs/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts:24) — **medium** — `orderSessions` blindly保留 `sessionOrder` 中已有 ID 的顺序，但 `setWriteMode`、`setSessionModel`、`rebindPane`、`stopSession` 等操作会返回带新 `updatedAt` 的 session，却不重算 `sessionOrder`。因此列表不再像旧实现一样按最新活动排序。修复：始终按 `compareSessions` 排序，或保证 store 中每次修改 `sessions` 都同步重算 `sessionOrder`。
-
-- [use-sidebar-agent-sessions.ts:122](/Users/konata/code/tmex-enhanced-wt-tabs/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts:122) — **medium** — `sessionsLoaded` 只在请求成功后才变为 `true`，不能防止并发 bootstrap。当前应用启用了 React StrictMode，effect 首次挂载会执行两次；快速切换 Panes/Agent tab 也能在首个请求完成前再次调用 `loadSessions()`。晚返回的旧列表可能覆盖期间的创建、重命名或删除结果。修复：在 agent store 内维护并复用 `loadSessions` 的 in-flight promise，而不是只检查完成标记。
-
-- [sidebar-agent-sessions.tsx:104](/Users/konata/code/tmex-enhanced-wt-tabs/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx:104) — **low** — 设备查询 pending 或首次失败时，父组件传入的 `knownDeviceIds` 是空数组，所有绑定了设备的 session 都会被误归为 orphan；加载时会闪烁，失败时则持续错误分类。修复：把设备查询的“尚未成功”状态传入分类逻辑；列表不可信时只将无 `deviceId`/`paneId` 的 session 判为 orphan，等待成功结果后再判断设备是否缺失。
-
-- [device-tree-navigation.ts:249](/Users/konata/code/tmex-enhanced-wt-tabs/packages/panels/src/device-tree/device-tree-navigation.ts:249) — **medium** — pending navigation 只会被 pane 导航、快照解析或五秒定时器清除。用户点击一个暂时没有 pane 的窗口后，如果通过普通 `NavLink` 导航到 `/devices` 或其他页面，pending 仍存活；五秒内快照到达会把用户重新导航回那个 pane。修复：监听 `location.pathname`，在 pending 创建后的任何外部路由变化时清除它，或让所有用户导航入口统一取消 pending。
-
-- [nav-main.tsx:46](/Users/konata/code/tmex-enhanced-wt-tabs/apps/fe/src/components/page-layouts/components/nav-main.tsx:46) — **low** — 改用 `SidebarMenuButton` 的 `render` 后丢掉了旧实现的 `tooltip={t(item.title)}`，属于拆分时丢失的 prop。修复：保留 tooltip，并让 `SidebarMenuButton` 使用 `<TooltipTrigger render={render} />` 合成自定义链接元素；当前 HEAD 的后续提交已采用这一修复。
