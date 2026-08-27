@@ -60,3 +60,7 @@
 - 指挥官按 `design-review-02.md` 修订为 v3.2（admit 绑定 pending、临时钥只登录、TOTP 由 delegation 决定、opaque sid + 7 天上限、本机 reset-root、transcript 排序等）；用户尚未对"7 天绝对上限"表态。
 - 用户：说明各 phase 内容（已答）；**开始 Phase 0，发现记录到文件，后续在新会话继续。**
 - Phase 0 已完成（worktree `../tmex-enhanced-wt-hub`）：`sub/e0-1..4-result.md`、`sub/baseline.md`，摘要与决策在 `phase0-result.md`。下一会话从 Phase 1 开始。
+
+### User（追加，2026-08-27 Phase 1 开工）
+
+继续开发，分批 commit 并在最后 push。按顺序读 `phase0-result.md` → `plan-00.md` → 设计 v3.2（§2/§3/§5）→ `sub/e0-*-result.md`。分工：grok(4.6, high) 后端、opus5(high) 前端、codex(gpt-5.6-luna, xhigh) 探索、codex(gpt-5.6-sol, high) 审查（过度防御由指挥官判断）、Claude 指挥官 / planner，激进并行，控制单 agent 工作量。只在 worktree `../tmex-enhanced-wt-hub` 干活。
