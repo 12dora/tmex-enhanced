@@ -1,0 +1,69 @@
+# I1 WAN (node-a → hub over TURN DC) 8 MiB abort evidence, run 8, 2026-08-28T17:08–17:09Z
+## node-a
+2026-08-28T17:08:44.047769344Z [mesh][rtc] dial start peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 role=offerer stun_count=2 turn_enabled=true
+2026-08-28T17:08:44.048394177Z [mesh][rtc] datachannel created peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 label=peer
+2026-08-28T17:08:44.048892969Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=checking
+2026-08-28T17:08:44.048896927Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=connecting
+2026-08-28T17:08:52.126061208Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=connected
+2026-08-28T17:08:52.516800417Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=connected
+2026-08-28T17:08:52.534220542Z [mesh][rtc] datachannel open peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 label=peer
+2026-08-28T17:08:54.939580209Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=completed
+2026-08-28T17:09:09.370469133Z [mesh][http] forward aborted status=200 sent=1048508 expected=- reason=http stream aborted
+2026-08-28T17:09:19.403545096Z [mesh][rtc] datachannel closed peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 label=peer
+2026-08-28T17:09:19.403600513Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=disconnected
+2026-08-28T17:09:19.403605013Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=closed
+2026-08-28T17:09:39.915120550Z [mesh][rtc] dial start peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 role=offerer stun_count=2 turn_enabled=true
+2026-08-28T17:09:39.915767342Z [mesh][rtc] datachannel created peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 label=peer
+2026-08-28T17:09:39.916844092Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=checking
+2026-08-28T17:09:39.916853008Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=connecting
+2026-08-28T17:09:54.924768293Z [mesh][rtc] dial failed peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 reason=datachannel open timeout
+2026-08-28T17:09:54.925925668Z [mesh][rtc] dial failed peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 reason=datachannel open timeout fallback=ws-secure
+2026-08-28T17:09:54.926805293Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=closed
+2026-08-28T17:09:54.926838459Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=closed
+2026-08-28T17:09:57.927435628Z [mesh][rtc] dial failed peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 reason=datachannel open timeout fallback=relay
+2026-08-28T17:09:57.987344711Z [mesh][rtc] upgrade retry peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 attempt=1 in_ms=5000
+2026-08-28T17:09:57.988986628Z [mesh][rtc] dial start peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 role=offerer stun_count=2 turn_enabled=true
+2026-08-28T17:09:57.989589711Z [mesh][rtc] datachannel created peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 label=peer
+2026-08-28T17:09:57.990117003Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=checking
+2026-08-28T17:09:57.990120419Z [mesh][rtc] peer state peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=connecting
+2026-08-28T17:10:03.072926255Z [mesh][rtc] ice peer=ce6a6ece6deeb78a9626b3b9f80b2ab1 state=connected
+## hub
+2026-08-28T17:08:52.162438765Z [mesh][rtc] dial start peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 role=answerer stun_count=2 turn_enabled=true
+2026-08-28T17:08:52.163681578Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=checking
+2026-08-28T17:08:52.163700517Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connecting
+2026-08-28T17:08:52.587809713Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connected
+2026-08-28T17:08:52.645982094Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connected
+2026-08-28T17:08:52.662887101Z [mesh][rtc] datachannel received peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+2026-08-28T17:08:52.662985024Z [mesh][rtc] datachannel open peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+2026-08-28T17:08:52.663426980Z [mesh][rtc] datachannel open peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+2026-08-28T17:08:55.061313864Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=completed
+2026-08-28T17:09:19.516095505Z [mesh][rtc] liveness timeout peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 idle_ms=10000
+2026-08-28T17:09:19.516131213Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=closed
+2026-08-28T17:09:19.516133683Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=closed
+2026-08-28T17:09:19.516135412Z [mesh][rtc] datachannel closed peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+2026-08-28T17:09:40.067016707Z [mesh][rtc] dial start peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 role=answerer stun_count=2 turn_enabled=true
+2026-08-28T17:09:40.072612919Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=checking
+2026-08-28T17:09:40.074340526Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connecting
+2026-08-28T17:09:55.068227762Z [mesh][rtc] dial failed peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 reason=datachannel open timeout
+2026-08-28T17:09:55.068325605Z [mesh][rtc] dial failed peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 reason=datachannel open timeout fallback=ws-secure
+2026-08-28T17:09:55.069226135Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=closed
+2026-08-28T17:09:55.069240374Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=closed
+2026-08-28T17:09:58.112338244Z [mesh][rtc] upgrade retry peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 attempt=1 in_ms=5000
+2026-08-28T17:10:03.113995716Z [mesh][rtc] dial start peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 role=answerer stun_count=2 turn_enabled=true
+2026-08-28T17:10:03.115799318Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=checking
+2026-08-28T17:10:03.115800668Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connecting
+2026-08-28T17:10:03.384826853Z [mesh][rtc] ice peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connected
+2026-08-28T17:10:03.451638064Z [mesh][rtc] peer state peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 state=connected
+2026-08-28T17:10:03.473244161Z [mesh][rtc] datachannel received peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+2026-08-28T17:10:03.473314146Z [mesh][rtc] datachannel open peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+2026-08-28T17:10:03.473659980Z [mesh][rtc] datachannel open peer=4b9f24d16a18aaeddff3bfb0db7f1fc9 label=peer
+## run.sh excerpt
+1402-Bun v1.3.14 (Linux arm64)
+1403-
+1404-SyntaxError: Failed to parse JSON
+1405-
+1406-Bun v1.3.14 (Linux arm64)
+1407-SyntaxError: Failed to parse JSON
+1408-
+1409-Bun v1.3.14 (Linux arm64)
+1410:[split-e2e] FAIL I1 8MiB sha256 over dc

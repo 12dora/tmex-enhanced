@@ -1,0 +1,28 @@
+# home re-join to run-8 VM hub: admitted but uplink auth_rejected (2026-08-28 17:1x–17:20Z)
+## hub enroll log
+join token: 7EXmS64biSRew7EzV_zt5jwXZlPWA35clXEWY6lm4KxZwSzm4J1l3FG01xk4IdIWL_sAAePna8c1nfAonV0E2n86VHzkk2tsd_1suym0atw1
+npx tmex-cli hub join https://hub.tmex.test:18443 --token 7EXmS64biSRew7EzV_zt5jwXZlPWA35clXEWY6lm4KxZwSzm4J1l3FG01xk4Id
+admit-node failed: node_id_reused
+## hub logs (uplink/auth/redeem)
+2026-08-28T17:01:54.725176555Z [mesh] starting hub uplink without resolved userId; key-log catch-up skipped until a unique user exists
+2026-08-28T17:01:54.734968547Z [uplink] connect failed hub=hub.tmex.test attempt=1 reason=auth_rejected next_retry_ms=606
+2026-08-28T17:01:57.454644940Z [mesh] starting hub uplink without resolved userId; key-log catch-up skipped until a unique user exists
+2026-08-28T17:01:57.464128095Z [uplink] connect failed hub=hub.tmex.test:18443 attempt=1 reason=auth_rejected next_retry_ms=988
+2026-08-28T17:02:21.375278133Z [uplink] online hub=hub.tmex.test:18443 after_ms=16
+2026-08-28T17:04:05.938786722Z [uplink] offline reason=stopped
+2026-08-28T17:04:11.075327949Z [uplink] online hub=hub.tmex.test:18443 after_ms=17
+2026-08-28T17:04:26.923946897Z [uplink] offline reason=stopped
+2026-08-28T17:04:27.763473801Z [uplink] online hub=hub.tmex.test:18443 after_ms=29
+2026-08-28T17:07:08.408514997Z [uplink] offline reason=stopped
+2026-08-28T17:07:09.242379944Z [uplink] online hub=hub.tmex.test:18443 after_ms=18
+## hub nodes
+## home journal
+allow inbound TMEX_PEER_PORT (39001) on the LAN firewall for direct links
+RC=0
+Aug 28 17:20:04 konata tmex[2794809]: [uplink] connect failed hub=118.195.194.170:18443 attempt=1 reason=auth_rejected next_ret
+ry_ms=846
+Aug 28 17:20:50 konata tmex[2794809]: [uplink] connect failed hub=118.195.194.170:18443 attempt=7 reason=auth_rejected next_ret
+ry_ms=57262
+Aug 28 17:21:47 konata tmex[2794809]: [uplink] connect failed hub=118.195.194.170:18443 attempt=8 reason=auth_rejected next_ret
+ry_ms=59568
+konata@konata:~/tmex-e2e/package$

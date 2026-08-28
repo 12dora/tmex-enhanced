@@ -1,0 +1,13 @@
+# Exploration: why cross-NAT RTC direct path never gets established (read-only)
+
+Context: hub/node mesh in `apps/gateway/src/mesh/` (design `docs/hub/2026082700-hub-node-architecture.md`, ops `docs/hub/2026082800-hub-node-operations.md`). In the split docker harness (`scripts/hub-e2e/split/run.sh`, scenario D) a public hub node (`hub,node` roles, x86, docker on a public server, port 39001 published) and a NAT'd local node (`node-a`, docker bridge, outbound only) both have `direct_capable=true` (native `node_datachannel` installed via `direct enable`), STUN configured to reachable servers (`TMEX_E2E_STUN_SERVERS`), yet streams keep `path=relay` and the logs contain no RTC/DataChannel diagnostics whatsoever. In-process test `apps/gateway/src/mesh/integration/direct-path.integration.test.ts` passes.
+
+Your job (read-only, do NOT modify files): trace the full RTC direct-path lifecycle and explain precisely why nothing happens across real machines. Cover:
+1. Who initiates an RTC dial and under what conditions (`rtc-peer-manager.ts`, `peer-manager.ts`, upgrade dialing, `direct_capable` gating, whether a peer that already has a relay link is ever tried for RTC, whether the node role vs hub role matters, whether an "upgrade" only tries LAN WS endpoints and never RTC).
+2. How signaling travels (`rtc.signal` ctl frames via hub), whether offers/answers/candidates are forwarded correctly for a node↔hub-node pair (the hub itself is a node here — check for self-routing/short-circuit bugs when the target node id is the hub's own node id).
+3. How STUN servers reach `node_datachannel` config (env var → settings → PeerConnection config), and whether ICE candidate gathering / state changes are logged at all.
+4. What `direct enable` actually flips at runtime (does the running process detect native module presence only at boot? is `direct_capable` advertised in presence/`node.list` and used by the dialer?).
+5. Where a fallback to TURN would plug in (`TMEX_TURN_*`).
+6. Exactly which log lines exist today in the RTC path and which are missing to diagnose ICE (candidate types, ICE connection state, DTLS, DataChannel open, failure reasons).
+
+Deliverable: a markdown report with (a) sequence of the intended flow with file:line references, (b) the concrete root cause(s) / most likely reasons the dial never starts or never completes across NAT, ranked by confidence with evidence, (c) a minimal list of code changes (file + function) a backend engineer should make to (i) make the dial actually happen and (ii) add diagnostics, (d) how the harness scenario D should assert `transport === 'dc'` (which API/field exposes the actual transport of an open stream). Be concrete; quote code. No speculation without a file reference.
