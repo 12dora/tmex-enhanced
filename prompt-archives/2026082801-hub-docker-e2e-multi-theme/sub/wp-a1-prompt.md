@@ -1,0 +1,16 @@
+# WP-A1 — theme package: preset registry, CSS tokens, terminal palettes
+
+## Scope (only these paths)
+- `packages/theme/src/presets.ts`, `packages/theme/src/themes.css`, `packages/theme/src/index.ts`, `packages/theme/src/presets.test.ts`
+- new files under `packages/theme/src/` (e.g. `preset-meta.ts`, `preset-palettes.ts`) and optionally a generator script `scripts/theme/build-theme-presets.ts` (read `scripts/theme/build-shortcut-tokens.ts` for the pattern) if you choose to generate the CSS from TS — recommended: keep hand-editable TS palette definitions as the source of truth and generate/verify `themes.css` from them so the 14 blocks stay consistent. If you generate, the generated CSS file must be committed and a test must assert it is up to date.
+- `packages/panels/src/code-viewer/hljs-terminal-theme.css` (add `[data-theme-preset=…]` overrides for the `--code-*` tokens, or restructure so they derive from the semantic tokens — your call, but every preset must get readable syntax highlighting).
+
+## Task
+1. Replace the 7 unused design presets (`underground`, `ocean-breeze`, …) in `presets.ts`/`themes.css` with the 14 presets from the frozen interface. Remove the old preset CSS blocks (lines ~8–763 of `themes.css`); keep the unrelated `data-theme-chart-preset` / `data-theme-radius` / `data-theme-scale` / `data-theme-font` sections at the end untouched.
+2. Implement `THEME_PRESET_META`, `ThemePresetMeta`, `ThemeAppearance`, `resolveTerminalTheme` exactly as in the frozen interface and export everything from `packages/theme/src/index.ts`. Import `TerminalThemeColors`, `TERMINAL_THEME_LIGHT`, `TERMINAL_THEME_DARK` from `@tmex/shared` (`packages/shared/src/appearance.ts`).
+3. For each preset, use the official palettes (Dracula spec, Tokyo Night night/storm/light by enkia, Catppuccin mocha/latte, Nord, One Dark (Atom), Solarized dark/light by Ethan Schoonover, Gruvbox dark/light medium, GitHub dark/light default). Terminal 16 ANSI colors + fg/bg/cursor/selectionBackground must follow each scheme's published terminal palette.
+4. For each preset define ALL semantic CSS variables listed in `packages/theme/src/tokens.css` (`--background … --sidebar-ring`, `--chat-surface`, the `--fc-*` FullCalendar tokens) under `[data-theme-preset="<id>"]`. Look at `tokens.css` to see the value format (oklch? hex? — match what the existing `:root`/`.dark` use so Tailwind v4 `@theme` mappings in `apps/fe/src/index.css` keep working; check that file to see how tokens are consumed). Contrast must be usable: foreground/background AA, muted-foreground readable, borders visible, primary distinct. Derive card/popover/sidebar/muted/accent from the scheme's own surface steps (e.g. Dracula bg #282a36, current-line #44475a, comment #6272a4, fg #f8f8f2, purple #bd93f9, pink #ff79c6…).
+5. Update `presets.test.ts`: registry ↔ CSS selector consistency, every preset defines the full token set, `resolveTerminalTheme` fallbacks, META appearance/preview sanity (preview.background equals terminal.background or the UI --background).
+6. Do not touch `tokens.css`, `tokens.generated.css`, `terminal-shortcut-tokens.ts`, fonts.
+
+Write the final report to `prompt-archives/2026082801-hub-docker-e2e-multi-theme/sub/wp-a1-result.md`.

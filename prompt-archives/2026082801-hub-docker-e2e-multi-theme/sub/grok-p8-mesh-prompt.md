@@ -1,0 +1,15 @@
+# Backend task (gateway mesh) — round 5: fix the 9 findings of review-p45
+
+Worktree `/Users/konata/code/tmex-enhanced-wt-merge` (branch chore/merge-hub-tabs, HEAD af33b95). Read `AGENTS.md`, the review `prompt-archives/2026082801-hub-docker-e2e-multi-theme/sub/review-p45.md` (9 findings — ALL accepted) and your reports `sub/grok-p4-mesh-result.md`, `sub/grok-p5-peer-result.md`. You own `apps/gateway/src/mesh/**` and `apps/gateway/src/hub/**` (+ tests). Another agent works only under `scripts/hub-e2e/split/` and docs. No git operations, no TODOs. Each finding gets a failing-then-passing unit test.
+
+1. Mixed-version fence: negotiate quiesce capability BEFORE dialing the upgrade (e.g. `link.hello`/capability flag exchanged on link auth, or a `link.quiesce.probe` that must be ACKed); peers without the capability are excluded from background upgrades (user-path `getLink` may still upgrade only when no streams are open on the old link).
+2. Retire: never hard-close a retiring link that still has active streams; the 30 s cap applies only when `streams === 0` and the fence is incomplete. Add a test with a 60 s stream.
+3. `getLink` upgrade path must respect `nextEligibleAt` (backoff) for replacing an existing link; only the very first attempt is immediate.
+4. Any exception thrown by `head()/list()/applyMany()` enters the same bounded retry state machine → teardown; `fork` stays a hard failure.
+5. Bind every catch-up task to its connection generation; validate after each await; cancel/ignore stale tasks; make `listEpoch` monotonic across generations (or use `(generation, epoch)`).
+6. userId guard must run before `peerManager.start()`/peer listener bind; node role with empty userId = deny-all, nothing bound. Hub role with an empty DB: either delay the peer listener until a user exists, or bind with a deny-all policy until userId is known (then keep working after `hub user add` without restart — test that).
+7. `authenticatedGeneration === generation` on all outbound paths (`sendCtl`, `openRelay`, `sendStatus`, `appendAndAck`) and on inbound relay OPEN; replacing a connection immediately leaves `online`.
+8. Hub presence freshness: valid only after the current generation received a node.list and completed catch-up; cleared on disconnect; offline NODE_EVENTs de-duplicated against the last emitted state.
+9. `keyLogReqBuckets` / `keyLogReqLogs`: bounded LRU with idle TTL sweep, cleared on stop, entries removed on revoke; keep short-lived state across quick reconnects so burst cannot be reset by reconnecting.
+
+Verify: `bun test` in `apps/gateway` 0 fail (baseline 2272), tsc ≤ 21, biome clean. Then ONE remote single-host harness run: `bash /private/tmp/claude-501/-Users-konata-code-tmex-enhanced/741cc3a1-5392-48be-8081-06f3803bdeb4/scratchpad/remote-cycle.sh p8` (it now runs bundle:resources + runtime + cli pack; project `tmex-e2e`, port 127.0.0.1:18543 on the server; another project `tmex-split` may be running there — leave it alone) must be all-PASS. Report to `prompt-archives/2026082801-hub-docker-e2e-multi-theme/sub/grok-p8-mesh-result.md`.
