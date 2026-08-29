@@ -1,0 +1,2011 @@
+diff --git a/apps/fe/src/components/device-connection-status.test.ts b/apps/fe/src/components/device-connection-status.test.ts
+index 93d14d88..bc2088d4 100644
+--- a/apps/fe/src/components/device-connection-status.test.ts
++++ b/apps/fe/src/components/device-connection-status.test.ts
+@@ -2,9 +2,14 @@ import { describe, expect, test } from 'bun:test';
+ import type { DeviceConnectionStatus } from '@tmex/panels';
+ import {
+   type DeviceConnectionSnapshot,
++  MAX_PENDING_STATUS_MS,
++  MIN_PENDING_STATUS_MS,
+   createDeviceConnectionSnapshot,
+   deriveDeviceConnectionStatus,
++  deriveSettledConnectionStatus,
+   isDeviceConnected,
++  isPendingRequestSettled,
++  pendingSettleDelay,
+   selectRestorableDeviceIds,
+   selectStaleSubscribedDeviceIds,
+   shouldEnsureDeviceSubscription,
+@@ -84,6 +89,49 @@ describe('deriveDeviceConnectionStatus 优先级矩阵', () => {
+   });
+ });
+ 
++describe('在飞请求（防按钮闪烁）', () => {
++  test('pending connect 稳定展示 connecting，哪怕真实态已经 connected', () => {
++    const pending = new Map([[DEVICE, { kind: 'connect' as const, at: 0 }]]);
++    const snapshot = { ...snapshotOf({ subscribed: true, connected: true }), pending };
++    expect(deriveDeviceConnectionStatus(DEVICE, snapshot)).toBe('connecting');
++    expect(deriveSettledConnectionStatus(DEVICE, snapshot)).toBe('connected');
++  });
++
++  test('pending disconnect 展示 disconnecting，而不是立刻跳回 disconnected', () => {
++    const pending = new Map([[DEVICE, { kind: 'disconnect' as const, at: 0 }]]);
++    const snapshot = { ...snapshotOf({ intentionallyDisconnected: true }), pending };
++    expect(deriveDeviceConnectionStatus(DEVICE, snapshot)).toBe('disconnecting');
++    expect(deriveSettledConnectionStatus(DEVICE, snapshot)).toBe('disconnected');
++  });
++
++  test('其它设备的 pending 不影响本设备', () => {
++    const pending = new Map([['other', { kind: 'connect' as const, at: 0 }]]);
++    expect(deriveDeviceConnectionStatus(DEVICE, { ...snapshotOf({}), pending })).toBe(
++      'disconnected'
++    );
++  });
++
++  test('落定判定：connect 到 connected / error / reconnecting 为止，disconnect 到 disconnected 为止', () => {
++    const connect = { kind: 'connect' as const, at: 0 };
++    const disconnect = { kind: 'disconnect' as const, at: 0 };
++    expect(isPendingRequestSettled(connect, 'connected')).toBe(true);
++    expect(isPendingRequestSettled(connect, 'error')).toBe(true);
++    expect(isPendingRequestSettled(connect, 'reconnecting')).toBe(true);
++    expect(isPendingRequestSettled(connect, 'connecting')).toBe(false);
++    expect(isPendingRequestSettled(connect, 'disconnected')).toBe(false);
++    expect(isPendingRequestSettled(disconnect, 'disconnected')).toBe(true);
++    expect(isPendingRequestSettled(disconnect, 'connected')).toBe(false);
++  });
++
++  test('摘掉时机：落定且展示够最短时长立刻摘；不够就补足；没落定到最长时长放弃', () => {
++    const request = { kind: 'connect' as const, at: 1000 };
++    expect(pendingSettleDelay(request, 'connected', 1000 + MIN_PENDING_STATUS_MS)).toBe(0);
++    expect(pendingSettleDelay(request, 'connected', 1100)).toBe(MIN_PENDING_STATUS_MS - 100);
++    expect(pendingSettleDelay(request, 'connecting', 1100)).toBe(MAX_PENDING_STATUS_MS - 100);
++    expect(pendingSettleDelay(request, 'connecting', 1000 + MAX_PENDING_STATUS_MS + 5)).toBe(0);
++  });
++});
++
+ describe('createDeviceConnectionSnapshot', () => {
+   test('把连接意图与 store 切片合并为快照', () => {
+     const intentionallyDisconnected = new Set([DEVICE]);
+diff --git a/apps/fe/src/components/device-connection-status.ts b/apps/fe/src/components/device-connection-status.ts
+index 97e3d0cf..166117f1 100644
+--- a/apps/fe/src/components/device-connection-status.ts
++++ b/apps/fe/src/components/device-connection-status.ts
+@@ -1,4 +1,5 @@
+ import type { DeviceConnectionStatus } from '@tmex/panels';
++import type { PendingConnectionRequest, PendingConnectionSnapshot } from './device-intent-store';
+ 
+ export interface DeviceConnectionSnapshot {
+   /** 用户主动断开的设备（连接意图），优先级最高 */
+@@ -8,16 +9,27 @@ export interface DeviceConnectionSnapshot {
+   deviceConnected: Record<string, boolean | undefined>;
+   deviceErrors: Record<string, unknown>;
+   deviceReconnecting: Record<string, unknown>;
++  /** 用户刚点下、还没落定的连接 / 断开请求：在飞期间稳定展示 connecting / disconnecting */
++  pending?: PendingConnectionSnapshot;
+ }
+ 
+ /** 连接状态所依赖的 tmux store 切片（不含用户连接意图） */
+-export type DeviceRuntimeSlices = Omit<DeviceConnectionSnapshot, 'intentionallyDisconnected'>;
++export type DeviceRuntimeSlices = Omit<
++  DeviceConnectionSnapshot,
++  'intentionallyDisconnected' | 'pending'
++>;
++
++/** pending 态至少展示这么久，避免「连接 → 连接中 → 断开」在一帧内连跳三档 */
++export const MIN_PENDING_STATUS_MS = 350;
++/** 请求迟迟没有落定（网关没回音）时放弃 pending，回到真实推导态 */
++export const MAX_PENDING_STATUS_MS = 8000;
+ 
+ export function createDeviceConnectionSnapshot(
+   intentionallyDisconnected: ReadonlySet<string>,
+-  slices: DeviceRuntimeSlices
++  slices: DeviceRuntimeSlices,
++  pending?: PendingConnectionSnapshot
+ ): DeviceConnectionSnapshot {
+-  return { intentionallyDisconnected, ...slices };
++  return { intentionallyDisconnected, ...slices, pending };
+ }
+ 
+ function ownValue<T>(record: Record<string, T | undefined>, key: string): T | undefined {
+@@ -31,7 +43,8 @@ export function isDeviceConnected(
+   return ownValue(deviceConnected, deviceId) === true;
+ }
+ 
+-export function deriveDeviceConnectionStatus(
++/** 不看在飞请求的真实推导态 */
++export function deriveSettledConnectionStatus(
+   deviceId: string,
+   snapshot: DeviceConnectionSnapshot
+ ): DeviceConnectionStatus {
+@@ -44,6 +57,45 @@ export function deriveDeviceConnectionStatus(
+   return 'disconnected';
+ }
+ 
++export function deriveDeviceConnectionStatus(
++  deviceId: string,
++  snapshot: DeviceConnectionSnapshot
++): DeviceConnectionStatus {
++  if (!deviceId) return 'disconnected';
++  const pending = snapshot.pending?.get(deviceId);
++  if (pending) return pending.kind === 'connect' ? 'connecting' : 'disconnecting';
++  return deriveSettledConnectionStatus(deviceId, snapshot);
++}
++
++/** 真实推导态已经到达请求的目标（或失败）了吗 */
++export function isPendingRequestSettled(
++  request: PendingConnectionRequest,
++  settledStatus: DeviceConnectionStatus
++): boolean {
++  if (request.kind === 'connect') {
++    return (
++      settledStatus === 'connected' || settledStatus === 'error' || settledStatus === 'reconnecting'
++    );
++  }
++  return settledStatus === 'disconnected';
++}
++
++/**
++ * 在飞请求什么时候可以摘掉：落定且展示够了最短时长 → 立刻（返回 0）；落定但还没到最短时长 →
++ * 剩余毫秒数；没落定 → 到最长时长为止的剩余毫秒数（到点放弃）。
++ */
++export function pendingSettleDelay(
++  request: PendingConnectionRequest,
++  settledStatus: DeviceConnectionStatus,
++  now: number
++): number {
++  const elapsed = Math.max(0, now - request.at);
++  if (isPendingRequestSettled(request, settledStatus)) {
++    return Math.max(0, MIN_PENDING_STATUS_MS - elapsed);
++  }
++  return Math.max(0, MAX_PENDING_STATUS_MS - elapsed);
++}
++
+ export function shouldEnsureRouteDeviceSubscription(
+   deviceId: string | undefined,
+   devicesData: { devices: Array<{ id: string }> } | undefined
+diff --git a/apps/fe/src/components/device-intent-store.test.ts b/apps/fe/src/components/device-intent-store.test.ts
+index a73e9fd4..74de5bd0 100644
+--- a/apps/fe/src/components/device-intent-store.test.ts
++++ b/apps/fe/src/components/device-intent-store.test.ts
+@@ -11,6 +11,7 @@ installWindowStorage();
+ const {
+   DeviceIntentStore,
+   deviceIntentStore,
++  pendingConnectionRequests,
+   reconcileDeviceSubscriptions,
+   resetDeviceIntentStores,
+ } = await import('./device-intent-store');
+@@ -231,3 +232,32 @@ describe('reconcileDeviceSubscriptions', () => {
+     expect(log).toEqual([]);
+   });
+ });
++
++describe('在飞请求表', () => {
++  test('同 prefix 同实例；重复发起同方向不换快照，换方向替换，落定后摘掉', () => {
++    const store = pendingConnectionRequests(PREFIX_A);
++    expect(pendingConnectionRequests(PREFIX_A)).toBe(store);
++    expect(pendingConnectionRequests(PREFIX_B)).not.toBe(store);
++
++    let notified = 0;
++    store.subscribe(() => {
++      notified += 1;
++    });
++    store.begin('dev-1', 'connect', 100);
++    const snapshot = store.getSnapshot();
++    expect(snapshot.get('dev-1')).toEqual({ kind: 'connect', at: 100 });
++
++    store.begin('dev-1', 'connect', 200);
++    expect(store.getSnapshot()).toBe(snapshot);
++    store.begin('', 'connect');
++    expect(store.getSnapshot()).toBe(snapshot);
++
++    store.begin('dev-1', 'disconnect', 300);
++    expect(store.getSnapshot().get('dev-1')).toEqual({ kind: 'disconnect', at: 300 });
++
++    store.settle('dev-1');
++    expect(store.getSnapshot().size).toBe(0);
++    store.settle('dev-1');
++    expect(notified).toBe(3);
++  });
++});
+diff --git a/apps/fe/src/components/device-intent-store.ts b/apps/fe/src/components/device-intent-store.ts
+index 640f1b91..0228236b 100644
+--- a/apps/fe/src/components/device-intent-store.ts
++++ b/apps/fe/src/components/device-intent-store.ts
+@@ -120,9 +120,73 @@ export function deviceIntentStore(storagePrefix: string): DeviceIntentStore {
+   return store;
+ }
+ 
++export type PendingConnectionKind = 'connect' | 'disconnect';
++
++export interface PendingConnectionRequest {
++  kind: PendingConnectionKind;
++  /** 发起时刻（ms），用来保证 pending 态至少展示一小段时间，按钮不闪 */
++  at: number;
++}
++
++export type PendingConnectionSnapshot = ReadonlyMap<string, PendingConnectionRequest>;
++
++const EMPTY_PENDING: PendingConnectionSnapshot = new Map();
++
++/**
++ * 用户刚点下的连接 / 断开请求（同一个 node 的多份 provider 共用）。
++ * 与意图分开存：意图是持久化的「用户想要什么」，这里是转瞬即逝的「请求还没落定」，
++ * 重复点同一方向不换快照（保留最早的发起时刻），落定后由 provider 摘掉。
++ */
++export class PendingConnectionRequests {
++  private readonly listeners = new Set<() => void>();
++  private snapshot: PendingConnectionSnapshot = EMPTY_PENDING;
++
++  subscribe = (listener: () => void): (() => void) => {
++    this.listeners.add(listener);
++    return () => {
++      this.listeners.delete(listener);
++    };
++  };
++
++  getSnapshot = (): PendingConnectionSnapshot => this.snapshot;
++
++  begin = (deviceId: string, kind: PendingConnectionKind, at = Date.now()): void => {
++    if (!deviceId) return;
++    if (this.snapshot.get(deviceId)?.kind === kind) return;
++    const next = new Map(this.snapshot);
++    next.set(deviceId, { kind, at });
++    this.commit(next);
++  };
++
++  settle = (deviceId: string): void => {
++    if (!this.snapshot.has(deviceId)) return;
++    const next = new Map(this.snapshot);
++    next.delete(deviceId);
++    this.commit(next.size === 0 ? EMPTY_PENDING : next);
++  };
++
++  private commit(next: PendingConnectionSnapshot): void {
++    this.snapshot = next;
++    for (const listener of [...this.listeners]) listener();
++  }
++}
++
++const pendingRequests = new Map<string, PendingConnectionRequests>();
++
++/** 取该 storagePrefix 的在飞请求表（懒建）；同 prefix 恒返回同一实例。 */
++export function pendingConnectionRequests(storagePrefix: string): PendingConnectionRequests {
++  let store = pendingRequests.get(storagePrefix);
++  if (!store) {
++    store = new PendingConnectionRequests();
++    pendingRequests.set(storagePrefix, store);
++  }
++  return store;
++}
++
+ /** 测试用：丢弃实例表，让下一次取用重新从存储读取。 */
+ export function resetDeviceIntentStores(): void {
+   stores.clear();
++  pendingRequests.clear();
+ }
+ 
+ export interface DeviceSubscriptionActions {
+diff --git a/apps/fe/src/components/global-device-provider-shared-intent.test.tsx b/apps/fe/src/components/global-device-provider-shared-intent.test.tsx
+index 0e4ec9af..ec0616ee 100644
+--- a/apps/fe/src/components/global-device-provider-shared-intent.test.tsx
++++ b/apps/fe/src/components/global-device-provider-shared-intent.test.tsx
+@@ -23,7 +23,9 @@ const { RuntimeProvider } = await import('@tmex/stores/react');
+ const { renderToStaticMarkup } = await import('react-dom/server');
+ const { MemoryRouter } = await import('react-router');
+ const { GlobalDeviceProvider, useGlobalDevice } = await import('./global-device-provider');
+-const { deviceIntentStore, resetDeviceIntentStores } = await import('./device-intent-store');
++const { deviceIntentStore, pendingConnectionRequests, resetDeviceIntentStores } = await import(
++  './device-intent-store'
++);
+ 
+ type TransportEventHandler = Parameters<GatewayTransport['onEvent']>[0];
+ 
+@@ -151,7 +153,10 @@ describe('缺陷 2：同一 node 的两份 provider 共享连接意图', () => {
+     expect(intent.disconnected.has('dev-1')).toBe(true);
+     expect(intent.connected.has('dev-1')).toBe(false);
+     expect(second.route[0].connection.isIntentionallyDisconnected('dev-1')).toBe(true);
+-    expect(second.route[0].connection.status('dev-1')).toBe('disconnected');
++    // 刚点下的断开先稳定停在「断开中」，落定并展示够最短时长后才回到「已断开」（由 effect 摘掉）
++    expect(second.route[0].connection.status('dev-1')).toBe('disconnecting');
++    pendingConnectionRequests(PREFIX_A).settle('dev-1');
++    expect(renderProviders(runtime).route[0].connection.status('dev-1')).toBe('disconnected');
+ 
+     runtime.dispose();
+   });
+diff --git a/apps/fe/src/components/global-device-provider.tsx b/apps/fe/src/components/global-device-provider.tsx
+index 677c9834..dfc8886a 100644
+--- a/apps/fe/src/components/global-device-provider.tsx
++++ b/apps/fe/src/components/global-device-provider.tsx
+@@ -16,14 +16,19 @@ import {
+   type DeviceRuntimeSlices,
+   createDeviceConnectionSnapshot,
+   deriveDeviceConnectionStatus,
++  deriveSettledConnectionStatus,
+   isDeviceConnected,
++  pendingSettleDelay,
+   shouldEnsureDeviceSubscription,
+   shouldEnsureRouteDeviceSubscription,
+ } from './device-connection-status';
+ import {
+   type DeviceIntentSnapshot,
+   type DeviceIntentStore,
++  type PendingConnectionRequests,
++  type PendingConnectionSnapshot,
+   deviceIntentStore,
++  pendingConnectionRequests,
+   reconcileDeviceSubscriptions,
+ } from './device-intent-store';
+ 
+@@ -84,13 +89,52 @@ function useDeviceIntent(storagePrefix: string): {
+   return { store, snapshot };
+ }
+ 
++// 在飞的连接 / 断开请求：与意图同样按 storagePrefix 共享，同一个 node 的多份 provider 看到同一份。
++function usePendingRequests(storagePrefix: string): {
++  store: PendingConnectionRequests;
++  snapshot: PendingConnectionSnapshot;
++} {
++  const store = pendingConnectionRequests(storagePrefix);
++  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
++  return { store, snapshot };
++}
++
++/**
++ * 在飞请求的落定：真实推导态到达目标（连上 / 出错 / 断开）且 pending 已展示够最短时长才摘掉，
++ * 迟迟不落定的到最长时长也摘掉。按钮文案因此只会「连接 → 连接中 → 断开」各停一档，不再抖动。
++ */
++function usePendingSettlement(
++  pendingStore: PendingConnectionRequests,
++  pending: PendingConnectionSnapshot,
++  intentionallyDisconnected: ReadonlySet<string>,
++  slices: DeviceRuntimeSlices
++): void {
++  useEffect(() => {
++    if (pending.size === 0) return;
++    const snapshot = createDeviceConnectionSnapshot(intentionallyDisconnected, slices);
++    const now = Date.now();
++    const timers: ReturnType<typeof setTimeout>[] = [];
++    for (const [deviceId, request] of pending) {
++      const settled = deriveSettledConnectionStatus(deviceId, snapshot);
++      const delay = pendingSettleDelay(request, settled, now);
++      if (delay === 0) pendingStore.settle(deviceId);
++      else timers.push(setTimeout(() => pendingStore.settle(deviceId), delay));
++    }
++    return () => {
++      for (const timer of timers) clearTimeout(timer);
++    };
++  }, [pendingStore, pending, intentionallyDisconnected, slices]);
++}
++
+ function useDeviceStatusSlices(): DeviceRuntimeSlices {
+-  return {
+-    connectedDevices: useTmuxStore((state) => state.connectedDevices),
+-    deviceConnected: useTmuxStore((state) => state.deviceConnected),
+-    deviceErrors: useTmuxStore((state) => state.deviceErrors),
+-    deviceReconnecting: useTmuxStore((state) => state.deviceReconnecting),
+-  };
++  const connectedDevices = useTmuxStore((state) => state.connectedDevices);
++  const deviceConnected = useTmuxStore((state) => state.deviceConnected);
++  const deviceErrors = useTmuxStore((state) => state.deviceErrors);
++  const deviceReconnecting = useTmuxStore((state) => state.deviceReconnecting);
++  return useMemo(
++    () => ({ connectedDevices, deviceConnected, deviceErrors, deviceReconnecting }),
++    [connectedDevices, deviceConnected, deviceErrors, deviceReconnecting]
++  );
+ }
+ 
+ interface DeviceStoreActions {
+@@ -157,6 +201,7 @@ function useRouteDeviceSubscription(
+ 
+ function useIntentActions(
+   intentStore: DeviceIntentStore,
++  pendingStore: PendingConnectionRequests,
+   actions: DeviceStoreActions
+ ): Pick<DeviceConnectionAdapter, 'connect' | 'disconnect'> {
+   const { connectTmuxDevice, disconnectTmuxDevice, clearDeviceError } = actions;
+@@ -164,20 +209,22 @@ function useIntentActions(
+   const connect = useCallback(
+     (deviceId: string) => {
+       if (!deviceId) return;
++      pendingStore.begin(deviceId, 'connect');
+       intentStore.markConnectIntent(deviceId);
+       clearDeviceError(deviceId);
+       connectTmuxDevice(deviceId);
+     },
+-    [intentStore, clearDeviceError, connectTmuxDevice]
++    [intentStore, pendingStore, clearDeviceError, connectTmuxDevice]
+   );
+ 
+   const disconnect = useCallback(
+     (deviceId: string) => {
+       if (!deviceId) return;
++      pendingStore.begin(deviceId, 'disconnect');
+       intentStore.markDisconnectIntent(deviceId);
+       disconnectTmuxDevice(deviceId);
+     },
+-    [intentStore, disconnectTmuxDevice]
++    [intentStore, pendingStore, disconnectTmuxDevice]
+   );
+ 
+   return { connect, disconnect };
+@@ -186,34 +233,21 @@ function useIntentActions(
+ function useDeviceConnectionAdapter(
+   intentionallyDisconnected: ReadonlySet<string>,
+   slices: DeviceRuntimeSlices,
++  pending: PendingConnectionSnapshot,
+   intentActions: Pick<DeviceConnectionAdapter, 'connect' | 'disconnect'>
+ ): DeviceConnectionAdapter {
+-  const { connectedDevices, deviceConnected, deviceErrors, deviceReconnecting } = slices;
+   const { connect, disconnect } = intentActions;
+ 
+   return useMemo<DeviceConnectionAdapter>(() => {
+-    const snapshot = createDeviceConnectionSnapshot(intentionallyDisconnected, {
+-      connectedDevices,
+-      deviceConnected,
+-      deviceErrors,
+-      deviceReconnecting,
+-    });
++    const snapshot = createDeviceConnectionSnapshot(intentionallyDisconnected, slices, pending);
+     return {
+-      isConnected: (deviceId) => isDeviceConnected(deviceConnected, deviceId),
++      isConnected: (deviceId) => isDeviceConnected(slices.deviceConnected, deviceId),
+       status: (deviceId) => deriveDeviceConnectionStatus(deviceId, snapshot),
+       isIntentionallyDisconnected: (deviceId) => intentionallyDisconnected.has(deviceId),
+       connect,
+       disconnect,
+     };
+-  }, [
+-    intentionallyDisconnected,
+-    connectedDevices,
+-    deviceConnected,
+-    deviceErrors,
+-    deviceReconnecting,
+-    connect,
+-    disconnect,
+-  ]);
++  }, [intentionallyDisconnected, slices, pending, connect, disconnect]);
+ }
+ 
+ /**
+@@ -245,6 +279,7 @@ export function GlobalDeviceProvider({ children }: GlobalDeviceProviderProps) {
+   const actions = useDeviceStoreActions();
+   const slices = useDeviceStatusSlices();
+   const { store: intentStore, snapshot: intent } = useDeviceIntent(runtime.storagePrefix);
++  const { store: pendingStore, snapshot: pending } = usePendingRequests(runtime.storagePrefix);
+   const { connectedDevices } = slices;
+   const { connectTmuxDevice, disconnectTmuxDevice } = actions;
+ 
+@@ -271,8 +306,14 @@ export function GlobalDeviceProvider({ children }: GlobalDeviceProviderProps) {
+     disconnectTmuxDevice,
+   });
+ 
+-  const intentActions = useIntentActions(intentStore, actions);
+-  const connection = useDeviceConnectionAdapter(intent.disconnected, slices, intentActions);
++  usePendingSettlement(pendingStore, pending, intent.disconnected, slices);
++  const intentActions = useIntentActions(intentStore, pendingStore, actions);
++  const connection = useDeviceConnectionAdapter(
++    intent.disconnected,
++    slices,
++    pending,
++    intentActions
++  );
+ 
+   const value = useMemo(
+     () => ({ ensureDeviceSubscribed, connection }),
+diff --git a/apps/fe/src/pages/DevicesPage.test.tsx b/apps/fe/src/pages/DevicesPage.test.tsx
+index 478ca1ac..cad70b86 100644
+--- a/apps/fe/src/pages/DevicesPage.test.tsx
++++ b/apps/fe/src/pages/DevicesPage.test.tsx
+@@ -14,23 +14,23 @@ installWindowStorage();
+ mock.module('@tmex/panels/device-management', () => ({
+   DeviceManagementPanel: ({
+     listenOpenAddDeviceEvent,
+-    excludeDeviceIds,
++    offline,
++    fallbackDevices,
+   }: {
+     listenOpenAddDeviceEvent?: boolean;
+-    excludeDeviceIds?: ReadonlySet<string>;
++    offline?: boolean;
++    fallbackDevices?: readonly { id: string; name: string }[];
+   }) => (
+     <span
+       data-testid="device-panel"
+       data-listen={String(listenOpenAddDeviceEvent ?? true)}
+-      data-excluded={[...(excludeDeviceIds ?? [])].join(',')}
++      data-offline={String(offline ?? false)}
++      data-fallback={(fallbackDevices ?? []).map((device) => device.name).join(',')}
+     />
+   ),
+   DeviceManagementActions: ({ onAddDevice }: { onAddDevice?: () => void }) => (
+     <span data-testid="device-actions" data-callback={String(Boolean(onAddDevice))} />
+   ),
+-  DeviceCardHost: ({ device }: { device: { id: string } }) => (
+-    <span data-testid={`device-card-host-${device.id}`} />
+-  ),
+ }));
+ 
+ // 文件夹布局的数据层要 self runtime + QueryClient；本文件只关心「树把条目映射成什么」，
+@@ -42,10 +42,11 @@ mock.module('./devices/use-device-folders', () => ({
+     isError: false,
+     pending: false,
+     submitLayout: () => undefined,
+-    moveItemToRoot: () => undefined,
++    moveNodeToRoot: () => undefined,
+     createFolder: () => undefined,
+     renameFolder: () => undefined,
+     deleteFolder: () => undefined,
++    resetLayout: () => undefined,
+     refetch: () => undefined,
+   }),
+ }));
+@@ -58,6 +59,9 @@ const DevicesPageModule = await import('./DevicesPage');
+ const DevicesPage = DevicesPageModule.default;
+ const { PageActions } = DevicesPageModule;
+ const { nodeDeviceGroupState, toNodeDeviceGroups } = await import('./devices/node-device-group');
++const { registerDevicesPageCommands, resetDevicesPageCommandsForTest } = await import(
++  './devices/page-commands'
++);
+ const {
+   getAddDeviceTargets,
+   registerAddDeviceTarget,
+@@ -127,6 +131,8 @@ function renderMeshWith(nodes: MeshNode[]): string {
+ beforeEach(() => {
+   resetMeshNodesStateForTest();
+   resetAddDeviceTargetsForTest();
++  resetDevicesPageCommandsForTest();
++  localStorage.clear();
+ });
+ 
+ function target(overrides: { runtimeNodeId: string; name: string; isSelf?: boolean }) {
+@@ -189,11 +195,22 @@ describe('nodeDeviceGroupState', () => {
+ });
+ 
+ describe('DevicesPage', () => {
+-  test('mode 未加载时只渲染 loading，不建任何运行时', () => {
++  test('mode 未加载时只渲染 loading，不建任何运行时；loading 与就绪态共用同一个页面容器', () => {
+     const html = render();
+     expect(html).not.toContain('data-testid="device-panel"');
+     expect(html).not.toContain('data-testid="devices-folders-view"');
+     expect(html).toContain('animate-spin');
++    expect(html).toContain('data-testid="devices-page-container"');
++
++    setMeshNodesStateForTest({ mode: { ...MODE, mode: 'none' }, modeLoaded: true });
++    const ready = render();
++    const containerOf = (markup: string) => {
++      const index = markup.indexOf('data-testid="devices-page-container"');
++      return markup.slice(markup.lastIndexOf('<', index), markup.indexOf('>', index));
++    };
++    expect(containerOf(ready)).toBe(containerOf(html));
++    expect(containerOf(ready)).toContain('max-w-6xl');
++    expect(containerOf(ready)).toContain('xl:max-w-7xl');
+   });
+ 
+   test('standalone（mode:none）根层直接是本机的卡片网格：有面板但没有分组头', () => {
+@@ -250,11 +267,10 @@ describe('DevicesPage', () => {
+     expect(html).toContain('data-testid="devices-node-panel-self"');
+     expect(html).toContain('data-listen="true"');
+ 
+-    // 离线：灰显最近一次已知 inventory，不挂面板、不给登录按钮
+-    expect(html).toContain(`data-testid="devices-node-offline-${OFFLINE_ID}"`);
+-    expect(html).toContain('data-testid="devices-node-offline-device-d1"');
+-    expect(html).toContain('书房');
+-    expect(html).not.toContain(`data-testid="devices-node-panel-${OFFLINE_ID}"`);
++    // 离线：运行时与卡片面板仍在（offline 模式），卡片来自 inventory 兜底；不给登录按钮
++    const offlinePanel = html.slice(html.indexOf(`data-testid="devices-node-panel-${OFFLINE_ID}"`));
++    expect(offlinePanel).toContain('data-offline="true"');
++    expect(offlinePanel).toContain('data-fallback="书房"');
+     expect(html).not.toContain(`data-testid="node-login-${OFFLINE_ID}"`);
+ 
+     // 在线未登录：只给登录按钮，不挂面板
+@@ -285,9 +301,9 @@ describe('DevicesPage', () => {
+     expect(html).toContain(`data-testid="node-badge-${OFFLINE_ID}"`);
+     expect(html).toContain('data-online="false"');
+     expect(html).toContain('data-state="offline"');
+-    // inventory 为空时给空态
+-    expect(html).toContain(`data-testid="devices-node-offline-${OFFLINE_ID}"`);
+-    expect(html).not.toContain('data-testid="devices-node-offline-device-');
++    // inventory 为空且没有快照：面板拿到空的兜底列表，由面板渲染离线空态
++    const offlinePanel = html.slice(html.indexOf(`data-testid="devices-node-panel-${OFFLINE_ID}"`));
++    expect(offlinePanel).toContain('data-fallback=""');
+   });
+ });
+ 
+@@ -338,6 +354,23 @@ describe('PageActions（全页唯一的 +）', () => {
+     expect(html).toContain('data-testid="device-actions"');
+     expect(html).toContain('data-callback="false"');
+     expect(html).not.toContain('data-testid="devices-add"');
++    // 页面主体没挂载：分组相关的两个按钮都不显示
++    expect(html).not.toContain('data-testid="devices-new-folder"');
++    expect(html).not.toContain('data-testid="devices-reset-layout"');
++  });
++
++  test('页面主体登记命令后，顶栏出现「恢复默认布局」与「新建分组」', () => {
++    registerDevicesPageCommands({ newFolder: () => undefined, resetLayout: () => undefined });
++    const html = renderToStaticMarkup(
++      <MemoryRouter>
++        <PageActions />
++      </MemoryRouter>
++    );
++    expect(html).toContain('data-testid="devices-reset-layout"');
++    expect(html).toContain('data-testid="devices-new-folder"');
++    expect(html.indexOf('data-testid="devices-reset-layout"')).toBeLessThan(
++      html.indexOf('data-testid="devices-new-folder"')
++    );
+   });
+ 
+   test('只有一个 ready node 时是直接打开该节点对话框的单按钮', () => {
+diff --git a/apps/fe/src/pages/DevicesPage.tsx b/apps/fe/src/pages/DevicesPage.tsx
+index e0d604f7..34b8b5d0 100644
+--- a/apps/fe/src/pages/DevicesPage.tsx
++++ b/apps/fe/src/pages/DevicesPage.tsx
+@@ -1,22 +1,36 @@
+-// 设备管理页。页面主体是一棵文件夹树：文件夹里可以放整个 node 分组，也可以放单台设备；
+-// 没被放进任何文件夹的 node 按老顺序（self 在前、其余按名）排在根层末尾。
++// 设备管理页。页面主体是一个分组列表：分组只有一层，里面放整个 node；node 下的设备永远跟着
++// 节点走，只能在节点内排序。没被放进任何分组的 node 按老顺序（self 在前、其余按名）排在根层末尾。
+ // standalone / mesh 列表还没回来时根层只有一个 self 条目，直接就是今天的卡片网格（不显示分组头）。
+ //
+-// 文件夹布局只存在 entry 自己的库里，所有 `/api/device-folders/*` 请求都在本页顶层的 runtime
++// 分组布局只存在 entry 自己的库里，所有 `/api/device-folders/*` 请求都在本页顶层的 runtime
+ // 上发（见 `devices/use-device-folders.ts`），远端 node 的运行时里不发这类请求。
++//
++// 宽度 / 内边距只由 `DevicesPageContainer` 一处负责：loading、空态、错误态、就绪态共用，
++// 内层面板一律 `w-full`，不再各自套 max-width / padding。
+ 
+ import { useMeshNodes, useSharedAuthMode } from '@/node/mesh-nodes';
+ import { SELF_NODE_ID } from '@tmex/api-client';
+ import { DeviceManagementActions } from '@tmex/panels/device-management';
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogMedia,
++  AlertDialogTitle,
++} from '@tmex/ui/alert-dialog';
+ import { Button } from '@tmex/ui/button';
+-import { FolderPlus, Loader2 } from 'lucide-react';
+-import { useMemo } from 'react';
++import { FolderPlus, Loader2, RotateCcw } from 'lucide-react';
++import { type ReactNode, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { AddDeviceMenu } from './devices/add-device-menu';
+ import { useAddDeviceTargets } from './devices/add-device-targets';
+ import { DeviceFoldersView } from './devices/device-folders-view';
+-import { useNewFolderRequest } from './devices/new-folder-request';
+ import { type NodeDeviceGroupEntry, toNodeDeviceGroups } from './devices/node-device-group';
++import { useDevicesPageCommands } from './devices/page-commands';
+ 
+ /** standalone（以及 mesh 列表还没回来时）唯一的那个分组：本机自己。 */
+ function selfGroup(name: string): NodeDeviceGroupEntry {
+@@ -33,6 +47,17 @@ function selfGroup(name: string): NodeDeviceGroupEntry {
+   };
+ }
+ 
++export function DevicesPageContainer({ children }: { children: ReactNode }) {
++  return (
++    <div
++      data-testid="devices-page-container"
++      className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-3 px-4 py-3 pb-[calc(1rem+env(safe-area-inset-bottom))] sm:gap-4 sm:px-6 sm:py-5 xl:max-w-7xl"
++    >
++      {children}
++    </div>
++  );
++}
++
+ function DevicesBody({
+   meshEnabled,
+   entryNodeId,
+@@ -59,14 +84,17 @@ function DevicesBody({
+ export default function DevicesPage() {
+   const { loaded, meshEnabled, entryNodeId } = useSharedAuthMode();
+ 
+-  if (!loaded) {
+-    return (
+-      <div className="flex h-full items-center justify-center p-8 text-muted-foreground">
+-        <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
+-      </div>
+-    );
+-  }
+-  return <DevicesBody meshEnabled={meshEnabled} entryNodeId={entryNodeId} />;
++  return (
++    <DevicesPageContainer>
++      {loaded ? (
++        <DevicesBody meshEnabled={meshEnabled} entryNodeId={entryNodeId} />
++      ) : (
++        <div className="flex items-center justify-center py-16 text-muted-foreground">
++          <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
++        </div>
++      )}
++    </DevicesPageContainer>
++  );
+ }
+ 
+ // Page title component
+@@ -75,29 +103,77 @@ export function PageTitle() {
+   return <>{t('sidebar.manageDevices')}</>;
+ }
+ 
++function ResetLayoutButton({ onConfirm }: { onConfirm: () => void }) {
++  const { t } = useTranslation();
++  const [open, setOpen] = useState(false);
++  return (
++    <>
++      <Button
++        variant="ghost"
++        size="icon-sm"
++        data-testid="devices-reset-layout"
++        aria-label={t('devices.folders.resetLayout')}
++        title={t('devices.folders.resetLayout')}
++        onClick={() => setOpen(true)}
++      >
++        <RotateCcw className="h-4 w-4" />
++      </Button>
++      <AlertDialog open={open} onOpenChange={setOpen}>
++        <AlertDialogContent>
++          <AlertDialogHeader>
++            <AlertDialogMedia>
++              <RotateCcw className="h-5 w-5" />
++            </AlertDialogMedia>
++            <AlertDialogTitle>{t('devices.folders.resetConfirmTitle')}</AlertDialogTitle>
++            <AlertDialogDescription>
++              {t('devices.folders.resetConfirmDescription')}
++            </AlertDialogDescription>
++          </AlertDialogHeader>
++          <AlertDialogFooter>
++            <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
++            <AlertDialogAction
++              variant="destructive"
++              data-testid="devices-reset-layout-confirm"
++              onClick={() => {
++                setOpen(false);
++                onConfirm();
++              }}
++            >
++              {t('devices.folders.resetLayout')}
++            </AlertDialogAction>
++          </AlertDialogFooter>
++        </AlertDialogContent>
++      </AlertDialog>
++    </>
++  );
++}
++
+ // Page actions component
+ //
+-// 「新建文件夹」由页面主体登记入口（两棵子树，见 devices/new-folder-request.ts），没挂载就不显示。
+-// 全页唯一的「+」：多个 ready 节点先选目标，单个直接开该节点的对话框；
++// 「新建分组」「恢复默认布局」由页面主体登记入口（两棵子树，见 devices/page-commands.ts），
++// 没挂载就不显示。全页唯一的「+」：多个 ready 节点先选目标，单个直接开该节点的对话框；
+ // 一个都没登记（standalone / 单面板）时退回派发全局事件，与旧行为一致。
+ export function PageActions() {
+   const { t } = useTranslation();
+   const targets = useAddDeviceTargets();
+-  const newFolder = useNewFolderRequest();
++  const commands = useDevicesPageCommands();
+ 
+   return (
+     <div className="flex items-center gap-0.5">
+-      {newFolder && (
+-        <Button
+-          variant="ghost"
+-          size="icon-sm"
+-          data-testid="devices-new-folder"
+-          aria-label={t('devices.folders.newFolder')}
+-          title={t('devices.folders.newFolder')}
+-          onClick={newFolder}
+-        >
+-          <FolderPlus className="h-4 w-4" />
+-        </Button>
++      {commands && (
++        <>
++          <ResetLayoutButton onConfirm={commands.resetLayout} />
++          <Button
++            variant="ghost"
++            size="icon-sm"
++            data-testid="devices-new-folder"
++            aria-label={t('devices.folders.newFolder')}
++            title={t('devices.folders.newFolder')}
++            onClick={commands.newFolder}
++          >
++            <FolderPlus className="h-4 w-4" />
++          </Button>
++        </>
+       )}
+       {targets.length > 1 ? (
+         <AddDeviceMenu targets={targets} />
+diff --git a/apps/fe/src/pages/devices/device-folders-view.test.tsx b/apps/fe/src/pages/devices/device-folders-view.test.tsx
+index d0c5d1be..c0d8b015 100644
+--- a/apps/fe/src/pages/devices/device-folders-view.test.tsx
++++ b/apps/fe/src/pages/devices/device-folders-view.test.tsx
+@@ -1,35 +1,35 @@
+-// 文件夹树 ←→ 节点分组 / 单卡的映射。无 DOM 环境，用 react-dom/server 静态渲染
++// 分组列表 ←→ 节点分组的映射。无 DOM 环境，用 react-dom/server 静态渲染
+ // （与 DevicesPage.test.tsx、侧边栏聚合视图的测试同一套做法）。
+ 
+-import { describe, expect, mock, test } from 'bun:test';
++import { beforeEach, describe, expect, mock, test } from 'bun:test';
+ import type { DeviceFolderLayout } from '@tmex/shared';
+ import type { AppRuntime } from '@tmex/stores';
+ import { installWindowStorage } from '@tmex/stores/test-utils';
+ 
+ installWindowStorage();
+ 
+-// 面板与单卡换成探针：本文件测的是映射（谁被排除、谁进了哪个文件夹），
++// 面板换成探针：本文件测的是映射（谁进了哪个分组、把手落在哪里），
+ // 面板 / 卡片自身由 packages/panels 覆盖。
+ mock.module('@tmex/panels/device-management', () => ({
+   DeviceManagementPanel: ({
+     listenOpenAddDeviceEvent,
+-    excludeDeviceIds,
++    offline,
++    fallbackDevices,
+   }: {
+     listenOpenAddDeviceEvent?: boolean;
+-    excludeDeviceIds?: ReadonlySet<string>;
++    offline?: boolean;
++    fallbackDevices?: readonly { id: string }[];
+   }) => (
+     <span
+       data-testid="device-panel"
+       data-listen={String(listenOpenAddDeviceEvent ?? true)}
+-      data-excluded={[...(excludeDeviceIds ?? [])].join(',')}
++      data-offline={String(offline ?? false)}
++      data-fallback={(fallbackDevices ?? []).map((device) => device.id).join(',')}
+     />
+   ),
+   DeviceManagementActions: ({ onAddDevice }: { onAddDevice?: () => void }) => (
+     <span data-testid="device-actions" data-callback={String(Boolean(onAddDevice))} />
+   ),
+-  DeviceCardHost: ({ device }: { device: { id: string } }) => (
+-    <span data-testid={`device-card-host-${device.id}`} />
+-  ),
+ }));
+ 
+ let layout: DeviceFolderLayout = { folders: [], placements: [] };
+@@ -42,10 +42,11 @@ mock.module('./use-device-folders', () => ({
+     isError: false,
+     pending: false,
+     submitLayout: (next: DeviceFolderLayout | null) => submitted.push(next),
+-    moveItemToRoot: () => undefined,
++    moveNodeToRoot: () => undefined,
+     createFolder: () => undefined,
+     renameFolder: () => undefined,
+     deleteFolder: () => undefined,
++    resetLayout: () => undefined,
+     refetch: () => undefined,
+   }),
+ }));
+@@ -53,7 +54,7 @@ mock.module('./use-device-folders', () => ({
+ const { renderToStaticMarkup } = await import('react-dom/server');
+ const { MemoryRouter } = await import('react-router');
+ const { RuntimeProvider } = await import('@tmex/stores/react');
+-const { DeviceFoldersView, nodeItemCandidates } = await import('./device-folders-view');
++const { DeviceFoldersView, nodeCandidates } = await import('./device-folders-view');
+ 
+ const REMOTE_ID = '0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f';
+ const OFFLINE_ID = '0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c';
+@@ -76,13 +77,17 @@ function group(overrides: Partial<Group> & { runtimeNodeId: string }): Group {
+ 
+ const SELF = group({ runtimeNodeId: 'self', name: 'entry', isSelf: true });
+ const REMOTE = group({ runtimeNodeId: REMOTE_ID, name: 'studio' });
+-const OFFLINE = group({ runtimeNodeId: OFFLINE_ID, name: 'attic', online: false });
++const OFFLINE = group({
++  runtimeNodeId: OFFLINE_ID,
++  name: 'attic',
++  online: false,
++  inventory: { devices: [{ id: 'd9', name: '阁楼' }] },
++});
+ 
+ function folder(id: string) {
+   return {
+     id,
+     name: `folder-${id}`,
+-    parentId: null,
+     sortOrder: 0,
+     createdAt: '2026-08-29T00:00:00.000Z',
+     updatedAt: '2026-08-29T00:00:00.000Z',
+@@ -108,13 +113,20 @@ function render(groups: Group[], showNodeHeaders: boolean): string {
+   );
+ }
+ 
+-describe('nodeItemCandidates', () => {
+-  test('按分组顺序生成 node 条目（self 在前由 toNodeDeviceGroups 决定）', () => {
+-    expect(nodeItemCandidates([SELF, OFFLINE, REMOTE])).toEqual([
+-      { kind: 'node', nodeId: 'self', deviceId: null },
+-      { kind: 'node', nodeId: OFFLINE_ID, deviceId: null },
+-      { kind: 'node', nodeId: REMOTE_ID, deviceId: null },
+-    ]);
++function slice(html: string, testId: string): string {
++  const start = html.indexOf(`data-testid="${testId}"`);
++  const next = html.indexOf('data-testid="device-folder-item-', start + 1);
++  return html.slice(start, next === -1 ? undefined : next);
++}
++
++beforeEach(() => {
++  localStorage.clear();
++  submitted.length = 0;
++});
++
++describe('nodeCandidates', () => {
++  test('按分组顺序生成节点 id（self 在前由 toNodeDeviceGroups 决定）', () => {
++    expect(nodeCandidates([SELF, OFFLINE, REMOTE])).toEqual(['self', OFFLINE_ID, REMOTE_ID]);
+   });
+ });
+ 
+@@ -134,12 +146,10 @@ describe('DeviceFoldersView', () => {
+     expect(html).toContain('data-testid="devices-node-header-self"');
+   });
+ 
+-  test('被放进文件夹的节点从根层消失，出现在文件夹里', () => {
++  test('被放进分组的节点从根层消失，出现在分组里；把手落在节点头部', () => {
+     layout = {
+       folders: [folder('a')],
+-      placements: [
+-        { kind: 'node', nodeId: REMOTE_ID, deviceId: null, folderId: 'a', sortOrder: 0 },
+-      ],
++      placements: [{ nodeId: REMOTE_ID, folderId: 'a', sortOrder: 0 }],
+     };
+     const html = render([SELF, REMOTE], true);
+ 
+@@ -147,41 +157,46 @@ describe('DeviceFoldersView', () => {
+     const folderIndex = html.indexOf('data-testid="device-folder-a"');
+     const remoteIndex = html.indexOf(`data-testid="device-folder-item-node:${REMOTE_ID}"`);
+     const selfIndex = html.indexOf('data-testid="device-folder-item-node:self"');
+-    // 文件夹整体排在根层条目之前，被放进去的节点在文件夹内部
++    // 分组整体排在根层节点之前，被放进去的节点在分组内部
+     expect(folderIndex).toBeLessThan(remoteIndex);
+     expect(remoteIndex).toBeLessThan(selfIndex);
+-  });
+ 
+-  test('被单独放置的设备从所属节点的卡片网格里排除', () => {
+-    layout = {
+-      folders: [folder('a')],
+-      placements: [{ kind: 'device', nodeId: 'self', deviceId: 'd1', folderId: 'a', sortOrder: 0 }],
+-    };
+-    const html = render([SELF], true);
+-
+-    expect(html).toContain('data-excluded="d1"');
+-    expect(html).toContain('data-testid="device-folder-item-device:self:d1"');
++    const remote = slice(html, `device-folder-item-node:${REMOTE_ID}`);
++    const header = remote.indexOf(`data-testid="devices-node-header-${REMOTE_ID}"`);
++    const handle = remote.indexOf(`data-testid="device-folder-handle-${REMOTE_ID}"`);
++    const panel = remote.indexOf('data-testid="device-panel"');
++    expect(header).toBeGreaterThan(-1);
++    expect(handle).toBeGreaterThan(header);
++    expect(handle).toBeLessThan(panel);
++    // 分组内的节点额外给一个「移出分组」的入口
++    expect(remote).toContain(`data-testid="device-folder-move-out-${REMOTE_ID}"`);
+   });
+ 
+-  test('节点不可用时被放置的设备渲染灰色占位，且不改布局', () => {
+-    layout = {
+-      folders: [folder('a')],
+-      placements: [
+-        { kind: 'device', nodeId: OFFLINE_ID, deviceId: 'd9', folderId: 'a', sortOrder: 0 },
+-      ],
+-    };
++  test('离线节点保留运行时与卡片面板（offline 模式），兜底设备来自 inventory', () => {
++    layout = { folders: [], placements: [] };
+     const html = render([SELF, OFFLINE], true);
+ 
+-    expect(html).toContain(`data-testid="device-folder-missing-device:${OFFLINE_ID}:d9"`);
+-    expect(html).toContain('devices.folders.missingDevice');
+-    expect(html).toContain('attic · d9');
++    const offline = slice(html, `device-folder-item-node:${OFFLINE_ID}`);
++    expect(offline).toContain(`data-testid="devices-node-panel-${OFFLINE_ID}"`);
++    expect(offline).toContain('data-offline="true"');
++    expect(offline).toContain('data-fallback="d9"');
+     expect(submitted).toHaveLength(0);
+   });
+ 
++  test('离线节点优先用本地快照', () => {
++    localStorage.setItem(
++      `tmex:device-snapshot:${OFFLINE_ID}`,
++      JSON.stringify([{ id: 'snap', name: '快照', type: 'local', sortOrder: 0 }])
++    );
++    layout = { folders: [], placements: [] };
++    const html = render([SELF, OFFLINE], true);
++    expect(slice(html, `device-folder-item-node:${OFFLINE_ID}`)).toContain('data-fallback="snap"');
++  });
++
+   test('mesh 列表里已经没有的节点不渲染，也不改布局', () => {
+     layout = {
+       folders: [folder('a')],
+-      placements: [{ kind: 'node', nodeId: 'ghost', deviceId: null, folderId: 'a', sortOrder: 0 }],
++      placements: [{ nodeId: 'ghost', folderId: 'a', sortOrder: 0 }],
+     };
+     const html = render([SELF], true);
+ 
+@@ -200,16 +215,24 @@ describe('DeviceFoldersView', () => {
+     expect(html).not.toContain('devices.folders.dragHandle');
+   });
+ 
+-  test('standalone 下文件夹里的条目仍然可以拖回去', () => {
++  test('standalone 下进了分组的节点仍然可以拖回去', () => {
+     layout = {
+       folders: [folder('a')],
+-      placements: [{ kind: 'device', nodeId: 'self', deviceId: 'd1', folderId: 'a', sortOrder: 0 }],
++      placements: [{ nodeId: 'self', folderId: 'a', sortOrder: 0 }],
+     };
+     const html = render([SELF], false);
+ 
+-    expect(html).toContain('data-testid="device-folder-item-device:self:d1"');
+-    expect(html).toContain('devices.folders.dragHandle');
+-    // 文件夹内的条目额外给一个「移出文件夹」的入口
+-    expect(html).toContain('devices.folders.moveToRoot');
++    expect(html).toContain('data-testid="device-folder-item-node:self"');
++    expect(html).toContain('data-testid="device-folder-handle-self"');
++    expect(html).toContain('data-testid="device-folder-move-out-self"');
++  });
++
++  test('页面级容器不在这里：主体只是 w-full，不再套 max-width / padding', () => {
++    layout = { folders: [], placements: [] };
++    const html = render([SELF], false);
++    const start = html.indexOf('data-testid="devices-folders-view"');
++    const tag = html.slice(html.lastIndexOf('<', start), html.indexOf('>', start));
++    expect(tag).not.toContain('max-w-');
++    expect(tag).not.toMatch(/\b(p|px|py)-\d/);
+   });
+ });
+diff --git a/apps/fe/src/pages/devices/device-folders-view.tsx b/apps/fe/src/pages/devices/device-folders-view.tsx
+index 5fed4136..2a85cdea 100644
+--- a/apps/fe/src/pages/devices/device-folders-view.tsx
++++ b/apps/fe/src/pages/devices/device-folders-view.tsx
+@@ -1,62 +1,29 @@
+-// 设备管理页的主体：文件夹树 + 节点分组 / 单卡的映射。
++// 设备管理页的主体：分组列表 + 节点分组的映射。
+ //
+-// 树本身（拖拽、折叠、菜单、落点判定）在 `@tmex/panels/device-folders`，与业务解耦；
+-// 这里只负责把条目翻译成「一个 node 分组」或「一台被单独放置的设备」，以及把布局变更
+-// 交给 `use-device-folders`（只打 self 节点）。
++// 列表本身（拖拽、折叠、菜单、落点判定）在 `@tmex/panels/device-folders`，与业务解耦；
++// 这里只负责把节点 id 翻译成「一个 node 分组」（把手塞进分组头），以及把布局变更
++// 交给 `use-device-folders`（只打 self 节点），并把顶栏用的命令登记出去。
+ 
+ import {
+   type DeviceFolderDrop,
+-  DeviceFolderItemShell,
++  type DeviceFolderNodeContext,
+   DeviceFolderTree,
+   type DeviceFolderTreeHandle,
+   applyDrop,
+-  implicitRootItems,
+-  placedDeviceIds,
++  implicitRootNodeIds,
+ } from '@tmex/panels/device-folders';
+-import type { DeviceManagementPanelProps } from '@tmex/panels/device-management';
+-import type { Device, DeviceFolderItemRef } from '@tmex/shared';
+-import { deviceFolderItemKey } from '@tmex/shared';
+ import { useUIStore } from '@tmex/stores/react';
+ import { Button } from '@tmex/ui/button';
+ import { Reveal } from '@tmex/ui/motion';
+-import { type ReactNode, useCallback, useEffect, useMemo, useRef } from 'react';
++import { useCallback, useEffect, useMemo, useRef } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { deviceDisplayName, rememberDeviceName } from './device-name-cache';
+-import { registerNewFolderRequest } from './new-folder-request';
+ import { NodeDeviceGroup, type NodeDeviceGroupEntry } from './node-device-group';
+-import { PlacedDevice } from './placed-device';
++import { registerDevicesPageCommands } from './page-commands';
+ import { useDeviceFolders } from './use-device-folders';
+ 
+-/** 节点分组 → 树的候选条目（顺序即根层隐式条目的顺序：self 在前，其余按名） */
+-export function nodeItemCandidates(groups: readonly NodeDeviceGroupEntry[]): DeviceFolderItemRef[] {
+-  return groups.map((group) => ({
+-    kind: 'node' as const,
+-    nodeId: group.runtimeNodeId,
+-    deviceId: null,
+-  }));
+-}
+-
+-function makeRenderCard(
+-  runtimeNodeId: string,
+-  dragDisabled: boolean
+-): NonNullable<DeviceManagementPanelProps['renderCard']> {
+-  return (card: ReactNode, device: Device) => {
+-    rememberDeviceName(runtimeNodeId, device.id, device.name);
+-    return (
+-      <DeviceFolderItemShell
+-        key={device.id}
+-        itemKey={deviceFolderItemKey({
+-          kind: 'device',
+-          nodeId: runtimeNodeId,
+-          deviceId: device.id,
+-        })}
+-        mode="draggable"
+-        disabled={dragDisabled}
+-      >
+-        {card}
+-      </DeviceFolderItemShell>
+-    );
+-  };
++/** 节点分组 → 列表的候选节点 id（顺序即根层隐式节点的顺序：self 在前，其余按名） */
++export function nodeCandidates(groups: readonly NodeDeviceGroupEntry[]): string[] {
++  return groups.map((group) => group.runtimeNodeId);
+ }
+ 
+ export interface DeviceFoldersViewProps {
+@@ -72,62 +39,49 @@ export function DeviceFoldersView({ groups, showNodeHeaders }: DeviceFoldersView
+   const setExpanded = useUIStore((state) => state.setDeviceFolderExpanded);
+   const treeRef = useRef<DeviceFolderTreeHandle>(null);
+ 
+-  // 顶栏的「新建文件夹」按钮隔着一棵子树，只能靠模块级注册表把入口递上去
+-  useEffect(() => registerNewFolderRequest(() => treeRef.current?.startNewFolder(null)), []);
++  // 顶栏的按钮隔着一棵子树，只能靠模块级注册表把入口递上去
++  const { resetLayout } = folders;
++  useEffect(
++    () =>
++      registerDevicesPageCommands({
++        newFolder: () => treeRef.current?.startNewFolder(),
++        resetLayout,
++      }),
++    [resetLayout]
++  );
+ 
+   const { layout, pending } = folders;
+   const groupsById = useMemo(
+     () => new Map(groups.map((group) => [group.runtimeNodeId, group])),
+     [groups]
+   );
+-  const candidates = useMemo(() => nodeItemCandidates(groups), [groups]);
+-  const implicit = useMemo(() => implicitRootItems(layout, candidates), [layout, candidates]);
+-  const excludedByNode = useMemo(() => {
+-    const map = new Map<string, ReadonlySet<string>>();
+-    for (const group of groups) {
+-      map.set(group.runtimeNodeId, placedDeviceIds(layout, group.runtimeNodeId));
+-    }
+-    return map;
+-  }, [groups, layout]);
+-  const renderCardByNode = useMemo(() => {
+-    const map = new Map<string, NonNullable<DeviceManagementPanelProps['renderCard']>>();
+-    for (const group of groups) {
+-      map.set(group.runtimeNodeId, makeRenderCard(group.runtimeNodeId, pending));
+-    }
+-    return map;
+-  }, [groups, pending]);
++  const candidates = useMemo(() => nodeCandidates(groups), [groups]);
++  const implicit = useMemo(() => implicitRootNodeIds(layout, candidates), [layout, candidates]);
+ 
+-  const renderItem = useCallback(
+-    (item: DeviceFolderItemRef) => {
+-      const group = groupsById.get(item.nodeId) ?? null;
+-      if (item.kind === 'node') {
+-        // mesh 列表里已经没有这台机器（被移除 / 撤销）：不渲染，也不动布局
+-        if (!group) return null;
+-        return (
+-          <NodeDeviceGroup
+-            node={group}
+-            showHeader={showNodeHeaders}
+-            excludeDeviceIds={excludedByNode.get(group.runtimeNodeId)}
+-            renderCard={renderCardByNode.get(group.runtimeNodeId)}
+-          />
+-        );
+-      }
+-      return <PlacedDevice item={item} node={group} />;
++  const renderNode = useCallback(
++    (nodeId: string, ctx: DeviceFolderNodeContext) => {
++      const group = groupsById.get(nodeId);
++      // mesh 列表里已经没有这台机器（被移除 / 撤销）：不渲染，也不动布局
++      if (!group) return null;
++      return (
++        <NodeDeviceGroup
++          node={group}
++          showHeader={showNodeHeaders}
++          dragControls={ctx.dragControls}
++        />
++      );
+     },
+-    [groupsById, excludedByNode, renderCardByNode, showNodeHeaders]
++    [groupsById, showNodeHeaders]
+   );
+ 
+-  const itemLabel = useCallback(
+-    (item: DeviceFolderItemRef) => {
+-      if (item.kind === 'node') return groupsById.get(item.nodeId)?.name ?? item.nodeId;
+-      return deviceDisplayName(item.nodeId, item.deviceId ?? '');
+-    },
++  const nodeLabel = useCallback(
++    (nodeId: string) => groupsById.get(nodeId)?.name ?? nodeId,
+     [groupsById]
+   );
+ 
+-  const itemDraggable = useCallback(
+-    (item: DeviceFolderItemRef, ctx: { folderId: string | null }) =>
+-      showNodeHeaders || item.kind !== 'node' || ctx.folderId !== null,
++  // standalone 只有一个节点且没有分组头：根层的它拖不到别处去；进了分组的仍要能拖回来
++  const nodeDraggable = useCallback(
++    (_nodeId: string, ctx: { folderId: string | null }) => showNodeHeaders || ctx.folderId !== null,
+     [showNodeHeaders]
+   );
+ 
+@@ -138,10 +92,7 @@ export function DeviceFoldersView({ groups, showNodeHeaders }: DeviceFoldersView
+   );
+ 
+   return (
+-    <Reveal
+-      data-testid="devices-folders-view"
+-      className="mx-auto flex w-full max-w-6xl flex-col gap-3 p-3 pb-[calc(1rem+env(safe-area-inset-bottom))] sm:gap-4 sm:p-5"
+-    >
++    <Reveal data-testid="devices-folders-view" className="flex w-full min-w-0 flex-col gap-3">
+       {folders.isError && (
+         <div
+           data-testid="devices-folders-error"
+@@ -156,20 +107,20 @@ export function DeviceFoldersView({ groups, showNodeHeaders }: DeviceFoldersView
+       <DeviceFolderTree
+         ref={treeRef}
+         layout={layout}
+-        implicitRootItems={implicit}
+-        renderItem={renderItem}
+-        itemLabel={itemLabel}
+-        itemDraggable={itemDraggable}
++        implicitRootNodeIds={implicit}
++        renderNode={renderNode}
++        nodeLabel={nodeLabel}
++        nodeDraggable={nodeDraggable}
+         expanded={expanded}
+         onExpandedChange={setExpanded}
+         onDrop={handleDrop}
+         onCreateFolder={folders.createFolder}
+         onRenameFolder={folders.renameFolder}
+         onDeleteFolder={folders.deleteFolder}
+-        onMoveItemToRoot={folders.moveItemToRoot}
++        onMoveNodeToRoot={folders.moveNodeToRoot}
+         disabled={pending}
+       />
+-      {/* 布局提交在飞时禁用拖拽，避免先发后到的旧顺序覆盖新顺序（与设备树重排同一条规则） */}
++      {/* 布局提交在飞时禁用拖拽，避免先发后到的旧顺序覆盖新顺序（与设备排序同一条规则） */}
+       {pending && <span data-testid="devices-folders-pending" className="sr-only" />}
+     </Reveal>
+   );
+diff --git a/apps/fe/src/pages/devices/device-snapshot-store.test.ts b/apps/fe/src/pages/devices/device-snapshot-store.test.ts
+new file mode 100644
+index 00000000..8e5c2f23
+--- /dev/null
++++ b/apps/fe/src/pages/devices/device-snapshot-store.test.ts
+@@ -0,0 +1,114 @@
++// 节点设备列表的离线快照：落盘字段、读取校验、inventory 兜底。
++
++import { describe, expect, test } from 'bun:test';
++import type { Device } from '@tmex/shared';
++import {
++  type DeviceSnapshotStorage,
++  clearDeviceSnapshot,
++  deviceSnapshotKey,
++  inventoryFallbackDevices,
++  offlineDevices,
++  readDeviceSnapshot,
++  toSnapshotDevice,
++  writeDeviceSnapshot,
++} from './device-snapshot-store';
++
++const NODE_ID = '0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c';
++
++function memoryStorage(initial: Record<string, string> = {}): DeviceSnapshotStorage & {
++  entries: Map<string, string>;
++} {
++  const entries = new Map(Object.entries(initial));
++  return {
++    entries,
++    getItem: (key) => entries.get(key) ?? null,
++    setItem: (key, value) => {
++      entries.set(key, value);
++    },
++    removeItem: (key) => {
++      entries.delete(key);
++    },
++  };
++}
++
++const DEVICE: Device = {
++  id: 'd1',
++  name: '书房',
++  type: 'ssh',
++  host: '10.0.0.2',
++  port: 22,
++  username: 'root',
++  authMode: 'password',
++  passwordEnc: 'secret',
++  privateKeyEnc: 'secret-key',
++  sortOrder: 3,
++  createdAt: '2026-01-01T00:00:00.000Z',
++  updatedAt: '2026-01-01T00:00:00.000Z',
++};
++
++describe('device-snapshot-store', () => {
++  test('快照按节点分键，写入后原样读回，凭证字段不落盘', () => {
++    const storage = memoryStorage();
++    writeDeviceSnapshot(NODE_ID, [DEVICE], storage);
++    const raw = storage.entries.get(deviceSnapshotKey(NODE_ID)) ?? '';
++    expect(raw).not.toContain('secret');
++    expect(readDeviceSnapshot(NODE_ID, storage)).toEqual([toSnapshotDevice(DEVICE)]);
++    expect(readDeviceSnapshot('other', storage)).toBeNull();
++  });
++
++  test('坏数据 / 非数组 / 缺字段的条目被过滤', () => {
++    const storage = memoryStorage({
++      [deviceSnapshotKey(NODE_ID)]: JSON.stringify([
++        { id: 'ok', name: 'ok', type: 'local', sortOrder: 0 },
++        { id: 'bad-type', name: 'x', type: 'usb', sortOrder: 0 },
++        { name: 'no-id', type: 'local', sortOrder: 0 },
++        null,
++      ]),
++      [deviceSnapshotKey('broken')]: '{not json',
++      [deviceSnapshotKey('object')]: '{"id":"x"}',
++    });
++    expect(readDeviceSnapshot(NODE_ID, storage)?.map((device) => device.id)).toEqual(['ok']);
++    expect(readDeviceSnapshot('broken', storage)).toBeNull();
++    expect(readDeviceSnapshot('object', storage)).toBeNull();
++  });
++
++  test('clearDeviceSnapshot 只删自己的键', () => {
++    const storage = memoryStorage();
++    writeDeviceSnapshot(NODE_ID, [DEVICE], storage);
++    writeDeviceSnapshot('other', [DEVICE], storage);
++    clearDeviceSnapshot(NODE_ID, storage);
++    expect(readDeviceSnapshot(NODE_ID, storage)).toBeNull();
++    expect(readDeviceSnapshot('other', storage)).not.toBeNull();
++  });
++
++  test('没有 storage 时读写都静默', () => {
++    writeDeviceSnapshot(NODE_ID, [DEVICE], null);
++    expect(readDeviceSnapshot(NODE_ID, null)).toBeNull();
++  });
++
++  test('inventory 里的简化设备映射成最小 DTO，保持顺序', () => {
++    const devices = inventoryFallbackDevices({
++      devices: [
++        { id: 'a', name: '客厅' },
++        { id: 'b' },
++        { id: 'c', name: '远端', type: 'ssh' },
++        { name: 'no-id' },
++        'junk',
++      ],
++    });
++    expect(
++      devices.map((device) => [device.id, device.name, device.type, device.sortOrder])
++    ).toEqual([
++      ['a', '客厅', 'local', 0],
++      ['b', 'b', 'local', 1],
++      ['c', '远端', 'ssh', 2],
++    ]);
++    expect(inventoryFallbackDevices(null)).toEqual([]);
++    expect(inventoryFallbackDevices({ devices: 3 })).toEqual([]);
++  });
++
++  test('offlineDevices：本地快照优先，其次 inventory', () => {
++    const inventory = { devices: [{ id: 'inv', name: 'inventory' }] };
++    expect(offlineDevices('never-seen', inventory).map((device) => device.id)).toEqual(['inv']);
++  });
++});
+diff --git a/apps/fe/src/pages/devices/device-snapshot-store.ts b/apps/fe/src/pages/devices/device-snapshot-store.ts
+new file mode 100644
+index 00000000..cbeb07b6
+--- /dev/null
++++ b/apps/fe/src/pages/devices/device-snapshot-store.ts
+@@ -0,0 +1,126 @@
++// 每个节点最近一次成功拿到的设备列表快照，落在 localStorage（按 runtimeNodeId 分键）。
++// 节点离线时（含刷新后冷启动）设备页仍能渲染完整卡片；没有快照才退回服务端节点 inventory
++// 里的简化设备（只有 id / name）。
++
++import type { Device } from '@tmex/shared';
++
++const KEY_PREFIX = 'tmex:device-snapshot:';
++
++export interface DeviceSnapshotStorage {
++  getItem(key: string): string | null;
++  setItem(key: string, value: string): void;
++  removeItem(key: string): void;
++}
++
++function defaultStorage(): DeviceSnapshotStorage | null {
++  try {
++    return typeof window === 'undefined' ? null : window.localStorage;
++  } catch {
++    return null;
++  }
++}
++
++export function deviceSnapshotKey(runtimeNodeId: string): string {
++  return `${KEY_PREFIX}${runtimeNodeId}`;
++}
++
++/** 快照只留渲染卡片需要的字段，凭证之类的敏感字段一律不落盘 */
++export function toSnapshotDevice(device: Device): Device {
++  return {
++    id: device.id,
++    name: device.name,
++    type: device.type,
++    host: device.host,
++    port: device.port,
++    username: device.username,
++    sshConfigRef: device.sshConfigRef,
++    session: device.session,
++    authMode: device.authMode,
++    defaultWorkingDir: device.defaultWorkingDir,
++    sortOrder: device.sortOrder,
++    createdAt: device.createdAt,
++    updatedAt: device.updatedAt,
++  };
++}
++
++export function writeDeviceSnapshot(
++  runtimeNodeId: string,
++  devices: readonly Device[],
++  storage: DeviceSnapshotStorage | null = defaultStorage()
++): void {
++  if (!storage) return;
++  try {
++    storage.setItem(
++      deviceSnapshotKey(runtimeNodeId),
++      JSON.stringify(devices.map(toSnapshotDevice))
++    );
++  } catch {
++    // 配额满 / 隐私模式：快照只是离线兜底，写不进去也不影响在线功能
++  }
++}
++
++function isDevice(value: unknown): value is Device {
++  if (!value || typeof value !== 'object') return false;
++  const row = value as Record<string, unknown>;
++  return (
++    typeof row.id === 'string' &&
++    typeof row.name === 'string' &&
++    (row.type === 'local' || row.type === 'ssh') &&
++    typeof row.sortOrder === 'number'
++  );
++}
++
++export function readDeviceSnapshot(
++  runtimeNodeId: string,
++  storage: DeviceSnapshotStorage | null = defaultStorage()
++): Device[] | null {
++  if (!storage) return null;
++  try {
++    const raw = storage.getItem(deviceSnapshotKey(runtimeNodeId));
++    if (!raw) return null;
++    const parsed: unknown = JSON.parse(raw);
++    if (!Array.isArray(parsed)) return null;
++    return parsed.filter(isDevice);
++  } catch {
++    return null;
++  }
++}
++
++export function clearDeviceSnapshot(
++  runtimeNodeId: string,
++  storage: DeviceSnapshotStorage | null = defaultStorage()
++): void {
++  try {
++    storage?.removeItem(deviceSnapshotKey(runtimeNodeId));
++  } catch {
++    // ignore
++  }
++}
++
++/** 节点 inventory（`{ devices: [{ id, name }] }`）→ 只够渲染卡片的最小设备 DTO */
++export function inventoryFallbackDevices(inventory: unknown): Device[] {
++  if (!inventory || typeof inventory !== 'object') return [];
++  const devices = (inventory as { devices?: unknown }).devices;
++  if (!Array.isArray(devices)) return [];
++  const out: Device[] = [];
++  devices.forEach((item, index) => {
++    if (!item || typeof item !== 'object') return;
++    const row = item as { id?: unknown; name?: unknown; type?: unknown };
++    if (typeof row.id !== 'string' || !row.id) return;
++    out.push({
++      id: row.id,
++      name: typeof row.name === 'string' && row.name ? row.name : row.id,
++      type: row.type === 'ssh' ? 'ssh' : 'local',
++      authMode: 'auto',
++      sortOrder: index,
++      createdAt: '',
++      updatedAt: '',
++    });
++  });
++  return out;
++}
++
++/** 离线时的卡片数据来源：本地快照优先，其次节点 inventory */
++export function offlineDevices(runtimeNodeId: string, inventory: unknown): Device[] {
++  return readDeviceSnapshot(runtimeNodeId) ?? inventoryFallbackDevices(inventory);
++}
+diff --git a/apps/fe/src/pages/devices/node-device-group.tsx b/apps/fe/src/pages/devices/node-device-group.tsx
+index bd59b798..362882b7 100644
+--- a/apps/fe/src/pages/devices/node-device-group.tsx
++++ b/apps/fe/src/pages/devices/node-device-group.tsx
+@@ -1,7 +1,11 @@
+-// 设备管理页里的「一个 node」分组。三种形态与侧边栏聚合视图一致：
+-//   - 离线：灰显最近一次已知 inventory 里的设备名，不建连接、不发请求；
+-//   - 在线但未登录：只渲染「登录此节点」按钮，不建连接（避免每次渲染都撞 4401）；
+-//   - 在线且已登录：懒挂该 node 的运行时，在里面渲染完整的设备管理面板。
++// 设备管理页里的「一个 node」分组：分组头（把手 / 名称 / 在线态 / Hub / 版本）+ 该节点的设备卡片网格。
++//
++// 三种形态：
++//   - 在线且已登录：挂该 node 的运行时，在里面渲染完整的设备管理面板；
++//   - 离线：**运行时保持挂载**（ready→offline 翻转不卸载子树，卡片不会消失），面板进 offline
++//     模式：不再拉列表，卡片来自 query 缓存 / 本地快照 / 节点 inventory，带「节点离线」标记；
++//     连接开关显示「连接」，点了就是一次手动连接尝试（节点仍不通时会走到 error / reconnecting）；
++//   - 在线但未登录：只渲染「登录此节点」按钮，不建运行时（避免每次渲染都撞 4401）。
+ //
+ // 「添加设备」全页只有顶栏一个 +：ready 的分组把自己的 `openAddDevice` 登记到
+ // `add-device-targets` 注册表，顶栏据此直接开或先让用户选节点；面板自身仍不监听全局事件
+@@ -9,21 +13,20 @@
+ 
+ import { NodeLoginButton } from '@/auth';
+ import { useGlobalDevice } from '@/components/global-device-provider';
+-import { inventoryDevices } from '@/components/page-layouts/components/sidebar-node-section';
+ import { NodeRuntimeScope } from '@/node/node-runtime-scope';
+ import { SELF_NODE_ID } from '@tmex/api-client';
+ import type { MeshNode } from '@tmex/api-client/auth/index';
+ import {
+   DeviceManagementPanel,
+   type DeviceManagementPanelHandle,
+-  type DeviceManagementPanelProps,
+   type DeviceNodeContext,
+ } from '@tmex/panels/device-management';
+ import { NodeBadge } from '@tmex/panels/device-tree';
+-import { Monitor } from 'lucide-react';
+-import { type Ref, useCallback, useEffect, useRef } from 'react';
++import type { Device } from '@tmex/shared';
++import { type ReactNode, type Ref, useCallback, useEffect, useMemo, useRef } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { registerAddDeviceTarget } from './add-device-targets';
++import { offlineDevices, writeDeviceSnapshot } from './device-snapshot-store';
+ 
+ export interface NodeDeviceGroupEntry {
+   /** mesh 列表里的真实 node id。 */
+@@ -100,13 +103,20 @@ function StatusChip({ node }: { node: NodeDeviceGroupEntry }) {
+   );
+ }
+ 
+-function GroupHeader({ node }: { node: NodeDeviceGroupEntry }) {
++function GroupHeader({
++  node,
++  dragControls,
++}: {
++  node: NodeDeviceGroupEntry;
++  dragControls: ReactNode;
++}) {
+   const { t } = useTranslation();
+   return (
+     <div
+       className="flex min-w-0 flex-wrap items-center gap-1.5"
+       data-testid={`devices-node-header-${node.runtimeNodeId}`}
+     >
++      {dragControls}
+       <NodeBadge
+         info={{
+           nodeId: node.runtimeNodeId,
+@@ -137,39 +147,6 @@ function GroupHeader({ node }: { node: NodeDeviceGroupEntry }) {
+   );
+ }
+ 
+-function OfflineBody({ node }: { node: NodeDeviceGroupEntry }) {
+-  const { t } = useTranslation();
+-  const devices = inventoryDevices(node.inventory);
+-  return (
+-    <div
+-      data-testid={`devices-node-offline-${node.runtimeNodeId}`}
+-      className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2"
+-    >
+-      {devices.length === 0 ? (
+-        <p className="text-xs text-muted-foreground/60">{t('devices.nodes.noKnownDevices')}</p>
+-      ) : (
+-        <>
+-          <p className="pb-1.5 text-[11px] text-muted-foreground/60">
+-            {t('devices.nodes.lastKnownDevices')}
+-          </p>
+-          <ul className="space-y-1">
+-            {devices.map((device) => (
+-              <li
+-                key={device.id}
+-                data-testid={`devices-node-offline-device-${device.id}`}
+-                className="flex items-center gap-2 text-xs text-muted-foreground/60"
+-              >
+-                <Monitor className="h-3.5 w-3.5 shrink-0" />
+-                <span className="truncate">{device.name}</span>
+-              </li>
+-            ))}
+-          </ul>
+-        </>
+-      )}
+-    </div>
+-  );
+-}
+-
+ function SignedOutBody({ node }: { node: NodeDeviceGroupEntry }) {
+   const { t } = useTranslation();
+   return (
+@@ -194,47 +171,46 @@ export function nodeDeviceContext(node: NodeDeviceGroupEntry): DeviceNodeContext
+ function NodeDevicePanel({
+   node,
+   panelRef,
+-  excludeDeviceIds,
+-  renderCard,
++  offline,
+ }: {
+   node: NodeDeviceGroupEntry;
+   panelRef: Ref<DeviceManagementPanelHandle>;
+-  excludeDeviceIds?: ReadonlySet<string>;
+-  renderCard?: DeviceManagementPanelProps['renderCard'];
++  offline: boolean;
+ }) {
+   const { connection } = useGlobalDevice();
++  const runtimeNodeId = node.runtimeNodeId;
++  const onDevicesLoaded = useCallback(
++    (devices: Device[]) => writeDeviceSnapshot(runtimeNodeId, devices),
++    [runtimeNodeId]
++  );
++  // 只在离线时才去读快照 / inventory；在线时面板用的是真实列表
++  const fallbackDevices = useMemo(
++    () => (offline ? offlineDevices(runtimeNodeId, node.inventory) : undefined),
++    [offline, runtimeNodeId, node.inventory]
++  );
+   return (
+     <DeviceManagementPanel
+       ref={panelRef}
+       nodeContext={nodeDeviceContext(node)}
+       connection={connection}
+-      excludeDeviceIds={excludeDeviceIds}
+-      renderCard={renderCard}
+-      // 设备都被单独放进文件夹了：再显示「还没有设备」的空态只会误导
+-      hideEmptyState={(excludeDeviceIds?.size ?? 0) > 0}
++      offline={offline}
++      fallbackDevices={fallbackDevices}
++      onDevicesLoaded={onDevicesLoaded}
+       // entry 自身保留全局事件：外壳右上角的「添加设备」作用于 self。
+       listenOpenAddDeviceEvent={node.isSelf}
+-      className="max-w-none gap-2 p-0 pb-0 sm:gap-2 sm:p-0"
+     />
+   );
+ }
+ 
+ export interface NodeDeviceGroupProps {
+   node: NodeDeviceGroupEntry;
+-  /** 已被单独放进文件夹的设备，不再出现在本分组的卡片网格里 */
+-  excludeDeviceIds?: ReadonlySet<string>;
+-  /** 给每张卡片套一层（文件夹树用它挂拖拽把手） */
+-  renderCard?: DeviceManagementPanelProps['renderCard'];
+   /** standalone 只有一个节点，根层直接显示卡片网格，不要分组头 */
+   showHeader?: boolean;
++  /** 分组列表给的拖拽把手（与「移出分组」按钮），放在分组头最左 */
++  dragControls?: ReactNode;
+ }
+ 
+-export function NodeDeviceGroup({
+-  node,
+-  excludeDeviceIds,
+-  renderCard,
+-  showHeader = true,
+-}: NodeDeviceGroupProps) {
++export function NodeDeviceGroup({ node, showHeader = true, dragControls }: NodeDeviceGroupProps) {
+   const panelRef = useRef<DeviceManagementPanelHandle>(null);
+   const state = nodeDeviceGroupState(node);
+   const openAddDevice = useCallback(() => panelRef.current?.openAddDevice(), []);
+@@ -254,20 +230,22 @@ export function NodeDeviceGroup({
+     <section
+       data-testid={`devices-node-group-${node.runtimeNodeId}`}
+       data-state={state}
+-      className="flex flex-col gap-1.5"
++      className="flex min-w-0 flex-col gap-1.5"
+     >
+-      {showHeader && <GroupHeader node={node} />}
+-      {state === 'offline' && <OfflineBody node={node} />}
+-      {state === 'signedOut' && <SignedOutBody node={node} />}
+-      {state === 'ready' && (
+-        <div data-testid={`devices-node-panel-${node.runtimeNodeId}`}>
++      {/* standalone 根层不要分组头；但进了分组的节点必须有头（把手与「移出分组」都在头上） */}
++      {(showHeader || dragControls != null) && (
++        <GroupHeader node={node} dragControls={dragControls ?? null} />
++      )}
++      {state === 'signedOut' ? (
++        <SignedOutBody node={node} />
++      ) : (
++        // ready 与 offline 共用同一棵运行时子树：节点掉线只是把面板切到离线模式，不重挂
++        <div
++          data-testid={`devices-node-panel-${node.runtimeNodeId}`}
++          data-offline={state === 'offline' ? 'true' : undefined}
++        >
+           <NodeRuntimeScope nodeId={node.runtimeNodeId}>
+-            <NodeDevicePanel
+-              node={node}
+-              panelRef={panelRef}
+-              excludeDeviceIds={excludeDeviceIds}
+-              renderCard={renderCard}
+-            />
++            <NodeDevicePanel node={node} panelRef={panelRef} offline={state === 'offline'} />
+           </NodeRuntimeScope>
+         </div>
+       )}
+diff --git a/apps/fe/src/pages/devices/page-commands.test.ts b/apps/fe/src/pages/devices/page-commands.test.ts
+new file mode 100644
+index 00000000..95ebc88e
+--- /dev/null
++++ b/apps/fe/src/pages/devices/page-commands.test.ts
+@@ -0,0 +1,47 @@
++// 顶栏「新建分组 / 恢复默认布局」命令注册表。
++
++import { beforeEach, describe, expect, test } from 'bun:test';
++import {
++  type DevicesPageCommands,
++  getDevicesPageCommands,
++  registerDevicesPageCommands,
++  resetDevicesPageCommandsForTest,
++  subscribeDevicesPageCommands,
++} from './page-commands';
++
++function commands(): DevicesPageCommands {
++  return { newFolder: () => undefined, resetLayout: () => undefined };
++}
++
++describe('page-commands 注册表', () => {
++  beforeEach(() => resetDevicesPageCommandsForTest());
++
++  test('登记后顶栏拿得到命令，注销后回到空', () => {
++    expect(getDevicesPageCommands()).toBeNull();
++    const current = commands();
++    const unregister = registerDevicesPageCommands(current);
++    expect(getDevicesPageCommands()).toBe(current);
++    unregister();
++    expect(getDevicesPageCommands()).toBeNull();
++  });
++
++  test('旧的注销函数不会摘掉后来者（页面重挂时的顺序问题）', () => {
++    const first = commands();
++    const second = commands();
++    const unregisterFirst = registerDevicesPageCommands(first);
++    registerDevicesPageCommands(second);
++    unregisterFirst();
++    expect(getDevicesPageCommands()).toBe(second);
++  });
++
++  test('订阅者在登记 / 注销时各被通知一次', () => {
++    let notified = 0;
++    const unsubscribe = subscribeDevicesPageCommands(() => {
++      notified += 1;
++    });
++    const unregister = registerDevicesPageCommands(commands());
++    unregister();
++    unsubscribe();
++    expect(notified).toBe(2);
++  });
++});
+diff --git a/apps/fe/src/pages/devices/page-commands.ts b/apps/fe/src/pages/devices/page-commands.ts
+new file mode 100644
+index 00000000..b454aa58
+--- /dev/null
++++ b/apps/fe/src/pages/devices/page-commands.ts
+@@ -0,0 +1,54 @@
++// 顶栏「新建分组」「恢复默认布局」按钮的命令注册表。
++//
++// 与 `add-device-targets` 同一个理由：顶栏（PageActions）与页面主体（DevicesPage）挂在
++// 两棵互不相连的子树里，没法用 context 把树的 ref / 数据层递上去。页面主体挂载时登记一组
++// 回调，顶栏用 useSyncExternalStore 订阅；没人登记（页面没挂载）时顶栏不显示这些按钮。
++
++import { useSyncExternalStore } from 'react';
++
++export interface DevicesPageCommands {
++  newFolder: () => void;
++  resetLayout: () => void;
++}
++
++let current: DevicesPageCommands | null = null;
++const listeners = new Set<() => void>();
++
++function publish(): void {
++  for (const listener of listeners) listener();
++}
++
++/** 登记页面主体的命令，返回注销函数。 */
++export function registerDevicesPageCommands(commands: DevicesPageCommands): () => void {
++  current = commands;
++  publish();
++  return () => {
++    if (current !== commands) return;
++    current = null;
++    publish();
++  };
++}
++
++export function getDevicesPageCommands(): DevicesPageCommands | null {
++  return current;
++}
++
++export function subscribeDevicesPageCommands(onChange: () => void): () => void {
++  listeners.add(onChange);
++  return () => {
++    listeners.delete(onChange);
++  };
++}
++
++export function resetDevicesPageCommandsForTest(): void {
++  current = null;
++  listeners.clear();
++}
++
++export function useDevicesPageCommands(): DevicesPageCommands | null {
++  return useSyncExternalStore(
++    subscribeDevicesPageCommands,
++    getDevicesPageCommands,
++    getDevicesPageCommands
++  );
++}
+diff --git a/apps/fe/src/pages/devices/use-device-folders.ts b/apps/fe/src/pages/devices/use-device-folders.ts
+index 835faa15..952fc961 100644
+--- a/apps/fe/src/pages/devices/use-device-folders.ts
++++ b/apps/fe/src/pages/devices/use-device-folders.ts
+@@ -1,9 +1,10 @@
+-// 设备管理页文件夹布局的数据层。
++// 设备管理页分组布局的数据层。
+ //
+ // 这些请求**只打 self 节点**（提供 UI 的那台机器自己的库），所以必须在 DevicesPage 顶层的
+ // runtime 下调用，不能挂到远端 node 的 NodeRuntimeScope 里。
+ // 移动与排序统一走 `PUT /api/device-folders/layout`：新布局由 `@tmex/shared` 的纯函数算出，
+ // 乐观写进 query cache，失败整份回滚；上一次提交在飞时禁用拖拽（`pending`）。
++// 「恢复默认布局」走 `POST /api/device-folders/reset`，服务端一个事务删光分组与 placement。
+ 
+ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+ import {
+@@ -12,13 +13,13 @@ import {
+   deviceFoldersQueryKey,
+   fetchDeviceFolderLayout,
+   replaceDeviceFolderLayout,
++  resetDeviceFolderLayout,
+   updateDeviceFolder,
+ } from '@tmex/api-client';
+ import {
+-  type DeviceFolderItemRef,
+   type DeviceFolderLayout,
+   type UpdateDeviceFolderLayoutRequest,
+-  removeItemFromLayout,
++  removeNodeFromLayout,
+   reparentOnFolderDelete,
+ } from '@tmex/shared';
+ import { useRuntime } from '@tmex/stores/react';
+@@ -30,11 +31,7 @@ const EMPTY_LAYOUT: DeviceFolderLayout = { folders: [], placements: [] };
+ 
+ export function toLayoutRequest(layout: DeviceFolderLayout): UpdateDeviceFolderLayoutRequest {
+   return {
+-    folders: layout.folders.map((folder) => ({
+-      id: folder.id,
+-      parentId: folder.parentId,
+-      sortOrder: folder.sortOrder,
+-    })),
++    folders: layout.folders.map((folder) => ({ id: folder.id, sortOrder: folder.sortOrder })),
+     placements: layout.placements,
+   };
+ }
+@@ -47,10 +44,11 @@ export interface DeviceFoldersApi {
+   pending: boolean;
+   /** 提交一份算好的新布局；null（非法落点）直接忽略 */
+   submitLayout: (next: DeviceFolderLayout | null) => void;
+-  moveItemToRoot: (item: DeviceFolderItemRef) => void;
+-  createFolder: (name: string, parentId: string | null) => void;
++  moveNodeToRoot: (nodeId: string) => void;
++  createFolder: (name: string) => void;
+   renameFolder: (folderId: string, name: string) => void;
+   deleteFolder: (folderId: string) => void;
++  resetLayout: () => void;
+   refetch: () => void;
+ }
+ 
+@@ -64,7 +62,7 @@ export function useDeviceFolders(): DeviceFoldersApi {
+     queryFn: () => fetchDeviceFolderLayout(runtime.apiClient),
+     throwOnError: false,
+   });
+-  // 布局没取到（首次加载中 / 失败）时只能展示空树，绝不能据此写回：
++  // 布局没取到（首次加载中 / 失败）时只能展示空列表，绝不能据此写回：
+   // 服务端可能有根层 placement，整表替换会把它们抹掉。
+   const ready = query.data !== undefined;
+   const layout = query.data ?? EMPTY_LAYOUT;
+@@ -93,12 +91,8 @@ export function useDeviceFolders(): DeviceFoldersApi {
+   });
+ 
+   const createMutation = useMutation({
+-    mutationFn: (variables: { name: string; parentId: string | null }) =>
+-      createDeviceFolder(
+-        { name: variables.name, parentId: variables.parentId },
+-        t('devices.folders.createFailed'),
+-        runtime.apiClient
+-      ),
++    mutationFn: (name: string) =>
++      createDeviceFolder({ name }, t('devices.folders.createFailed'), runtime.apiClient),
+     onSuccess: () => {
+       void queryClient.invalidateQueries({ queryKey: deviceFoldersQueryKey });
+     },
+@@ -126,7 +120,7 @@ export function useDeviceFolders(): DeviceFoldersApi {
+   const deleteMutation = useMutation({
+     mutationFn: (folderId: string) =>
+       deleteDeviceFolder(folderId, t('devices.folders.deleteFailed'), runtime.apiClient),
+-    // 服务端同样把子项上提到父级，乐观结果与之一致
++    // 服务端同样把其中的节点上提到根层，乐观结果与之一致
+     onMutate: async (folderId: string) => {
+       await queryClient.cancelQueries({ queryKey: deviceFoldersQueryKey });
+       const previous = queryClient.getQueryData<DeviceFolderLayout>(deviceFoldersQueryKey);
+@@ -144,10 +138,28 @@ export function useDeviceFolders(): DeviceFoldersApi {
+     },
+   });
+ 
++  const resetMutation = useMutation({
++    mutationFn: () => resetDeviceFolderLayout(t('devices.folders.resetFailed'), runtime.apiClient),
++    onMutate: async () => {
++      await queryClient.cancelQueries({ queryKey: deviceFoldersQueryKey });
++      const previous = queryClient.getQueryData<DeviceFolderLayout>(deviceFoldersQueryKey);
++      queryClient.setQueryData(deviceFoldersQueryKey, EMPTY_LAYOUT);
++      return { previous };
++    },
++    onError: (error, _variables, context) => {
++      if (context?.previous) queryClient.setQueryData(deviceFoldersQueryKey, context.previous);
++      toast.error(error instanceof Error ? error.message : t('devices.folders.resetFailed'));
++    },
++    onSuccess: (result) => {
++      queryClient.setQueryData(deviceFoldersQueryKey, result);
++      toast.success(t('devices.folders.resetDone'));
++    },
++  });
++
+   // 整表替换必须串行：上一份还在飞时再提交，先发后到的旧布局会覆盖新布局；
+   // 这里直接拒绝（拖拽与菜单入口在 pending 期间同样被禁用）。
+   const replaceMutate = replaceLayout.mutate;
+-  const replacePending = replaceLayout.isPending;
++  const replacePending = replaceLayout.isPending || resetMutation.isPending;
+   const submitLayout = useCallback(
+     (next: DeviceFolderLayout | null) => {
+       if (!next || !ready || replacePending) return;
+@@ -156,16 +168,13 @@ export function useDeviceFolders(): DeviceFoldersApi {
+     [replaceMutate, ready, replacePending]
+   );
+ 
+-  const moveItemToRoot = useCallback(
+-    (item: DeviceFolderItemRef) => submitLayout(removeItemFromLayout(layout, item)),
++  const moveNodeToRoot = useCallback(
++    (nodeId: string) => submitLayout(removeNodeFromLayout(layout, nodeId)),
+     [layout, submitLayout]
+   );
+ 
+   const createMutate = createMutation.mutate;
+-  const createFolder = useCallback(
+-    (name: string, parentId: string | null) => createMutate({ name, parentId }),
+-    [createMutate]
+-  );
++  const createFolder = useCallback((name: string) => createMutate(name), [createMutate]);
+ 
+   const renameMutate = renameMutation.mutate;
+   const renameFolder = useCallback(
+@@ -176,6 +185,13 @@ export function useDeviceFolders(): DeviceFoldersApi {
+   const deleteMutate = deleteMutation.mutate;
+   const deleteFolder = useCallback((folderId: string) => deleteMutate(folderId), [deleteMutate]);
+ 
++  const resetMutate = resetMutation.mutate;
++  const resetPending = resetMutation.isPending;
++  const resetLayout = useCallback(() => {
++    if (!ready || resetPending) return;
++    resetMutate();
++  }, [resetMutate, ready, resetPending]);
++
+   const refetchQuery = query.refetch;
+   const refetch = useCallback(() => void refetchQuery(), [refetchQuery]);
+ 
+@@ -183,12 +199,13 @@ export function useDeviceFolders(): DeviceFoldersApi {
+     layout,
+     isLoading: query.isLoading,
+     isError: query.isError,
+-    pending: !ready || replaceLayout.isPending,
++    pending: !ready || replacePending,
+     submitLayout,
+-    moveItemToRoot,
++    moveNodeToRoot,
+     createFolder,
+     renameFolder,
+     deleteFolder,
++    resetLayout,
+     refetch,
+   };
+ }

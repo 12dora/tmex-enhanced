@@ -1,0 +1,2947 @@
+diff --git a/packages/panels/src/device-connection.ts b/packages/panels/src/device-connection.ts
+index 77c54798..37c64694 100644
+--- a/packages/panels/src/device-connection.ts
++++ b/packages/panels/src/device-connection.ts
+@@ -1,6 +1,7 @@
+ export type DeviceConnectionStatus =
+   | 'connected'
+   | 'connecting'
++  | 'disconnecting'
+   | 'disconnected'
+   | 'reconnecting'
+   | 'error';
+diff --git a/packages/panels/src/device-folders/device-folder-tree.test.tsx b/packages/panels/src/device-folders/device-folder-tree.test.tsx
+index 7370b887..ad5a4277 100644
+--- a/packages/panels/src/device-folders/device-folder-tree.test.tsx
++++ b/packages/panels/src/device-folders/device-folder-tree.test.tsx
+@@ -2,37 +2,28 @@
+ // 交互态（重命名 / 新建行）由外部 props 驱动的 FolderSection / FolderNameEditor 直接覆盖。
+ 
+ import { describe, expect, test } from 'bun:test';
+-import type { DeviceFolder, DeviceFolderItemRef, DeviceFolderLayout } from '@tmex/shared';
++import type { DeviceFolder, DeviceFolderLayout } from '@tmex/shared';
+ import { renderToStaticMarkup } from 'react-dom/server';
+ 
+ import { DeviceFolderTree } from './device-folder-tree';
+ import { FolderNameEditor } from './folder-name-editor';
+ import { FolderSection } from './folder-section';
+ 
+-function folder(id: string, parentId: string | null, sortOrder: number): DeviceFolder {
++function folder(id: string, sortOrder: number): DeviceFolder {
+   return {
+     id,
+     name: `folder-${id}`,
+-    parentId,
+     sortOrder,
+     createdAt: '2026-08-29T00:00:00.000Z',
+     updatedAt: '2026-08-29T00:00:00.000Z',
+   };
+ }
+ 
+-function nodeItem(nodeId: string): DeviceFolderItemRef {
+-  return { kind: 'node', nodeId, deviceId: null };
+-}
+-
+-function deviceItem(nodeId: string, deviceId: string): DeviceFolderItemRef {
+-  return { kind: 'device', nodeId, deviceId };
+-}
+-
+ const LAYOUT: DeviceFolderLayout = {
+-  folders: [folder('a', null, 0), folder('b', null, 1), folder('a1', 'a', 0)],
++  folders: [folder('a', 0), folder('b', 1)],
+   placements: [
+-    { ...deviceItem('self', 'd1'), folderId: 'a', sortOrder: 0 },
+-    { ...nodeItem('n1'), folderId: null, sortOrder: 0 },
++    { nodeId: 'n1', folderId: 'a', sortOrder: 0 },
++    { nodeId: 'n2', folderId: null, sortOrder: 0 },
+   ],
+ };
+ 
+@@ -42,89 +33,105 @@ function renderTree(
+   return renderToStaticMarkup(
+     <DeviceFolderTree
+       layout={LAYOUT}
+-      implicitRootItems={[nodeItem('self')]}
++      implicitRootNodeIds={['self']}
+       expanded={{}}
+-      itemLabel={(item) => `label:${item.nodeId}`}
+-      renderItem={(item) => <span data-testid={`rendered-${item.kind}-${item.nodeId}`} />}
++      nodeLabel={(nodeId) => `label:${nodeId}`}
++      renderNode={(nodeId, ctx) => (
++        <span data-testid={`rendered-${nodeId}`} data-in-folder={ctx.folderId ?? 'root'}>
++          {ctx.dragControls}
++        </span>
++      )}
+       onExpandedChange={() => undefined}
+       onDrop={() => undefined}
+       onCreateFolder={() => undefined}
+       onRenameFolder={() => undefined}
+       onDeleteFolder={() => undefined}
+-      onMoveItemToRoot={() => undefined}
++      onMoveNodeToRoot={() => undefined}
+       {...overrides}
+     />
+   );
+ }
+ 
+ describe('DeviceFolderTree', () => {
+-  test('渲染文件夹层级、计数与条目外壳', () => {
++  test('渲染分组、计数与节点外壳', () => {
+     const html = renderTree();
+ 
+     expect(html).toContain('data-testid="device-folder-tree"');
+     expect(html).toContain('data-testid="device-folder-a"');
+     expect(html).toContain('data-testid="device-folder-b"');
+-    expect(html).toContain('data-testid="device-folder-a1"');
+     expect(html).toContain('data-testid="device-folder-toggle-a"');
+     expect(html).toContain('data-testid="device-folder-name-a"');
+     expect(html).toContain('data-testid="device-folder-menu-a"');
+-    // 条目外壳按 deviceFolderItemKey 命名
+     expect(html).toContain('data-testid="device-folder-item-node:n1"');
++    expect(html).toContain('data-testid="device-folder-item-node:n2"');
+     expect(html).toContain('data-testid="device-folder-item-node:self"');
+-    expect(html).toContain('data-testid="device-folder-item-device:self:d1"');
+-    expect(html).toContain('data-testid="rendered-device-self"');
++    expect(html).toContain('data-in-folder="a"');
++  });
++
++  test('分组是虚线边框的放置区', () => {
++    const html = renderTree();
++    const index = html.indexOf('data-testid="device-folder-a"');
++    const tag = html.slice(html.lastIndexOf('<', index), html.indexOf('>', index));
++    expect(tag).toContain('border-dashed');
+   });
+ 
+-  test('缩进层级写在 data-depth 上，根文件夹为 0、子文件夹为 1', () => {
++  test('把手与「移出分组」按钮交给宿主放进节点头部', () => {
+     const html = renderTree();
+-    const depthOf = (id: string) => {
+-      const marker = `data-testid="device-folder-${id}"`;
+-      const index = html.indexOf(marker);
+-      const tag = html.slice(html.lastIndexOf('<', index), html.indexOf('>', index));
+-      return tag.match(/data-depth="(\d+)"/)?.[1] ?? null;
+-    };
+-    expect(depthOf('a')).toBe('0');
+-    expect(depthOf('a1')).toBe('1');
++    const n1 = html.slice(
++      html.indexOf('data-testid="rendered-n1"'),
++      html.indexOf('data-testid="rendered-n2"')
++    );
++    expect(n1).toContain('data-testid="device-folder-handle-n1"');
++    expect(n1).toContain('data-testid="device-folder-move-out-n1"');
++    const n2 = html.slice(html.indexOf('data-testid="rendered-n2"'));
++    expect(n2).toContain('data-testid="device-folder-handle-n2"');
++    expect(n2).not.toContain('data-testid="device-folder-move-out-n2"');
+   });
+ 
+-  test('隐式根条目排在显式 placement 之后', () => {
++  test('隐式根节点排在显式 placement 之后', () => {
+     const html = renderTree();
+-    expect(html.indexOf('data-testid="device-folder-item-node:n1"')).toBeLessThan(
++    expect(html.indexOf('data-testid="device-folder-item-node:n2"')).toBeLessThan(
+       html.indexOf('data-testid="device-folder-item-node:self"')
+     );
+   });
+ 
+-  test('空文件夹渲染放置提示，非空的不渲染', () => {
++  test('空分组渲染虚线放置提示，非空的不渲染', () => {
+     const html = renderTree();
+-    expect(html).toContain('data-testid="device-folder-drop-a1"');
+     expect(html).toContain('data-testid="device-folder-drop-b"');
+     expect(html).not.toContain('data-testid="device-folder-drop-a"');
+   });
+ 
+-  test('itemDraggable 返回 false 的条目不套拖拽把手', () => {
+-    const html = renderTree({
+-      itemDraggable: (item) => !(item.kind === 'node' && item.nodeId === 'self'),
+-    });
++  test('没有拖拽时不渲染「移到最外层」落点条', () => {
++    expect(renderTree()).not.toContain('data-testid="device-folder-drop-root"');
++  });
++
++  test('分组菜单里没有「新建子分组」', () => {
++    const html = renderTree();
++    expect(html).not.toContain('device-folder-new-sub-');
++    expect(html).not.toContain('devices.folders.newSubfolder');
++  });
++
++  test('nodeDraggable 返回 false 的节点不套拖拽把手', () => {
++    const html = renderTree({ nodeDraggable: (nodeId) => nodeId !== 'self' });
+     const index = html.indexOf('data-testid="device-folder-item-node:self"');
+-    const nextItem = html.indexOf('data-testid="device-folder-item-', index + 1);
+-    const slice = html.slice(index, nextItem === -1 ? undefined : nextItem);
+-    expect(slice).toContain('data-testid="rendered-node-self"');
++    const slice = html.slice(index);
++    expect(slice).toContain('data-testid="rendered-self"');
+     expect(slice).not.toContain('devices.folders.dragHandle');
+   });
+ 
+-  test('初始就收起的文件夹不挂载内容（其中的落点与远端 runtime 随之释放），并标记 aria-hidden', () => {
++  test('初始就收起的分组不挂载内容，并标记 aria-hidden', () => {
+     const html = renderTree({ expanded: { a: false } });
+     const index = html.indexOf('data-testid="device-folder-a"');
+     const tag = html.slice(html.lastIndexOf('<', index), html.indexOf('>', index));
+     expect(tag).toContain('data-expanded="false"');
+     expect(html).toContain('aria-hidden="true"');
+-    expect(html).not.toContain('data-testid="device-folder-item-device:self:d1"');
++    expect(html).not.toContain('data-testid="device-folder-item-node:n1"');
+   });
+ 
+-  test('没有文件夹也没有条目时只渲染空树容器', () => {
++  test('没有分组也没有节点时只渲染空树容器', () => {
+     const html = renderTree({
+       layout: { folders: [], placements: [] },
+-      implicitRootItems: [],
++      implicitRootNodeIds: [],
+     });
+     expect(html).toContain('data-testid="device-folder-tree"');
+     expect(html).not.toContain('data-testid="device-folder-item-');
+@@ -135,8 +142,7 @@ describe('FolderSection', () => {
+   function renderSection(overrides: Partial<React.ComponentProps<typeof FolderSection>> = {}) {
+     return renderToStaticMarkup(
+       <FolderSection
+-        folder={folder('a', null, 0)}
+-        depth={0}
++        folder={folder('a', 0)}
+         itemCount={3}
+         expanded={true}
+         renaming={false}
+@@ -146,7 +152,6 @@ describe('FolderSection', () => {
+         onStartRename={() => undefined}
+         onSubmitRename={() => undefined}
+         onCancelRename={() => undefined}
+-        onNewSubfolder={() => undefined}
+         onDelete={() => undefined}
+         {...overrides}
+       >
+@@ -171,17 +176,10 @@ describe('FolderSection', () => {
+     expect(html).not.toContain('data-testid="device-folder-menu-a"');
+   });
+ 
+-  test('拖拽命中时文件夹头标出 data-drop-target', () => {
++  test('拖拽命中时整个分组标出 data-drop-target', () => {
+     expect(renderSection()).not.toContain('data-drop-target="true"');
+     expect(renderSection({ dropTarget: true })).toContain('data-drop-target="true"');
+   });
+-
+-  test('缩进封顶：超过 MAX_INDENT_DEPTH 的层级不再加竖线与内边距', () => {
+-    expect(renderSection({ depth: 3 })).toContain('border-l');
+-    const capped = renderSection({ depth: 9 });
+-    expect(capped).toContain('data-depth="6"');
+-    expect(capped).not.toContain('border-l');
+-  });
+ });
+ 
+ describe('FolderNameEditor', () => {
+diff --git a/packages/panels/src/device-folders/device-folder-tree.tsx b/packages/panels/src/device-folders/device-folder-tree.tsx
+index 39905867..b22a5825 100644
+--- a/packages/panels/src/device-folders/device-folder-tree.tsx
++++ b/packages/panels/src/device-folders/device-folder-tree.tsx
+@@ -1,8 +1,9 @@
+-// 设备文件夹树的通用 UI：只认 `DeviceFolderLayout`、条目 key 与宿主给的 `renderItem`，
+-// 不知道设备 / 节点这些业务概念，宿主（apps/fe）负责把条目渲染成节点分组或设备卡片。
++// 设备分组列表的通用 UI：只认 `DeviceFolderLayout`、节点 id 与宿主给的 `renderNode`，
++// 不知道设备这个业务概念，宿主（apps/fe）负责把节点渲染成分组头 + 卡片网格。
+ //
+ // 落点判定全部在 `folder-tree-model.ts`（纯函数，有单测），本文件只做交互与呈现：
+-// 命中高亮、折叠文件夹的悬停自动展开、拖拽预览、就地重命名 / 新建 / 删除确认。
++// 命中高亮、折叠分组的悬停自动展开、拖拽预览、就地重命名 / 新建 / 删除确认、
++// 以及拖动分组内节点时出现在列表末尾的「移到最外层」落点条。
+ 
+ import {
+   DndContext,
+@@ -20,12 +21,9 @@ import type {
+ import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
+ import {
+   type DeviceFolder,
+-  type DeviceFolderItemRef,
+   type DeviceFolderLayout,
+-  buildDeviceFolderTree,
+-  deviceFolderItemKey,
+-  parseDeviceFolderItemKey,
+-  wouldCreateFolderCycle,
++  countFolderItems,
++  findNodeFolderId,
+ } from '@tmex/shared';
+ import { cn } from '@tmex/ui';
+ import {
+@@ -39,7 +37,7 @@ import {
+   AlertDialogMedia,
+   AlertDialogTitle,
+ } from '@tmex/ui/alert-dialog';
+-import { Folder, Monitor, Trash2 } from 'lucide-react';
++import { Folder, Server, Trash2 } from 'lucide-react';
+ import {
+   type ReactNode,
+   type Ref,
+@@ -53,9 +51,8 @@ import {
+   useState,
+ } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { toast } from 'sonner';
+ import { useDeviceTreeSensors } from '../device-tree/device-tree-dnd';
+-import { DeviceFolderItemShell } from './draggable-item';
++import { DeviceFolderNodeShell } from './draggable-item';
+ import { FolderNameEditor } from './folder-name-editor';
+ import { FolderDropArea, FolderSection } from './folder-section';
+ import {
+@@ -64,50 +61,53 @@ import {
+   ROOT_CONTAINER_ID,
+   bodyDropZoneId,
+   containerFolderId,
++  dropTargetContainerId,
+   dropZoneId,
+   folderContainerId,
+   listContainers,
+   parseDropZoneId,
+   parseFolderElementId,
++  parseNodeElementId,
+   resolveDrop,
+-  resolveDropTarget,
++  rootFolderElementIds,
+ } from './folder-tree-model';
+ 
+-/** 拖过折叠文件夹多久自动展开 */
++/** 拖过折叠分组多久自动展开 */
+ const AUTO_EXPAND_MS = 600;
+ 
+-export interface DeviceFolderItemContext {
+-  /** 条目所在文件夹；null = 根层 */
++export interface DeviceFolderNodeContext {
++  /** 节点所在分组；null = 根层 */
+   folderId: string | null;
+-  depth: number;
+-  /** 该条目没有 placement（还挂在节点分组的默认位置上） */
++  /** 该节点没有 placement（还挂在根层的默认位置上） */
+   implicit: boolean;
+   /** 上一次布局提交还在飞，拖拽应当禁用 */
+   dragDisabled: boolean;
++  /** 拖拽把手（分组内的节点还带「移出分组」按钮）；宿主放进节点头部。不可拖时为 null */
++  dragControls: ReactNode | null;
+ }
+ 
+ export interface DeviceFolderTreeHandle {
+-  /** 在某个容器末尾插入一行处于编辑态的新建文件夹（顶栏按钮用） */
+-  startNewFolder(parentId?: string | null): void;
++  /** 在列表末尾插入一行处于编辑态的新建分组（顶栏按钮用） */
++  startNewFolder(): void;
+ }
+ 
+ export interface DeviceFolderTreeProps {
+   layout: DeviceFolderLayout;
+-  /** 没有 placement 的根层条目，按宿主给的顺序追加在显式条目之后 */
+-  implicitRootItems: readonly DeviceFolderItemRef[];
+-  renderItem: (item: DeviceFolderItemRef, ctx: DeviceFolderItemContext) => ReactNode;
+-  /** 拖拽预览与无障碍公告用的条目名称 */
+-  itemLabel: (item: DeviceFolderItemRef) => string;
+-  /** 返回 false 的条目不套拖拽外壳（宿主自己挂把手，或该条目本来就不该被拖） */
+-  itemDraggable?: (item: DeviceFolderItemRef, ctx: DeviceFolderItemContext) => boolean;
+-  /** 文件夹展开态；缺键视为展开 */
++  /** 没有 placement 的根层节点，按宿主给的顺序追加在显式节点之后 */
++  implicitRootNodeIds: readonly string[];
++  renderNode: (nodeId: string, ctx: DeviceFolderNodeContext) => ReactNode;
++  /** 拖拽预览与无障碍公告用的节点名称 */
++  nodeLabel: (nodeId: string) => string;
++  /** 返回 false 的节点不套拖拽外壳（该节点本来就不该被拖，如 standalone 下唯一的本机） */
++  nodeDraggable?: (nodeId: string, ctx: { folderId: string | null }) => boolean;
++  /** 分组展开态；缺键视为展开 */
+   expanded: Record<string, boolean>;
+   onExpandedChange: (folderId: string, expanded: boolean) => void;
+   onDrop: (drop: DeviceFolderDrop) => void;
+-  onCreateFolder: (name: string, parentId: string | null) => void;
++  onCreateFolder: (name: string) => void;
+   onRenameFolder: (folderId: string, name: string) => void;
+   onDeleteFolder: (folderId: string) => void;
+-  onMoveItemToRoot: (item: DeviceFolderItemRef) => void;
++  onMoveNodeToRoot: (nodeId: string) => void;
+   /** 上一次布局提交还在飞：禁用拖拽，避免先发后到的旧顺序覆盖新顺序 */
+   disabled?: boolean;
+   className?: string;
+@@ -119,9 +119,9 @@ interface TreeContextValue {
+   foldersById: Map<string, DeviceFolder>;
+   itemCounts: Map<string, number>;
+   expandedOf: (folderId: string) => boolean;
+-  dropTargetContainerId: string | null;
++  dropContainerId: string | null;
+   dragDisabled: boolean;
+-  newFolderParentId: string | null | undefined;
++  creatingFolder: boolean;
+   renamingFolderId: string | null;
+   props: DeviceFolderTreeProps;
+   actions: {
+@@ -129,10 +129,8 @@ interface TreeContextValue {
+     startRename: (folderId: string) => void;
+     submitRename: (folderId: string, name: string) => void;
+     cancelRename: () => void;
+-    startNewFolder: (parentId: string | null) => void;
+-    submitNewFolder: (parentId: string | null, name: string) => void;
++    submitNewFolder: (name: string) => void;
+     cancelNewFolder: () => void;
+-    moveFolderToParent: (folder: DeviceFolder) => void;
+     requestDelete: (folder: DeviceFolder) => void;
+   };
+ }
+@@ -146,9 +144,9 @@ function useTree(): TreeContextValue {
+ }
+ 
+ /**
+- * 先用 pointerWithin 命中放置区（文件夹头 / 空态 / 根层落点条），没命中再按最近中心找兄弟元素。
++ * 先用 pointerWithin 命中放置区（分组头 / 空态 / 根层落点条），没命中再按最近中心找兄弟元素。
+  * 两步分开跑而不是交给一次 pointerWithin：放置区与它内部的兄弟元素矩形重叠，
+- * 混在一起排序会让「拖到文件夹头上」时不时落成「插到该文件夹的第一个孩子前面」。
++ * 混在一起排序会让「拖到分组头上」时不时落成「插到该分组的第一个节点前面」。
+  */
+ const collisionDetection: CollisionDetection = (args) => {
+   const zones = args.droppableContainers.filter(
+@@ -162,135 +160,93 @@ const collisionDetection: CollisionDetection = (args) => {
+   return closestCenter({ ...args, droppableContainers: rest });
+ };
+ 
+-function ItemNode({ itemKey, ctx }: { itemKey: string; ctx: DeviceFolderItemContext }) {
++function NodeItem({ nodeId, folderId }: { nodeId: string; folderId: string | null }) {
+   const { props, dragDisabled } = useTree();
+-  const item = parseDeviceFolderItemKey(itemKey);
+-  if (!item) return null;
+-  const content = props.renderItem(item, ctx);
+-  if (content === null || content === undefined || content === false) return null;
+-  if (props.itemDraggable && !props.itemDraggable(item, ctx)) {
+-    return <div data-testid={`device-folder-item-${itemKey}`}>{content}</div>;
++  const implicit = !props.layout.placements.some((placement) => placement.nodeId === nodeId);
++  if (props.nodeDraggable && !props.nodeDraggable(nodeId, { folderId })) {
++    const content = props.renderNode(nodeId, {
++      folderId,
++      implicit,
++      dragDisabled,
++      dragControls: null,
++    });
++    if (content === null || content === undefined || content === false) return null;
++    return <div data-testid={`device-folder-item-node:${nodeId}`}>{content}</div>;
+   }
+   return (
+-    <DeviceFolderItemShell
+-      itemKey={itemKey}
++    <DeviceFolderNodeShell
++      nodeId={nodeId}
+       disabled={dragDisabled}
+       onMoveToRoot={
+-        ctx.folderId === null || dragDisabled ? undefined : () => props.onMoveItemToRoot(item)
++        folderId === null || dragDisabled ? undefined : () => props.onMoveNodeToRoot(nodeId)
+       }
+     >
+-      {content}
+-    </DeviceFolderItemShell>
++      {(dragControls) =>
++        props.renderNode(nodeId, { folderId, implicit, dragDisabled, dragControls })
++      }
++    </DeviceFolderNodeShell>
+   );
+ }
+ 
+-function ContainerBody({ containerId, depth }: { containerId: string; depth: number }) {
++function NodeList({ containerId }: { containerId: string }) {
+   const { t } = useTranslation();
+   const tree = useTree();
+-  const { containers, foldersById, newFolderParentId, actions, props } = tree;
+-  const container = containers.get(containerId);
++  const container = tree.containers.get(containerId);
+   const folderId = containerFolderId(containerId) ?? null;
+   if (!container) return null;
+ 
+-  const editingHere = newFolderParentId !== undefined && newFolderParentId === folderId;
+-  const empty = container.folderIds.length === 0 && container.itemKeys.length === 0;
++  if (container.nodeIds.length === 0) {
++    if (folderId === null) return null;
++    return (
++      <FolderDropArea
++        zoneId={bodyDropZoneId(containerId)}
++        testId={`device-folder-drop-${folderId}`}
++        active={tree.dropContainerId === containerId}
++        label={t('devices.folders.empty')}
++        activeLabel={t('devices.folders.dropHere', {
++          name: tree.foldersById.get(folderId)?.name ?? '',
++        })}
++      />
++    );
++  }
+ 
+   return (
+-    <>
+-      {container.folderIds.length > 0 && (
+-        <SortableContext
+-          items={container.folderIds}
+-          strategy={verticalListSortingStrategy}
+-          disabled={tree.dragDisabled}
+-        >
+-          <div className="flex min-w-0 flex-col gap-1">
+-            {container.folderIds.map((elementId) => {
+-              const childId = parseFolderElementId(elementId);
+-              const folder = childId ? foldersById.get(childId) : undefined;
+-              if (!folder) return null;
+-              return <FolderNode key={elementId} folder={folder} depth={depth} />;
+-            })}
+-          </div>
+-        </SortableContext>
+-      )}
+-
+-      {editingHere && (
+-        <FolderNameEditor
+-          testId="device-folder-new"
+-          className="min-w-0"
+-          onSubmit={(name) => actions.submitNewFolder(folderId, name)}
+-          onCancel={actions.cancelNewFolder}
+-        />
+-      )}
+-
+-      {container.itemKeys.length > 0 && (
+-        <SortableContext
+-          items={container.itemKeys}
+-          strategy={verticalListSortingStrategy}
+-          disabled={tree.dragDisabled}
+-        >
+-          <div className="flex min-w-0 flex-col gap-3">
+-            {container.itemKeys.map((itemKey) => (
+-              <ItemNode
+-                key={itemKey}
+-                itemKey={itemKey}
+-                ctx={{
+-                  folderId,
+-                  depth,
+-                  implicit: !props.layout.placements.some(
+-                    (placement) => deviceFolderItemKey(placement) === itemKey
+-                  ),
+-                  dragDisabled: tree.dragDisabled,
+-                }}
+-              />
+-            ))}
+-          </div>
+-        </SortableContext>
+-      )}
+-
+-      {folderId !== null && empty && !editingHere && (
+-        <FolderDropArea
+-          zoneId={bodyDropZoneId(containerId)}
+-          testId={`device-folder-drop-${folderId}`}
+-          active={tree.dropTargetContainerId === containerId}
+-          label={t('devices.folders.empty')}
+-          activeLabel={t('devices.folders.dropHere', {
+-            name: foldersById.get(folderId)?.name ?? '',
+-          })}
+-        />
+-      )}
+-    </>
++    <SortableContext
++      items={container.nodeIds}
++      strategy={verticalListSortingStrategy}
++      disabled={tree.dragDisabled}
++    >
++      <div className="flex min-w-0 flex-col gap-3">
++        {container.nodeIds.map((elementId) => {
++          const nodeId = parseNodeElementId(elementId);
++          if (!nodeId) return null;
++          return <NodeItem key={elementId} nodeId={nodeId} folderId={folderId} />;
++        })}
++      </div>
++    </SortableContext>
+   );
+ }
+ 
+-function FolderNode({ folder, depth }: { folder: DeviceFolder; depth: number }) {
++function FolderNode({ folder }: { folder: DeviceFolder }) {
+   const tree = useTree();
+-  const { actions, expandedOf, itemCounts, dropTargetContainerId } = tree;
++  const { actions, expandedOf, itemCounts, dropContainerId } = tree;
+   const containerId = folderContainerId(folder.id);
+-  const expanded = expandedOf(folder.id);
+ 
+   return (
+     <FolderSection
+       folder={folder}
+-      depth={depth}
+       itemCount={itemCounts.get(folder.id) ?? 0}
+-      expanded={expanded}
++      expanded={expandedOf(folder.id)}
+       renaming={tree.renamingFolderId === folder.id}
+       dragDisabled={tree.dragDisabled}
+-      dropTarget={dropTargetContainerId === containerId}
++      dropTarget={dropContainerId === containerId}
+       onToggle={(next) => actions.toggle(folder.id, next)}
+       onStartRename={() => actions.startRename(folder.id)}
+       onSubmitRename={(name) => actions.submitRename(folder.id, name)}
+       onCancelRename={actions.cancelRename}
+-      onNewSubfolder={() => actions.startNewFolder(folder.id)}
+-      onMoveToParent={
+-        folder.parentId === null || tree.dragDisabled
+-          ? undefined
+-          : () => actions.moveFolderToParent(folder)
+-      }
+       onDelete={() => actions.requestDelete(folder)}
+     >
+-      <ContainerBody containerId={containerId} depth={depth + 1} />
++      <NodeList containerId={containerId} />
+     </FolderSection>
+   );
+ }
+@@ -300,7 +256,7 @@ function DragPreview({ activeId }: { activeId: string }) {
+   const { foldersById, itemCounts, props } = useTree();
+   const folderId = parseFolderElementId(activeId);
+   const folder = folderId ? foldersById.get(folderId) : undefined;
+-  const item = folderId === null ? parseDeviceFolderItemKey(activeId) : null;
++  const nodeId = folderId === null ? parseNodeElementId(activeId) : null;
+ 
+   return (
+     <div className="flex max-w-xs items-center gap-1.5 rounded-lg border border-border bg-popover px-2 py-1.5 text-sm shadow-lg scale-[1.02] motion-reduce:scale-100">
+@@ -312,10 +268,10 @@ function DragPreview({ activeId }: { activeId: string }) {
+             {t('devices.folders.itemCount', { count: itemCounts.get(folder.id) ?? 0 })}
+           </span>
+         </>
+-      ) : item ? (
++      ) : nodeId ? (
+         <>
+-          <Monitor className="size-4 shrink-0 text-muted-foreground" />
+-          <span className="min-w-0 truncate">{props.itemLabel(item)}</span>
++          <Server className="size-4 shrink-0 text-muted-foreground" />
++          <span className="min-w-0 truncate">{props.nodeLabel(nodeId)}</span>
+         </>
+       ) : null}
+     </div>
+@@ -325,7 +281,7 @@ function DragPreview({ activeId }: { activeId: string }) {
+ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+   const {
+     layout,
+-    implicitRootItems,
++    implicitRootNodeIds,
+     expanded,
+     onExpandedChange,
+     onDrop,
+@@ -341,91 +297,69 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+ 
+   const [activeId, setActiveId] = useState<string | null>(null);
+   const [overId, setOverId] = useState<string | null>(null);
+-  // undefined = 没有在新建；null = 在根层新建
+-  const [newFolderParentId, setNewFolderParentId] = useState<string | null | undefined>(undefined);
++  const [creatingFolder, setCreatingFolder] = useState(false);
+   const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
+   const [deleteCandidate, setDeleteCandidate] = useState<DeviceFolder | null>(null);
+ 
+   const containers = useMemo(
+-    () => listContainers(layout, implicitRootItems),
+-    [layout, implicitRootItems]
++    () => listContainers(layout, implicitRootNodeIds),
++    [layout, implicitRootNodeIds]
+   );
++  const folderElementIds = useMemo(() => rootFolderElementIds(layout), [layout]);
+   const foldersById = useMemo(
+     () => new Map(layout.folders.map((folder) => [folder.id, folder])),
+     [layout.folders]
+   );
+-  const itemCounts = useMemo(() => {
+-    const tree = buildDeviceFolderTree(layout);
+-    return new Map([...tree.byId].map(([id, node]) => [id, node.itemCount]));
+-  }, [layout]);
++  const itemCounts = useMemo(() => countFolderItems(layout), [layout]);
+ 
+   const expandedOf = useCallback((folderId: string) => expanded[folderId] !== false, [expanded]);
+ 
+-  const startNewFolder = useCallback(
+-    (parentId: string | null) => {
+-      setNewFolderParentId(parentId);
+-      if (parentId !== null) onExpandedChange(parentId, true);
+-    },
+-    [onExpandedChange]
+-  );
++  useImperativeHandle(ref, () => ({ startNewFolder: () => setCreatingFolder(true) }), []);
+ 
+-  useImperativeHandle(
+-    ref,
+-    () => ({ startNewFolder: (parentId = null) => startNewFolder(parentId) }),
+-    [startNewFolder]
++  const activeDrop = useMemo(
++    () => (activeId && overId ? resolveDrop(activeId, overId, layout, implicitRootNodeIds) : null),
++    [activeId, overId, layout, implicitRootNodeIds]
+   );
++  const dropContainerId = dropTargetContainerId(activeDrop);
+ 
+-  const dropTargetContainerId = useMemo(() => {
+-    if (!activeId || !overId) return null;
+-    const target = resolveDropTarget(activeId, overId, layout, implicitRootItems);
+-    if (!target) return null;
+-    return folderContainerId(target.targetFolderId);
+-  }, [activeId, overId, layout, implicitRootItems]);
++  // 「移到最外层」落点条只在拖动分组里的节点时出现
++  const activeNodeId = activeId === null ? null : parseNodeElementId(activeId);
++  const showRootDropArea = activeNodeId !== null && findNodeFolderId(layout, activeNodeId) !== null;
+ 
+-  // 拖过折叠的文件夹停留一会儿就自动展开，方便往深层里放
++  // 拖过折叠的分组停留一会儿就自动展开，方便往里放
+   const autoExpandRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   useEffect(() => {
+     if (autoExpandRef.current) clearTimeout(autoExpandRef.current);
+-    if (!activeId || !dropTargetContainerId) return;
+-    const folderId = containerFolderId(dropTargetContainerId);
++    if (!activeId || !dropContainerId) return;
++    const folderId = containerFolderId(dropContainerId);
+     if (!folderId || expanded[folderId] !== false) return;
+     autoExpandRef.current = setTimeout(() => onExpandedChange(folderId, true), AUTO_EXPAND_MS);
+     return () => {
+       if (autoExpandRef.current) clearTimeout(autoExpandRef.current);
+     };
+-  }, [activeId, dropTargetContainerId, expanded, onExpandedChange]);
++  }, [activeId, dropContainerId, expanded, onExpandedChange]);
+ 
+   const handleDragEnd = useCallback(
+     (event: DragEndEvent) => {
+       setActiveId(null);
+       setOverId(null);
+       if (disabled || !event.over) return;
+-      const active = String(event.active.id);
+-      const over = String(event.over.id);
+-      const drop = resolveDrop(active, over, layout, implicitRootItems);
+-      if (drop) {
+-        onDrop(drop);
+-        return;
+-      }
+-      // 唯一需要解释的失败：文件夹被放进了自己或自己的后代
+-      const folderId = parseFolderElementId(active);
+-      const target = folderId ? resolveDropTarget(active, over, layout, implicitRootItems) : null;
+-      if (
+-        folderId &&
+-        target &&
+-        wouldCreateFolderCycle(layout.folders, folderId, target.targetFolderId)
+-      ) {
+-        toast.error(t('devices.folders.cycle'));
+-      }
++      const drop = resolveDrop(
++        String(event.active.id),
++        String(event.over.id),
++        layout,
++        implicitRootNodeIds
++      );
++      if (drop) onDrop(drop);
+     },
+-    [disabled, layout, implicitRootItems, onDrop, t]
++    [disabled, layout, implicitRootNodeIds, onDrop]
+   );
+ 
+   const actions = useMemo<TreeContextValue['actions']>(
+     () => ({
+       toggle: (folderId, next) => onExpandedChange(folderId, next),
+       startRename: (folderId) => {
+-        setNewFolderParentId(undefined);
++        setCreatingFolder(false);
+         setRenamingFolderId(folderId);
+       },
+       submitRename: (folderId, name) => {
+@@ -435,24 +369,14 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+         onRenameFolder(folderId, name);
+       },
+       cancelRename: () => setRenamingFolderId(null),
+-      startNewFolder,
+-      submitNewFolder: (parentId, name) => {
+-        setNewFolderParentId(undefined);
+-        onCreateFolder(name, parentId);
+-      },
+-      cancelNewFolder: () => setNewFolderParentId(undefined),
+-      moveFolderToParent: (folder) => {
+-        const parent = folder.parentId === null ? null : foldersById.get(folder.parentId);
+-        onDrop({
+-          kind: 'folder',
+-          folderId: folder.id,
+-          targetFolderId: parent?.parentId ?? null,
+-          index: null,
+-        });
++      submitNewFolder: (name) => {
++        setCreatingFolder(false);
++        onCreateFolder(name);
+       },
++      cancelNewFolder: () => setCreatingFolder(false),
+       requestDelete: (folder) => setDeleteCandidate(folder),
+     }),
+-    [foldersById, onCreateFolder, onDrop, onExpandedChange, onRenameFolder, startNewFolder]
++    [foldersById, onCreateFolder, onExpandedChange, onRenameFolder]
+   );
+ 
+   const contextValue = useMemo<TreeContextValue>(
+@@ -461,9 +385,9 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       foldersById,
+       itemCounts,
+       expandedOf,
+-      dropTargetContainerId,
++      dropContainerId,
+       dragDisabled: disabled,
+-      newFolderParentId,
++      creatingFolder,
+       renamingFolderId,
+       props,
+       actions,
+@@ -473,9 +397,9 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       foldersById,
+       itemCounts,
+       expandedOf,
+-      dropTargetContainerId,
++      dropContainerId,
+       disabled,
+-      newFolderParentId,
++      creatingFolder,
+       renamingFolderId,
+       props,
+       actions,
+@@ -487,7 +411,7 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       <DndContext
+         sensors={sensors}
+         collisionDetection={collisionDetection}
+-        // 拖拽过程中容器高度会变（折叠的文件夹自动展开、根层落点条出现），必须持续重新测量
++        // 拖拽过程中容器高度会变（折叠的分组自动展开、根层落点条出现），必须持续重新测量
+         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+         onDragStart={(event: DragStartEvent) => setActiveId(String(event.active.id))}
+         onDragOver={(event: DragOverEvent) => setOverId(event.over ? String(event.over.id) : null)}
+@@ -501,12 +425,39 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+           data-testid="device-folder-tree"
+           className={cn('flex min-w-0 flex-col gap-3', className)}
+         >
+-          <ContainerBody containerId={ROOT_CONTAINER_ID} depth={0} />
+-          {activeId !== null && (
++          {folderElementIds.length > 0 && (
++            <SortableContext
++              items={folderElementIds}
++              strategy={verticalListSortingStrategy}
++              disabled={disabled}
++            >
++              <div className="flex min-w-0 flex-col gap-3">
++                {folderElementIds.map((elementId) => {
++                  const folderId = parseFolderElementId(elementId);
++                  const folder = folderId ? foldersById.get(folderId) : undefined;
++                  if (!folder) return null;
++                  return <FolderNode key={elementId} folder={folder} />;
++                })}
++              </div>
++            </SortableContext>
++          )}
++
++          {creatingFolder && (
++            <FolderNameEditor
++              testId="device-folder-new"
++              className="min-w-0"
++              onSubmit={actions.submitNewFolder}
++              onCancel={actions.cancelNewFolder}
++            />
++          )}
++
++          <NodeList containerId={ROOT_CONTAINER_ID} />
++
++          {showRootDropArea && (
+             <FolderDropArea
+               zoneId={dropZoneId(ROOT_CONTAINER_ID)}
+               testId="device-folder-drop-root"
+-              active={dropTargetContainerId === ROOT_CONTAINER_ID}
++              active={dropContainerId === ROOT_CONTAINER_ID}
+               label={t('devices.folders.dropToRoot')}
+             />
+           )}
+diff --git a/packages/panels/src/device-folders/draggable-item.tsx b/packages/panels/src/device-folders/draggable-item.tsx
+index eec5ff7c..56a0fde4 100644
+--- a/packages/panels/src/device-folders/draggable-item.tsx
++++ b/packages/panels/src/device-folders/draggable-item.tsx
+@@ -1,96 +1,37 @@
+-// 条目（节点分组 / 单台设备卡片）的拖拽外壳。
++// 节点条目的拖拽外壳：在容器（根层 / 分组）的有序列表里参与排序。
+ //
+-// 两种形态：
+-//  - `sortable`：条目在某个容器的有序列表里（根层显式条目、文件夹内条目），参与同容器排序；
+-//  - `draggable`：条目还在节点分组的卡片网格里（没有 placement），只能被拖出去落到别处，
+-//    容器内顺序由设备自身的 sortOrder 决定，不进 SortableContext。
++// 把手不再由外壳自己贴在条目左侧，而是作为 `dragControls` 交给宿主放进节点头部——
++// 「节点头（名称 / 在线态 / 把手）」才是被拖动的单元，卡片网格只是节点的内容。
+ 
+-import { useDraggable } from '@dnd-kit/core';
+ import { useSortable } from '@dnd-kit/sortable';
+ import { CSS } from '@dnd-kit/utilities';
+ import { cn } from '@tmex/ui';
+ import { CornerLeftUp, GripVertical } from 'lucide-react';
+-import type { CSSProperties, ReactNode } from 'react';
++import type { ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
++import { nodeElementId } from './folder-tree-model';
+ 
+-export interface DeviceFolderItemShellProps {
+-  /** `deviceFolderItemKey(ref)` */
+-  itemKey: string;
+-  mode?: 'sortable' | 'draggable';
++const CONTROL_CLASS =
++  'inline-flex size-6 shrink-0 items-center justify-center rounded-md border border-border/60 bg-background/90 text-muted-foreground shadow-sm transition-colors duration-(--tmex-motion-fast) ease-out hover:bg-accent hover:text-foreground motion-reduce:transition-none';
++
++export interface DeviceFolderNodeShellProps {
++  nodeId: string;
+   disabled?: boolean;
+-  /** 提供时在把手旁显示「移出文件夹」按钮 */
++  /** 提供时在把手旁显示「移出分组」按钮 */
+   onMoveToRoot?: () => void;
+   className?: string;
+-  style?: CSSProperties;
+-  children: ReactNode;
+-}
+-
+-interface ShellBodyProps extends Omit<DeviceFolderItemShellProps, 'mode'> {
+-  setNodeRef: (node: HTMLElement | null) => void;
+-  setHandleRef: (node: HTMLElement | null) => void;
+-  handleProps: Record<string, unknown>;
+-  isDragging: boolean;
+-  dragStyle: CSSProperties;
++  /** 拿到把手（与移出按钮）后渲染节点本体 */
++  children: (dragControls: ReactNode) => ReactNode;
+ }
+ 
+-const HANDLE_CLASS =
+-  'inline-flex size-6 items-center justify-center rounded-md border border-border/60 bg-background/90 text-muted-foreground opacity-0 shadow-sm transition-opacity duration-(--tmex-motion-fast) ease-out group-hover/folder-item:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none [@media(pointer:coarse)]:opacity-100';
+-
+-function ShellBody({
+-  itemKey,
++export function DeviceFolderNodeShell({
++  nodeId,
++  disabled,
+   onMoveToRoot,
+   className,
+-  style,
+   children,
+-  setNodeRef,
+-  setHandleRef,
+-  handleProps,
+-  isDragging,
+-  dragStyle,
+-}: ShellBodyProps) {
++}: DeviceFolderNodeShellProps) {
+   const { t } = useTranslation();
+-  return (
+-    <div
+-      ref={setNodeRef}
+-      data-testid={`device-folder-item-${itemKey}`}
+-      data-dragging={isDragging ? 'true' : undefined}
+-      className={cn(
+-        'group/folder-item relative min-w-0 pl-5',
+-        isDragging && 'opacity-40 motion-reduce:opacity-40',
+-        className
+-      )}
+-      style={{ ...dragStyle, ...style }}
+-    >
+-      <div className="absolute left-0 top-1 z-10 flex flex-col gap-1">
+-        <button
+-          type="button"
+-          ref={setHandleRef}
+-          aria-label={t('devices.folders.dragHandle')}
+-          title={t('devices.folders.dragHandle')}
+-          className={cn(HANDLE_CLASS, 'cursor-grab touch-none active:cursor-grabbing')}
+-          {...handleProps}
+-        >
+-          <GripVertical className="size-3.5" />
+-        </button>
+-        {onMoveToRoot && (
+-          <button
+-            type="button"
+-            aria-label={t('devices.folders.moveToRoot')}
+-            title={t('devices.folders.moveToRoot')}
+-            className={HANDLE_CLASS}
+-            onClick={onMoveToRoot}
+-          >
+-            <CornerLeftUp className="size-3.5" />
+-          </button>
+-        )}
+-      </div>
+-      {children}
+-    </div>
+-  );
+-}
+-
+-function SortableItemShell(props: DeviceFolderItemShellProps) {
+-  const { itemKey, disabled } = props;
+   const {
+     attributes,
+     listeners,
+@@ -99,37 +40,49 @@ function SortableItemShell(props: DeviceFolderItemShellProps) {
+     transform,
+     transition,
+     isDragging,
+-  } = useSortable({ id: itemKey, disabled });
++  } = useSortable({ id: nodeElementId(nodeId), disabled });
+ 
+-  return (
+-    <ShellBody
+-      {...props}
+-      setNodeRef={setNodeRef}
+-      setHandleRef={setActivatorNodeRef}
+-      handleProps={{ ...attributes, ...listeners }}
+-      isDragging={isDragging}
+-      dragStyle={{ transform: CSS.Translate.toString(transform), transition }}
+-    />
++  const dragControls = (
++    <span className="flex shrink-0 items-center gap-1">
++      <button
++        type="button"
++        ref={setActivatorNodeRef}
++        data-testid={`device-folder-handle-${nodeId}`}
++        aria-label={t('devices.folders.dragHandle')}
++        title={t('devices.folders.dragHandle')}
++        className={cn(CONTROL_CLASS, 'cursor-grab touch-none active:cursor-grabbing')}
++        {...attributes}
++        {...listeners}
++      >
++        <GripVertical className="size-3.5" />
++      </button>
++      {onMoveToRoot && (
++        <button
++          type="button"
++          data-testid={`device-folder-move-out-${nodeId}`}
++          aria-label={t('devices.folders.moveToRoot')}
++          title={t('devices.folders.moveToRoot')}
++          className={CONTROL_CLASS}
++          onClick={onMoveToRoot}
++        >
++          <CornerLeftUp className="size-3.5" />
++        </button>
++      )}
++    </span>
+   );
+-}
+-
+-function DraggableItemShell(props: DeviceFolderItemShellProps) {
+-  const { itemKey, disabled } = props;
+-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, isDragging } =
+-    useDraggable({ id: itemKey, disabled });
+ 
++  // 宿主决定不渲染这个节点（mesh 列表里已经没有它）时连外壳一起省掉，不留空行
++  const content = children(dragControls);
++  if (content === null || content === undefined || content === false) return null;
+   return (
+-    <ShellBody
+-      {...props}
+-      setNodeRef={setNodeRef}
+-      setHandleRef={setActivatorNodeRef}
+-      handleProps={{ ...attributes, ...listeners }}
+-      isDragging={isDragging}
+-      dragStyle={{ transform: CSS.Translate.toString(transform) }}
+-    />
++    <div
++      ref={setNodeRef}
++      data-testid={`device-folder-item-node:${nodeId}`}
++      data-dragging={isDragging ? 'true' : undefined}
++      className={cn('min-w-0', isDragging && 'opacity-40 motion-reduce:opacity-40', className)}
++      style={{ transform: CSS.Translate.toString(transform), transition }}
++    >
++      {content}
++    </div>
+   );
+ }
+-
+-export function DeviceFolderItemShell({ mode = 'sortable', ...props }: DeviceFolderItemShellProps) {
+-  return mode === 'sortable' ? <SortableItemShell {...props} /> : <DraggableItemShell {...props} />;
+-}
+diff --git a/packages/panels/src/device-folders/folder-section.tsx b/packages/panels/src/device-folders/folder-section.tsx
+index 6055d342..f86c3198 100644
+--- a/packages/panels/src/device-folders/folder-section.tsx
++++ b/packages/panels/src/device-folders/folder-section.tsx
+@@ -1,4 +1,4 @@
+-// 一个文件夹：可拖拽的头部（把手 / 折叠箭头 / 名称 / 计数 / 操作菜单）+ 可折叠的内容区。
++// 一个分组：虚线边框的放置区，头部（把手 / 折叠箭头 / 名称 / 计数 / 操作菜单）+ 可折叠的内容区。
+ //
+ // 内容区用 `grid-template-rows: 0fr → 1fr` 做高度过渡（不需要测量真实高度），折叠期间靠
+ // visibility 一起过渡：展开时立刻可见、折叠时等动画走完再隐藏，收起后的内容不会留在 Tab 序里。
+@@ -17,10 +17,8 @@ import {
+ } from '@tmex/ui/dropdown-menu';
+ import {
+   ChevronRight,
+-  CornerLeftUp,
+   Folder,
+   FolderOpen,
+-  FolderPlus,
+   GripVertical,
+   MoreHorizontal,
+   Pencil,
+@@ -31,27 +29,20 @@ import { useTranslation } from 'react-i18next';
+ import { FolderNameEditor } from './folder-name-editor';
+ import { dropZoneId, folderContainerId, folderElementId } from './folder-tree-model';
+ 
+-/** 再深的层级也不继续缩进，否则窄屏上内容会被挤没 */
+-export const MAX_INDENT_DEPTH = 6;
+-
+ const COLLAPSE_UNMOUNT_FALLBACK_MS = 400;
+ 
+ export interface FolderSectionProps {
+   folder: DeviceFolder;
+-  depth: number;
+   itemCount: number;
+   expanded: boolean;
+   renaming: boolean;
+   dragDisabled: boolean;
+-  /** 当前拖拽命中的容器就是这个文件夹 */
++  /** 当前拖拽命中的容器就是这个分组 */
+   dropTarget: boolean;
+   onToggle: (expanded: boolean) => void;
+   onStartRename: () => void;
+   onSubmitRename: (name: string) => void;
+   onCancelRename: () => void;
+-  onNewSubfolder: () => void;
+-  /** 非根文件夹才有：移到上一层 */
+-  onMoveToParent?: () => void;
+   onDelete: () => void;
+   children: ReactNode;
+ }
+@@ -61,7 +52,6 @@ const HANDLE_CLASS =
+ 
+ export function FolderSection({
+   folder,
+-  depth,
+   itemCount,
+   expanded,
+   renaming,
+@@ -71,13 +61,11 @@ export function FolderSection({
+   onStartRename,
+   onSubmitRename,
+   onCancelRename,
+-  onNewSubfolder,
+-  onMoveToParent,
+   onDelete,
+   children,
+ }: FolderSectionProps) {
+   const { t } = useTranslation();
+-  // 折叠后内容区整体卸载（让其中的 droppable / 远端 runtime 一起释放），
++  // 折叠后内容区整体卸载（让其中的 droppable 一起释放），
+   // 但要等收起过渡跑完再卸，reduced-motion 下没有 transitionend，用定时器兜底。
+   const [contentMounted, setContentMounted] = useState(expanded);
+   useEffect(() => {
+@@ -103,19 +91,19 @@ export function FolderSection({
+     <section
+       ref={setNodeRef}
+       data-testid={`device-folder-${folder.id}`}
+-      data-depth={Math.min(depth, MAX_INDENT_DEPTH)}
+       data-expanded={expanded ? 'true' : 'false'}
+       data-dragging={isDragging ? 'true' : undefined}
+-      className={cn('group/folder min-w-0', isDragging && 'opacity-40')}
++      data-drop-target={dropTarget ? 'true' : undefined}
++      className={cn(
++        'group/folder min-w-0 rounded-xl border-2 border-dashed border-border/80 bg-muted/10 transition-[border-color,background-color,box-shadow] duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
++        dropTarget && 'border-solid border-ring/70 bg-accent/40 ring-2 ring-ring/30',
++        isDragging && 'opacity-40'
++      )}
+       style={{ transform: CSS.Translate.toString(transform), transition }}
+     >
+       <div
+         ref={droppable.setNodeRef}
+-        data-drop-target={dropTarget ? 'true' : undefined}
+-        className={cn(
+-          'flex min-w-0 items-center gap-1 rounded-lg px-1 py-1 transition-[background-color,box-shadow] duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
+-          dropTarget && 'bg-accent/60 ring-2 ring-ring/50'
+-        )}
++        className="flex min-w-0 items-center gap-1 rounded-t-xl px-1.5 py-1.5"
+       >
+         <button
+           type="button"
+@@ -189,13 +177,6 @@ export function FolderSection({
+               </DropdownMenuTrigger>
+               <DropdownMenuContent align="end" className="min-w-40">
+                 <DropdownMenuGroup>
+-                  <DropdownMenuItem
+-                    data-testid={`device-folder-new-sub-${folder.id}`}
+-                    onClick={onNewSubfolder}
+-                  >
+-                    <FolderPlus className="size-4" />
+-                    {t('devices.folders.newSubfolder')}
+-                  </DropdownMenuItem>
+                   <DropdownMenuItem
+                     data-testid={`device-folder-rename-${folder.id}`}
+                     onClick={onStartRename}
+@@ -203,15 +184,6 @@ export function FolderSection({
+                     <Pencil className="size-4" />
+                     {t('devices.folders.rename')}
+                   </DropdownMenuItem>
+-                  {onMoveToParent && (
+-                    <DropdownMenuItem
+-                      data-testid={`device-folder-move-up-${folder.id}`}
+-                      onClick={onMoveToParent}
+-                    >
+-                      <CornerLeftUp className="size-4" />
+-                      {t('devices.folders.moveToRoot')}
+-                    </DropdownMenuItem>
+-                  )}
+                   <DropdownMenuItem
+                     variant="destructive"
+                     data-testid={`device-folder-delete-${folder.id}`}
+@@ -238,11 +210,12 @@ export function FolderSection({
+           aria-hidden={!expanded}
+           className={cn(
+             'overflow-hidden transition-[visibility] duration-(--tmex-motion-standard) motion-reduce:transition-none',
+-            !expanded && 'invisible',
+-            depth < MAX_INDENT_DEPTH && 'ml-3 border-l border-border/50 pl-3'
++            !expanded && 'invisible'
+           )}
+         >
+-          <div className="flex min-w-0 flex-col gap-2 py-2">{contentMounted && children}</div>
++          <div className="flex min-w-0 flex-col gap-3 px-2 pb-2 pt-0.5">
++            {contentMounted && children}
++          </div>
+         </div>
+       </div>
+     </section>
+@@ -257,15 +230,17 @@ export interface FolderDropAreaProps {
+   activeLabel?: string;
+   active: boolean;
+   testId: string;
++  className?: string;
+ }
+ 
+-/** 空文件夹 / 根层的落点提示：拖拽中变实线高亮 */
++/** 空分组 / 根层的落点提示：虚线框，拖拽命中时变实线高亮 */
+ export function FolderDropArea({
+   zoneId,
+   label,
+   activeLabel,
+   active,
+   testId,
++  className,
+ }: FolderDropAreaProps) {
+   const { setNodeRef } = useDroppable({ id: zoneId });
+   return (
+@@ -274,8 +249,9 @@ export function FolderDropArea({
+       data-testid={testId}
+       data-drop-target={active ? 'true' : undefined}
+       className={cn(
+-        'rounded-lg border border-dashed border-border/60 px-3 py-3 text-center text-xs text-muted-foreground transition-[background-color,border-color,box-shadow] duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
+-        active && 'border-solid border-ring/60 bg-accent/50 text-foreground ring-2 ring-ring/40'
++        'rounded-lg border-2 border-dashed border-border/70 px-3 py-4 text-center text-xs text-muted-foreground transition-[background-color,border-color,box-shadow] duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
++        active && 'border-solid border-ring/60 bg-accent/50 text-foreground ring-2 ring-ring/40',
++        className
+       )}
+     >
+       {active ? (activeLabel ?? label) : label}
+diff --git a/packages/panels/src/device-folders/folder-tree-model.test.ts b/packages/panels/src/device-folders/folder-tree-model.test.ts
+index 77397206..fe29bc3b 100644
+--- a/packages/panels/src/device-folders/folder-tree-model.test.ts
++++ b/packages/panels/src/device-folders/folder-tree-model.test.ts
+@@ -1,61 +1,56 @@
+ import { describe, expect, test } from 'bun:test';
+-import type { DeviceFolder, DeviceFolderItemRef, DeviceFolderLayout } from '@tmex/shared';
+-import { deviceFolderItemKey } from '@tmex/shared';
++import type { DeviceFolder, DeviceFolderLayout } from '@tmex/shared';
+ import {
+   ROOT_CONTAINER_ID,
+   applyDrop,
+   bodyDropZoneId,
+-  containerChildIds,
+   containerFolderId,
++  dropTargetContainerId,
+   dropZoneId,
+   folderContainerId,
+   folderElementId,
+-  implicitRootItems,
++  implicitRootNodeIds,
+   listContainers,
+-  materializeRootItems,
++  materializeRootNodes,
++  nodeElementId,
+   parseDropZoneId,
+   parseFolderElementId,
+-  placedDeviceIds,
++  parseNodeElementId,
+   resolveDrop,
++  rootFolderElementIds,
+ } from './folder-tree-model';
+ 
+-function folder(id: string, parentId: string | null, sortOrder: number): DeviceFolder {
++function folder(id: string, sortOrder: number): DeviceFolder {
+   return {
+     id,
+     name: id,
+-    parentId,
+     sortOrder,
+     createdAt: '2026-08-29T00:00:00.000Z',
+     updatedAt: '2026-08-29T00:00:00.000Z',
+   };
+ }
+ 
+-function nodeItem(nodeId: string): DeviceFolderItemRef {
+-  return { kind: 'node', nodeId, deviceId: null };
++function placement(nodeId: string, folderId: string | null, sortOrder: number) {
++  return { nodeId, folderId, sortOrder };
+ }
+ 
+-function deviceItem(nodeId: string, deviceId: string): DeviceFolderItemRef {
+-  return { kind: 'device', nodeId, deviceId };
+-}
+-
+-function placement(item: DeviceFolderItemRef, folderId: string | null, sortOrder: number) {
+-  return { ...item, folderId, sortOrder };
+-}
+-
+-/** a（含子 a1）与 b 两个根文件夹；a 里放着 self 的 d1，根层显式放着 node n1 */
++/** a 与 b 两个分组；a 里放着 n1，根层显式放着 n2 */
+ function sampleLayout(): DeviceFolderLayout {
+   return {
+-    folders: [folder('a', null, 0), folder('b', null, 1), folder('a1', 'a', 0)],
+-    placements: [placement(deviceItem('self', 'd1'), 'a', 0), placement(nodeItem('n1'), null, 0)],
++    folders: [folder('a', 0), folder('b', 1)],
++    placements: [placement('n1', 'a', 0), placement('n2', null, 0)],
+   };
+ }
+ 
+ describe('id 编解码', () => {
+-  test('文件夹元素 / 容器 / 放置区 id 可逆', () => {
++  test('分组 / 节点 / 容器 / 放置区 id 可逆', () => {
+     expect(folderElementId('a')).toBe('folder:a');
+     expect(parseFolderElementId('folder:a')).toBe('a');
+     expect(parseFolderElementId('node:self')).toBeNull();
+     expect(parseFolderElementId('folder:')).toBeNull();
++    expect(nodeElementId('self')).toBe('node:self');
++    expect(parseNodeElementId('node:self')).toBe('self');
++    expect(parseNodeElementId('folder:a')).toBeNull();
+ 
+     expect(folderContainerId(null)).toBe(ROOT_CONTAINER_ID);
+     expect(folderContainerId('a')).toBe('folder:a');
+@@ -67,177 +62,169 @@ describe('id 编解码', () => {
+     expect(parseDropZoneId('drop:folder:a')).toBe('folder:a');
+     expect(parseDropZoneId('drop:root')).toBe('root');
+     expect(parseDropZoneId('folder:a')).toBeNull();
+-    // 空文件夹内容区是同一容器的第二个放置区，id 不同但解析到同一个容器
+     expect(bodyDropZoneId(folderContainerId('a'))).toBe('dropin:folder:a');
+     expect(parseDropZoneId(bodyDropZoneId(folderContainerId('a')))).toBe('folder:a');
+   });
+ });
+ 
+ describe('listContainers', () => {
+-  test('每个容器按 sortOrder 排序，文件夹在前、条目在后', () => {
+-    const containers = listContainers(sampleLayout(), [nodeItem('self'), nodeItem('n2')]);
+-
+-    const root = containers.get(ROOT_CONTAINER_ID);
+-    expect(root).toBeDefined();
+-    expect(containerChildIds(root as NonNullable<typeof root>)).toEqual([
+-      'folder:a',
+-      'folder:b',
+-      'node:n1',
+-      'node:self',
+-      'node:n2',
+-    ]);
+-
+-    const a = containers.get('folder:a');
+-    expect(containerChildIds(a as NonNullable<typeof a>)).toEqual(['folder:a1', 'device:self:d1']);
+-    expect(containers.get('folder:a1')?.itemKeys).toEqual([]);
++  test('每个容器按 sortOrder 排序，根层显式在前、隐式在后', () => {
++    const containers = listContainers(sampleLayout(), ['self', 'n3']);
++    expect(containers.get(ROOT_CONTAINER_ID)?.nodeIds).toEqual(['node:n2', 'node:self', 'node:n3']);
++    expect(containers.get('folder:a')?.nodeIds).toEqual(['node:n1']);
++    expect(containers.get('folder:b')?.nodeIds).toEqual([]);
++    expect(rootFolderElementIds(sampleLayout())).toEqual(['folder:a', 'folder:b']);
+   });
+ 
+-  test('隐式根条目排在显式 placement 之后，已放置的不再是隐式', () => {
+-    const layout = sampleLayout();
+-    expect(implicitRootItems(layout, [nodeItem('n1'), nodeItem('self')])).toEqual([
+-      nodeItem('self'),
+-    ]);
++  test('已放置的节点不再是隐式', () => {
++    expect(implicitRootNodeIds(sampleLayout(), ['n1', 'self'])).toEqual(['self']);
+   });
+ 
+-  test('指向不存在文件夹的孤儿元素被忽略', () => {
+-    const layout: DeviceFolderLayout = {
+-      folders: [folder('a', 'ghost', 0)],
+-      placements: [placement(nodeItem('n1'), 'ghost', 0)],
+-    };
+-    const containers = listContainers(layout);
+-    expect(containers.get(ROOT_CONTAINER_ID)?.folderIds).toEqual([]);
+-    expect(containers.get(ROOT_CONTAINER_ID)?.itemKeys).toEqual([]);
+-    // 文件夹自身仍是一个容器（可以往里放东西）
+-    expect(containers.has('folder:a')).toBe(true);
++  test('指向不存在分组的孤儿 placement 被忽略', () => {
++    const containers = listContainers({
++      folders: [],
++      placements: [placement('n1', 'ghost', 0)],
++    });
++    expect(containers.get(ROOT_CONTAINER_ID)?.nodeIds).toEqual([]);
+   });
+ });
+ 
+-describe('resolveDrop', () => {
+-  const implicit = [nodeItem('self')];
++describe('resolveDrop：节点', () => {
++  const implicit = ['self'];
+ 
+-  test('空文件夹内容区与文件夹头是同一个落点', () => {
+-    expect(
+-      resolveDrop('node:self', bodyDropZoneId(folderContainerId('a1')), sampleLayout(), implicit)
+-    ).toEqual({ kind: 'item', item: nodeItem('self'), targetFolderId: 'a1', index: null });
+-  });
+-
+-  test('落在放置区上：追加到该容器末尾', () => {
+-    expect(resolveDrop('node:self', dropZoneId('folder:b'), sampleLayout(), implicit)).toEqual({
+-      kind: 'item',
+-      item: nodeItem('self'),
++  test('空分组内容区与分组头是同一个落点', () => {
++    expect(resolveDrop('node:self', bodyDropZoneId('folder:b'), sampleLayout(), implicit)).toEqual({
++      kind: 'node',
++      nodeId: 'self',
+       targetFolderId: 'b',
+       index: null,
+     });
+-    expect(resolveDrop('folder:b', dropZoneId('folder:a'), sampleLayout(), implicit)).toEqual({
+-      kind: 'folder',
+-      folderId: 'b',
++    expect(resolveDrop('node:self', 'folder:b', sampleLayout(), implicit)).toEqual({
++      kind: 'node',
++      nodeId: 'self',
++      targetFolderId: 'b',
++      index: null,
++    });
++  });
++
++  test('落在放置区上：追加到该容器末尾；根层落点条 = 移到最外层', () => {
++    expect(resolveDrop('node:self', dropZoneId('folder:a'), sampleLayout(), implicit)).toEqual({
++      kind: 'node',
++      nodeId: 'self',
+       targetFolderId: 'a',
+       index: null,
+     });
++    expect(resolveDrop('node:n1', dropZoneId(ROOT_CONTAINER_ID), sampleLayout(), implicit)).toEqual(
++      { kind: 'node', nodeId: 'n1', targetFolderId: null, index: null }
++    );
+   });
+ 
+-  test('落在兄弟条目上：插到该条目所在容器的这个位置', () => {
+-    expect(resolveDrop('node:self', 'device:self:d1', sampleLayout(), implicit)).toEqual({
+-      kind: 'item',
+-      item: nodeItem('self'),
++  test('落在兄弟节点上：插到该节点所在容器的这个位置', () => {
++    expect(resolveDrop('node:self', 'node:n1', sampleLayout(), implicit)).toEqual({
++      kind: 'node',
++      nodeId: 'self',
+       targetFolderId: 'a',
+       index: 0,
+     });
++    expect(resolveDrop('node:n1', 'node:self', sampleLayout(), implicit)).toEqual({
++      kind: 'node',
++      nodeId: 'n1',
++      targetFolderId: null,
++      index: 1,
++    });
+   });
+ 
+-  test('条目落在文件夹行上 = 放进这个文件夹', () => {
+-    expect(resolveDrop('node:self', 'folder:a1', sampleLayout(), implicit)).toEqual({
+-      kind: 'item',
+-      item: nodeItem('self'),
+-      targetFolderId: 'a1',
+-      index: null,
+-    });
++  test('不认识的 id 一律返回 null', () => {
++    expect(resolveDrop('bogus', 'drop:root', sampleLayout(), implicit)).toBeNull();
++    expect(resolveDrop('node:self', 'bogus', sampleLayout(), implicit)).toBeNull();
++    expect(resolveDrop('node:self', 'drop:nope', sampleLayout(), implicit)).toBeNull();
++    expect(resolveDrop('node:self', 'drop:folder:ghost', sampleLayout(), implicit)).toBeNull();
++    expect(resolveDrop('node:self', 'node:self', sampleLayout(), implicit)).toBeNull();
+   });
++});
+ 
+-  test('文件夹落在文件夹上：插到目标所在容器的这个位置', () => {
+-    expect(resolveDrop('folder:b', 'folder:a1', sampleLayout(), implicit)).toEqual({
++describe('resolveDrop：分组', () => {
++  test('分组只能在根层重排：落在别的分组头上插到它的位置', () => {
++    expect(resolveDrop('folder:b', 'folder:a', sampleLayout())).toEqual({
+       kind: 'folder',
+       folderId: 'b',
+-      targetFolderId: 'a',
+       index: 0,
+     });
+-  });
+-
+-  test('文件夹落在条目上：追加到该容器的文件夹末尾', () => {
+-    expect(resolveDrop('folder:b', 'device:self:d1', sampleLayout(), implicit)).toEqual({
++    expect(resolveDrop('folder:a', dropZoneId(ROOT_CONTAINER_ID), sampleLayout())).toEqual({
+       kind: 'folder',
+-      folderId: 'b',
+-      targetFolderId: 'a',
++      folderId: 'a',
+       index: null,
+     });
+   });
+ 
+-  test('拖到自己 / 自己的后代内一律拒绝', () => {
+-    expect(resolveDrop('folder:a', 'folder:a', sampleLayout(), implicit)).toBeNull();
+-    expect(resolveDrop('folder:a', dropZoneId('folder:a'), sampleLayout(), implicit)).toBeNull();
+-    expect(resolveDrop('folder:a', dropZoneId('folder:a1'), sampleLayout(), implicit)).toBeNull();
+-    expect(resolveDrop('folder:a', 'folder:a1', sampleLayout(), implicit)).toBeNull();
++  test('分组落在节点 / 分组内容区 / 分组头放置区上一律无效（不能嵌套）', () => {
++    expect(resolveDrop('folder:b', 'node:n1', sampleLayout())).toBeNull();
++    expect(resolveDrop('folder:b', 'node:n2', sampleLayout())).toBeNull();
++    expect(resolveDrop('folder:b', bodyDropZoneId('folder:a'), sampleLayout())).toBeNull();
++    expect(resolveDrop('folder:b', dropZoneId('folder:a'), sampleLayout())).toBeNull();
++    expect(resolveDrop('folder:a', 'folder:a', sampleLayout())).toBeNull();
++    expect(resolveDrop('folder:ghost', 'folder:a', sampleLayout())).toBeNull();
+   });
+ 
+-  test('不认识的 id 一律返回 null', () => {
+-    expect(resolveDrop('bogus', 'drop:root', sampleLayout(), implicit)).toBeNull();
+-    expect(resolveDrop('node:self', 'bogus', sampleLayout(), implicit)).toBeNull();
+-    expect(resolveDrop('node:self', 'drop:nope', sampleLayout(), implicit)).toBeNull();
+-    expect(resolveDrop('node:self', 'drop:folder:ghost', sampleLayout(), implicit)).toBeNull();
++  test('dropTargetContainerId：分组重排高亮根层，节点高亮目标容器', () => {
++    expect(dropTargetContainerId(null)).toBeNull();
++    expect(dropTargetContainerId({ kind: 'folder', folderId: 'a', index: 0 })).toBe(
++      ROOT_CONTAINER_ID
++    );
++    expect(
++      dropTargetContainerId({ kind: 'node', nodeId: 'n1', targetFolderId: 'b', index: null })
++    ).toBe('folder:b');
+   });
+ });
+ 
+ describe('applyDrop', () => {
+-  test('条目移入文件夹后从根层消失', () => {
++  test('节点移入分组后从根层消失', () => {
+     const layout = sampleLayout();
+-    const drop = resolveDrop('node:n1', dropZoneId('folder:b'), layout, []);
++    const drop = resolveDrop('node:n2', dropZoneId('folder:b'), layout, []);
+     const next = applyDrop(layout, drop as NonNullable<typeof drop>, []);
+-    expect(next).not.toBeNull();
+     const containers = listContainers(next as DeviceFolderLayout, []);
+-    expect(containers.get(ROOT_CONTAINER_ID)?.itemKeys).toEqual([]);
+-    expect(containers.get('folder:b')?.itemKeys).toEqual(['node:n1']);
++    expect(containers.get(ROOT_CONTAINER_ID)?.nodeIds).toEqual([]);
++    expect(containers.get('folder:b')?.nodeIds).toEqual(['node:n2']);
+   });
+ 
+-  test('根层排序会把隐式条目显式化，顺序按拖拽结果落定', () => {
++  test('根层排序会把隐式节点显式化，顺序按拖拽结果落定', () => {
+     const layout: DeviceFolderLayout = { folders: [], placements: [] };
+-    const implicit = [nodeItem('self'), nodeItem('n1'), nodeItem('n2')];
++    const implicit = ['self', 'n1', 'n2'];
+     const drop = resolveDrop('node:n2', 'node:self', layout, implicit);
+     const next = applyDrop(layout, drop as NonNullable<typeof drop>, implicit);
+-    expect(listContainers(next as DeviceFolderLayout, []).get(ROOT_CONTAINER_ID)?.itemKeys).toEqual(
+-      ['node:n2', 'node:self', 'node:n1']
+-    );
++    expect(listContainers(next as DeviceFolderLayout, []).get(ROOT_CONTAINER_ID)?.nodeIds).toEqual([
++      'node:n2',
++      'node:self',
++      'node:n1',
++    ]);
+   });
+ 
+   test('同容器内向下移动落在目标之后', () => {
+     const layout: DeviceFolderLayout = {
+       folders: [],
+-      placements: [
+-        placement(nodeItem('a'), null, 0),
+-        placement(nodeItem('b'), null, 1),
+-        placement(nodeItem('c'), null, 2),
+-      ],
++      placements: [placement('a', null, 0), placement('b', null, 1), placement('c', null, 2)],
+     };
+     const drop = resolveDrop('node:a', 'node:c', layout, []);
+     const next = applyDrop(layout, drop as NonNullable<typeof drop>, []);
+-    expect(listContainers(next as DeviceFolderLayout, []).get(ROOT_CONTAINER_ID)?.itemKeys).toEqual(
+-      ['node:b', 'node:c', 'node:a']
+-    );
++    expect(listContainers(next as DeviceFolderLayout, []).get(ROOT_CONTAINER_ID)?.nodeIds).toEqual([
++      'node:b',
++      'node:c',
++      'node:a',
++    ]);
+   });
+ 
+-  test('文件夹移动到根层末尾', () => {
++  test('分组重排', () => {
+     const layout = sampleLayout();
+-    const drop = resolveDrop('folder:a1', dropZoneId(ROOT_CONTAINER_ID), layout, []);
++    const drop = resolveDrop('folder:b', 'folder:a', layout, []);
+     const next = applyDrop(layout, drop as NonNullable<typeof drop>, []);
+-    expect(
+-      listContainers(next as DeviceFolderLayout, []).get(ROOT_CONTAINER_ID)?.folderIds
+-    ).toEqual(['folder:a', 'folder:b', 'folder:a1']);
++    expect(rootFolderElementIds(next as DeviceFolderLayout)).toEqual(['folder:b', 'folder:a']);
+   });
+ 
+-  test('目标文件夹不存在时返回 null，不产生半截布局', () => {
++  test('目标分组不存在时返回 null，不产生半截布局', () => {
+     expect(
+       applyDrop(sampleLayout(), {
+-        kind: 'item',
+-        item: nodeItem('n1'),
++        kind: 'node',
++        nodeId: 'n2',
+         targetFolderId: 'ghost',
+         index: null,
+       })
+@@ -245,33 +232,18 @@ describe('applyDrop', () => {
+   });
+ });
+ 
+-describe('materializeRootItems / placedDeviceIds', () => {
+-  test('隐式条目落成显式 placement 时接在现有根层之后', () => {
+-    const layout = sampleLayout();
+-    const next = materializeRootItems(layout, [nodeItem('self'), nodeItem('n1')]);
+-    const rootKeys = next.placements
++describe('materializeRootNodes', () => {
++  test('隐式节点落成显式 placement 时接在现有根层之后', () => {
++    const next = materializeRootNodes(sampleLayout(), ['self', 'n2']);
++    const rootIds = next.placements
+       .filter((item) => item.folderId === null)
+       .sort((a, b) => a.sortOrder - b.sortOrder)
+-      .map(deviceFolderItemKey);
+-    expect(rootKeys).toEqual(['node:n1', 'node:self']);
++      .map((item) => item.nodeId);
++    expect(rootIds).toEqual(['n2', 'self']);
+   });
+ 
+-  test('没有隐式条目时原样返回', () => {
++  test('没有隐式节点时原样返回', () => {
+     const layout = sampleLayout();
+-    expect(materializeRootItems(layout, [])).toBe(layout);
+-  });
+-
+-  test('只统计该 node 上被单独放置的设备', () => {
+-    const layout: DeviceFolderLayout = {
+-      folders: [folder('a', null, 0)],
+-      placements: [
+-        placement(deviceItem('self', 'd1'), 'a', 0),
+-        placement(deviceItem('n1', 'd2'), 'a', 1),
+-        placement(nodeItem('n2'), 'a', 2),
+-      ],
+-    };
+-    expect([...placedDeviceIds(layout, 'self')]).toEqual(['d1']);
+-    expect([...placedDeviceIds(layout, 'n1')]).toEqual(['d2']);
+-    expect([...placedDeviceIds(layout, 'n2')]).toEqual([]);
++    expect(materializeRootNodes(layout, [])).toBe(layout);
+   });
+ });
+diff --git a/packages/panels/src/device-folders/folder-tree-model.ts b/packages/panels/src/device-folders/folder-tree-model.ts
+index 7d135c0f..79fddf26 100644
+--- a/packages/panels/src/device-folders/folder-tree-model.ts
++++ b/packages/panels/src/device-folders/folder-tree-model.ts
+@@ -1,23 +1,22 @@
+-// 文件夹树的容器 / 落点模型：把 `DeviceFolderLayout` + 宿主给出的隐式根条目摊平成
+-// 「每个容器的有序子元素 id」，并把一次 dnd 的 (active, over) 翻译成布局变更。
++// 分组列表的容器 / 落点模型：把 `DeviceFolderLayout` + 宿主给出的隐式根节点摊平成
++// 「每个容器的有序节点 id」，并把一次 dnd 的 (active, over) 翻译成布局变更。
+ // 布局本身的合法性与重排全部复用 `@tmex/shared` 的纯函数，这里只负责 id 编解码与落点判定。
++//
++// 分组只有一层：分组只能在根层彼此排序；节点只能在根层与分组之间移动。设备不是本模型的
++// 条目——它永远跟着自己的节点走，节点内的顺序由设备自己的 sortOrder 决定。
+ 
+ import {
+-  type DeviceFolderItemRef,
+   type DeviceFolderLayout,
+   type DeviceFolderPlacement,
+-  deviceFolderItemKey,
+   moveFolderInLayout,
+-  moveItemInLayout,
+-  parseDeviceFolderItemKey,
+-  sameDeviceFolderItem,
+-  wouldCreateFolderCycle,
++  moveNodeInLayout,
+ } from '@tmex/shared';
+ 
+-/** 根容器 id；文件夹容器为 `folder:<id>` */
++/** 根容器 id；分组容器为 `folder:<id>` */
+ export const ROOT_CONTAINER_ID = 'root';
+ 
+ const FOLDER_PREFIX = 'folder:';
++const NODE_PREFIX = 'node:';
+ const DROP_PREFIX = 'drop:';
+ const DROP_BODY_PREFIX = 'dropin:';
+ 
+@@ -25,28 +24,37 @@ export function folderElementId(folderId: string): string {
+   return `${FOLDER_PREFIX}${folderId}`;
+ }
+ 
+-/** 文件夹元素 id → 文件夹 id；不是文件夹元素返回 null */
++/** 分组元素 id → 分组 id；不是分组元素返回 null */
+ export function parseFolderElementId(elementId: string): string | null {
+   return elementId.startsWith(FOLDER_PREFIX) ? elementId.slice(FOLDER_PREFIX.length) || null : null;
+ }
+ 
++export function nodeElementId(nodeId: string): string {
++  return `${NODE_PREFIX}${nodeId}`;
++}
++
++/** 节点元素 id → 节点 id；不是节点元素返回 null */
++export function parseNodeElementId(elementId: string): string | null {
++  return elementId.startsWith(NODE_PREFIX) ? elementId.slice(NODE_PREFIX.length) || null : null;
++}
++
+ export function folderContainerId(folderId: string | null): string {
+   return folderId === null ? ROOT_CONTAINER_ID : folderElementId(folderId);
+ }
+ 
+-/** 容器 id → 文件夹 id（根为 null）；非法容器 id 返回 undefined */
++/** 容器 id → 分组 id（根为 null）；非法容器 id 返回 undefined */
+ export function containerFolderId(containerId: string): string | null | undefined {
+   if (containerId === ROOT_CONTAINER_ID) return null;
+   return parseFolderElementId(containerId) ?? undefined;
+ }
+ 
+-/** 容器的放置区（文件夹头 / 根层落点条）的 droppable id */
++/** 容器的放置区（分组头 / 根层「移到最外层」落点条）的 droppable id */
+ export function dropZoneId(containerId: string): string {
+   return `${DROP_PREFIX}${containerId}`;
+ }
+ 
+ /**
+- * 同一个容器的第二个放置区（空文件夹内容区）。droppable id 全局唯一，空文件夹的头部与
++ * 同一个容器的第二个放置区（空分组内容区）。droppable id 全局唯一，空分组的头部与
+  * 内容区都能接收落点，必须用两个不同的 id 指向同一个容器。
+  */
+ export function bodyDropZoneId(containerId: string): string {
+@@ -64,46 +72,42 @@ export interface DeviceFolderContainer {
+   containerId: string;
+   /** null = 根容器 */
+   folderId: string | null;
+-  /** 子文件夹的元素 id，按 sortOrder */
+-  folderIds: string[];
+-  /** 子条目的 key，显式 placement 在前，隐式根条目在后 */
+-  itemKeys: string[];
+-}
+-
+-/** 容器内的全部子元素 id：文件夹在前，条目在后 */
+-export function containerChildIds(container: DeviceFolderContainer): string[] {
+-  return [...container.folderIds, ...container.itemKeys];
++  /** 节点元素 id，按 sortOrder；根容器里显式 placement 在前，隐式节点在后 */
++  nodeIds: string[];
+ }
+ 
+ function byOrder(a: { sortOrder: number }, b: { sortOrder: number }): number {
+   return a.sortOrder - b.sortOrder;
+ }
+ 
+-/** 没有 placement 的候选条目（宿主决定候选集与它们之间的默认顺序） */
+-export function implicitRootItems(
++/** 没有 placement 的候选节点（宿主决定候选集与它们之间的默认顺序） */
++export function implicitRootNodeIds(
+   layout: DeviceFolderLayout,
+-  candidates: readonly DeviceFolderItemRef[]
+-): DeviceFolderItemRef[] {
+-  return candidates.filter(
+-    (candidate) =>
+-      !layout.placements.some((placement) => sameDeviceFolderItem(placement, candidate))
+-  );
++  candidates: readonly string[]
++): string[] {
++  const placed = new Set(layout.placements.map((placement) => placement.nodeId));
++  return candidates.filter((nodeId) => !placed.has(nodeId));
++}
++
++/** 根层分组的元素 id，按 sortOrder */
++export function rootFolderElementIds(layout: DeviceFolderLayout): string[] {
++  return [...layout.folders].sort(byOrder).map((folder) => folderElementId(folder.id));
+ }
+ 
+ /**
+- * 每个容器的有序子元素。隐式根条目只影响根容器，且永远排在显式 placement 之后。
+- * parentId / folderId 指向不存在文件夹的孤儿元素被忽略（服务端不会产生，手改库时兜底）。
++ * 每个容器的有序节点。隐式根节点只影响根容器，且永远排在显式 placement 之后。
++ * folderId 指向不存在分组的孤儿 placement 被忽略（服务端不会产生，手改库时兜底）。
+  */
+ export function listContainers(
+   layout: DeviceFolderLayout,
+-  implicit: readonly DeviceFolderItemRef[] = []
++  implicit: readonly string[] = []
+ ): Map<string, DeviceFolderContainer> {
+   const containers = new Map<string, DeviceFolderContainer>();
+   const ensure = (folderId: string | null): DeviceFolderContainer => {
+     const containerId = folderContainerId(folderId);
+     let container = containers.get(containerId);
+     if (!container) {
+-      container = { containerId, folderId, folderIds: [], itemKeys: [] };
++      container = { containerId, folderId, nodeIds: [] };
+       containers.set(containerId, container);
+     }
+     return container;
+@@ -112,167 +116,122 @@ export function listContainers(
+   ensure(null);
+   const knownFolderIds = new Set(layout.folders.map((folder) => folder.id));
+   for (const folder of layout.folders) ensure(folder.id);
+-  for (const folder of [...layout.folders].sort(byOrder)) {
+-    if (folder.parentId !== null && !knownFolderIds.has(folder.parentId)) continue;
+-    ensure(folder.parentId).folderIds.push(folderElementId(folder.id));
+-  }
+   for (const placement of [...layout.placements].sort(byOrder)) {
+     if (placement.folderId !== null && !knownFolderIds.has(placement.folderId)) continue;
+-    ensure(placement.folderId).itemKeys.push(deviceFolderItemKey(placement));
++    ensure(placement.folderId).nodeIds.push(nodeElementId(placement.nodeId));
+   }
+   const root = ensure(null);
+-  for (const item of implicit) root.itemKeys.push(deviceFolderItemKey(item));
++  for (const nodeId of implicit) root.nodeIds.push(nodeElementId(nodeId));
+   return containers;
+ }
+ 
+-interface ElementLocation {
+-  containerId: string;
+-  /** 在同类列表（文件夹列表 / 条目列表）中的下标 */
+-  index: number;
+-  kind: 'folder' | 'item';
+-}
+-
+-function locateElement(
++function locateNode(
+   containers: Map<string, DeviceFolderContainer>,
+   elementId: string
+-): ElementLocation | null {
++): { containerId: string; index: number } | null {
+   for (const container of containers.values()) {
+-    const folderIndex = container.folderIds.indexOf(elementId);
+-    if (folderIndex >= 0) {
+-      return { containerId: container.containerId, index: folderIndex, kind: 'folder' };
+-    }
+-    const itemIndex = container.itemKeys.indexOf(elementId);
+-    if (itemIndex >= 0) {
+-      return { containerId: container.containerId, index: itemIndex, kind: 'item' };
+-    }
++    const index = container.nodeIds.indexOf(elementId);
++    if (index >= 0) return { containerId: container.containerId, index };
+   }
+   return null;
+ }
+ 
+ export type DeviceFolderDrop =
+-  | { kind: 'folder'; folderId: string; targetFolderId: string | null; index: number | null }
+-  | {
+-      kind: 'item';
+-      item: DeviceFolderItemRef;
+-      targetFolderId: string | null;
+-      index: number | null;
+-    };
+-
+-export interface DeviceFolderDropTarget {
+-  targetFolderId: string | null;
+-  /** null = 追加到末尾 */
+-  index: number | null;
+-}
++  | { kind: 'folder'; folderId: string; index: number | null }
++  | { kind: 'node'; nodeId: string; targetFolderId: string | null; index: number | null };
+ 
+ /**
+- * 只解析落点位置，**不做成环判定**：UI 需要区分「无效落点」（什么都不做）与
+- * 「落到了自己的后代里」（提示 `devices.folders.cycle`）。
+- *
+- * `overId` 可以是放置区（`drop:<container>`，落到容器末尾）或者某个兄弟元素
+- * （插到该元素所在容器的这个位置）。条目落在文件夹行上视为放进那个文件夹；
+- * 文件夹落在条目上视为追加到该容器的文件夹列表末尾。
++ * 只解析落点：
++ *  - 分组只能在根层重排：落在别的分组头上 = 插到它的位置；落在根层落点条上 = 排到末尾；
++ *    落在节点 / 分组内容区上一律无效（分组不能进分组）。
++ *  - 节点：落在放置区上 = 追加到该容器末尾；落在分组头上 = 放进该分组末尾；
++ *    落在别的节点上 = 插到该节点所在容器的这个位置。
++ * 无效落点返回 null。
+  */
+-export function resolveDropTarget(
++export function resolveDrop(
+   activeId: string,
+   overId: string,
+   layout: DeviceFolderLayout,
+-  implicit: readonly DeviceFolderItemRef[] = []
+-): DeviceFolderDropTarget | null {
++  implicit: readonly string[] = []
++): DeviceFolderDrop | null {
+   if (activeId === overId) return null;
+   const activeFolderId = parseFolderElementId(activeId);
+-  const activeItem = activeFolderId === null ? parseDeviceFolderItemKey(activeId) : null;
+-  if (activeFolderId === null && activeItem === null) return null;
++  if (activeFolderId !== null) {
++    if (!layout.folders.some((folder) => folder.id === activeFolderId)) return null;
++    if (parseDropZoneId(overId) === ROOT_CONTAINER_ID) {
++      return { kind: 'folder', folderId: activeFolderId, index: null };
++    }
++    const overFolderId = parseFolderElementId(overId);
++    if (overFolderId === null) return null;
++    const index = rootFolderElementIds(layout).indexOf(overId);
++    if (index < 0) return null;
++    return { kind: 'folder', folderId: activeFolderId, index };
++  }
+ 
++  const activeNodeId = parseNodeElementId(activeId);
++  if (activeNodeId === null) return null;
+   const containers = listContainers(layout, implicit);
++
+   let targetContainerId: string;
+   let index: number | null;
+-
+   const zoneContainerId = parseDropZoneId(overId);
+   const overFolderId = zoneContainerId === null ? parseFolderElementId(overId) : null;
+   if (zoneContainerId !== null) {
+     targetContainerId = zoneContainerId;
+     index = null;
+-  } else if (overFolderId !== null && activeItem !== null) {
+-    // 条目落到文件夹行上：放进这个文件夹的末尾
++  } else if (overFolderId !== null) {
+     targetContainerId = folderContainerId(overFolderId);
+     index = null;
+   } else {
+-    const location = locateElement(containers, overId);
++    const location = locateNode(containers, overId);
+     if (!location) return null;
+     targetContainerId = location.containerId;
+-    // 只有同类元素之间才谈得上「插到这个位置」，异类落点一律追加到末尾
+-    index = location.kind === (activeFolderId !== null ? 'folder' : 'item') ? location.index : null;
++    index = location.index;
+   }
+ 
+   if (!containers.has(targetContainerId)) return null;
+   const targetFolderId = containerFolderId(targetContainerId);
+   if (targetFolderId === undefined) return null;
+-  return { targetFolderId, index };
++  return { kind: 'node', nodeId: activeNodeId, targetFolderId, index };
+ }
+ 
+-/** 落点 + 成环判定；无效落点或把文件夹放进自己 / 后代返回 null */
+-export function resolveDrop(
+-  activeId: string,
+-  overId: string,
+-  layout: DeviceFolderLayout,
+-  implicit: readonly DeviceFolderItemRef[] = []
+-): DeviceFolderDrop | null {
+-  const target = resolveDropTarget(activeId, overId, layout, implicit);
+-  if (!target) return null;
+-  const activeFolderId = parseFolderElementId(activeId);
+-  if (activeFolderId !== null) {
+-    if (wouldCreateFolderCycle(layout.folders, activeFolderId, target.targetFolderId)) return null;
+-    return { kind: 'folder', folderId: activeFolderId, ...target };
+-  }
+-  const item = parseDeviceFolderItemKey(activeId);
+-  if (!item) return null;
+-  return { kind: 'item', item, ...target };
++/** 落点对应的容器 id（拖拽中高亮用）；无效落点返回 null */
++export function dropTargetContainerId(drop: DeviceFolderDrop | null): string | null {
++  if (!drop) return null;
++  return drop.kind === 'folder' ? ROOT_CONTAINER_ID : folderContainerId(drop.targetFolderId);
+ }
+ 
+ /**
+- * 把隐式根条目落成显式 placement（追加在现有根层条目之后，保持宿主给的顺序）。
+- * 根层一旦参与排序就必须全部显式化，否则「显式在前、隐式在后」会把刚拖动的条目弹回队首。
++ * 把隐式根节点落成显式 placement（追加在现有根层节点之后，保持宿主给的顺序）。
++ * 根层一旦参与排序就必须全部显式化，否则「显式在前、隐式在后」会把刚拖动的节点弹回队首。
+  */
+-export function materializeRootItems(
++export function materializeRootNodes(
+   layout: DeviceFolderLayout,
+-  implicit: readonly DeviceFolderItemRef[]
++  implicit: readonly string[]
+ ): DeviceFolderLayout {
+-  const pending = implicitRootItems(layout, implicit);
++  const pending = implicitRootNodeIds(layout, implicit);
+   if (pending.length === 0) return layout;
+   const nextOrder =
+     layout.placements
+       .filter((placement) => placement.folderId === null)
+       .reduce((max, placement) => Math.max(max, placement.sortOrder), -1) + 1;
+-  const added: DeviceFolderPlacement[] = pending.map((item, offset) => ({
+-    kind: item.kind,
+-    nodeId: item.nodeId,
+-    deviceId: item.kind === 'node' ? null : (item.deviceId ?? null),
++  const added: DeviceFolderPlacement[] = pending.map((nodeId, offset) => ({
++    nodeId,
+     folderId: null,
+     sortOrder: nextOrder + offset,
+   }));
+   return { folders: layout.folders, placements: [...layout.placements, ...added] };
+ }
+ 
+-/** 应用一次落点；非法（目标文件夹不存在 / 成环）返回 null */
++/** 应用一次落点；非法（目标分组不存在）返回 null */
+ export function applyDrop(
+   layout: DeviceFolderLayout,
+   drop: DeviceFolderDrop,
+-  implicit: readonly DeviceFolderItemRef[] = []
++  implicit: readonly string[] = []
+ ): DeviceFolderLayout | null {
+   if (drop.kind === 'folder') {
+-    return moveFolderInLayout(layout, drop.folderId, drop.targetFolderId, drop.index);
+-  }
+-  const base = drop.targetFolderId === null ? materializeRootItems(layout, implicit) : layout;
+-  return moveItemInLayout(base, drop.item, drop.targetFolderId, drop.index);
+-}
+-
+-/** 某个 node 上已被单独放置（脱离节点分组）的设备 id */
+-export function placedDeviceIds(layout: DeviceFolderLayout, nodeId: string): Set<string> {
+-  const ids = new Set<string>();
+-  for (const placement of layout.placements) {
+-    if (placement.kind === 'device' && placement.nodeId === nodeId && placement.deviceId) {
+-      ids.add(placement.deviceId);
+-    }
++    return moveFolderInLayout(layout, drop.folderId, drop.index);
+   }
+-  return ids;
++  const base = drop.targetFolderId === null ? materializeRootNodes(layout, implicit) : layout;
++  return moveNodeInLayout(base, drop.nodeId, drop.targetFolderId, drop.index);
+ }
+diff --git a/packages/panels/src/device-folders/index.ts b/packages/panels/src/device-folders/index.ts
+index 78fd6d99..593d1197 100644
+--- a/packages/panels/src/device-folders/index.ts
++++ b/packages/panels/src/device-folders/index.ts
+@@ -1,30 +1,30 @@
+ export {
+   DeviceFolderTree,
+-  type DeviceFolderItemContext,
++  type DeviceFolderNodeContext,
+   type DeviceFolderTreeHandle,
+   type DeviceFolderTreeProps,
+ } from './device-folder-tree';
+-export { DeviceFolderItemShell, type DeviceFolderItemShellProps } from './draggable-item';
++export { DeviceFolderNodeShell, type DeviceFolderNodeShellProps } from './draggable-item';
+ export { FolderNameEditor, type FolderNameEditorProps } from './folder-name-editor';
+-export { FolderDropArea, FolderSection, MAX_INDENT_DEPTH } from './folder-section';
++export { FolderDropArea, FolderSection } from './folder-section';
+ export {
+   ROOT_CONTAINER_ID,
+   applyDrop,
+   bodyDropZoneId,
+-  containerChildIds,
+   containerFolderId,
++  dropTargetContainerId,
+   dropZoneId,
+   folderContainerId,
+   folderElementId,
+-  implicitRootItems,
++  implicitRootNodeIds,
+   listContainers,
+-  materializeRootItems,
++  materializeRootNodes,
++  nodeElementId,
+   parseDropZoneId,
+   parseFolderElementId,
+-  placedDeviceIds,
++  parseNodeElementId,
+   resolveDrop,
+-  resolveDropTarget,
++  rootFolderElementIds,
+   type DeviceFolderContainer,
+   type DeviceFolderDrop,
+-  type DeviceFolderDropTarget,
+ } from './folder-tree-model';
+diff --git a/packages/panels/src/device-management/device-card-connect-toggle.test.ts b/packages/panels/src/device-management/device-card-connect-toggle.test.ts
+index 06ec3f4d..30a89a80 100644
+--- a/packages/panels/src/device-management/device-card-connect-toggle.test.ts
++++ b/packages/panels/src/device-management/device-card-connect-toggle.test.ts
+@@ -1,15 +1,16 @@
+-// 连接状态 → 卡片主按钮动作的映射。
++// 连接状态 → 卡片主按钮动作的映射，以及节点离线时的展示状态。
+ 
+ import { describe, expect, test } from 'bun:test';
+-import { deviceConnectAction } from './device-card-connect-toggle';
++import { deviceConnectAction, displayedConnectionStatus } from './device-card-connect-toggle';
+ 
+ describe('deviceConnectAction', () => {
+   test('已连接可断开', () => {
+     expect(deviceConnectAction('connected')).toBe('disconnect');
+   });
+ 
+-  test('连接中/重连中一律置为 pending（按钮禁用）', () => {
++  test('连接中 / 断开中 / 重连中一律置为 pending（按钮禁用）', () => {
+     expect(deviceConnectAction('connecting')).toBe('pending');
++    expect(deviceConnectAction('disconnecting')).toBe('pending');
+     expect(deviceConnectAction('reconnecting')).toBe('pending');
+   });
+ 
+@@ -18,3 +19,20 @@ describe('deviceConnectAction', () => {
+     expect(deviceConnectAction('error')).toBe('connect');
+   });
+ });
++
++describe('displayedConnectionStatus', () => {
++  test('节点离线时残留的 connected 按 disconnected 展示', () => {
++    expect(displayedConnectionStatus('connected', true)).toBe('disconnected');
++  });
++
++  test('离线时手动尝试产生的 connecting / error 照常展示', () => {
++    expect(displayedConnectionStatus('connecting', true)).toBe('connecting');
++    expect(displayedConnectionStatus('error', true)).toBe('error');
++    expect(displayedConnectionStatus('reconnecting', true)).toBe('reconnecting');
++  });
++
++  test('在线时原样透传', () => {
++    expect(displayedConnectionStatus('connected', false)).toBe('connected');
++    expect(displayedConnectionStatus('disconnecting', false)).toBe('disconnecting');
++  });
++});
+diff --git a/packages/panels/src/device-management/device-card-connect-toggle.tsx b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+index 85b92511..663ee910 100644
+--- a/packages/panels/src/device-management/device-card-connect-toggle.tsx
++++ b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+@@ -1,8 +1,13 @@
+ // 卡片主按钮：真实的连接/断开开关，由宿主注入的 DeviceConnectionAdapter 驱动。
+ // 点「连接」会顺带清掉持久化的「断开意图」（见 adapter 实现），所以这里只做状态映射。
++//
++// 节点离线时（`offline`）：已连接态不可信（节点掉线后 store 里可能残留旧的 connected），
++// 一律按「已断开」展示，让用户能点「连接」发起一次手动尝试；尝试产生的 connecting / error
++// 照常展示。
+ 
+ import { cn } from '@tmex/ui';
+ import { Button } from '@tmex/ui/button';
++import { Loader2 } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
+ import { deviceStatusDotClass } from '../device-tree/device-connection-control';
+@@ -14,6 +19,7 @@ export function deviceConnectAction(status: DeviceConnectionStatus): DeviceConne
+     case 'connected':
+       return 'disconnect';
+     case 'connecting':
++    case 'disconnecting':
+     case 'reconnecting':
+       return 'pending';
+     default:
+@@ -21,28 +27,44 @@ export function deviceConnectAction(status: DeviceConnectionStatus): DeviceConne
+   }
+ }
+ 
++/** 节点离线时的展示状态：残留的 connected 视为 disconnected，其余照旧 */
++export function displayedConnectionStatus(
++  status: DeviceConnectionStatus,
++  offline: boolean
++): DeviceConnectionStatus {
++  return offline && status === 'connected' ? 'disconnected' : status;
++}
++
+ export interface DeviceCardConnectToggleProps {
+   deviceId: string;
+   connection: DeviceConnectionAdapter;
++  offline?: boolean;
+ }
+ 
+-export function DeviceCardConnectToggle({ deviceId, connection }: DeviceCardConnectToggleProps) {
++export function DeviceCardConnectToggle({
++  deviceId,
++  connection,
++  offline = false,
++}: DeviceCardConnectToggleProps) {
+   const { t } = useTranslation();
+-  const status = connection.status(deviceId);
++  const status = displayedConnectionStatus(connection.status(deviceId), offline);
+   const action = deviceConnectAction(status);
+   const label =
+     action === 'disconnect'
+       ? t('device.disconnect')
+-      : action === 'pending'
+-        ? t('device.connecting')
+-        : t('device.connect');
++      : status === 'disconnecting'
++        ? t('device.disconnecting')
++        : action === 'pending'
++          ? t('device.connecting')
++          : t('device.connect');
+ 
+   return (
+     <Button
+       type="button"
+       variant="outline"
+       size="sm"
+-      className="shrink-0"
++      // 固定最小宽度：文案在「连接 / 连接中 / 断开」之间切换时按钮不再跳宽
++      className="min-w-[5.5rem] shrink-0 justify-start"
+       data-testid={`device-card-connect-${deviceId}`}
+       data-state={status}
+       data-action={action}
+@@ -58,14 +80,21 @@ export function DeviceCardConnectToggle({ deviceId, connection }: DeviceCardConn
+         }
+       }}
+     >
+-      <span
+-        aria-hidden="true"
+-        className={cn(
+-          'h-2 w-2 shrink-0 rounded-full transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
+-          deviceStatusDotClass(status)
+-        )}
+-      />
+-      {label}
++      {action === 'pending' ? (
++        <Loader2
++          aria-hidden="true"
++          className="size-3 shrink-0 animate-spin text-muted-foreground motion-reduce:animate-none"
++        />
++      ) : (
++        <span
++          aria-hidden="true"
++          className={cn(
++            'h-2 w-2 shrink-0 rounded-full transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
++            deviceStatusDotClass(status)
++          )}
++        />
++      )}
++      <span className="truncate">{label}</span>
+     </Button>
+   );
+ }
+diff --git a/packages/panels/src/device-management/device-card-host.tsx b/packages/panels/src/device-management/device-card-host.tsx
+index 2d9dab3b..410a28a7 100644
+--- a/packages/panels/src/device-management/device-card-host.tsx
++++ b/packages/panels/src/device-management/device-card-host.tsx
+@@ -1,8 +1,8 @@
+ // 单张设备卡片的宿主：把编辑对话框与删除确认的状态下放到每张卡片，
+-// 这样文件夹、拖拽等外层容器可以直接复用一张「自带交互」的卡片。
++// 这样分组、拖拽等外层容器可以直接复用一张「自带交互」的卡片。
+ 
+ import type { Device } from '@tmex/shared';
+-import { type CSSProperties, useState } from 'react';
++import { type CSSProperties, type ReactNode, useState } from 'react';
+ import type { DeviceConnectionAdapter } from '../device-connection';
+ import { DeviceCard } from './device-card';
+ import { DeviceDeleteDialog } from './device-delete-dialog';
+@@ -14,6 +14,8 @@ export interface DeviceCardHostProps {
+   queryKey: readonly unknown[];
+   nodeContext: DeviceNodeContext;
+   connection?: DeviceConnectionAdapter;
++  offline?: boolean;
++  dragHandle?: ReactNode;
+   style?: CSSProperties;
+   className?: string;
+ }
+@@ -23,6 +25,8 @@ export function DeviceCardHost({
+   queryKey,
+   nodeContext,
+   connection,
++  offline,
++  dragHandle,
+   style,
+   className,
+ }: DeviceCardHostProps) {
+@@ -35,6 +39,8 @@ export function DeviceCardHost({
+         device={device}
+         nodeContext={nodeContext}
+         connection={connection}
++        offline={offline}
++        dragHandle={dragHandle}
+         style={style}
+         className={className}
+         onEdit={() => setEditing(true)}
+diff --git a/packages/panels/src/device-management/device-card.test.tsx b/packages/panels/src/device-management/device-card.test.tsx
+index 7c032b05..9425e1cd 100644
+--- a/packages/panels/src/device-management/device-card.test.tsx
++++ b/packages/panels/src/device-management/device-card.test.tsx
+@@ -68,6 +68,7 @@ function renderCard(options: {
+   device?: Device;
+   nodeContext?: DeviceNodeContext;
+   connection?: DeviceConnectionAdapter;
++  offline?: boolean;
+ }): string {
+   const nodeContext = options.nodeContext ?? SELF_CONTEXT;
+   // 每次一个独立的 persist key：共享的内存 localStorage 不会把用例之间的偏好串起来。
+@@ -84,6 +85,7 @@ function renderCard(options: {
+               device={options.device ?? LOCAL_DEVICE}
+               nodeContext={nodeContext}
+               connection={options.connection}
++              offline={options.offline}
+               onEdit={() => undefined}
+               onDelete={() => undefined}
+             />
+@@ -133,16 +135,17 @@ describe('DeviceCard 的设备种类展示', () => {
+     expect(html).toContain('data-device-kind="ssh"');
+   });
+ 
+-  test('远端节点上的本机设备说「节点 X 上的本机设备」，并带远端角标', () => {
++  test('远端节点上的本机设备说「远程本地设备」，并带远端角标', () => {
+     const html = renderCard({ nodeContext: REMOTE_CONTEXT });
+-    expect(html).toContain('节点 书房节点 上的本机设备');
++    expect(html).toContain('远程本地设备');
++    expect(html).not.toContain('书房节点');
+     expect(html).toContain('data-device-kind="nodeLocal"');
+     expect(html).toContain('data-testid="device-card-remote-dev-1"');
+   });
+ 
+-  test('远端节点上的 SSH 设备说「节点 X 上的 SSH 设备」', () => {
++  test('远端节点上的 SSH 设备说「远程 SSH 设备」', () => {
+     const html = renderCard({ device: SSH_DEVICE, nodeContext: REMOTE_CONTEXT });
+-    expect(html).toContain('节点 书房节点 上的 SSH 设备');
++    expect(html).toContain('远程 SSH 设备');
+     expect(html).toContain('data-device-kind="nodeSsh"');
+   });
+ 
+@@ -201,12 +204,44 @@ describe('DeviceCard 的连接开关', () => {
+     expect(tag).toContain('data-action="pending"');
+   });
+ 
++  test('断开中：禁用并显示「断开中...」，不闪回「连接」', () => {
++    const html = renderCard({ connection: stubConnection('disconnecting') });
++    const tag = tagOf(html, 'device-card-connect-dev-1');
++    expect(tag).toContain('data-state="disconnecting"');
++    expect(tag).toContain('data-action="pending"');
++    expect(tag).toContain('disabled');
++    expect(html).toContain('断开中...');
++  });
++
+   test('有 connection 时「打开」仍在，只是变成图标按钮', () => {
+     const html = renderCard({ connection: stubConnection('connected') });
+     expect(tagOf(html, 'device-card-open-dev-1')).toContain('href="/devices/dev-1"');
+   });
+ });
+ 
++describe('DeviceCard 的离线态', () => {
++  test('节点离线：标「节点离线」、灰显，残留的 connected 按「连接」展示', () => {
++    const html = renderCard({
++      nodeContext: REMOTE_CONTEXT,
++      connection: stubConnection('connected'),
++      offline: true,
++    });
++    expect(tagOf(html, 'device-card')).toContain('data-offline="true"');
++    expect(html).toContain('data-testid="device-card-offline-dev-1"');
++    expect(html).toContain('节点离线');
++    const toggle = tagOf(html, 'device-card-connect-dev-1');
++    expect(toggle).toContain('data-state="disconnected"');
++    expect(toggle).toContain('data-action="connect"');
++    expect(toggle).not.toContain('disabled=""');
++  });
++
++  test('在线时不带离线标记', () => {
++    const html = renderCard({ connection: stubConnection('connected') });
++    expect(html).not.toContain('data-testid="device-card-offline-dev-1"');
++    expect(tagOf(html, 'device-card')).not.toContain('data-offline');
++  });
++});
++
+ describe('DeviceCard 的侧栏可见性开关', () => {
+   test('self 的设备默认开', () => {
+     expect(switchState(renderCard({}))).toBe('checked');
+diff --git a/packages/panels/src/device-management/device-card.tsx b/packages/panels/src/device-management/device-card.tsx
+index 54c25b36..90b8dd07 100644
+--- a/packages/panels/src/device-management/device-card.tsx
++++ b/packages/panels/src/device-management/device-card.tsx
+@@ -1,6 +1,9 @@
+-// 设备卡片：紧凑两行布局。第一行图标/名称/SSH 目标 + 连接开关、打开与更多菜单；
+-// 第二行「设备种类」pill（本地 / SSH / 节点 X 上的…，种类只在这里出现一次）、会话、
++// 设备卡片：紧凑两行布局。第一行（可选的拖拽把手）图标/名称/SSH 目标 + 连接开关、打开与更多菜单；
++// 第二行「设备种类」pill（本地 / SSH / 远程…，种类只在这里出现一次）、会话、
+ // 状态徽标与「显示在侧栏」开关（浏览器本地偏好，按 `${runtimeNodeId}:${deviceId}` 记）。
++//
++// `offline`：所属节点离线，卡片来自最近一次快照——灰显、标「节点离线」、编辑/删除/测试等
++// 要打远端 API 的动作禁用；连接开关仍可点（手动发起一次连接尝试）。
+ 
+ import { useMutation } from '@tanstack/react-query';
+ import { testDeviceConnection } from '@tmex/api-client';
+@@ -27,9 +30,10 @@ import {
+   Network,
+   Pencil,
+   Trash2,
++  WifiOff,
+   Zap,
+ } from 'lucide-react';
+-import type { CSSProperties } from 'react';
++import type { CSSProperties, ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ import { toast } from 'sonner';
+@@ -51,6 +55,10 @@ export interface DeviceCardProps {
+   nodeContext: DeviceNodeContext;
+   /** 有它才显示真实的连接/断开开关；缺省时只留「打开」 */
+   connection?: DeviceConnectionAdapter;
++  /** 所属节点离线：灰显 + 禁用需要远端 API 的操作 */
++  offline?: boolean;
++  /** 节点内排序的把手（宿主注入），渲染在第一行最左 */
++  dragHandle?: ReactNode;
+   /** 卡片根节点内联样式；列表用它挂 `--tmex-stagger-index` 做逐项入场 */
+   style?: CSSProperties;
+   className?: string;
+@@ -85,7 +93,8 @@ function DeviceCardMenu({
+   device,
+   onEdit,
+   onDelete,
+-}: Pick<DeviceCardProps, 'device' | 'onEdit' | 'onDelete'>) {
++  offline,
++}: Pick<DeviceCardProps, 'device' | 'onEdit' | 'onDelete'> & { offline: boolean }) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+ 
+@@ -116,7 +125,11 @@ function DeviceCardMenu({
+         <MoreHorizontal className="h-4 w-4" />
+       </DropdownMenuTrigger>
+       <DropdownMenuContent align="end">
+-        <DropdownMenuItem data-testid={`device-card-edit-${device.id}`} onClick={onEdit}>
++        <DropdownMenuItem
++          data-testid={`device-card-edit-${device.id}`}
++          onClick={onEdit}
++          disabled={offline}
++        >
+           <Pencil className="h-4 w-4" />
+           {t('common.edit')}
+         </DropdownMenuItem>
+@@ -124,7 +137,7 @@ function DeviceCardMenu({
+           <DropdownMenuItem
+             data-testid={`device-card-test-${device.id}`}
+             onClick={() => testConnection.mutate()}
+-            disabled={testConnection.isPending}
++            disabled={offline || testConnection.isPending}
+           >
+             <Zap className="h-4 w-4" />
+             {t('common.test')}
+@@ -135,6 +148,7 @@ function DeviceCardMenu({
+           data-testid={`device-card-delete-${device.id}`}
+           variant="destructive"
+           onClick={onDelete}
++          disabled={offline}
+         >
+           <Trash2 className="h-4 w-4" />
+           {t('common.delete')}
+@@ -150,6 +164,8 @@ export function DeviceCard({
+   onDelete,
+   nodeContext,
+   connection,
++  offline = false,
++  dragHandle,
+   style,
+   className,
+ }: DeviceCardProps) {
+@@ -163,7 +179,7 @@ export function DeviceCard({
+   const setSidebarVisible = useUIStore((state) => state.setSidebarDeviceVisibility);
+ 
+   const kind = deviceDisplayKind(device.type, nodeContext);
+-  const kindLabel = deviceKindLabel(t, kind, nodeContext.name);
++  const kindLabel = deviceKindLabel(t, kind);
+   const target = sshTarget(device);
+ 
+   return (
+@@ -173,13 +189,16 @@ export function DeviceCard({
+       data-device-id={device.id}
+       data-device-name={device.name}
+       data-device-kind={kind}
++      data-offline={offline ? 'true' : undefined}
+       style={style}
+       className={cn(
+-        'gap-2 overflow-hidden border-border/50 py-2.5 transition-[box-shadow,border-color] duration-(--tmex-motion-standard) ease-out hover:shadow-md hover:ring-foreground/20 motion-reduce:transition-none',
++        'gap-2 overflow-hidden border-border/50 py-2.5 transition-[box-shadow,border-color,opacity] duration-(--tmex-motion-standard) ease-out hover:shadow-md hover:ring-foreground/20 motion-reduce:transition-none',
++        offline && 'border-dashed bg-muted/20 opacity-75 hover:shadow-none',
+         className
+       )}
+     >
+       <CardContent className="flex items-center gap-2">
++        {dragHandle}
+         <DeviceCardIcon device={device} remote={isRemoteDeviceKind(kind)} />
+         <div className="min-w-0 flex-1">
+           <div className="truncate text-sm font-medium leading-tight" title={device.name}>
+@@ -191,7 +210,9 @@ export function DeviceCard({
+             </div>
+           )}
+         </div>
+-        {connection && <DeviceCardConnectToggle deviceId={device.id} connection={connection} />}
++        {connection && (
++          <DeviceCardConnectToggle deviceId={device.id} connection={connection} offline={offline} />
++        )}
+         <Link
+           to={hostAppPath(runtime.host, `/devices/${device.id}`)}
+           data-testid={`device-card-open-${device.id}`}
+@@ -206,7 +227,7 @@ export function DeviceCard({
+           <ArrowUpRight className="h-4 w-4" />
+           {connection ? null : t('device.open')}
+         </Link>
+-        <DeviceCardMenu device={device} onEdit={onEdit} onDelete={onDelete} />
++        <DeviceCardMenu device={device} onEdit={onEdit} onDelete={onDelete} offline={offline} />
+       </CardContent>
+ 
+       <CardContent className="flex flex-wrap items-center gap-x-2 gap-y-1">
+@@ -222,7 +243,18 @@ export function DeviceCard({
+             {device.session}
+           </Badge>
+         )}
+-        <DeviceStatusBadge deviceId={device.id} />
++        {offline ? (
++          <Badge
++            variant="outline"
++            data-testid={`device-card-offline-${device.id}`}
++            className="h-5 gap-1 px-1.5 text-[10px] font-normal text-muted-foreground"
++          >
++            <WifiOff className="h-3 w-3" />
++            {t('devices.nodes.deviceOffline')}
++          </Badge>
++        ) : (
++          <DeviceStatusBadge deviceId={device.id} />
++        )}
+         <div
+           className="ml-auto flex shrink-0 items-center gap-1.5 text-[11px] text-muted-foreground"
+           title={t('device.sidebar.hint')}
+diff --git a/packages/panels/src/device-management/device-dialog.tsx b/packages/panels/src/device-management/device-dialog.tsx
+index 7e8d6dc1..579b679a 100644
+--- a/packages/panels/src/device-management/device-dialog.tsx
++++ b/packages/panels/src/device-management/device-dialog.tsx
+@@ -74,7 +74,7 @@ export function DeviceDialog({ mode, device, nodeContext, onClose, queryKey }: D
+                 data-testid="device-dialog-node-chip"
+                 className="rounded border border-border/60 px-1.5 py-px text-[10px] font-normal leading-none text-muted-foreground"
+               >
+-                {deviceKindLabel(t, kind, nodeContext.name)}
++                {nodeContext.name || deviceKindLabel(t, kind)}
+               </span>
+             )}
+           </DialogTitle>
+diff --git a/packages/panels/src/device-management/device-management-panel.tsx b/packages/panels/src/device-management/device-management-panel.tsx
+index 5c6f9a1b..c6f15135 100644
+--- a/packages/panels/src/device-management/device-management-panel.tsx
++++ b/packages/panels/src/device-management/device-management-panel.tsx
+@@ -1,21 +1,51 @@
+-// 设备管理面板：设备卡片网格 + 新建对话框 + 空态/加载/错误态（每张卡片的编辑与删除
+-// 由 DeviceCardHost 自己管）。数据自取（fetchDevices + 注入 queryKey），REST 一律经
+-// runtime.apiClient；「添加设备」既可经全局事件（缺省监听，多面板宿主可关）也可经 ref 命令式打开。
++// 设备管理面板：设备卡片网格（节点内可拖拽排序）+ 新建对话框 + 空态/加载/错误态
++// （每张卡片的编辑与删除由 DeviceCardHost 自己管）。数据自取（fetchDevices + 注入 queryKey），
++// REST 一律经 runtime.apiClient；「添加设备」既可经全局事件（缺省监听，多面板宿主可关）也可经
++// ref 命令式打开。
++//
++// `offline`：所属节点离线。不再拉列表，卡片来自 query 缓存里最近一次成功的列表，缓存也没有时
++// 退回宿主给的 `fallbackDevices`（本地快照 / 节点 inventory）；卡片带 offline 标记、排序禁用。
++//
++// 宽度与内边距由页面级容器统一负责，本面板只是 `w-full`。
+ 
+-import { useQuery } from '@tanstack/react-query';
+-import { devicesQueryKey as defaultDevicesQueryKey, fetchDevices } from '@tmex/api-client';
+-import type { Device } from '@tmex/shared';
++import {
++  DndContext,
++  type DragEndEvent,
++  KeyboardSensor,
++  MouseSensor,
++  TouchSensor,
++  closestCenter,
++  useSensor,
++  useSensors,
++} from '@dnd-kit/core';
++import {
++  SortableContext,
++  arrayMove,
++  rectSortingStrategy,
++  sortableKeyboardCoordinates,
++  useSortable,
++} from '@dnd-kit/sortable';
++import { CSS } from '@dnd-kit/utilities';
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
++import {
++  type DevicesResponse,
++  devicesQueryKey as defaultDevicesQueryKey,
++  fetchDevices,
++  reorderDevices,
++} from '@tmex/api-client';
++import type { Device, LocaleCode } from '@tmex/shared';
+ import { toBCP47 } from '@tmex/shared';
+ import { useRuntime, useSiteStore, useTmuxStore } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import { Button } from '@tmex/ui/button';
+ import { Card, CardContent } from '@tmex/ui/card';
+ import { staggerItemStyle } from '@tmex/ui/motion';
+-import { Monitor, Plus } from 'lucide-react';
++import { GripVertical, Monitor, Plus } from 'lucide-react';
+ import {
+-  Fragment,
++  type CSSProperties,
+   type ReactNode,
+   type Ref,
++  useCallback,
+   useEffect,
+   useImperativeHandle,
+   useMemo,
+@@ -23,6 +53,7 @@ import {
+   useState,
+ } from 'react';
+ import { useTranslation } from 'react-i18next';
++import { toast } from 'sonner';
+ import type { DeviceConnectionAdapter } from '../device-connection';
+ import { DeviceCardHost } from './device-card-host';
+ import { DeviceDialog } from './device-dialog';
+@@ -31,6 +62,8 @@ import { OPEN_ADD_DEVICE_EVENT } from './events';
+ 
+ /** 首屏逐项入场的延迟档位上限（35ms/档），超出的卡片与最后一档同时进场 */
+ const STAGGER_MAX_INDEX = 11;
++/** 入场动画兜底：animationend 没等到（隐藏标签页等）也在此之后摘掉 stagger 类 */
++const STAGGER_FALLBACK_MS = 1500;
+ 
+ export interface DeviceManagementPanelHandle {
+   openAddDevice(): void;
+@@ -49,6 +82,18 @@ export function subscribeOpenAddDevice(
+   return () => window.removeEventListener(OPEN_ADD_DEVICE_EVENT, onOpen);
+ }
+ 
++/** 卡片顺序与侧边栏 Panes Tab 一致：先 sortOrder，再按设备名 locale 感知排序 */
++export function sortDevices<T extends Pick<Device, 'name' | 'sortOrder'>>(
++  devices: readonly T[],
++  language: LocaleCode
++): T[] {
++  return [...devices].sort(
++    (a, b) =>
++      a.sortOrder - b.sortOrder ||
++      a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
++  );
++}
++
+ export interface DeviceManagementPanelProps {
+   /** 设备列表查询 key；多实例宿主按 gateway 区分，缺省与既有共享缓存一致 */
+   devicesQueryKey?: readonly unknown[];
+@@ -58,29 +103,91 @@ export interface DeviceManagementPanelProps {
+   nodeContext?: DeviceNodeContext;
+   /** 有它卡片才显示真实连接/断开开关；没有时退化为只有「打开」 */
+   connection?: DeviceConnectionAdapter;
+-  /** 这些设备不在本面板网格里渲染（已被宿主放进文件夹之类的容器） */
+-  excludeDeviceIds?: ReadonlySet<string>;
+-  /** 宿主在卡片外再包一层（拖拽把手等） */
+-  renderCard?: (card: ReactNode, device: Device, index: number) => ReactNode;
+-  /** 列表为空/全被排除时不渲染空态卡片，只留对话框 */
+-  hideEmptyState?: boolean;
++  /** 所属节点离线：不拉列表，卡片来自缓存 / fallbackDevices，并带 offline 标记 */
++  offline?: boolean;
++  /** 离线且缓存里没有列表时用的设备（本地快照 / 节点 inventory） */
++  fallbackDevices?: readonly Device[];
++  /** 每次成功拿到设备列表时回调（宿主用来写离线快照） */
++  onDevicesLoaded?: (devices: Device[]) => void;
+   className?: string;
+   ref?: Ref<DeviceManagementPanelHandle>;
+ }
+ 
++function useDeviceGridSensors() {
++  return useSensors(
++    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
++    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
++    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
++  );
++}
++
++const HANDLE_CLASS =
++  'inline-flex size-6 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-muted-foreground/60 transition-colors duration-(--tmex-motion-fast) ease-out hover:bg-accent hover:text-foreground active:cursor-grabbing motion-reduce:transition-none';
++
++function SortableDeviceCard({
++  device,
++  disabled,
++  style,
++  children,
++}: {
++  device: Device;
++  disabled: boolean;
++  style?: CSSProperties;
++  children: (dragHandle: ReactNode) => ReactNode;
++}) {
++  const { t } = useTranslation();
++  const {
++    attributes,
++    listeners,
++    setNodeRef,
++    setActivatorNodeRef,
++    transform,
++    transition,
++    isDragging,
++  } = useSortable({ id: device.id, disabled });
++
++  const dragHandle = disabled ? null : (
++    <button
++      type="button"
++      ref={setActivatorNodeRef}
++      data-testid={`device-card-handle-${device.id}`}
++      aria-label={t('device.dragHandle')}
++      title={t('device.dragHandle')}
++      className={HANDLE_CLASS}
++      {...attributes}
++      {...listeners}
++    >
++      <GripVertical className="size-3.5" />
++    </button>
++  );
++
++  return (
++    <div
++      ref={setNodeRef}
++      data-testid={`device-card-slot-${device.id}`}
++      data-dragging={isDragging ? 'true' : undefined}
++      className={cn('min-w-0', isDragging && 'z-10 opacity-60')}
++      style={{ ...style, transform: CSS.Translate.toString(transform), transition }}
++    >
++      {children(dragHandle)}
++    </div>
++  );
++}
++
+ export function DeviceManagementPanel({
+   devicesQueryKey = defaultDevicesQueryKey,
+   listenOpenAddDeviceEvent = true,
+   nodeContext,
+   connection,
+-  excludeDeviceIds,
+-  renderCard,
+-  hideEmptyState = false,
++  offline = false,
++  fallbackDevices,
++  onDevicesLoaded,
+   className,
+   ref,
+ }: DeviceManagementPanelProps) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
++  const queryClient = useQueryClient();
+   const [showAddModal, setShowAddModal] = useState(false);
+   const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
+ 
+@@ -100,6 +207,7 @@ export function DeviceManagementPanel({
+     queryKey: devicesQueryKey,
+     queryFn: () => fetchDevices(runtime.apiClient),
+     throwOnError: false,
++    enabled: !offline,
+   });
+ 
+   const hydrateDeviceErrors = useTmuxStore((state) => state.hydrateDeviceErrors);
+@@ -113,33 +221,80 @@ export function DeviceManagementPanel({
+         lastErrorType: d.lastErrorType ?? null,
+       }))
+     );
+-  }, [data, hydrateDeviceErrors]);
++    onDevicesLoaded?.(data.devices);
++  }, [data, hydrateDeviceErrors, onDevicesLoaded]);
+ 
+-  // 卡片顺序与侧边栏 Panes Tab 一致：先 sortOrder，再按设备名 locale 感知排序
+   const devices = useMemo(() => {
+-    const list = data?.devices ?? [];
+-    return [...list].sort(
+-      (a, b) =>
+-        a.sortOrder - b.sortOrder ||
+-        a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
+-    );
+-  }, [data?.devices, language]);
+-
+-  const visibleDevices = useMemo(
+-    () =>
+-      excludeDeviceIds ? devices.filter((device) => !excludeDeviceIds.has(device.id)) : devices,
+-    [devices, excludeDeviceIds]
+-  );
++    const list = data?.devices ?? (offline ? fallbackDevices : undefined);
++    return list ? sortDevices(list, language) : undefined;
++  }, [data?.devices, offline, fallbackDevices, language]);
+ 
+-  // 逐项入场只做首屏那一批：之后 refetch/新增设备不再整列表重放（新卡片按 index 0 单独淡入）。
+-  // 延迟档位封顶 STAGGER_MAX_INDEX，避免长列表拖尾。
++  // 逐项入场只做首屏那一批，动画跑完就摘掉 stagger 类：之后 refetch / 重排 / 状态更新都不再
++  // 重放（DOM 节点被移动时 CSS 动画会重新触发，摘掉类是唯一稳妥的办法）。
+   const initialBatchRef = useRef<ReadonlySet<string> | null>(null);
+-  if (initialBatchRef.current === null && data) {
++  if (initialBatchRef.current === null && devices) {
+     initialBatchRef.current = new Set(devices.map((device) => device.id));
+   }
+   const initialBatch = initialBatchRef.current;
++  const [entered, setEntered] = useState(false);
++  const enteredCountRef = useRef(0);
++  useEffect(() => {
++    if (!initialBatch || entered) return;
++    if (initialBatch.size === 0) {
++      setEntered(true);
++      return;
++    }
++    const timer = window.setTimeout(() => setEntered(true), STAGGER_FALLBACK_MS);
++    return () => window.clearTimeout(timer);
++  }, [initialBatch, entered]);
++  const handleAnimationEnd = useCallback(() => {
++    if (!initialBatch || entered) return;
++    enteredCountRef.current += 1;
++    if (enteredCountRef.current >= initialBatch.size) setEntered(true);
++  }, [initialBatch, entered]);
++
++  const reorderMutation = useMutation({
++    mutationFn: (deviceIds: string[]) => reorderDevices(deviceIds, runtime.apiClient),
++    onMutate: async (deviceIds: string[]) => {
++      await queryClient.cancelQueries({ queryKey: devicesQueryKey });
++      const previous = queryClient.getQueryData<DevicesResponse>(devicesQueryKey);
++      if (previous) {
++        const byId = new Map(previous.devices.map((device) => [device.id, device]));
++        const reordered = deviceIds.flatMap((id, index) => {
++          const device = byId.get(id);
++          return device ? [{ ...device, sortOrder: index }] : [];
++        });
++        const rest = previous.devices.filter((device) => !deviceIds.includes(device.id));
++        queryClient.setQueryData(devicesQueryKey, { devices: [...reordered, ...rest] });
++      }
++      return { previous };
++    },
++    onError: (_error, _ids, context) => {
++      if (context?.previous) queryClient.setQueryData(devicesQueryKey, context.previous);
++      toast.error(t('device.reorderFailed'));
++    },
++    onSuccess: (result) => {
++      queryClient.setQueryData(devicesQueryKey, result);
++    },
++  });
+ 
+-  const emptyState = hideEmptyState ? null : (
++  const deviceIds = useMemo(() => (devices ?? []).map((device) => device.id), [devices]);
++  const reorderMutate = reorderMutation.mutate;
++  const handleDragEnd = useCallback(
++    (event: DragEndEvent) => {
++      const { active, over } = event;
++      if (!over || active.id === over.id) return;
++      const from = deviceIds.indexOf(String(active.id));
++      const to = deviceIds.indexOf(String(over.id));
++      if (from < 0 || to < 0) return;
++      reorderMutate(arrayMove([...deviceIds], from, to));
++    },
++    [deviceIds, reorderMutate]
++  );
++  const sensors = useDeviceGridSensors();
++  const reorderDisabled = offline || reorderMutation.isPending || deviceIds.length < 2;
++
++  const emptyState = (
+     <Card size="sm" className="tmex-reveal">
+       <CardContent className="space-y-3 py-8 text-center">
+         <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-muted">
+@@ -162,54 +317,90 @@ export function DeviceManagementPanel({
+     </Card>
+   );
+ 
+-  return (
++  const offlineEmptyState = (
+     <div
+-      className={cn(
+-        'mx-auto flex w-full max-w-6xl flex-col gap-3 p-3 pb-[calc(1rem+env(safe-area-inset-bottom))] sm:p-5',
+-        className
+-      )}
+-      data-testid="devices-page"
++      data-testid="devices-offline-empty"
++      className="rounded-lg border border-dashed border-border/60 bg-muted/20 px-3 py-3 text-xs text-muted-foreground/70"
+     >
+-      {isLoading ? (
++      {t('devices.nodes.noKnownDevices')}
++    </div>
++  );
++
++  let body: ReactNode;
++  if (!devices) {
++    body =
++      isLoading || (!isError && !offline) ? (
+         <Card size="sm" className="tmex-reveal">
+           <CardContent className="py-10 text-center text-sm text-muted-foreground">
+             {t('common.loading')}
+           </CardContent>
+         </Card>
+-      ) : isError ? (
++      ) : offline ? (
++        offlineEmptyState
++      ) : (
+         <Card size="sm" className="tmex-reveal">
+           <CardContent className="py-10 text-center text-sm text-destructive">
+             {t('device.loadFailed')}
+           </CardContent>
+         </Card>
+-      ) : visibleDevices.length === 0 ? (
+-        emptyState
+-      ) : (
+-        <div className="tmex-stagger grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+-          {visibleDevices.map((device, index) => {
+-            const card = (
+-              <DeviceCardHost
++      );
++  } else if (devices.length === 0) {
++    body = offline ? offlineEmptyState : emptyState;
++  } else {
++    body = (
++      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
++        <SortableContext
++          items={deviceIds}
++          strategy={rectSortingStrategy}
++          disabled={reorderDisabled}
++        >
++          <div
++            data-testid="devices-grid"
++            className={cn(
++              'grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4',
++              !entered && 'tmex-stagger'
++            )}
++            onAnimationEnd={handleAnimationEnd}
++          >
++            {devices.map((device, index) => (
++              <SortableDeviceCard
++                key={device.id}
+                 device={device}
+-                queryKey={devicesQueryKey}
+-                nodeContext={resolvedNodeContext}
+-                connection={connection}
++                disabled={reorderDisabled}
+                 style={
+-                  initialBatch?.has(device.id)
++                  !entered && initialBatch?.has(device.id)
+                     ? staggerItemStyle(Math.min(index, STAGGER_MAX_INDEX))
+                     : undefined
+                 }
+-              />
+-            );
+-            return (
+-              <Fragment key={device.id}>
+-                {renderCard ? renderCard(card, device, index) : card}
+-              </Fragment>
+-            );
+-          })}
+-        </div>
++              >
++                {(dragHandle) => (
++                  <DeviceCardHost
++                    device={device}
++                    queryKey={devicesQueryKey}
++                    nodeContext={resolvedNodeContext}
++                    connection={connection}
++                    offline={offline}
++                    dragHandle={dragHandle}
++                  />
++                )}
++              </SortableDeviceCard>
++            ))}
++          </div>
++        </SortableContext>
++      </DndContext>
++    );
++  }
++
++  return (
++    <div className={cn('flex w-full min-w-0 flex-col gap-3', className)} data-testid="devices-page">
++      {offline && devices && devices.length > 0 && (
++        <p data-testid="devices-offline-hint" className="text-[11px] text-muted-foreground/70">
++          {t('devices.nodes.offlineSnapshot')}
++        </p>
+       )}
++      {body}
+ 
+-      {showAddModal && (
++      {showAddModal && !offline && (
+         <DeviceDialog
+           mode="create"
+           nodeContext={resolvedNodeContext}
+diff --git a/packages/panels/src/device-management/device-node-context.test.ts b/packages/panels/src/device-management/device-node-context.test.ts
+index e1ff0a9c..8d55c4ac 100644
+--- a/packages/panels/src/device-management/device-node-context.test.ts
++++ b/packages/panels/src/device-management/device-node-context.test.ts
+@@ -35,13 +35,13 @@ describe('isRemoteDeviceKind', () => {
+ });
+ 
+ describe('deviceKindLabel', () => {
+-  test('本机两种不带节点名', () => {
+-    expect(deviceKindLabel(i18n.t, 'local', '书房节点')).toBe('本地设备');
+-    expect(deviceKindLabel(i18n.t, 'ssh', '书房节点')).toBe('SSH 设备');
++  test('本机两种', () => {
++    expect(deviceKindLabel(i18n.t, 'local')).toBe('本地设备');
++    expect(deviceKindLabel(i18n.t, 'ssh')).toBe('SSH 设备');
+   });
+ 
+-  test('远端两种插入节点名', () => {
+-    expect(deviceKindLabel(i18n.t, 'nodeLocal', '书房节点')).toBe('节点 书房节点 上的本机设备');
+-    expect(deviceKindLabel(i18n.t, 'nodeSsh', '书房节点')).toBe('节点 书房节点 上的 SSH 设备');
++  test('远端两种说「远程…」，节点名已在分组头上，不再重复', () => {
++    expect(deviceKindLabel(i18n.t, 'nodeLocal')).toBe('远程本地设备');
++    expect(deviceKindLabel(i18n.t, 'nodeSsh')).toBe('远程 SSH 设备');
+   });
+ });
+diff --git a/packages/panels/src/device-management/device-node-context.ts b/packages/panels/src/device-management/device-node-context.ts
+index 22001986..dcd9e8df 100644
+--- a/packages/panels/src/device-management/device-node-context.ts
++++ b/packages/panels/src/device-management/device-node-context.ts
+@@ -1,5 +1,5 @@
+ // 设备的「所属节点」渲染上下文。`Device.type` 只有 local | ssh，「是否属于远端 mesh 节点」
+-// 是宿主按运行时注入的展示信息，不落在数据里。
++// 是宿主按运行时注入的展示信息，不落在数据里。节点名已经在分组头上，种类文案不再重复它。
+ 
+ import type { DeviceType } from '@tmex/shared';
+ import type { TFunction } from 'i18next';
+@@ -29,15 +29,15 @@ export function isRemoteDeviceKind(kind: DeviceDisplayKind): boolean {
+   return kind === 'nodeLocal' || kind === 'nodeSsh';
+ }
+ 
+-export function deviceKindLabel(t: TFunction, kind: DeviceDisplayKind, nodeName: string): string {
++export function deviceKindLabel(t: TFunction, kind: DeviceDisplayKind): string {
+   switch (kind) {
+     case 'local':
+       return t('device.kind.local');
+     case 'ssh':
+       return t('device.kind.ssh');
+     case 'nodeLocal':
+-      return t('device.kind.nodeLocal', { node: nodeName });
++      return t('device.kind.nodeLocal');
+     default:
+-      return t('device.kind.nodeSsh', { node: nodeName });
++      return t('device.kind.nodeSsh');
+   }
+ }

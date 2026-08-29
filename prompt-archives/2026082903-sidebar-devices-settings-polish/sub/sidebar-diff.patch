@@ -1,0 +1,791 @@
+diff --git a/apps/fe/src/components/page-layouts/components/nav-main.tsx b/apps/fe/src/components/page-layouts/components/nav-main.tsx
+index 273b9ab2..8642255e 100644
+--- a/apps/fe/src/components/page-layouts/components/nav-main.tsx
++++ b/apps/fe/src/components/page-layouts/components/nav-main.tsx
+@@ -14,8 +14,23 @@ import { useTranslation } from 'react-i18next';
+ import { useLocation } from 'react-router';
+ import { NavLink } from './nav-link';
+ 
+-function isPathActive(pathname: string, url: string): boolean {
+-  return pathname === url || pathname.startsWith(`${url}/`);
++/**
++ * 去掉 `/n/:nodeId` 前缀、query/hash 与结尾斜杠，把 NavLink 生成的宿主感知路径
++ * 与地址栏的 pathname 归一到同一形状再比。
++ */
++export function normalizeNavPath(value: string): string {
++  const [path = ''] = value.split(/[?#]/);
++  const withoutNodePrefix = path.replace(/^\/n\/[^/]+(?=\/|$)/, '');
++  const trimmed = withoutNodePrefix.replace(/\/+$/, '');
++  return trimmed || '/';
++}
++
++/**
++ * 只认「就是这一页」：`/devices/:deviceId/...` 是终端页，不该把「管理设备」点亮；
++ * 现有导航项都不是 section 根，没有前缀匹配的需求。
++ */
++export function isPathActive(pathname: string, url: string): boolean {
++  return normalizeNavPath(pathname) === normalizeNavPath(url);
+ }
+ 
+ export function NavMain({
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+index 917fc916..2ab5592e 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+@@ -8,7 +8,8 @@ import {
+   useSidebarDeviceStats,
+ } from '@tmex/panels/device-tree';
+ import { useRuntime } from '@tmex/stores/react';
+-import type { ReactNode } from 'react';
++import { cn } from '@tmex/ui';
++import type { CSSProperties, ReactNode } from 'react';
+ import { SidebarAgentSessionsProvider, useSidebarAgentAdapter } from './sidebar-agent-sessions';
+ 
+ /** 聚合视图的分节外壳：分节头与设备树同生共死，没有可显示的设备时整节都不渲染。 */
+@@ -17,6 +18,13 @@ export interface SidebarNodeSectionShell {
+   header: ReactNode;
+   /** 该 node 一台设备都没有时是否仍渲染（本机保留空态引导，远端直接隐藏） */
+   keepWhenNoDevices?: boolean;
++  /**
++   * 分节根元素的拖拽接线。分节可能整节隐藏（return null），所以 sortable 的
++   * ref/transform 只能挂在这个真正的根元素上，不能由调用方在外面套一层空壳。
++   */
++  containerRef?: (element: HTMLElement | null) => void;
++  containerStyle?: CSSProperties;
++  containerClassName?: string;
+ }
+ 
+ export interface SideBarDeviceListForRuntimeProps {
+@@ -65,7 +73,12 @@ function NodeSection({
+   }
+ 
+   return (
+-    <div data-testid={section.testId} className="space-y-1">
++    <div
++      ref={section.containerRef}
++      style={section.containerStyle}
++      data-testid={section.testId}
++      className={cn('space-y-0.5', section.containerClassName)}
++    >
+       {section.header}
+       <DeviceTree {...rest} />
+     </div>
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
+index 846f16ce..e9309065 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
+@@ -32,10 +32,17 @@ const { renderToStaticMarkup } = await import('react-dom/server');
+ const { MemoryRouter } = await import('react-router');
+ const { sidebarDeviceVisibilityKey } = await import('@tmex/stores');
+ const { RuntimeProvider } = await import('@tmex/stores/react');
+-const { SideBarDeviceList, toSidebarEntries } = await import('./sidebar-device-list');
++const {
++  SideBarDeviceList,
++  applySidebarNodeOrder,
++  sidebarNodeIdFromSortableId,
++  sidebarNodeSortableId,
++  toSidebarEntries,
++} = await import('./sidebar-device-list');
+ const { SidebarNodeSection, inventoryDevices, selectedDeviceIdForNode } = await import(
+   './sidebar-node-section'
+ );
++const { SortableVerticalList, useSortableRow } = await import('@tmex/panels/device-tree');
+ 
+ /**
+  * 分节自身要读宿主级共享的 UI store（设备可见性）；生产里 AppSidebar 永远在
+@@ -106,6 +113,63 @@ describe('toSidebarEntries', () => {
+     expect(entries[0].isSelf).toBe(false);
+     expect(entries[0].runtimeNodeId).toBe('a');
+   });
++
++  test('手工顺序优先于 API 顺序，新 node 追加在末尾', () => {
++    const nodes = [meshNode({ id: 'a' }), meshNode({ id: 'b' }), meshNode({ id: 'c' })];
++    expect(toSidebarEntries(nodes, null, ['c', 'gone', 'a']).map((e) => e.id)).toEqual([
++      'c',
++      'a',
++      'b',
++    ]);
++  });
++
++  test('手工顺序用的是 mesh node id，self 也能被拖到别的位置', () => {
++    const nodes = [meshNode({ id: 'a' }), meshNode({ id: 'b' })];
++    const entries = toSidebarEntries(nodes, 'a', ['b', 'a']);
++    expect(entries.map((e) => e.id)).toEqual(['b', 'a']);
++    expect(entries[1].runtimeNodeId).toBe('self');
++  });
++});
++
++describe('applySidebarNodeOrder', () => {
++  const entries = [{ id: 'a' }, { id: 'b' }, { id: 'c' }] as unknown as Parameters<
++    typeof applySidebarNodeOrder
++  >[0];
++
++  test('空顺序原样返回 API 顺序', () => {
++    expect(applySidebarNodeOrder(entries, []).map((e) => e.id)).toEqual(['a', 'b', 'c']);
++  });
++
++  test('保存过的 id 按保存顺序在前，新 node 按 API 顺序追加在后', () => {
++    expect(applySidebarNodeOrder(entries, ['c', 'a']).map((e) => e.id)).toEqual(['c', 'a', 'b']);
++  });
++
++  test('已不存在的 id 直接跳过，重复 id 只算一次', () => {
++    expect(applySidebarNodeOrder(entries, ['gone', 'b', 'b', 'gone2']).map((e) => e.id)).toEqual([
++      'b',
++      'a',
++      'c',
++    ]);
++  });
++
++  test('顺序覆盖全部 node 时完全按保存顺序', () => {
++    expect(applySidebarNodeOrder(entries, ['c', 'b', 'a']).map((e) => e.id)).toEqual([
++      'c',
++      'b',
++      'a',
++    ]);
++  });
++});
++
++describe('sidebar node sortable ids', () => {
++  test('加前缀与还原互为逆运算，与设备/窗口/pane 的 id 空间隔开', () => {
++    expect(sidebarNodeSortableId('node-1')).toBe('sidebar-node:node-1');
++    expect(sidebarNodeIdFromSortableId(sidebarNodeSortableId('node-1'))).toBe('node-1');
++  });
++
++  test('没有前缀的 id 原样返回', () => {
++    expect(sidebarNodeIdFromSortableId('node-1')).toBe('node-1');
++  });
+ });
+ 
+ describe('inventoryDevices', () => {
+@@ -235,6 +299,41 @@ describe('SidebarNodeSection', () => {
+   });
+ });
+ 
++describe('分节拖拽接线', () => {
++  const NODE = '0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d';
++  const DRAG_LABEL = '拖动以调整节点顺序';
++
++  // 生产里 `MeshDeviceList` 就是这么接的：分节 id 加 `sidebar-node:` 前缀，
++  // 与分节内部设备/窗口/pane 三层排序的 id 空间隔开。
++  function SortableProbe({ node }: { node: Parameters<typeof SidebarNodeSection>[0]['node'] }) {
++    const sortable = useSortableRow(sidebarNodeSortableId(node.id));
++    return <SidebarNodeSection node={node} drag={{ sortable, dragHandleLabel: DRAG_LABEL }} />;
++  }
++
++  test('分节头兼作拖拽手柄：可拖拽属性挂在 header 上，节点名不再是带框徽标', () => {
++    const node = {
++      id: NODE,
++      runtimeNodeId: NODE,
++      name: 'studio',
++      online: false,
++      loggedIn: true,
++      isSelf: true,
++      inventory: null,
++    };
++    const html = render(
++      <SortableVerticalList ids={[sidebarNodeSortableId(NODE)]} onReorder={() => {}}>
++        <SortableProbe node={node} />
++      </SortableVerticalList>
++    );
++
++    expect(html).toContain(`data-testid="sidebar-node-header-${NODE}"`);
++    expect(html).toContain(`aria-label="${DRAG_LABEL}"`);
++    expect(html).toContain('cursor-grab');
++    expect(html).toContain('data-variant="plain"');
++    expect(html).not.toContain('border-border/60');
++  });
++});
++
+ describe('selectedDeviceIdForNode', () => {
+   const NODE = '0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c';
+ 
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx
+index 635971fd..40b964dd 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list.tsx
+@@ -4,15 +4,58 @@
+ import { useMeshNodes, useSharedAuthMode } from '@/node/mesh-nodes';
+ import { SELF_NODE_ID } from '@tmex/api-client';
+ import type { MeshNode } from '@tmex/api-client/auth/index';
++import { SortableVerticalList, useSortableRow } from '@tmex/panels/device-tree';
++import { useUIStore } from '@tmex/stores/react';
++import { useCallback, useMemo } from 'react';
++import { useTranslation } from 'react-i18next';
+ import { SideBarDeviceListForRuntime } from './sidebar-device-list-runtime';
+ import { type SidebarNodeEntry, SidebarNodeSection } from './sidebar-node-section';
+ 
+-/** mesh 节点列表 → 侧边栏分节。self 已由 `sortNodes` 排在最前，这里只做字段映射。 */
++const NODE_SORTABLE_PREFIX = 'sidebar-node:';
++
++/** 分节的 sortable id 单独加前缀：分节内部还有设备/窗口/pane 三层排序，id 空间不能撞。 */
++export function sidebarNodeSortableId(nodeId: string): string {
++  return `${NODE_SORTABLE_PREFIX}${nodeId}`;
++}
++
++export function sidebarNodeIdFromSortableId(sortableId: string): string {
++  return sortableId.startsWith(NODE_SORTABLE_PREFIX)
++    ? sortableId.slice(NODE_SORTABLE_PREFIX.length)
++    : sortableId;
++}
++
++/**
++ * 手工顺序（本机 UI 偏好，见 UI store `sidebarNodeOrder`）优先：
++ * 保存过且仍存在的 node 按保存顺序在前，其余按 API 顺序追加在后。
++ */
++export function applySidebarNodeOrder(
++  entries: SidebarNodeEntry[],
++  order: readonly string[]
++): SidebarNodeEntry[] {
++  if (order.length === 0) return entries;
++
++  const byId = new Map(entries.map((entry) => [entry.id, entry]));
++  const ordered: SidebarNodeEntry[] = [];
++  const taken = new Set<string>();
++  for (const id of order) {
++    const entry = byId.get(id);
++    if (!entry || taken.has(id)) continue;
++    taken.add(id);
++    ordered.push(entry);
++  }
++  for (const entry of entries) {
++    if (!taken.has(entry.id)) ordered.push(entry);
++  }
++  return ordered;
++}
++
++/** mesh 节点列表 → 侧边栏分节。self 已由 `sortNodes` 排在最前，这里做字段映射并应用手工顺序。 */
+ export function toSidebarEntries(
+   nodes: MeshNode[],
+-  entryNodeId: string | null
++  entryNodeId: string | null,
++  order: readonly string[] = []
+ ): SidebarNodeEntry[] {
+-  return nodes.map((node) => {
++  const entries = nodes.map((node) => {
+     const isSelf = entryNodeId != null && node.id === entryNodeId;
+     return {
+       id: node.id,
+@@ -25,11 +68,39 @@ export function toSidebarEntries(
+       inventory: node.inventory ?? null,
+     } satisfies SidebarNodeEntry;
+   });
++  return applySidebarNodeOrder(entries, order);
++}
++
++function SortableNodeSection({
++  node,
++  dragHandleLabel,
++}: {
++  node: SidebarNodeEntry;
++  dragHandleLabel: string;
++}) {
++  const sortable = useSortableRow(sidebarNodeSortableId(node.id));
++  return <SidebarNodeSection node={node} drag={{ sortable, dragHandleLabel }} />;
+ }
+ 
+ function MeshDeviceList({ entryNodeId }: { entryNodeId: string | null }) {
++  const { t } = useTranslation();
+   const { nodes } = useMeshNodes();
+-  const entries = toSidebarEntries(nodes, entryNodeId);
++  const sidebarNodeOrder = useUIStore((state) => state.sidebarNodeOrder);
++  const setSidebarNodeOrder = useUIStore((state) => state.setSidebarNodeOrder);
++
++  const entries = useMemo(
++    () => toSidebarEntries(nodes, entryNodeId, sidebarNodeOrder),
++    [nodes, entryNodeId, sidebarNodeOrder]
++  );
++  const sortableIds = useMemo(
++    () => entries.map((entry) => sidebarNodeSortableId(entry.id)),
++    [entries]
++  );
++
++  const handleReorder = useCallback(
++    (nextIds: string[]) => setSidebarNodeOrder(nextIds.map(sidebarNodeIdFromSortableId)),
++    [setSidebarNodeOrder]
++  );
+ 
+   // mesh 列表还没回来时先渲染 self 的设备树，避免侧边栏首屏闪空。
+   if (entries.length === 0) {
+@@ -37,10 +108,16 @@ function MeshDeviceList({ entryNodeId }: { entryNodeId: string | null }) {
+   }
+ 
+   return (
+-    <div className="flex flex-col gap-2" data-testid="sidebar-node-list">
+-      {entries.map((entry) => (
+-        <SidebarNodeSection key={entry.runtimeNodeId} node={entry} />
+-      ))}
++    <div className="flex flex-col gap-1" data-testid="sidebar-node-list">
++      <SortableVerticalList ids={sortableIds} onReorder={handleReorder}>
++        {entries.map((entry) => (
++          <SortableNodeSection
++            key={entry.runtimeNodeId}
++            node={entry}
++            dragHandleLabel={t('sidebar.node.dragHandle')}
++          />
++        ))}
++      </SortableVerticalList>
+     </div>
+   );
+ }
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+index 4063f8d6..cde02c60 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+@@ -14,16 +14,24 @@ import { SELF_NODE_ID, nodeAppPath, parseNodeIdFromPath } from '@tmex/api-client
+ import {
+   NodeBadge,
+   type NodeBadgeInfo,
++  type SortableRow,
+   shouldHideSidebarNodeSection,
+ } from '@tmex/panels/device-tree';
+ import { isSidebarDeviceVisible } from '@tmex/stores';
+ import { useUIStore } from '@tmex/stores/react';
++import { cn } from '@tmex/ui';
+ import { ChevronRight, Loader2, Monitor } from 'lucide-react';
+ import { useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link, matchPath, useLocation } from 'react-router';
+ import { SideBarDeviceListForRuntime } from './sidebar-device-list-runtime';
+ 
++/** 分节整体的拖拽接线；未传即不可拖（standalone / 单元测试直接渲染分节时）。 */
++export interface SidebarNodeSortable {
++  sortable: SortableRow;
++  dragHandleLabel: string;
++}
++
+ export interface SidebarNodeEntry {
+   /** mesh 列表里的真实 node id。 */
+   id: string;
+@@ -82,14 +90,34 @@ function badgeOf(node: SidebarNodeEntry): NodeBadgeInfo {
+   };
+ }
+ 
+-function SectionHeader({ node, hint }: { node: SidebarNodeEntry; hint?: string }) {
++/**
++ * 分节头兼作整节的拖拽手柄：鼠标要移动 8px 才激活（`useDeviceTreeSensors`），
++ * 触摸要长按 250ms，所以头里的按钮照常点得动；`touch-pan-y` 让竖向滑动仍归页面滚动。
++ */
++function SectionHeader({
++  node,
++  hint,
++  drag,
++}: {
++  node: SidebarNodeEntry;
++  hint?: string;
++  drag?: SidebarNodeSortable;
++}) {
+   return (
+     <div
+-      className="flex items-center gap-2 px-1 pt-1"
++      ref={drag?.sortable.setDragHandleRef}
++      {...drag?.sortable.dragHandleProps}
++      aria-label={drag?.dragHandleLabel}
++      className={cn(
++        'flex items-center gap-2 px-1 py-0.5',
++        drag && 'cursor-grab touch-pan-y select-none'
++      )}
+       data-testid={`sidebar-node-header-${node.runtimeNodeId}`}
+     >
+-      <NodeBadge info={badgeOf(node)} />
+-      {hint && <span className="truncate text-[10px] text-muted-foreground">{hint}</span>}
++      <NodeBadge info={badgeOf(node)} variant="plain" className="min-w-0 flex-1" />
++      {hint && (
++        <span className="shrink-0 truncate text-[10px] text-muted-foreground/70">{hint}</span>
++      )}
+     </div>
+   );
+ }
+@@ -99,15 +127,20 @@ function SectionHeader({ node, hint }: { node: SidebarNodeEntry; hint?: string }
+  * （`useNodeLoginGate` 用内存里的会话钥），登录期间显示转圈，失败退回「登录此节点」按钮
+  * ——会话钥已经没了的话那个按钮会带 `?node=` 去登录页。
+  */
+-function SidebarNodeSignIn({ node }: { node: SidebarNodeEntry }) {
++function SidebarNodeSignIn({ node, drag }: { node: SidebarNodeEntry; drag?: SidebarNodeSortable }) {
+   const { t } = useTranslation();
+   const [expanded, setExpanded] = useState(false);
+   const gate = useNodeLoginGate(node.runtimeNodeId, { enabled: expanded });
+ 
+   return (
+-    <div data-testid={`sidebar-node-login-${node.runtimeNodeId}`} className="space-y-1">
+-      <SectionHeader node={node} />
+-      <div className="px-1 pb-1">
++    <div
++      ref={drag?.sortable.setNodeRef}
++      style={drag?.sortable.style}
++      data-testid={`sidebar-node-login-${node.runtimeNodeId}`}
++      className={cn('space-y-0.5', drag?.sortable.isDragging && 'opacity-60')}
++    >
++      <SectionHeader node={node} drag={drag} />
++      <div className="px-1 pb-0.5">
+         {!expanded ? (
+           <button
+             type="button"
+@@ -144,7 +177,10 @@ function SidebarNodeSignIn({ node }: { node: SidebarNodeEntry }) {
+   );
+ }
+ 
+-export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
++export function SidebarNodeSection({
++  node,
++  drag,
++}: { node: SidebarNodeEntry; drag?: SidebarNodeSortable }) {
+   const { t } = useTranslation();
+   // UI store 是宿主级共享实例（所有 node 同一份），离线分节没有自己的 runtime 也读得到。
+   const visibility = useUIStore((state) => state.sidebarDeviceVisibility);
+@@ -168,8 +204,13 @@ export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
+     }
+ 
+     return (
+-      <div data-testid={`sidebar-node-offline-${node.runtimeNodeId}`} className="space-y-1">
+-        <SectionHeader node={node} hint={t('sidebar.node.offline')} />
++      <div
++        ref={drag?.sortable.setNodeRef}
++        style={drag?.sortable.style}
++        data-testid={`sidebar-node-offline-${node.runtimeNodeId}`}
++        className={cn('space-y-0.5', drag?.sortable.isDragging && 'opacity-60')}
++      >
++        <SectionHeader node={node} hint={t('sidebar.node.offline')} drag={drag} />
+         {knownDevices.length === 0 ? (
+           <div className="tmex-fade px-2 py-1 text-[11px] text-muted-foreground/60">
+             {t('sidebar.node.noKnownDevices')}
+@@ -192,7 +233,7 @@ export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
+   }
+ 
+   if (!node.loggedIn) {
+-    return <SidebarNodeSignIn node={node} />;
++    return <SidebarNodeSignIn node={node} drag={drag} />;
+   }
+ 
+   // 分节头交给设备树一起渲染：可见设备数只有挂上该 node 运行时才读得到，
+@@ -202,8 +243,11 @@ export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
+       <SideBarDeviceListForRuntime
+         section={{
+           testId: `sidebar-node-${node.runtimeNodeId}`,
+-          header: <SectionHeader node={node} />,
++          header: <SectionHeader node={node} drag={drag} />,
+           keepWhenNoDevices: node.isSelf,
++          containerRef: drag?.sortable.setNodeRef,
++          containerStyle: drag?.sortable.style,
++          containerClassName: drag?.sortable.isDragging ? 'opacity-60' : undefined,
+         }}
+         expansionKeyFor={
+           node.runtimeNodeId === SELF_NODE_ID
+diff --git a/apps/fe/tests/sidebar-device-disclosure.spec.ts b/apps/fe/tests/sidebar-device-disclosure.spec.ts
+index a1210f10..f07ee470 100644
+--- a/apps/fe/tests/sidebar-device-disclosure.spec.ts
++++ b/apps/fe/tests/sidebar-device-disclosure.spec.ts
+@@ -98,7 +98,7 @@ test('sidebar: device disclosure persists and tabs stay mutually exclusive', asy
+     const treePaddingLeft = await deviceTree.evaluate((node) =>
+       Number.parseFloat(getComputedStyle(node).paddingLeft)
+     );
+-    expect(treePaddingLeft).toBeGreaterThanOrEqual(40);
++    expect(treePaddingLeft).toBeGreaterThanOrEqual(20);
+ 
+     await deviceToggle.click();
+     await expect(page.getByTestId(`window-item-${windowId}`)).toHaveCount(0);
+diff --git a/packages/panels/src/device-tree/device-window-list.tsx b/packages/panels/src/device-tree/device-window-list.tsx
+index ffbc646f..999afd3c 100644
+--- a/packages/panels/src/device-tree/device-window-list.tsx
++++ b/packages/panels/src/device-tree/device-window-list.tsx
+@@ -30,7 +30,7 @@ export function DeviceWindowList(props: DeviceWindowListProps) {
+   return (
+     <div
+       data-testid={`device-tree-${deviceId}`}
+-      className="tmex-reveal space-y-1.5 py-1.5 pr-1.5 pl-10 [@media(any-pointer:coarse)]:space-y-2"
++      className="tmex-reveal space-y-1.5 py-1.5 pr-1.5 pl-6 [@media(any-pointer:coarse)]:space-y-2"
+     >
+       {!windows && <DeviceTreeHint text={t('common.loading')} />}
+       {windows?.length === 0 && <DeviceTreeHint text={t('window.noWindows')} />}
+diff --git a/packages/panels/src/device-tree/index.ts b/packages/panels/src/device-tree/index.ts
+index b2bcca6b..e9580025 100644
+--- a/packages/panels/src/device-tree/index.ts
++++ b/packages/panels/src/device-tree/index.ts
+@@ -13,5 +13,13 @@ export {
+   nodeBadgeAppearance,
+   type NodeBadgeAppearance,
+   type NodeBadgeInfo,
++  type NodeBadgeVariant,
+ } from './node-badge';
++export {
++  SortableVerticalList,
++  reorderIdsByDragEnd,
++  useDeviceTreeSensors,
++  useSortableRow,
++  type SortableRow,
++} from './device-tree-dnd';
+ export type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
+diff --git a/packages/panels/src/device-tree/node-badge.tsx b/packages/panels/src/device-tree/node-badge.tsx
+index 9c7a7172..85c1b4b1 100644
+--- a/packages/panels/src/device-tree/node-badge.tsx
++++ b/packages/panels/src/device-tree/node-badge.tsx
+@@ -1,4 +1,4 @@
+-// node 徽标（多 node 聚合侧边栏的分节头用）。单 node / standalone 宿主没有分节头，也就不渲染它。
++// node 标识（多 node 聚合视图的分节头用）。单 node / standalone 宿主没有分节头，也就不渲染它。
+ 
+ import { cn } from '@tmex/ui';
+ import { Server } from 'lucide-react';
+@@ -19,7 +19,13 @@ export interface NodeBadgeAppearance {
+   dimmed: boolean;
+ }
+ 
+-/** 纯函数：徽标文案与灰显判定（离线 node 灰显，见设计 §4「侧边栏聚合视图」）。 */
++/**
++ * `chip` 为带边框的徽标（设备管理页的分组头）；`plain` 去掉边框，只留状态点 + 名称，
++ * 给侧边栏这种寸土寸金的窄栏用。
++ */
++export type NodeBadgeVariant = 'chip' | 'plain';
++
++/** 纯函数：标识文案与灰显判定（离线 node 灰显，见设计 §4「侧边栏聚合视图」）。 */
+ export function nodeBadgeAppearance(info: NodeBadgeInfo): NodeBadgeAppearance {
+   const label = info.name.trim() || info.nodeId;
+   return {
+@@ -29,13 +35,48 @@ export function nodeBadgeAppearance(info: NodeBadgeInfo): NodeBadgeAppearance {
+   };
+ }
+ 
+-export function NodeBadge({ info, className }: { info: NodeBadgeInfo; className?: string }) {
++export function NodeBadge({
++  info,
++  className,
++  variant = 'chip',
++}: {
++  info: NodeBadgeInfo;
++  className?: string;
++  variant?: NodeBadgeVariant;
++}) {
+   const appearance = nodeBadgeAppearance(info);
++  const shared = {
++    'data-testid': `node-badge-${info.nodeId}`,
++    'data-online': info.online,
++    'data-variant': variant,
++    title: appearance.title,
++  };
++
++  if (variant === 'plain') {
++    return (
++      <span
++        {...shared}
++        className={cn(
++          'inline-flex min-w-0 items-center gap-1.5 text-[13px] font-semibold leading-none',
++          appearance.dimmed ? 'text-muted-foreground/60' : 'text-muted-foreground',
++          className
++        )}
++      >
++        <span
++          aria-hidden="true"
++          className={cn(
++            'h-1.5 w-1.5 shrink-0 rounded-full',
++            appearance.dimmed ? 'bg-gray-400' : 'bg-emerald-500'
++          )}
++        />
++        <span className="truncate">{appearance.label}</span>
++      </span>
++    );
++  }
++
+   return (
+     <span
+-      data-testid={`node-badge-${info.nodeId}`}
+-      data-online={info.online}
+-      title={appearance.title}
++      {...shared}
+       className={cn(
+         'inline-flex max-w-[7rem] shrink-0 items-center gap-1 rounded border border-border/60 px-1 py-px text-[10px] leading-none',
+         appearance.dimmed ? 'text-muted-foreground/60' : 'text-muted-foreground',
+diff --git a/packages/panels/src/device-tree/sidebar-device-list.tsx b/packages/panels/src/device-tree/sidebar-device-list.tsx
+index a64e3790..24cb7c46 100644
+--- a/packages/panels/src/device-tree/sidebar-device-list.tsx
++++ b/packages/panels/src/device-tree/sidebar-device-list.tsx
+@@ -244,9 +244,9 @@ export function SideBarDeviceList({
+   );
+ 
+   return (
+-    <SidebarGroup className="flex flex-col flex-1 min-h-0 pt-0">
++    <SidebarGroup className="flex flex-col flex-1 min-h-0 py-0">
+       <ScrollArea className="flex-1 min-h-0">
+-        <div className="space-y-1.5 pb-2 pt-1 select-none [-webkit-user-select:none] [-webkit-touch-callout:none]">
++        <div className="space-y-1.5 pb-1 pt-0.5 select-none [-webkit-user-select:none] [-webkit-touch-callout:none]">
+           <SortableVerticalList
+             ids={sortedDeviceIds}
+             disabled={reorderDevicesMutation.isPending}
+diff --git a/packages/panels/src/device-tree/window-pane-list.tsx b/packages/panels/src/device-tree/window-pane-list.tsx
+index 93c692e7..6154f251 100644
+--- a/packages/panels/src/device-tree/window-pane-list.tsx
++++ b/packages/panels/src/device-tree/window-pane-list.tsx
+@@ -26,7 +26,7 @@ export function WindowRowFooter(props: WindowRowFooterProps) {
+   const singlePane = panes[0];
+   if (!singlePane || !agent) return null;
+   return (
+-    <div className="ml-[36px] pl-2 border-l border-border/50">
++    <div className="ml-4.5 pl-2 border-l border-border/50">
+       <agent.PaneSessions nav={nav} deviceId={deviceId} paneId={singlePane.id} />
+     </div>
+   );
+@@ -52,7 +52,7 @@ function WindowPaneList({
+   nav,
+ }: WindowPaneListProps) {
+   return (
+-    <div className="ml-4 pl-2 border-l border-border/50 space-y-1 [@media(any-pointer:coarse)]:space-y-1.5">
++    <div className="ml-4.5 pl-2 border-l border-border/50 space-y-1 [@media(any-pointer:coarse)]:space-y-1.5">
+       <SortableVerticalList ids={paneIds} onReorder={onReorder}>
+         {tmuxWindow.panes.map((pane) => (
+           <PaneRow
+diff --git a/packages/stores/src/ui.test.ts b/packages/stores/src/ui.test.ts
+index 33fe3056..e0fba1cc 100644
+--- a/packages/stores/src/ui.test.ts
++++ b/packages/stores/src/ui.test.ts
+@@ -192,6 +192,68 @@ describe('sidebar tab state', () => {
+   });
+ });
+ 
++describe('sidebar node order', () => {
++  beforeEach(() => {
++    storage.clear();
++  });
++
++  test('defaults to an empty order', () => {
++    expect(createStore().getState().sidebarNodeOrder).toEqual([]);
++  });
++
++  test('persists the manual node order across store instances', () => {
++    const prefix = `ui-sidebar-node-order-${Date.now()}-`;
++    const store = createUIStore({ storagePrefix: prefix });
++
++    store.getState().setSidebarNodeOrder(['node-b', 'node-a']);
++    expect(store.getState().sidebarNodeOrder).toEqual(['node-b', 'node-a']);
++
++    const persisted = JSON.parse(storage.getItem(`${prefix}tmex-ui`) ?? '{}') as {
++      state?: { sidebarNodeOrder?: string[] };
++    };
++    expect(persisted.state?.sidebarNodeOrder).toEqual(['node-b', 'node-a']);
++
++    expect(createUIStore({ storagePrefix: prefix }).getState().sidebarNodeOrder).toEqual([
++      'node-b',
++      'node-a',
++    ]);
++  });
++
++  test('drops non-string, blank and duplicated ids on write', () => {
++    const store = createStore();
++    store
++      .getState()
++      .setSidebarNodeOrder(['node-a', '  ', 'node-a', 'node-b'] as unknown as string[]);
++    expect(store.getState().sidebarNodeOrder).toEqual(['node-a', 'node-b']);
++  });
++
++  test('normalizes invalid persisted node order', () => {
++    const prefix = `ui-sidebar-node-order-invalid-${Date.now()}-`;
++    storage.setItem(
++      `${prefix}tmex-ui`,
++      JSON.stringify({
++        state: { sidebarNodeOrder: ['node-a', 7, null, 'node-a', 'node-b'] },
++        version: 0,
++      })
++    );
++
++    expect(createUIStore({ storagePrefix: prefix }).getState().sidebarNodeOrder).toEqual([
++      'node-a',
++      'node-b',
++    ]);
++  });
++
++  test('falls back to an empty order when the persisted value is not an array', () => {
++    const prefix = `ui-sidebar-node-order-shape-${Date.now()}-`;
++    storage.setItem(
++      `${prefix}tmex-ui`,
++      JSON.stringify({ state: { sidebarNodeOrder: { 0: 'node-a' } }, version: 0 })
++    );
++
++    expect(createUIStore({ storagePrefix: prefix }).getState().sidebarNodeOrder).toEqual([]);
++  });
++});
++
+ describe('sidebar collapse state', () => {
+   beforeEach(() => {
+     storage.clear();
+diff --git a/packages/stores/src/ui.ts b/packages/stores/src/ui.ts
+index 82fce6ef..4480311e 100644
+--- a/packages/stores/src/ui.ts
++++ b/packages/stores/src/ui.ts
+@@ -20,6 +20,24 @@ function normalizeBooleanMap(value: unknown): Record<string, boolean> {
+   return normalized;
+ }
+ 
++/** 持久化的 id 顺序表可能被手工改坏，只保留非空字符串并去重 */
++function normalizeIdList(value: unknown): string[] {
++  if (!Array.isArray(value)) {
++    return [];
++  }
++
++  const normalized: string[] = [];
++  const seen = new Set<string>();
++  for (const item of value) {
++    if (typeof item !== 'string') continue;
++    const id = item.trim();
++    if (!id || seen.has(id)) continue;
++    seen.add(id);
++    normalized.push(id);
++  }
++  return normalized;
++}
++
+ // 预设名单会随版本增删，localStorage 里可能残留已下线的 id（会命中不存在的 CSS 规则）。
+ function normalizeThemePreset(value: unknown): ThemePreset | null {
+   return isThemePreset(value) ? value : null;
+@@ -82,6 +100,8 @@ export interface UIState {
+   sidebarDeviceVisibility: Record<string, boolean>;
+   /** 设备管理页文件夹的展开态；key 为文件夹 id，缺键视为展开 */
+   deviceFolderExpanded: Record<string, boolean>;
++  /** 侧边栏 node 分节的手工顺序（mesh node id）；未列出的 node 按 API 顺序排在后面 */
++  sidebarNodeOrder: string[];
+   inputMode: 'direct' | 'editor';
+   editorSendWithEnter: boolean;
+   theme: 'light' | 'dark';
+@@ -99,6 +119,7 @@ export interface UIState {
+   /** key 由 `sidebarDeviceVisibilityKey(runtimeNodeId, deviceId)` 生成 */
+   setSidebarDeviceVisibility: (key: string, visible: boolean) => void;
+   setDeviceFolderExpanded: (folderId: string, expanded: boolean) => void;
++  setSidebarNodeOrder: (nodeIds: string[]) => void;
+   setInputMode: (mode: 'direct' | 'editor') => void;
+   setKeyboardBehaviorMode: (mode: KeyboardBehaviorMode) => void;
+   setEditorSendWithEnter: (enabled: boolean) => void;
+@@ -125,6 +146,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+         sidebarDeviceExpanded: {},
+         sidebarDeviceVisibility: {},
+         deviceFolderExpanded: {},
++        sidebarNodeOrder: [],
+         inputMode: 'direct',
+         editorSendWithEnter: true,
+         theme: 'dark',
+@@ -150,6 +172,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+           set((state) => ({
+             deviceFolderExpanded: { ...state.deviceFolderExpanded, [folderId]: expanded },
+           })),
++        setSidebarNodeOrder: (nodeIds) => set({ sidebarNodeOrder: normalizeIdList(nodeIds) }),
+         setInputMode: (mode) => set({ inputMode: mode }),
+         setKeyboardBehaviorMode: (mode) => set({ keyboardBehaviorMode: mode }),
+         setEditorSendWithEnter: (enabled) => set({ editorSendWithEnter: enabled }),
+@@ -205,6 +228,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+           sidebarDeviceExpanded: state.sidebarDeviceExpanded,
+           sidebarDeviceVisibility: state.sidebarDeviceVisibility,
+           deviceFolderExpanded: state.deviceFolderExpanded,
++          sidebarNodeOrder: state.sidebarNodeOrder,
+           inputMode: state.inputMode,
+           editorSendWithEnter: state.editorSendWithEnter,
+           theme: state.theme,
+@@ -224,6 +248,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+             sidebarDeviceExpanded,
+             sidebarDeviceVisibility,
+             deviceFolderExpanded,
++            sidebarNodeOrder,
+             themePreset,
+             ...rest
+           } = (persisted ?? {}) as Partial<UIState> & {
+@@ -235,6 +260,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+             sidebarDeviceExpanded: normalizeBooleanMap(sidebarDeviceExpanded),
+             sidebarDeviceVisibility: normalizeBooleanMap(sidebarDeviceVisibility),
+             deviceFolderExpanded: normalizeBooleanMap(deviceFolderExpanded),
++            sidebarNodeOrder: normalizeIdList(sidebarNodeOrder),
+             themePreset: normalizeThemePreset(themePreset),
+           };
+         },

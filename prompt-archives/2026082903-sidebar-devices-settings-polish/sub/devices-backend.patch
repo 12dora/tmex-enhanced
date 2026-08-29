@@ -1,0 +1,1994 @@
+diff --git a/apps/gateway/drizzle/0025_flat_device_groups.sql b/apps/gateway/drizzle/0025_flat_device_groups.sql
+new file mode 100644
+index 00000000..b4cde21b
+--- /dev/null
++++ b/apps/gateway/drizzle/0025_flat_device_groups.sql
+@@ -0,0 +1,2 @@
++UPDATE `device_folders` SET `parent_id` = NULL WHERE `parent_id` IS NOT NULL;--> statement-breakpoint
++DELETE FROM `device_folder_placements` WHERE `kind` <> 'node' OR `device_id` IS NOT NULL;
+diff --git a/apps/gateway/drizzle/meta/_journal.json b/apps/gateway/drizzle/meta/_journal.json
+index 868466e3..efb1e38a 100644
+--- a/apps/gateway/drizzle/meta/_journal.json
++++ b/apps/gateway/drizzle/meta/_journal.json
+@@ -176,6 +176,13 @@
+       "when": 1787994714692,
+       "tag": "0024_narrow_tomas",
+       "breakpoints": true
++    },
++    {
++      "idx": 25,
++      "version": "6",
++      "when": 1788019200000,
++      "tag": "0025_flat_device_groups",
++      "breakpoints": true
+     }
+   ]
+ }
+\ No newline at end of file
+diff --git a/apps/gateway/src/api/device-folder-routes.test.ts b/apps/gateway/src/api/device-folder-routes.test.ts
+index 22b71d3d..30c7327e 100644
+--- a/apps/gateway/src/api/device-folder-routes.test.ts
++++ b/apps/gateway/src/api/device-folder-routes.test.ts
+@@ -46,16 +46,26 @@ async function getLayout(): Promise<DeviceFolderLayout> {
+   return json as unknown as DeviceFolderLayout;
+ }
+ 
++async function createFolder(name: string): Promise<string> {
++  const { status, json } = await call('POST', '/api/device-folders', { name });
++  expect(status).toBe(201);
++  return (json.folder as { id: string }).id;
++}
++
++function folderOrder(layout: DeviceFolderLayout) {
++  return layout.folders.map((folder) => ({ id: folder.id, sortOrder: folder.sortOrder }));
++}
++
+ describe('POST /api/device-folders', () => {
+-  test('创建成功返回 201', async () => {
++  test('创建成功返回 201，且没有 parentId', async () => {
+     const received: SettingsNamespace[] = [];
+     registerSettingsBroadcaster((namespace) => received.push(namespace));
+     const { status, json } = await call('POST', '/api/device-folders', { name: '  运维 组 ' });
+     expect(status).toBe(201);
+-    const folder = json.folder as { name: string; parentId: string | null; id: string };
++    const folder = json.folder as Record<string, unknown>;
+     expect(folder.name).toBe('运维 组');
+-    expect(folder.parentId).toBeNull();
+-    expect(folder.id.length).toBeGreaterThan(0);
++    expect('parentId' in folder).toBe(false);
++    expect(String(folder.id).length).toBeGreaterThan(0);
+     expect(received).toEqual(['device-folders']);
+   });
+ 
+@@ -72,163 +82,171 @@ describe('POST /api/device-folders', () => {
+     expect(status).toBe(400);
+     expect(json).toEqual({ error: t('apiError.folderNameTooLong') });
+   });
++
++  test('试图嵌套（parentId 非空）返回 folderLayoutInvalid', async () => {
++    const parentId = await createFolder('nest-parent');
++    const { status, json } = await call('POST', '/api/device-folders', {
++      name: 'nest-child',
++      parentId,
++    });
++    expect(status).toBe(400);
++    expect(json).toEqual({ error: t('apiError.folderLayoutInvalid') });
++  });
+ });
+ 
+ describe('PATCH /api/device-folders/:id', () => {
+   test('改名成功', async () => {
+-    const created = await call('POST', '/api/device-folders', { name: 'old-name' });
+-    const id = (created.json.folder as { id: string }).id;
++    const id = await createFolder('old-name');
+     const { status, json } = await call('PATCH', `/api/device-folders/${id}`, { name: 'new-name' });
+     expect(status).toBe(200);
+     expect((json.folder as { name: string }).name).toBe('new-name');
+   });
+ 
+-  test('把文件夹挂到自己的子文件夹下成环 400', async () => {
+-    const parent = await call('POST', '/api/device-folders', { name: 'cycle-parent' });
+-    const parentId = (parent.json.folder as { id: string }).id;
+-    const child = await call('POST', '/api/device-folders', {
+-      name: 'cycle-child',
+-      parentId,
+-    });
+-    const childId = (child.json.folder as { id: string }).id;
+-    const { status, json } = await call('PATCH', `/api/device-folders/${parentId}`, {
+-      parentId: childId,
+-    });
++  test('试图改 parentId 返回 folderLayoutInvalid', async () => {
++    const a = await createFolder('patch-a');
++    const b = await createFolder('patch-b');
++    const { status, json } = await call('PATCH', `/api/device-folders/${a}`, { parentId: b });
+     expect(status).toBe(400);
+-    expect(json).toEqual({ error: t('apiError.folderCycle') });
++    expect(json).toEqual({ error: t('apiError.folderLayoutInvalid') });
++  });
++
++  test('不存在返回 404', async () => {
++    const { status } = await call('PATCH', '/api/device-folders/nope', { name: 'x' });
++    expect(status).toBe(404);
+   });
+ });
+ 
+ describe('DELETE /api/device-folders/:id', () => {
+-  test('删除后子文件夹与 placement 上提到父级', async () => {
+-    const root = await call('POST', '/api/device-folders', { name: 'del-root' });
+-    const rootId = (root.json.folder as { id: string }).id;
+-    const mid = await call('POST', '/api/device-folders', { name: 'del-mid', parentId: rootId });
+-    const midId = (mid.json.folder as { id: string }).id;
+-    const nested = await call('POST', '/api/device-folders', {
+-      name: 'del-nested',
+-      parentId: midId,
+-    });
+-    const nestedId = (nested.json.folder as { id: string }).id;
+-
++  test('删除后其中的节点回到根层', async () => {
++    const id = await createFolder('del-group');
+     const layout = await getLayout();
+     await call('PUT', '/api/device-folders/layout', {
+-      folders: layout.folders.map((folder) => ({
+-        id: folder.id,
+-        parentId: folder.parentId,
+-        sortOrder: folder.sortOrder,
+-      })),
+-      placements: [
+-        ...layout.placements,
+-        {
+-          kind: 'device',
+-          nodeId: 'self',
+-          deviceId: 'del-dev',
+-          folderId: midId,
+-          sortOrder: 0,
+-        },
+-      ],
++      folders: folderOrder(layout),
++      placements: [...layout.placements, { nodeId: 'del-node', folderId: id, sortOrder: 0 }],
+     });
+ 
+-    const { status, json } = await call('DELETE', `/api/device-folders/${midId}`);
++    const { status, json } = await call('DELETE', `/api/device-folders/${id}`);
+     expect(status).toBe(200);
+     expect(json).toEqual({ success: true });
+ 
+     const after = await getLayout();
+-    expect(after.folders.some((folder) => folder.id === midId)).toBe(false);
+-    expect(after.folders.find((folder) => folder.id === nestedId)?.parentId).toBe(rootId);
+-    expect(
+-      after.placements.find((item) => item.kind === 'device' && item.deviceId === 'del-dev')
+-        ?.folderId
+-    ).toBe(rootId);
++    expect(after.folders.some((folder) => folder.id === id)).toBe(false);
++    expect(after.placements.find((item) => item.nodeId === 'del-node')?.folderId).toBeNull();
+   });
+ });
+ 
+ describe('PUT /api/device-folders/layout', () => {
+-  test('成功替换层级', async () => {
+-    const a = await call('POST', '/api/device-folders', { name: 'layout-a' });
+-    const b = await call('POST', '/api/device-folders', { name: 'layout-b' });
+-    const aId = (a.json.folder as { id: string }).id;
+-    const bId = (b.json.folder as { id: string }).id;
++  test('成功替换顺序与 placement', async () => {
++    const aId = await createFolder('layout-a');
++    const bId = await createFolder('layout-b');
+     const layout = await getLayout();
+     const { status, json } = await call('PUT', '/api/device-folders/layout', {
+       folders: layout.folders.map((folder) =>
+         folder.id === bId
+-          ? { id: bId, parentId: aId, sortOrder: 0 }
+-          : { id: folder.id, parentId: folder.parentId, sortOrder: folder.sortOrder }
++          ? { id: bId, sortOrder: -1 }
++          : { id: folder.id, sortOrder: folder.sortOrder }
+       ),
+-      placements: layout.placements,
++      placements: [{ nodeId: 'layout-node', folderId: aId, sortOrder: 0 }],
+     });
+     expect(status).toBe(200);
+     const next = json as unknown as DeviceFolderLayout;
+-    expect(next.folders.find((folder) => folder.id === bId)?.parentId).toBe(aId);
++    expect(next.folders[0]?.id).toBe(bId);
++    expect(next.placements).toEqual([{ nodeId: 'layout-node', folderId: aId, sortOrder: 0 }]);
+   });
+ 
+   test('id 集合不一致 400', async () => {
+-    await call('POST', '/api/device-folders', { name: 'layout-mismatch' });
++    await createFolder('layout-mismatch');
+     const layout = await getLayout();
+     const { status, json } = await call('PUT', '/api/device-folders/layout', {
+-      folders: layout.folders.slice(1).map((folder) => ({
+-        id: folder.id,
+-        parentId: folder.parentId,
+-        sortOrder: folder.sortOrder,
+-      })),
++      folders: folderOrder(layout).slice(1),
+       placements: [],
+     });
+     expect(status).toBe(400);
+     expect(json).toEqual({ error: t('apiError.folderLayoutInvalid') });
+   });
+ 
+-  test('成环 400', async () => {
+-    const a = await call('POST', '/api/device-folders', { name: 'cycle-a' });
+-    const b = await call('POST', '/api/device-folders', { name: 'cycle-b' });
+-    const aId = (a.json.folder as { id: string }).id;
+-    const bId = (b.json.folder as { id: string }).id;
++  test('嵌套分组 400', async () => {
++    const aId = await createFolder('nest-a');
++    const bId = await createFolder('nest-b');
+     const layout = await getLayout();
+     const { status, json } = await call('PUT', '/api/device-folders/layout', {
+-      folders: layout.folders.map((folder) => {
+-        if (folder.id === aId) return { id: aId, parentId: bId, sortOrder: 0 };
+-        if (folder.id === bId) return { id: bId, parentId: aId, sortOrder: 0 };
+-        return { id: folder.id, parentId: folder.parentId, sortOrder: folder.sortOrder };
+-      }),
++      folders: folderOrder(layout).map((folder) =>
++        folder.id === aId ? { ...folder, parentId: bId } : folder
++      ),
+       placements: layout.placements,
+     });
+     expect(status).toBe(400);
+-    expect(json).toEqual({ error: t('apiError.folderCycle') });
++    expect(json).toEqual({ error: t('apiError.folderLayoutInvalid') });
+   });
+ 
+-  test('非法 placement 400', async () => {
++  test('设备 placement / 非法 placement 400', async () => {
+     const layout = await getLayout();
+-    const folders = layout.folders.map((folder) => ({
+-      id: folder.id,
+-      parentId: folder.parentId,
+-      sortOrder: folder.sortOrder,
+-    }));
++    const folders = folderOrder(layout);
++    const devicePlacement = await call('PUT', '/api/device-folders/layout', {
++      folders,
++      placements: [
++        { kind: 'device', nodeId: 'self', deviceId: 'd1', folderId: null, sortOrder: 0 },
++      ],
++    });
++    expect(devicePlacement.status).toBe(400);
++    expect(devicePlacement.json).toEqual({ error: t('apiError.folderLayoutInvalid') });
++
+     const badKind = await call('PUT', '/api/device-folders/layout', {
+       folders,
+-      placements: [{ kind: 'folder', nodeId: 'n1', deviceId: null, folderId: null, sortOrder: 0 }],
++      placements: [{ kind: 'folder', nodeId: 'n1', folderId: null, sortOrder: 0 }],
+     });
+     expect(badKind.status).toBe(400);
+-    expect(badKind.json).toEqual({ error: t('apiError.folderLayoutInvalid') });
+ 
+-    const missingDeviceId = await call('PUT', '/api/device-folders/layout', {
++    const unknownFolder = await call('PUT', '/api/device-folders/layout', {
+       folders,
+-      placements: [
+-        { kind: 'device', nodeId: 'self', deviceId: null, folderId: null, sortOrder: 0 },
+-      ],
++      placements: [{ nodeId: 'n1', folderId: 'ghost', sortOrder: 0 }],
+     });
+-    expect(missingDeviceId.status).toBe(400);
++    expect(unknownFolder.status).toBe(400);
++    expect(unknownFolder.json).toEqual({ error: t('apiError.folderLayoutInvalid') });
+ 
+     const dup = await call('PUT', '/api/device-folders/layout', {
+       folders,
+       placements: [
+-        { kind: 'node', nodeId: 'n-dup', deviceId: null, folderId: null, sortOrder: 0 },
+-        { kind: 'node', nodeId: 'n-dup', deviceId: null, folderId: null, sortOrder: 1 },
++        { nodeId: 'n-dup', folderId: null, sortOrder: 0 },
++        { nodeId: 'n-dup', folderId: null, sortOrder: 1 },
+       ],
+     });
+     expect(dup.status).toBe(400);
+     expect(dup.json).toEqual({ error: t('apiError.folderLayoutInvalid') });
+   });
++
++  test('旧客户端形态（kind:node + deviceId:null）仍被接受', async () => {
++    const layout = await getLayout();
++    const { status, json } = await call('PUT', '/api/device-folders/layout', {
++      folders: folderOrder(layout),
++      placements: [
++        { kind: 'node', nodeId: 'legacy-node', deviceId: null, folderId: null, sortOrder: 0 },
++      ],
++    });
++    expect(status).toBe(200);
++    expect((json as unknown as DeviceFolderLayout).placements).toEqual([
++      { nodeId: 'legacy-node', folderId: null, sortOrder: 0 },
++    ]);
++  });
++});
++
++describe('POST /api/device-folders/reset', () => {
++  test('清空全部分组与 placement，并广播 device-folders', async () => {
++    const id = await createFolder('reset-group');
++    const layout = await getLayout();
++    await call('PUT', '/api/device-folders/layout', {
++      folders: folderOrder(layout),
++      placements: [{ nodeId: 'reset-node', folderId: id, sortOrder: 0 }],
++    });
++    const received: SettingsNamespace[] = [];
++    registerSettingsBroadcaster((namespace) => received.push(namespace));
++
++    const { status, json } = await call('POST', '/api/device-folders/reset');
++    expect(status).toBe(200);
++    expect(json).toEqual({ folders: [], placements: [] });
++    expect(received).toEqual(['device-folders']);
++    expect(await getLayout()).toEqual({ folders: [], placements: [] });
++  });
+ });
+ 
+ describe('GET /api/device-folders', () => {
+@@ -252,23 +270,21 @@ describe('handleApiRequest 路由可达', () => {
+     expect(Array.isArray(body.placements)).toBe(true);
+   });
+ 
+-  test('PUT /api/device-folders/layout 不被 :id 吃掉', async () => {
++  test('PUT /api/device-folders/layout 与 POST /reset 不被 :id 吃掉', async () => {
+     const layout = await getLayout();
+-    const res = await handleApiRequest(
++    const put = await handleApiRequest(
+       new Request('http://localhost/api/device-folders/layout', {
+         method: 'PUT',
+         headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({
+-          folders: layout.folders.map((folder) => ({
+-            id: folder.id,
+-            parentId: folder.parentId,
+-            sortOrder: folder.sortOrder,
+-          })),
+-          placements: layout.placements,
+-        }),
++        body: JSON.stringify({ folders: folderOrder(layout), placements: layout.placements }),
+       }),
+       {} as Server<unknown>
+     );
+-    expect(res.status).toBe(200);
++    expect(put.status).toBe(200);
++    const reset = await handleApiRequest(
++      new Request('http://localhost/api/device-folders/reset', { method: 'POST' }),
++      {} as Server<unknown>
++    );
++    expect(reset.status).toBe(200);
+   });
+ });
+diff --git a/apps/gateway/src/api/device-folder-routes.ts b/apps/gateway/src/api/device-folder-routes.ts
+index 5fc89eb5..c7bfd092 100644
+--- a/apps/gateway/src/api/device-folder-routes.ts
++++ b/apps/gateway/src/api/device-folder-routes.ts
+@@ -3,10 +3,8 @@ import {
+   type DeviceFolderNameError,
+   type DeviceFolderPlacement,
+   type UpdateDeviceFolderLayoutRequest,
+-  deviceFolderItemKey,
+-  isFolderForestValid,
++  isDeviceFolderLayoutValid,
+   validateDeviceFolderName,
+-  wouldCreateFolderCycle,
+ } from '@tmex/shared';
+ import {
+   createDeviceFolder,
+@@ -14,6 +12,7 @@ import {
+   getDeviceFolderById,
+   getDeviceFolderLayout,
+   replaceDeviceFolderLayout,
++  resetDeviceFolderLayout,
+   updateDeviceFolder,
+ } from '../db';
+ import { t } from '../i18n';
+@@ -26,10 +25,9 @@ function folderNameError(error: DeviceFolderNameError): Response {
+   return json({ error: t('apiError.folderNameTooLong') }, 400);
+ }
+ 
+-function parseParentId(raw: unknown): { ok: true; value: string | null } | { ok: false } {
+-  if (raw === null) return { ok: true, value: null };
+-  if (typeof raw === 'string') return { ok: true, value: raw };
+-  return { ok: false };
++/** 分组只有一层：请求里带了非 null 的 parentId 就是在试图嵌套 */
++function requestsNesting(body: Record<string, unknown>): boolean {
++  return body.parentId !== undefined && body.parentId !== null;
+ }
+ 
+ function handleGetLayout(): Response {
+@@ -41,24 +39,11 @@ async function handleCreate(req: Request): Promise<Response> {
+   if (!body || typeof body.name !== 'string') {
+     return json({ error: t('apiError.invalidRequest') }, 400);
+   }
++  if (requestsNesting(body)) return json({ error: t('apiError.folderLayoutInvalid') }, 400);
+   const validated = validateDeviceFolderName(body.name);
+   if (!validated.ok) return folderNameError(validated.error);
+ 
+-  let parentId: string | null = null;
+-  if (body.parentId !== undefined) {
+-    const parsed = parseParentId(body.parentId);
+-    if (!parsed.ok) return json({ error: t('apiError.invalidRequest') }, 400);
+-    parentId = parsed.value;
+-    if (parentId !== null && !getDeviceFolderById(parentId)) {
+-      return json({ error: t('apiError.folderNotFound') }, 404);
+-    }
+-  }
+-
+-  const folder = createDeviceFolder({
+-    id: crypto.randomUUID(),
+-    name: validated.name,
+-    parentId,
+-  });
++  const folder = createDeviceFolder({ id: crypto.randomUUID(), name: validated.name });
+   broadcastSettingsUpdate('device-folders');
+   return json({ folder }, 201);
+ }
+@@ -69,25 +54,15 @@ async function handleUpdate(req: Request, id: string): Promise<Response> {
+ 
+   const body = await readJsonObjectBody(req);
+   if (!body) return json({ error: t('apiError.invalidRequest') }, 400);
++  if (requestsNesting(body)) return json({ error: t('apiError.folderLayoutInvalid') }, 400);
+ 
+-  const patch: { name?: string; parentId?: string | null; sortOrder?: number } = {};
++  const patch: { name?: string; sortOrder?: number } = {};
+   if (body.name !== undefined) {
+     if (typeof body.name !== 'string') return json({ error: t('apiError.invalidRequest') }, 400);
+     const validated = validateDeviceFolderName(body.name);
+     if (!validated.ok) return folderNameError(validated.error);
+     patch.name = validated.name;
+   }
+-  if (body.parentId !== undefined) {
+-    const parsed = parseParentId(body.parentId);
+-    if (!parsed.ok) return json({ error: t('apiError.invalidRequest') }, 400);
+-    if (parsed.value !== null && !getDeviceFolderById(parsed.value)) {
+-      return json({ error: t('apiError.folderNotFound') }, 404);
+-    }
+-    if (wouldCreateFolderCycle(getDeviceFolderLayout().folders, id, parsed.value)) {
+-      return json({ error: t('apiError.folderCycle') }, 400);
+-    }
+-    patch.parentId = parsed.value;
+-  }
+   if (body.sortOrder !== undefined) {
+     if (typeof body.sortOrder !== 'number' || !Number.isInteger(body.sortOrder)) {
+       return json({ error: t('apiError.invalidRequest') }, 400);
+@@ -107,48 +82,31 @@ function handleDelete(id: string): Response {
+   return json({ success: true });
+ }
+ 
+-function parseLayoutFolder(
+-  raw: unknown
+-): Pick<
+-  UpdateDeviceFolderLayoutRequest['folders'][number],
+-  'id' | 'parentId' | 'sortOrder'
+-> | null {
++type LayoutFolder = UpdateDeviceFolderLayoutRequest['folders'][number];
++
++/** 结构不对返回 null；带非 null parentId（嵌套）返回 'nested' */
++function parseLayoutFolder(raw: unknown): LayoutFolder | 'nested' | null {
+   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+   const item = raw as Record<string, unknown>;
+   if (typeof item.id !== 'string' || !item.id) return null;
+-  if (item.parentId !== null && typeof item.parentId !== 'string') return null;
+   if (typeof item.sortOrder !== 'number' || !Number.isInteger(item.sortOrder)) return null;
+-  return { id: item.id, parentId: item.parentId, sortOrder: item.sortOrder };
++  if (requestsNesting(item)) return 'nested';
++  return { id: item.id, sortOrder: item.sortOrder };
+ }
+ 
+-function parsePlacement(raw: unknown, folderIds: Set<string>): DeviceFolderPlacement | null {
++/**
++ * placement 只认节点：旧客户端可能仍带 `kind` / `deviceId`，`kind` 只允许 'node'、
++ * `deviceId` 只允许空；带设备的 placement 一律视为布局非法。
++ */
++function parsePlacement(raw: unknown): DeviceFolderPlacement | null {
+   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+   const item = raw as Record<string, unknown>;
+-  if (item.kind !== 'node' && item.kind !== 'device') return null;
++  if (item.kind !== undefined && item.kind !== 'node') return null;
++  if (item.deviceId !== undefined && item.deviceId !== null) return null;
+   if (typeof item.nodeId !== 'string' || !item.nodeId) return null;
+   if (typeof item.sortOrder !== 'number' || !Number.isInteger(item.sortOrder)) return null;
+   if (item.folderId !== null && typeof item.folderId !== 'string') return null;
+-  if (item.folderId !== null && !folderIds.has(item.folderId)) return null;
+-  const folderId = item.folderId;
+-
+-  if (item.kind === 'node') {
+-    if (item.deviceId !== null && item.deviceId !== undefined) return null;
+-    return {
+-      kind: 'node',
+-      nodeId: item.nodeId,
+-      deviceId: null,
+-      folderId,
+-      sortOrder: item.sortOrder,
+-    };
+-  }
+-  if (typeof item.deviceId !== 'string' || !item.deviceId) return null;
+-  return {
+-    kind: 'device',
+-    nodeId: item.nodeId,
+-    deviceId: item.deviceId,
+-    folderId,
+-    sortOrder: item.sortOrder,
+-  };
++  return { nodeId: item.nodeId, folderId: item.folderId, sortOrder: item.sortOrder };
+ }
+ 
+ function sameIdSet(left: readonly string[], right: readonly string[]): boolean {
+@@ -168,39 +126,45 @@ async function handleReplaceLayout(req: Request): Promise<Response> {
+     return json({ error: t('apiError.invalidRequest') }, 400);
+   }
+ 
+-  const folders: UpdateDeviceFolderLayoutRequest['folders'] = [];
++  const folders: LayoutFolder[] = [];
+   for (const item of body.folders) {
+     const parsed = parseLayoutFolder(item);
+-    if (!parsed) return json({ error: t('apiError.invalidRequest') }, 400);
++    if (parsed === null) return json({ error: t('apiError.invalidRequest') }, 400);
++    if (parsed === 'nested') return json({ error: t('apiError.folderLayoutInvalid') }, 400);
+     folders.push(parsed);
+   }
+ 
+   const currentIds = getDeviceFolderLayout().folders.map((folder) => folder.id);
+-  const requestIds = folders.map((folder) => folder.id);
+-  if (!sameIdSet(currentIds, requestIds)) {
++  if (
++    !sameIdSet(
++      currentIds,
++      folders.map((folder) => folder.id)
++    )
++  ) {
+     return json({ error: t('apiError.folderLayoutInvalid') }, 400);
+   }
+-  if (!isFolderForestValid(folders)) {
+-    return json({ error: t('apiError.folderCycle') }, 400);
+-  }
+ 
+-  const folderIds = new Set(requestIds);
+   const placements: DeviceFolderPlacement[] = [];
+-  const seenKeys = new Set<string>();
+   for (const item of body.placements) {
+-    const parsed = parsePlacement(item, folderIds);
++    const parsed = parsePlacement(item);
+     if (!parsed) return json({ error: t('apiError.folderLayoutInvalid') }, 400);
+-    const key = deviceFolderItemKey(parsed);
+-    if (seenKeys.has(key)) return json({ error: t('apiError.folderLayoutInvalid') }, 400);
+-    seenKeys.add(key);
+     placements.push(parsed);
+   }
++  if (!isDeviceFolderLayoutValid({ folders, placements })) {
++    return json({ error: t('apiError.folderLayoutInvalid') }, 400);
++  }
+ 
+   const layout: DeviceFolderLayout = replaceDeviceFolderLayout({ folders, placements });
+   broadcastSettingsUpdate('device-folders');
+   return json(layout);
+ }
+ 
++function handleReset(): Response {
++  const layout = resetDeviceFolderLayout();
++  broadcastSettingsUpdate('device-folders');
++  return json(layout);
++}
++
+ export const deviceFolderRoutes: ApiRoute[] = [
+   route({ method: 'GET', path: '/api/device-folders', handler: () => handleGetLayout() }),
+   route({ method: 'POST', path: '/api/device-folders', handler: (req) => handleCreate(req) }),
+@@ -209,6 +173,7 @@ export const deviceFolderRoutes: ApiRoute[] = [
+     path: '/api/device-folders/layout',
+     handler: (req) => handleReplaceLayout(req),
+   }),
++  route({ method: 'POST', path: '/api/device-folders/reset', handler: () => handleReset() }),
+   route({
+     method: 'PATCH',
+     path: '/api/device-folders/:id',
+diff --git a/apps/gateway/src/db/device-folders.test.ts b/apps/gateway/src/db/device-folders.test.ts
+index 4ba73c1b..61ee4061 100644
+--- a/apps/gateway/src/db/device-folders.test.ts
++++ b/apps/gateway/src/db/device-folders.test.ts
+@@ -1,5 +1,6 @@
+ import { beforeAll, describe, expect, test } from 'bun:test';
+-import { DEVICE_FOLDER_SELF_NODE_ID, deviceFolderItemKey } from '@tmex/shared';
++import { DEVICE_FOLDER_SELF_NODE_ID } from '@tmex/shared';
++import { getDb as getOrmDb } from './client';
+ import {
+   createDeviceFolder,
+   deleteDeviceFolder,
+@@ -7,178 +8,163 @@ import {
+   getDeviceFolderLayout,
+   removeDeviceFolderPlacementsForDevice,
+   replaceDeviceFolderLayout,
++  resetDeviceFolderLayout,
+   updateDeviceFolder,
+ } from './device-folders';
+ import { runMigrations } from './migrate';
++import { deviceFolderPlacements, deviceFolders } from './schema';
+ 
+ beforeAll(() => {
+   runMigrations();
+ });
+ 
++function currentFolderOrder() {
++  return getDeviceFolderLayout().folders.map((folder) => ({
++    id: folder.id,
++    sortOrder: folder.sortOrder,
++  }));
++}
++
+ describe('device folder db helper', () => {
+-  test('createDeviceFolder 同父下 sortOrder 递增', () => {
+-    const a = createDeviceFolder({ id: 'df-create-a', name: 'A', parentId: null });
+-    const b = createDeviceFolder({ id: 'df-create-b', name: 'B', parentId: null });
++  test('createDeviceFolder sortOrder 递增，parent 恒为空', () => {
++    resetDeviceFolderLayout();
++    const a = createDeviceFolder({ id: 'df-create-a', name: 'A' });
++    const b = createDeviceFolder({ id: 'df-create-b', name: 'B' });
+     expect(b.sortOrder).toBe(a.sortOrder + 1);
+     expect(getDeviceFolderById('df-create-a')?.name).toBe('A');
+-    const child = createDeviceFolder({
+-      id: 'df-create-child',
+-      name: 'Child',
+-      parentId: 'df-create-a',
+-    });
+-    expect(child.parentId).toBe('df-create-a');
+-    expect(child.sortOrder).toBe(0);
++    expect('parentId' in a).toBe(false);
+   });
+ 
+-  test('updateDeviceFolder 改名，改 parent 未给 sortOrder 时排到新父末尾', () => {
+-    const parent = createDeviceFolder({ id: 'df-upd-p', name: 'P', parentId: null });
+-    createDeviceFolder({ id: 'df-upd-sib', name: 'Sib', parentId: parent.id });
+-    const moved = createDeviceFolder({ id: 'df-upd-m', name: 'M', parentId: null });
+-
+-    const renamed = updateDeviceFolder(moved.id, { name: 'Moved' });
+-    expect(renamed?.name).toBe('Moved');
+-
+-    const reparented = updateDeviceFolder(moved.id, { parentId: parent.id });
+-    expect(reparented?.parentId).toBe(parent.id);
+-    expect(reparented?.sortOrder).toBe(1);
++  test('updateDeviceFolder 改名 / 改顺序', () => {
++    resetDeviceFolderLayout();
++    const folder = createDeviceFolder({ id: 'df-upd', name: 'U' });
++    expect(updateDeviceFolder(folder.id, { name: 'Renamed' })?.name).toBe('Renamed');
++    expect(updateDeviceFolder(folder.id, { sortOrder: 7 })?.sortOrder).toBe(7);
+     expect(updateDeviceFolder('df-missing', { name: 'x' })).toBeNull();
+   });
+ 
+-  test('deleteDeviceFolder 把子文件夹与 placement 上提到父级', () => {
+-    const root = createDeviceFolder({ id: 'df-del-root', name: 'Root', parentId: null });
+-    const mid = createDeviceFolder({
+-      id: 'df-del-mid',
+-      name: 'Mid',
+-      parentId: root.id,
+-    });
+-    const nested = createDeviceFolder({
+-      id: 'df-del-nested',
+-      name: 'Nested',
+-      parentId: mid.id,
+-    });
++  test('deleteDeviceFolder 把其中的节点上提到根层，排在根层现有节点之后', () => {
++    resetDeviceFolderLayout();
++    const group = createDeviceFolder({ id: 'df-del', name: 'Del' });
+     replaceDeviceFolderLayout({
+-      folders: getDeviceFolderLayout().folders.map((folder) => ({
+-        id: folder.id,
+-        parentId: folder.parentId,
+-        sortOrder: folder.sortOrder,
+-      })),
++      folders: currentFolderOrder(),
+       placements: [
+-        ...getDeviceFolderLayout().placements,
+-        {
+-          kind: 'device',
+-          nodeId: DEVICE_FOLDER_SELF_NODE_ID,
+-          deviceId: 'df-del-dev',
+-          folderId: mid.id,
+-          sortOrder: 0,
+-        },
+-        {
+-          kind: 'node',
+-          nodeId: 'mesh-n1',
+-          deviceId: null,
+-          folderId: mid.id,
+-          sortOrder: 1,
+-        },
++        { nodeId: 'root-node', folderId: null, sortOrder: 0 },
++        { nodeId: 'mesh-n1', folderId: group.id, sortOrder: 0 },
++        { nodeId: 'mesh-n2', folderId: group.id, sortOrder: 1 },
+       ],
+     });
+ 
+-    expect(deleteDeviceFolder(mid.id)).toBe(true);
+-    expect(getDeviceFolderById(mid.id)).toBeNull();
+-    expect(getDeviceFolderById(nested.id)?.parentId).toBe(root.id);
+-
+-    const layout = getDeviceFolderLayout();
+-    const placement = layout.placements.find(
+-      (item) => item.kind === 'device' && item.deviceId === 'df-del-dev'
+-    );
+-    expect(placement?.folderId).toBe(root.id);
+-    const nodePlacement = layout.placements.find((item) => item.nodeId === 'mesh-n1');
+-    expect(nodePlacement?.folderId).toBe(root.id);
++    expect(deleteDeviceFolder(group.id)).toBe(true);
++    expect(getDeviceFolderById(group.id)).toBeNull();
++    const root = getDeviceFolderLayout()
++      .placements.filter((placement) => placement.folderId === null)
++      .sort((a, b) => a.sortOrder - b.sortOrder)
++      .map((placement) => placement.nodeId);
++    expect(root).toEqual(['root-node', 'mesh-n1', 'mesh-n2']);
+     expect(deleteDeviceFolder('df-del-missing')).toBe(false);
+   });
+ 
+   test('replaceDeviceFolderLayout 整体替换 placement 并规范化顺序', () => {
+-    const fa = createDeviceFolder({ id: 'df-rep-a', name: 'RA', parentId: null });
+-    const fb = createDeviceFolder({ id: 'df-rep-b', name: 'RB', parentId: null });
+-    const current = getDeviceFolderLayout();
++    resetDeviceFolderLayout();
++    const fa = createDeviceFolder({ id: 'df-rep-a', name: 'RA' });
++    const fb = createDeviceFolder({ id: 'df-rep-b', name: 'RB' });
+     const next = replaceDeviceFolderLayout({
+-      folders: current.folders.map((folder) =>
+-        folder.id === fb.id
+-          ? { id: fb.id, parentId: fa.id, sortOrder: 99 }
+-          : { id: folder.id, parentId: folder.parentId, sortOrder: folder.sortOrder }
+-      ),
+-      placements: [
+-        {
+-          kind: 'node',
+-          nodeId: 'rep-node',
+-          deviceId: null,
+-          folderId: fa.id,
+-          sortOrder: 5,
+-        },
++      folders: [
++        { id: fa.id, sortOrder: 99 },
++        { id: fb.id, sortOrder: 1 },
+       ],
++      placements: [{ nodeId: 'rep-node', folderId: fa.id, sortOrder: 5 }],
+     });
+-    expect(next.folders.find((folder) => folder.id === fb.id)?.parentId).toBe(fa.id);
+-    expect(next.folders.find((folder) => folder.id === fb.id)?.sortOrder).toBe(0);
+-    expect(next.placements).toEqual([
+-      {
+-        kind: 'node',
+-        nodeId: 'rep-node',
+-        deviceId: null,
+-        folderId: fa.id,
+-        sortOrder: 0,
+-      },
+-    ]);
++    expect(next.folders.map((folder) => folder.id)).toEqual([fb.id, fa.id]);
++    expect(next.folders.map((folder) => folder.sortOrder)).toEqual([0, 1]);
++    expect(next.placements).toEqual([{ nodeId: 'rep-node', folderId: fa.id, sortOrder: 0 }]);
+   });
+ 
+-  test('removeDeviceFolderPlacementsForDevice 只删 self 节点上该设备的 placement', () => {
+-    const folder = createDeviceFolder({ id: 'df-rm-f', name: 'RF', parentId: null });
++  test('replaceDeviceFolderLayout 拒绝 id 集合不一致与非法布局（绕过 HTTP 的最后防线）', () => {
++    resetDeviceFolderLayout();
++    const folder = createDeviceFolder({ id: 'df-guard', name: 'G' });
++    expect(() => replaceDeviceFolderLayout({ folders: [], placements: [] })).toThrow();
++    expect(() =>
++      replaceDeviceFolderLayout({
++        folders: [{ id: folder.id, sortOrder: 0 }],
++        placements: [{ nodeId: 'n', folderId: 'ghost', sortOrder: 0 }],
++      })
++    ).toThrow();
++    expect(() =>
++      replaceDeviceFolderLayout({
++        folders: [{ id: folder.id, sortOrder: 0 }],
++        placements: [
++          { nodeId: 'n', folderId: null, sortOrder: 0 },
++          { nodeId: 'n', folderId: null, sortOrder: 1 },
++        ],
++      })
++    ).toThrow();
++    expect(getDeviceFolderLayout().folders.map((item) => item.id)).toEqual([folder.id]);
++  });
++
++  test('resetDeviceFolderLayout 一次清掉全部分组与 placement', () => {
++    const folder = createDeviceFolder({ id: 'df-reset', name: 'R' });
+     replaceDeviceFolderLayout({
+-      folders: getDeviceFolderLayout().folders.map((item) => ({
+-        id: item.id,
+-        parentId: item.parentId,
+-        sortOrder: item.sortOrder,
+-      })),
+-      placements: [
+-        {
+-          kind: 'device',
+-          nodeId: DEVICE_FOLDER_SELF_NODE_ID,
+-          deviceId: 'dev-keep-other',
+-          folderId: folder.id,
+-          sortOrder: 0,
+-        },
+-        {
+-          kind: 'device',
+-          nodeId: DEVICE_FOLDER_SELF_NODE_ID,
+-          deviceId: 'dev-to-remove',
+-          folderId: folder.id,
+-          sortOrder: 1,
+-        },
+-        {
+-          kind: 'device',
+-          nodeId: 'mesh-other',
+-          deviceId: 'dev-to-remove',
+-          folderId: folder.id,
+-          sortOrder: 2,
+-        },
+-      ],
++      folders: currentFolderOrder(),
++      placements: [{ nodeId: 'reset-node', folderId: folder.id, sortOrder: 0 }],
+     });
++    expect(resetDeviceFolderLayout()).toEqual({ folders: [], placements: [] });
++    expect(getDeviceFolderLayout()).toEqual({ folders: [], placements: [] });
++  });
+ 
+-    removeDeviceFolderPlacementsForDevice('dev-to-remove');
+-    const keys = getDeviceFolderLayout().placements.map((item) => deviceFolderItemKey(item));
+-    expect(keys).toContain(
+-      deviceFolderItemKey({
+-        kind: 'device',
+-        nodeId: DEVICE_FOLDER_SELF_NODE_ID,
+-        deviceId: 'dev-keep-other',
++  test('读取时忽略库里残留的嵌套分组与设备 placement', () => {
++    resetDeviceFolderLayout();
++    const now = new Date().toISOString();
++    const orm = getOrmDb();
++    orm
++      .insert(deviceFolders)
++      .values({
++        id: 'df-legacy-root',
++        name: 'Root',
++        parentId: null,
++        sortOrder: 0,
++        createdAt: now,
++        updatedAt: now,
++      })
++      .run();
++    orm
++      .insert(deviceFolders)
++      .values({
++        id: 'df-legacy-child',
++        name: 'Child',
++        parentId: 'df-legacy-root',
++        sortOrder: 0,
++        createdAt: now,
++        updatedAt: now,
+       })
+-    );
+-    expect(keys).toContain(
+-      deviceFolderItemKey({ kind: 'device', nodeId: 'mesh-other', deviceId: 'dev-to-remove' })
+-    );
+-    expect(keys).not.toContain(
+-      deviceFolderItemKey({
++      .run();
++    orm
++      .insert(deviceFolderPlacements)
++      .values({
++        itemKey: 'device:self:legacy',
+         kind: 'device',
+         nodeId: DEVICE_FOLDER_SELF_NODE_ID,
+-        deviceId: 'dev-to-remove',
++        deviceId: 'legacy',
++        folderId: 'df-legacy-root',
++        sortOrder: 0,
++        createdAt: now,
++        updatedAt: now,
+       })
+-    );
++      .run();
++    const layout = getDeviceFolderLayout();
++    expect(layout.folders.map((folder) => folder.id)).toEqual(['df-legacy-root']);
++    expect(layout.placements).toEqual([]);
++    expect(getDeviceFolderById('df-legacy-child')).toBeNull();
++
++    removeDeviceFolderPlacementsForDevice('legacy');
++    expect(
++      orm
++        .select()
++        .from(deviceFolderPlacements)
++        .all()
++        .some((row) => row.deviceId === 'legacy')
++    ).toBe(false);
++    resetDeviceFolderLayout();
+   });
+ });
+diff --git a/apps/gateway/src/db/device-folders.ts b/apps/gateway/src/db/device-folders.ts
+index e273a70f..ee857783 100644
+--- a/apps/gateway/src/db/device-folders.ts
++++ b/apps/gateway/src/db/device-folders.ts
+@@ -4,7 +4,8 @@ import {
+   type DeviceFolderLayout,
+   type DeviceFolderPlacement,
+   type UpdateDeviceFolderLayoutRequest,
+-  deviceFolderItemKey,
++  deviceFolderPlacementKey,
++  isDeviceFolderLayoutValid,
+   normalizeFolderLayoutOrder,
+   reparentOnFolderDelete,
+ } from '@tmex/shared';
+@@ -12,11 +13,12 @@ import { and, asc, eq, isNull, max } from 'drizzle-orm';
+ import { getDb as getOrmDb } from './client';
+ import { deviceFolderPlacements, deviceFolders } from './schema';
+ 
++const PLACEMENT_KIND_NODE = 'node';
++
+ function toFolder(row: typeof deviceFolders.$inferSelect): DeviceFolder {
+   return {
+     id: row.id,
+     name: row.name,
+-    parentId: row.parentId ?? null,
+     sortOrder: row.sortOrder,
+     createdAt: row.createdAt,
+     updatedAt: row.updatedAt,
+@@ -25,41 +27,43 @@ function toFolder(row: typeof deviceFolders.$inferSelect): DeviceFolder {
+ 
+ function toPlacement(row: typeof deviceFolderPlacements.$inferSelect): DeviceFolderPlacement {
+   return {
+-    kind: row.kind === 'device' ? 'device' : 'node',
+     nodeId: row.nodeId,
+-    deviceId: row.deviceId ?? null,
+     folderId: row.folderId ?? null,
+     sortOrder: row.sortOrder,
+   };
+ }
+ 
+-function maxSortOrderForParent(tx: ReturnType<typeof getOrmDb>, parentId: string | null): number {
+-  const row =
+-    parentId === null
+-      ? tx
+-          .select({ value: max(deviceFolders.sortOrder) })
+-          .from(deviceFolders)
+-          .where(isNull(deviceFolders.parentId))
+-          .get()
+-      : tx
+-          .select({ value: max(deviceFolders.sortOrder) })
+-          .from(deviceFolders)
+-          .where(eq(deviceFolders.parentId, parentId))
+-          .get();
++function maxFolderSortOrder(tx: ReturnType<typeof getOrmDb>): number {
++  const row = tx
++    .select({ value: max(deviceFolders.sortOrder) })
++    .from(deviceFolders)
++    .where(isNull(deviceFolders.parentId))
++    .get();
+   return row?.value ?? -1;
+ }
+ 
++/**
++ * 分组只有一层、placement 只认节点：库里若还有旧数据（嵌套分组 / 设备 placement），
++ * 读出来时一律忽略，与迁移的扁平化结果一致。
++ */
+ export function getDeviceFolderLayout(): DeviceFolderLayout {
+   const orm = getOrmDb();
+   const folders = orm
+     .select()
+     .from(deviceFolders)
+-    .orderBy(asc(deviceFolders.parentId), asc(deviceFolders.sortOrder))
++    .where(isNull(deviceFolders.parentId))
++    .orderBy(asc(deviceFolders.sortOrder))
+     .all()
+     .map(toFolder);
+   const placements = orm
+     .select()
+     .from(deviceFolderPlacements)
++    .where(
++      and(
++        eq(deviceFolderPlacements.kind, PLACEMENT_KIND_NODE),
++        isNull(deviceFolderPlacements.deviceId)
++      )
++    )
+     .orderBy(asc(deviceFolderPlacements.folderId), asc(deviceFolderPlacements.sortOrder))
+     .all()
+     .map(toPlacement);
+@@ -68,22 +72,22 @@ export function getDeviceFolderLayout(): DeviceFolderLayout {
+ 
+ export function getDeviceFolderById(id: string): DeviceFolder | null {
+   const orm = getOrmDb();
+-  const row = orm.select().from(deviceFolders).where(eq(deviceFolders.id, id)).get();
++  const row = orm
++    .select()
++    .from(deviceFolders)
++    .where(and(eq(deviceFolders.id, id), isNull(deviceFolders.parentId)))
++    .get();
+   return row ? toFolder(row) : null;
+ }
+ 
+-export function createDeviceFolder(input: {
+-  id: string;
+-  name: string;
+-  parentId: string | null;
+-}): DeviceFolder {
++export function createDeviceFolder(input: { id: string; name: string }): DeviceFolder {
+   const orm = getOrmDb();
+   const now = new Date().toISOString();
+-  const sortOrder = maxSortOrderForParent(orm, input.parentId) + 1;
++  const sortOrder = maxFolderSortOrder(orm) + 1;
+   const row = {
+     id: input.id,
+     name: input.name,
+-    parentId: input.parentId,
++    parentId: null,
+     sortOrder,
+     createdAt: now,
+     updatedAt: now,
+@@ -94,37 +98,22 @@ export function createDeviceFolder(input: {
+ 
+ export function updateDeviceFolder(
+   id: string,
+-  patch: { name?: string; parentId?: string | null; sortOrder?: number }
++  patch: { name?: string; sortOrder?: number }
+ ): DeviceFolder | null {
+   const current = getDeviceFolderById(id);
+   if (!current) return null;
+ 
+   const orm = getOrmDb();
+-  const nextParentId = patch.parentId !== undefined ? patch.parentId : current.parentId;
+-  const parentChanged = nextParentId !== current.parentId;
+-  let nextSortOrder = current.sortOrder;
+-  if (patch.sortOrder !== undefined) {
+-    nextSortOrder = patch.sortOrder;
+-  } else if (parentChanged) {
+-    nextSortOrder = maxSortOrderForParent(orm, nextParentId) + 1;
+-  }
+-
+   const now = new Date().toISOString();
+   const next: DeviceFolder = {
+     ...current,
+     name: patch.name ?? current.name,
+-    parentId: nextParentId,
+-    sortOrder: nextSortOrder,
++    sortOrder: patch.sortOrder ?? current.sortOrder,
+     updatedAt: now,
+   };
+   orm
+     .update(deviceFolders)
+-    .set({
+-      name: next.name,
+-      parentId: next.parentId,
+-      sortOrder: next.sortOrder,
+-      updatedAt: now,
+-    })
++    .set({ name: next.name, sortOrder: next.sortOrder, updatedAt: now })
+     .where(eq(deviceFolders.id, id))
+     .run();
+   return next;
+@@ -139,22 +128,14 @@ export function deleteDeviceFolder(id: string): boolean {
+   orm.transaction((tx) => {
+     for (const folder of next.folders) {
+       tx.update(deviceFolders)
+-        .set({
+-          parentId: folder.parentId,
+-          sortOrder: folder.sortOrder,
+-          updatedAt: now,
+-        })
++        .set({ sortOrder: folder.sortOrder, updatedAt: now })
+         .where(eq(deviceFolders.id, folder.id))
+         .run();
+     }
+     for (const placement of next.placements) {
+       tx.update(deviceFolderPlacements)
+-        .set({
+-          folderId: placement.folderId,
+-          sortOrder: placement.sortOrder,
+-          updatedAt: now,
+-        })
+-        .where(eq(deviceFolderPlacements.itemKey, deviceFolderItemKey(placement)))
++        .set({ folderId: placement.folderId, sortOrder: placement.sortOrder, updatedAt: now })
++        .where(eq(deviceFolderPlacements.itemKey, deviceFolderPlacementKey(placement.nodeId)))
+         .run();
+     }
+     tx.delete(deviceFolders).where(eq(deviceFolders.id, id)).run();
+@@ -162,39 +143,42 @@ export function deleteDeviceFolder(id: string): boolean {
+   return true;
+ }
+ 
++/**
++ * 整表替换。请求里的分组 id 集合必须与库中一致；布局本身（分组唯一、节点唯一、folderId
++ * 存在）不合法直接抛错——这是绕过 HTTP 层直接调用时的最后一道防线。
++ */
+ export function replaceDeviceFolderLayout(
+   layout: UpdateDeviceFolderLayoutRequest
+ ): DeviceFolderLayout {
+   const current = getDeviceFolderLayout();
+   const byId = new Map(current.folders.map((folder) => [folder.id, folder]));
++  if (
++    layout.folders.length !== byId.size ||
++    layout.folders.some((folder) => !byId.has(folder.id))
++  ) {
++    throw new Error('device folder layout: folder id set mismatch');
++  }
++  if (!isDeviceFolderLayoutValid(layout)) {
++    throw new Error('device folder layout: invalid layout');
++  }
+   const now = new Date().toISOString();
+   const folders: DeviceFolder[] = layout.folders.map((item) => {
+-    const prev = byId.get(item.id);
+-    return {
+-      id: item.id,
+-      name: prev?.name ?? '',
+-      parentId: item.parentId,
+-      sortOrder: item.sortOrder,
+-      createdAt: prev?.createdAt ?? now,
+-      updatedAt: now,
+-    };
++    const prev = byId.get(item.id) as DeviceFolder;
++    return { ...prev, sortOrder: item.sortOrder, updatedAt: now };
+   });
+   const normalized = normalizeFolderLayoutOrder({
+     folders,
+     placements: layout.placements.map((placement) => ({
+-      ...placement,
+-      deviceId: placement.kind === 'node' ? null : placement.deviceId,
++      nodeId: placement.nodeId,
++      folderId: placement.folderId,
++      sortOrder: placement.sortOrder,
+     })),
+   });
+   const orm = getOrmDb();
+   orm.transaction((tx) => {
+     for (const folder of normalized.folders) {
+       tx.update(deviceFolders)
+-        .set({
+-          parentId: folder.parentId,
+-          sortOrder: folder.sortOrder,
+-          updatedAt: now,
+-        })
++        .set({ sortOrder: folder.sortOrder, updatedAt: now })
+         .where(eq(deviceFolders.id, folder.id))
+         .run();
+     }
+@@ -202,10 +186,10 @@ export function replaceDeviceFolderLayout(
+     for (const placement of normalized.placements) {
+       tx.insert(deviceFolderPlacements)
+         .values({
+-          itemKey: deviceFolderItemKey(placement),
+-          kind: placement.kind,
++          itemKey: deviceFolderPlacementKey(placement.nodeId),
++          kind: PLACEMENT_KIND_NODE,
+           nodeId: placement.nodeId,
+-          deviceId: placement.deviceId,
++          deviceId: null,
+           folderId: placement.folderId,
+           sortOrder: placement.sortOrder,
+           createdAt: now,
+@@ -217,6 +201,17 @@ export function replaceDeviceFolderLayout(
+   return getDeviceFolderLayout();
+ }
+ 
++/** 恢复默认布局：删掉全部分组与 placement（节点回到根层默认顺序），一个事务完成。 */
++export function resetDeviceFolderLayout(): DeviceFolderLayout {
++  const orm = getOrmDb();
++  orm.transaction((tx) => {
++    tx.delete(deviceFolderPlacements).run();
++    tx.delete(deviceFolders).run();
++  });
++  return getDeviceFolderLayout();
++}
++
++/** 旧数据兜底：设备 placement 已不再产生，删设备时仍把可能残留的行清掉。 */
+ export function removeDeviceFolderPlacementsForDevice(
+   deviceId: string,
+   db: Pick<ReturnType<typeof getOrmDb>, 'delete'> = getOrmDb()
+diff --git a/apps/gateway/src/db/index.ts b/apps/gateway/src/db/index.ts
+index 5a1b592e..4acba3d3 100644
+--- a/apps/gateway/src/db/index.ts
++++ b/apps/gateway/src/db/index.ts
+@@ -29,6 +29,7 @@ export {
+   getDeviceFolderLayout,
+   removeDeviceFolderPlacementsForDevice,
+   replaceDeviceFolderLayout,
++  resetDeviceFolderLayout,
+   updateDeviceFolder,
+ } from './device-folders';
+ 
+diff --git a/apps/gateway/src/db/managed-migrations.ts b/apps/gateway/src/db/managed-migrations.ts
+index 28a4e0f7..a721787b 100644
+--- a/apps/gateway/src/db/managed-migrations.ts
++++ b/apps/gateway/src/db/managed-migrations.ts
+@@ -30,6 +30,7 @@ const MIGRATIONS = [
+   '0022_hub_trust.sql',
+   '0023_acme_account_directory.sql',
+   '0024_narrow_tomas.sql',
++  '0025_flat_device_groups.sql',
+ ] as const;
+ 
+ export interface MaterializedMigrations {
+diff --git a/packages/api-client/src/device-folders.ts b/packages/api-client/src/device-folders.ts
+index e404b0c6..3ae00a95 100644
+--- a/packages/api-client/src/device-folders.ts
++++ b/packages/api-client/src/device-folders.ts
+@@ -1,4 +1,4 @@
+-// 设备文件夹 REST 端点
++// 设备分组 REST 端点
+ 
+ import type {
+   CreateDeviceFolderRequest,
+@@ -16,14 +16,14 @@ export async function fetchDeviceFolderLayout(
+ ): Promise<DeviceFolderLayout> {
+   const res = await client.fetch('/api/device-folders');
+   if (!res.ok) {
+-    throw new Error(await parseApiError(res, 'Failed to load device folders'));
++    throw new Error(await parseApiError(res, 'Failed to load device groups'));
+   }
+   return (await res.json()) as DeviceFolderLayout;
+ }
+ 
+ export async function createDeviceFolder(
+   body: CreateDeviceFolderRequest,
+-  errorFallback = 'Failed to create folder',
++  errorFallback = 'Failed to create group',
+   client: ApiClient = defaultApiClient
+ ): Promise<DeviceFolder> {
+   const res = await client.fetch('/api/device-folders', {
+@@ -41,7 +41,7 @@ export async function createDeviceFolder(
+ export async function updateDeviceFolder(
+   id: string,
+   body: UpdateDeviceFolderRequest,
+-  errorFallback = 'Failed to update folder',
++  errorFallback = 'Failed to update group',
+   client: ApiClient = defaultApiClient
+ ): Promise<DeviceFolder> {
+   const res = await client.fetch(`/api/device-folders/${id}`, {
+@@ -58,7 +58,7 @@ export async function updateDeviceFolder(
+ 
+ export async function deleteDeviceFolder(
+   id: string,
+-  errorFallback = 'Failed to delete folder',
++  errorFallback = 'Failed to delete group',
+   client: ApiClient = defaultApiClient
+ ): Promise<void> {
+   const res = await client.fetch(`/api/device-folders/${id}`, { method: 'DELETE' });
+@@ -69,7 +69,7 @@ export async function deleteDeviceFolder(
+ 
+ export async function replaceDeviceFolderLayout(
+   body: UpdateDeviceFolderLayoutRequest,
+-  errorFallback = 'Failed to update folder layout',
++  errorFallback = 'Failed to update group layout',
+   client: ApiClient = defaultApiClient
+ ): Promise<DeviceFolderLayout> {
+   const res = await client.fetch('/api/device-folders/layout', {
+@@ -82,3 +82,15 @@ export async function replaceDeviceFolderLayout(
+   }
+   return (await res.json()) as DeviceFolderLayout;
+ }
++
++/** 恢复默认布局：删除全部分组，节点回到根层默认顺序。服务端一个事务完成。 */
++export async function resetDeviceFolderLayout(
++  errorFallback = 'Failed to reset group layout',
++  client: ApiClient = defaultApiClient
++): Promise<DeviceFolderLayout> {
++  const res = await client.fetch('/api/device-folders/reset', { method: 'POST' });
++  if (!res.ok) {
++    throw new Error(await parseApiError(res, errorFallback));
++  }
++  return (await res.json()) as DeviceFolderLayout;
++}
+diff --git a/packages/shared/src/contracts/device-folders.ts b/packages/shared/src/contracts/device-folders.ts
+index 3dacc72d..b714fafa 100644
+--- a/packages/shared/src/contracts/device-folders.ts
++++ b/packages/shared/src/contracts/device-folders.ts
+@@ -1,27 +1,19 @@
+-// 设备管理页文件夹层级契约：文件夹可任意嵌套；节点 / 设备通过 placement 落到某个文件夹
+-// （或 folderId=null 的根层显式排序）；没有 placement 的条目在根层按默认顺序排在最后。
++// 设备管理页分组契约：分组只有一层（不能嵌套）；只有**节点**能被放进分组（或 folderId=null
++// 的根层显式排序），设备永远跟着自己的节点走，只在节点内部排序。没有 placement 的节点在根层
++// 按默认顺序排在最后。
+ // 数据只存在**提供 UI 的节点**（entry / self）自己的库里；self 节点的 nodeId 固定为 'self'，
+ // 远端 mesh 节点用其 mesh node id。
+ 
+-export type DeviceFolderItemKind = 'node' | 'device';
+-
+ export interface DeviceFolder {
+   id: string;
+   name: string;
+-  parentId: string | null;
+   sortOrder: number;
+   createdAt: string;
+   updatedAt: string;
+ }
+ 
+-export interface DeviceFolderItemRef {
+-  kind: DeviceFolderItemKind;
++export interface DeviceFolderPlacement {
+   nodeId: string;
+-  /** kind='node' 时为 null */
+-  deviceId: string | null;
+-}
+-
+-export interface DeviceFolderPlacement extends DeviceFolderItemRef {
+   /** null = 根层（带显式顺序） */
+   folderId: string | null;
+   sortOrder: number;
+@@ -34,18 +26,16 @@ export interface DeviceFolderLayout {
+ 
+ export interface CreateDeviceFolderRequest {
+   name: string;
+-  parentId?: string | null;
+ }
+ 
+ export interface UpdateDeviceFolderRequest {
+   name?: string;
+-  parentId?: string | null;
+   sortOrder?: number;
+ }
+ 
+ export interface UpdateDeviceFolderLayoutRequest {
+-  /** 必须与库中现有文件夹 id 集合完全一致（只改层级 / 顺序，不增删） */
+-  folders: Array<Pick<DeviceFolder, 'id' | 'parentId' | 'sortOrder'>>;
++  /** 必须与库中现有分组 id 集合完全一致（只改顺序，不增删） */
++  folders: Array<Pick<DeviceFolder, 'id' | 'sortOrder'>>;
+   /** 整体替换全部 placement */
+   placements: DeviceFolderPlacement[];
+ }
+diff --git a/packages/shared/src/device-folders.test.ts b/packages/shared/src/device-folders.test.ts
+index bedfda6a..8f8e583f 100644
+--- a/packages/shared/src/device-folders.test.ts
++++ b/packages/shared/src/device-folders.test.ts
+@@ -1,38 +1,29 @@
+ import { describe, expect, test } from 'bun:test';
+ import type { DeviceFolder, DeviceFolderLayout } from './contracts/device-folders';
+ import {
+-  buildDeviceFolderTree,
+-  deviceFolderItemKey,
+-  findItemFolderId,
+-  isFolderForestValid,
++  countFolderItems,
++  deviceFolderPlacementKey,
++  findNodeFolderId,
++  isDeviceFolderLayoutValid,
++  isFolderListValid,
+   moveFolderInLayout,
+-  moveItemInLayout,
+-  parseDeviceFolderItemKey,
+-  removeItemFromLayout,
++  moveNodeInLayout,
++  normalizeFolderLayoutOrder,
++  removeNodeFromLayout,
+   reparentOnFolderDelete,
+   validateDeviceFolderName,
+-  wouldCreateFolderCycle,
+ } from './device-folders';
+ 
+-function folder(id: string, parentId: string | null, sortOrder = 0): DeviceFolder {
+-  return { id, name: id, parentId, sortOrder, createdAt: 't', updatedAt: 't' };
++function folder(id: string, sortOrder = 0): DeviceFolder {
++  return { id, name: id, sortOrder, createdAt: 't', updatedAt: 't' };
+ }
+ 
+-// ops ─┬─ web ─── deep
+-//      └─ db
+ const LAYOUT: DeviceFolderLayout = {
+-  folders: [
+-    folder('ops', null, 0),
+-    folder('web', 'ops', 0),
+-    folder('db', 'ops', 1),
+-    folder('deep', 'web', 0),
+-    folder('misc', null, 1),
+-  ],
++  folders: [folder('ops', 0), folder('misc', 1)],
+   placements: [
+-    { kind: 'node', nodeId: 'a', deviceId: null, folderId: 'ops', sortOrder: 0 },
+-    { kind: 'device', nodeId: 'self', deviceId: 'd1', folderId: 'web', sortOrder: 0 },
+-    { kind: 'device', nodeId: 'self', deviceId: 'd2', folderId: 'web', sortOrder: 1 },
+-    { kind: 'device', nodeId: 'b', deviceId: 'd3', folderId: null, sortOrder: 0 },
++    { nodeId: 'a', folderId: 'ops', sortOrder: 0 },
++    { nodeId: 'b', folderId: 'ops', sortOrder: 1 },
++    { nodeId: 'c', folderId: null, sortOrder: 0 },
+   ],
+ };
+ 
+@@ -45,105 +36,122 @@ describe('validateDeviceFolderName', () => {
+   });
+ });
+ 
+-describe('item keys', () => {
+-  test('round-trips node and device refs', () => {
+-    const node = { kind: 'node' as const, nodeId: 'n1', deviceId: null };
+-    const device = { kind: 'device' as const, nodeId: 'self', deviceId: 'd-1' };
+-    expect(deviceFolderItemKey(node)).toBe('node:n1');
+-    expect(deviceFolderItemKey(device)).toBe('device:self:d-1');
+-    expect(parseDeviceFolderItemKey('node:n1')).toEqual(node);
+-    expect(parseDeviceFolderItemKey('device:self:d-1')).toEqual(device);
+-    expect(parseDeviceFolderItemKey('device:self')).toBeNull();
+-    expect(parseDeviceFolderItemKey('folder:x')).toBeNull();
++describe('placement keys', () => {
++  test('keeps the legacy node:<id> primary key', () => {
++    expect(deviceFolderPlacementKey('n1')).toBe('node:n1');
+   });
+ });
+ 
+-describe('cycle detection', () => {
+-  test('moving into own descendant or self is a cycle', () => {
+-    expect(wouldCreateFolderCycle(LAYOUT.folders, 'ops', 'deep')).toBe(true);
+-    expect(wouldCreateFolderCycle(LAYOUT.folders, 'ops', 'ops')).toBe(true);
+-    expect(wouldCreateFolderCycle(LAYOUT.folders, 'ops', 'misc')).toBe(false);
+-    expect(wouldCreateFolderCycle(LAYOUT.folders, 'deep', null)).toBe(false);
++describe('layout validation', () => {
++  test('isFolderListValid rejects duplicate ids', () => {
++    expect(isFolderListValid(LAYOUT.folders)).toBe(true);
++    expect(isFolderListValid([folder('a'), folder('a')])).toBe(false);
+   });
+ 
+-  test('isFolderForestValid rejects cycles, dangling parents and duplicate ids', () => {
+-    expect(isFolderForestValid(LAYOUT.folders)).toBe(true);
+-    expect(isFolderForestValid([folder('a', 'b'), folder('b', 'a')])).toBe(false);
+-    expect(isFolderForestValid([folder('a', 'ghost')])).toBe(false);
+-    expect(isFolderForestValid([folder('a', null), folder('a', null)])).toBe(false);
++  test('isDeviceFolderLayoutValid rejects unknown folders, duplicate nodes and empty node ids', () => {
++    expect(isDeviceFolderLayoutValid(LAYOUT)).toBe(true);
++    expect(
++      isDeviceFolderLayoutValid({
++        folders: [],
++        placements: [{ nodeId: 'a', folderId: 'ghost', sortOrder: 0 }],
++      })
++    ).toBe(false);
++    expect(
++      isDeviceFolderLayoutValid({
++        folders: [],
++        placements: [
++          { nodeId: 'a', folderId: null, sortOrder: 0 },
++          { nodeId: 'a', folderId: null, sortOrder: 1 },
++        ],
++      })
++    ).toBe(false);
++    expect(
++      isDeviceFolderLayoutValid({
++        folders: [],
++        placements: [{ nodeId: '', folderId: null, sortOrder: 0 }],
++      })
++    ).toBe(false);
++    expect(
++      isDeviceFolderLayoutValid({
++        folders: [],
++        placements: [{ nodeId: 'a', folderId: null, sortOrder: 1.5 }],
++      })
++    ).toBe(false);
++  });
++});
++
++describe('normalizeFolderLayoutOrder', () => {
++  test('renumbers folders globally and placements per container', () => {
++    const next = normalizeFolderLayoutOrder({
++      folders: [folder('x', 7), folder('y', 3)],
++      placements: [
++        { nodeId: 'a', folderId: 'x', sortOrder: 9 },
++        { nodeId: 'b', folderId: 'x', sortOrder: 4 },
++        { nodeId: 'c', folderId: null, sortOrder: 5 },
++      ],
++    });
++    expect(next.folders.map((item) => [item.id, item.sortOrder])).toEqual([
++      ['y', 0],
++      ['x', 1],
++    ]);
++    expect(next.placements).toEqual([
++      { nodeId: 'b', folderId: 'x', sortOrder: 0 },
++      { nodeId: 'a', folderId: 'x', sortOrder: 1 },
++      { nodeId: 'c', folderId: null, sortOrder: 0 },
++    ]);
+   });
+ });
+ 
+ describe('moveFolderInLayout', () => {
+-  test('reparents and renumbers siblings', () => {
+-    const next = moveFolderInLayout(LAYOUT, 'db', null, 0);
+-    expect(next).not.toBeNull();
+-    const roots = next?.folders
+-      .filter((f) => f.parentId === null)
+-      .sort((a, b) => a.sortOrder - b.sortOrder);
+-    expect(roots?.map((f) => f.id)).toEqual(['db', 'ops', 'misc']);
+-    expect(next?.folders.filter((f) => f.parentId === 'ops').map((f) => f.id)).toEqual(['web']);
++  test('reorders and renumbers', () => {
++    const next = moveFolderInLayout(LAYOUT, 'misc', 0);
++    expect(next?.folders.map((item) => item.id)).toEqual(['misc', 'ops']);
++    expect(next?.folders.map((item) => item.sortOrder)).toEqual([0, 1]);
+   });
+ 
+-  test('returns null on cycle or unknown target', () => {
+-    expect(moveFolderInLayout(LAYOUT, 'ops', 'deep', null)).toBeNull();
+-    expect(moveFolderInLayout(LAYOUT, 'ops', 'nope', null)).toBeNull();
+-    expect(moveFolderInLayout(LAYOUT, 'nope', null, null)).toBeNull();
++  test('unknown folder returns null', () => {
++    expect(moveFolderInLayout(LAYOUT, 'nope', null)).toBeNull();
+   });
+ });
+ 
+-describe('moveItemInLayout', () => {
+-  test('moves an existing placement between folders at an index', () => {
+-    const next = moveItemInLayout(
+-      LAYOUT,
+-      { kind: 'device', nodeId: 'self', deviceId: 'd2' },
+-      'web',
+-      0
+-    );
+-    const web = next?.placements
+-      .filter((p) => p.folderId === 'web')
+-      .sort((a, b) => a.sortOrder - b.sortOrder);
+-    expect(web?.map((p) => p.deviceId)).toEqual(['d2', 'd1']);
++describe('moveNodeInLayout', () => {
++  test('moves an existing placement between containers at an index', () => {
++    const next = moveNodeInLayout(LAYOUT, 'b', 'ops', 0);
++    const ops = next?.placements
++      .filter((placement) => placement.folderId === 'ops')
++      .sort((x, y) => x.sortOrder - y.sortOrder);
++    expect(ops?.map((placement) => placement.nodeId)).toEqual(['b', 'a']);
+   });
+ 
+-  test('adds a placement for an implicitly-rooted item and removes it again', () => {
+-    const ref = { kind: 'device' as const, nodeId: 'self', deviceId: 'new' };
+-    const next = moveItemInLayout(LAYOUT, ref, 'db', null);
+-    expect(findItemFolderId(next as DeviceFolderLayout, ref)).toBe('db');
+-    const removed = removeItemFromLayout(next as DeviceFolderLayout, ref);
++  test('adds a placement for an implicitly-rooted node and removes it again', () => {
++    const next = moveNodeInLayout(LAYOUT, 'new', 'misc', null);
++    expect(findNodeFolderId(next as DeviceFolderLayout, 'new')).toBe('misc');
++    const removed = removeNodeFromLayout(next as DeviceFolderLayout, 'new');
+     expect(removed.placements).toHaveLength(LAYOUT.placements.length);
+   });
+ 
+-  test('rejects unknown target folder', () => {
+-    expect(
+-      moveItemInLayout(LAYOUT, { kind: 'node', nodeId: 'a', deviceId: null }, 'nope', null)
+-    ).toBeNull();
++  test('moves into root explicit order', () => {
++    const next = moveNodeInLayout(LAYOUT, 'a', null, 0);
++    const root = next?.placements
++      .filter((placement) => placement.folderId === null)
++      .sort((x, y) => x.sortOrder - y.sortOrder);
++    expect(root?.map((placement) => placement.nodeId)).toEqual(['a', 'c']);
+   });
+-});
+ 
+-describe('reparentOnFolderDelete', () => {
+-  test('children folders and items go to the parent, appended after existing content', () => {
+-    const next = reparentOnFolderDelete(LAYOUT, 'web');
+-    expect(next.folders.map((f) => f.id)).not.toContain('web');
+-    const opsChildren = next.folders
+-      .filter((f) => f.parentId === 'ops')
+-      .sort((a, b) => a.sortOrder - b.sortOrder);
+-    expect(opsChildren.map((f) => f.id)).toEqual(['db', 'deep']);
+-    const opsItems = next.placements
+-      .filter((p) => p.folderId === 'ops')
+-      .sort((a, b) => a.sortOrder - b.sortOrder);
+-    expect(opsItems.map((p) => p.deviceId ?? p.nodeId)).toEqual(['a', 'd1', 'd2']);
++  test('rejects unknown target folder and empty node id', () => {
++    expect(moveNodeInLayout(LAYOUT, 'a', 'nope', null)).toBeNull();
++    expect(moveNodeInLayout(LAYOUT, '', null, null)).toBeNull();
+   });
++});
+ 
+-  test('deleting a root folder lifts content to root', () => {
++describe('reparentOnFolderDelete', () => {
++  test('nodes in the deleted folder go to the root after existing root nodes', () => {
+     const next = reparentOnFolderDelete(LAYOUT, 'ops');
+-    expect(
+-      next.folders
+-        .filter((f) => f.parentId === null)
+-        .map((f) => f.id)
+-        .sort()
+-    ).toEqual(['db', 'misc', 'web']);
+-    expect(next.placements.find((p) => p.nodeId === 'a')?.folderId).toBeNull();
++    expect(next.folders.map((item) => item.id)).toEqual(['misc']);
++    const root = next.placements
++      .filter((placement) => placement.folderId === null)
++      .sort((x, y) => x.sortOrder - y.sortOrder);
++    expect(root.map((placement) => placement.nodeId)).toEqual(['c', 'a', 'b']);
+   });
+ 
+   test('unknown folder is a no-op', () => {
+@@ -151,22 +159,10 @@ describe('reparentOnFolderDelete', () => {
+   });
+ });
+ 
+-describe('buildDeviceFolderTree', () => {
+-  test('nests folders, sorts by sortOrder and counts descendants', () => {
+-    const tree = buildDeviceFolderTree(LAYOUT);
+-    expect(tree.roots.map((n) => n.folder.id)).toEqual(['ops', 'misc']);
+-    const ops = tree.byId.get('ops');
+-    expect(ops?.children.map((n) => n.folder.id)).toEqual(['web', 'db']);
+-    expect(ops?.itemCount).toBe(3);
+-    expect(tree.byId.get('web')?.itemCount).toBe(2);
+-    expect(tree.rootItems.map((p) => p.deviceId)).toEqual(['d3']);
+-  });
+-
+-  test('placements pointing at missing folders fall back to root', () => {
+-    const tree = buildDeviceFolderTree({
+-      folders: [],
+-      placements: [{ kind: 'node', nodeId: 'x', deviceId: null, folderId: 'gone', sortOrder: 0 }],
+-    });
+-    expect(tree.rootItems).toHaveLength(1);
++describe('countFolderItems', () => {
++  test('counts nodes per folder, zero for empty folders', () => {
++    const counts = countFolderItems(LAYOUT);
++    expect(counts.get('ops')).toBe(2);
++    expect(counts.get('misc')).toBe(0);
+   });
+ });
+diff --git a/packages/shared/src/device-folders.ts b/packages/shared/src/device-folders.ts
+index 0b785282..b0898fac 100644
+--- a/packages/shared/src/device-folders.ts
++++ b/packages/shared/src/device-folders.ts
+@@ -1,9 +1,8 @@
+-// 设备文件夹树的纯逻辑：gateway 校验与前端乐观更新共用，保证两侧对「合法布局」的判断一致。
++// 设备分组的纯逻辑：gateway 校验与前端乐观更新共用，保证两侧对「合法布局」的判断一致。
+ 
+ import {
+   DEVICE_FOLDER_NAME_MAX_LENGTH,
+   type DeviceFolder,
+-  type DeviceFolderItemRef,
+   type DeviceFolderLayout,
+   type DeviceFolderPlacement,
+ } from './contracts/device-folders';
+@@ -24,75 +23,33 @@ export function validateDeviceFolderName(
+   return { ok: true, name: normalized };
+ }
+ 
+-export function deviceFolderItemKey(ref: DeviceFolderItemRef): string {
+-  return ref.kind === 'node' ? `node:${ref.nodeId}` : `device:${ref.nodeId}:${ref.deviceId ?? ''}`;
++/** placement 在库里的主键：与旧数据兼容，仍写成 `node:<nodeId>` */
++export function deviceFolderPlacementKey(nodeId: string): string {
++  return `node:${nodeId}`;
+ }
+ 
+-export function parseDeviceFolderItemKey(key: string): DeviceFolderItemRef | null {
+-  const parts = key.split(':');
+-  if (parts[0] === 'node' && parts.length === 2 && parts[1]) {
+-    return { kind: 'node', nodeId: parts[1], deviceId: null };
+-  }
+-  if (parts[0] === 'device' && parts.length === 3 && parts[1] && parts[2]) {
+-    return { kind: 'device', nodeId: parts[1], deviceId: parts[2] };
+-  }
+-  return null;
+-}
+-
+-export function sameDeviceFolderItem(a: DeviceFolderItemRef, b: DeviceFolderItemRef): boolean {
+-  return (
+-    a.kind === b.kind && a.nodeId === b.nodeId && (a.deviceId ?? null) === (b.deviceId ?? null)
+-  );
+-}
+-
+-type FolderLink = Pick<DeviceFolder, 'id' | 'parentId'>;
+-
+-/** 含自身在内的全部后代 id */
+-export function folderDescendantIds(folders: readonly FolderLink[], folderId: string): Set<string> {
+-  const childrenOf = new Map<string | null, string[]>();
+-  for (const folder of folders) {
+-    const list = childrenOf.get(folder.parentId) ?? [];
+-    list.push(folder.id);
+-    childrenOf.set(folder.parentId, list);
+-  }
+-  const result = new Set<string>([folderId]);
+-  const queue = [folderId];
+-  while (queue.length > 0) {
+-    const current = queue.shift() as string;
+-    for (const child of childrenOf.get(current) ?? []) {
+-      if (!result.has(child)) {
+-        result.add(child);
+-        queue.push(child);
+-      }
+-    }
+-  }
+-  return result;
+-}
+-
+-/** 把 folderId 挂到 newParentId 下会不会成环（挂到自己或自己的后代下） */
+-export function wouldCreateFolderCycle(
+-  folders: readonly FolderLink[],
+-  folderId: string,
+-  newParentId: string | null
+-): boolean {
+-  if (newParentId === null) return false;
+-  return folderDescendantIds(folders, folderId).has(newParentId);
++/** 分组列表是否合法：id 唯一即可（分组只有一层，不存在层级关系） */
++export function isFolderListValid(folders: readonly Pick<DeviceFolder, 'id'>[]): boolean {
++  const ids = new Set(folders.map((folder) => folder.id));
++  return ids.size === folders.length;
+ }
+ 
+-/** 整个文件夹集合是否无环且 parentId 都指向存在的文件夹 */
+-export function isFolderForestValid(folders: readonly FolderLink[]): boolean {
+-  const ids = new Set(folders.map((folder) => folder.id));
+-  if (ids.size !== folders.length) return false;
+-  const parentOf = new Map(folders.map((folder) => [folder.id, folder.parentId] as const));
+-  for (const folder of folders) {
+-    if (folder.parentId !== null && !ids.has(folder.parentId)) return false;
+-    const seen = new Set<string>();
+-    let cursor: string | null = folder.id;
+-    while (cursor !== null) {
+-      if (seen.has(cursor)) return false;
+-      seen.add(cursor);
+-      cursor = parentOf.get(cursor) ?? null;
+-    }
++/**
++ * 整份布局是否合法：分组 id 唯一、placement 的 nodeId 唯一、folderId 指向存在的分组。
++ * 前端乐观更新与 gateway / DB helper 都以此为准，绕过 HTTP 直接写库也会被 helper 拦下。
++ */
++export function isDeviceFolderLayoutValid(layout: {
++  folders: readonly Pick<DeviceFolder, 'id'>[];
++  placements: readonly DeviceFolderPlacement[];
++}): boolean {
++  if (!isFolderListValid(layout.folders)) return false;
++  const folderIds = new Set(layout.folders.map((folder) => folder.id));
++  const nodeIds = new Set<string>();
++  for (const placement of layout.placements) {
++    if (!placement.nodeId || nodeIds.has(placement.nodeId)) return false;
++    nodeIds.add(placement.nodeId);
++    if (placement.folderId !== null && !folderIds.has(placement.folderId)) return false;
++    if (!Number.isInteger(placement.sortOrder)) return false;
+   }
+   return true;
+ }
+@@ -101,63 +58,41 @@ function byOrder<T extends { sortOrder: number }>(a: T, b: T): number {
+   return a.sortOrder - b.sortOrder;
+ }
+ 
+-/** 同一容器内按 sortOrder 重编号为 0..n-1（文件夹与条目各自独立编号） */
++/** 分组按 sortOrder 重编号为 0..n-1；每个容器内的 placement 各自独立编号 */
+ export function normalizeFolderLayoutOrder(layout: DeviceFolderLayout): DeviceFolderLayout {
+-  const renumber = <T extends { sortOrder: number }>(
+-    list: readonly T[],
+-    keyOf: (item: T) => string | null
+-  ): T[] => {
+-    const groups = new Map<string | null, T[]>();
+-    for (const item of list) {
+-      const group = groups.get(keyOf(item)) ?? [];
+-      group.push(item);
+-      groups.set(keyOf(item), group);
+-    }
+-    const out: T[] = [];
+-    for (const group of groups.values()) {
+-      group.sort(byOrder).forEach((item, index) => out.push({ ...item, sortOrder: index }));
+-    }
+-    return out;
+-  };
+-  return {
+-    folders: renumber(layout.folders, (folder) => folder.parentId),
+-    placements: renumber(layout.placements, (placement) => placement.folderId),
+-  };
++  const folders = [...layout.folders].sort(byOrder).map((folder, index) => ({
++    ...folder,
++    sortOrder: index,
++  }));
++  const groups = new Map<string | null, DeviceFolderPlacement[]>();
++  for (const placement of layout.placements) {
++    const group = groups.get(placement.folderId) ?? [];
++    group.push(placement);
++    groups.set(placement.folderId, group);
++  }
++  const placements: DeviceFolderPlacement[] = [];
++  for (const group of groups.values()) {
++    group.sort(byOrder).forEach((item, index) => placements.push({ ...item, sortOrder: index }));
++  }
++  return { folders, placements };
+ }
+ 
+-/**
+- * 删除文件夹：子文件夹与其中条目全部上提到被删文件夹的父级（父级为根时条目保留为根层
+- * 显式排序），排在父级现有内容之后。
+- */
++/** 删除分组：其中的节点回到根层显式排序，排在根层现有内容之后。 */
+ export function reparentOnFolderDelete(
+   layout: DeviceFolderLayout,
+   folderId: string
+ ): DeviceFolderLayout {
+-  const target = layout.folders.find((folder) => folder.id === folderId);
+-  if (!target) return layout;
+-  const parentId = target.parentId;
+-  const siblingFolderMax = Math.max(
+-    -1,
+-    ...layout.folders
+-      .filter((folder) => folder.parentId === parentId && folder.id !== folderId)
+-      .map((folder) => folder.sortOrder)
+-  );
+-  const siblingItemMax = Math.max(
++  if (!layout.folders.some((folder) => folder.id === folderId)) return layout;
++  const rootMax = Math.max(
+     -1,
+     ...layout.placements
+-      .filter((placement) => placement.folderId === parentId)
++      .filter((placement) => placement.folderId === null)
+       .map((placement) => placement.sortOrder)
+   );
+-  const folders = layout.folders
+-    .filter((folder) => folder.id !== folderId)
+-    .map((folder) =>
+-      folder.parentId === folderId
+-        ? { ...folder, parentId, sortOrder: siblingFolderMax + 1 + folder.sortOrder }
+-        : folder
+-    );
++  const folders = layout.folders.filter((folder) => folder.id !== folderId);
+   const placements = layout.placements.map((placement) =>
+     placement.folderId === folderId
+-      ? { ...placement, folderId: parentId, sortOrder: siblingItemMax + 1 + placement.sortOrder }
++      ? { ...placement, folderId: null, sortOrder: rootMax + 1 + placement.sortOrder }
+       : placement
+   );
+   return normalizeFolderLayoutOrder({ folders, placements });
+@@ -174,117 +109,66 @@ function insertAt<T extends { sortOrder: number }>(
+   return sorted.map((item, i) => ({ ...item, sortOrder: i }));
+ }
+ 
+-/**
+- * 移动文件夹到 targetParentId 下的 index 位置（null = 末尾）。成环返回 null。
+- */
++/** 把分组移到列表的 index 位置（null = 末尾）。分组不存在返回 null。 */
+ export function moveFolderInLayout(
+   layout: DeviceFolderLayout,
+   folderId: string,
+-  targetParentId: string | null,
+   index: number | null
+ ): DeviceFolderLayout | null {
+   const target = layout.folders.find((folder) => folder.id === folderId);
+   if (!target) return null;
+-  if (wouldCreateFolderCycle(layout.folders, folderId, targetParentId)) return null;
+-  if (targetParentId !== null && !layout.folders.some((folder) => folder.id === targetParentId)) {
+-    return null;
+-  }
+   const others = layout.folders.filter((folder) => folder.id !== folderId);
+-  const siblings = others.filter((folder) => folder.parentId === targetParentId);
+-  const rest = others.filter((folder) => folder.parentId !== targetParentId);
+-  const placed = insertAt(siblings, { ...target, parentId: targetParentId }, index);
+   return normalizeFolderLayoutOrder({
+-    folders: [...rest, ...placed],
++    folders: insertAt(others, target, index),
+     placements: layout.placements,
+   });
+ }
+ 
+ /**
+- * 移动条目到 targetFolderId（null = 根层显式排序）下的 index 位置（null = 末尾）。
+- * 条目原先没有 placement（隐式根层）时视为新增。目标文件夹不存在返回 null。
++ * 把节点移到 targetFolderId（null = 根层显式排序）下的 index 位置（null = 末尾）。
++ * 节点原先没有 placement（隐式根层）时视为新增。目标分组不存在返回 null。
+  */
+-export function moveItemInLayout(
++export function moveNodeInLayout(
+   layout: DeviceFolderLayout,
+-  item: DeviceFolderItemRef,
++  nodeId: string,
+   targetFolderId: string | null,
+   index: number | null
+ ): DeviceFolderLayout | null {
++  if (!nodeId) return null;
+   if (targetFolderId !== null && !layout.folders.some((folder) => folder.id === targetFolderId)) {
+     return null;
+   }
+-  const others = layout.placements.filter((placement) => !sameDeviceFolderItem(placement, item));
++  const others = layout.placements.filter((placement) => placement.nodeId !== nodeId);
+   const siblings = others.filter((placement) => placement.folderId === targetFolderId);
+   const rest = others.filter((placement) => placement.folderId !== targetFolderId);
+-  const moved: DeviceFolderPlacement = {
+-    kind: item.kind,
+-    nodeId: item.nodeId,
+-    deviceId: item.kind === 'node' ? null : (item.deviceId ?? null),
+-    folderId: targetFolderId,
+-    sortOrder: 0,
+-  };
++  const moved: DeviceFolderPlacement = { nodeId, folderId: targetFolderId, sortOrder: 0 };
+   const placed = insertAt(siblings, moved, index);
+   return normalizeFolderLayoutOrder({ folders: layout.folders, placements: [...rest, ...placed] });
+ }
+ 
+-/** 把条目从任何文件夹里拿出来，回到隐式根层（删除其 placement） */
+-export function removeItemFromLayout(
++/** 把节点从分组里拿出来，回到隐式根层（删除其 placement） */
++export function removeNodeFromLayout(
+   layout: DeviceFolderLayout,
+-  item: DeviceFolderItemRef
++  nodeId: string
+ ): DeviceFolderLayout {
+   return {
+     folders: layout.folders,
+-    placements: layout.placements.filter((placement) => !sameDeviceFolderItem(placement, item)),
++    placements: layout.placements.filter((placement) => placement.nodeId !== nodeId),
+   };
+ }
+ 
+-export interface DeviceFolderTreeNode {
+-  folder: DeviceFolder;
+-  children: DeviceFolderTreeNode[];
+-  items: DeviceFolderPlacement[];
+-  /** 含全部后代的条目数 */
+-  itemCount: number;
+-}
+-
+-export interface DeviceFolderTree {
+-  roots: DeviceFolderTreeNode[];
+-  /** 根层显式排序的条目（folderId=null） */
+-  rootItems: DeviceFolderPlacement[];
+-  byId: Map<string, DeviceFolderTreeNode>;
++/** 节点当前所在分组 id；无 placement 或 placement 指向根返回 null */
++export function findNodeFolderId(layout: DeviceFolderLayout, nodeId: string): string | null {
++  return layout.placements.find((placement) => placement.nodeId === nodeId)?.folderId ?? null;
+ }
+ 
+-export function buildDeviceFolderTree(layout: DeviceFolderLayout): DeviceFolderTree {
+-  const byId = new Map<string, DeviceFolderTreeNode>();
+-  for (const folder of layout.folders) {
+-    byId.set(folder.id, { folder, children: [], items: [], itemCount: 0 });
+-  }
+-  const roots: DeviceFolderTreeNode[] = [];
+-  for (const folder of [...layout.folders].sort(byOrder)) {
+-    const node = byId.get(folder.id) as DeviceFolderTreeNode;
+-    const parent = folder.parentId === null ? null : byId.get(folder.parentId);
+-    if (parent) parent.children.push(node);
+-    else roots.push(node);
+-  }
+-  const rootItems: DeviceFolderPlacement[] = [];
+-  for (const placement of [...layout.placements].sort(byOrder)) {
+-    const node = placement.folderId === null ? null : byId.get(placement.folderId);
+-    if (node) node.items.push(placement);
+-    else rootItems.push(placement);
++/** 每个分组里的节点数 */
++export function countFolderItems(layout: DeviceFolderLayout): Map<string, number> {
++  const counts = new Map<string, number>(layout.folders.map((folder) => [folder.id, 0]));
++  for (const placement of layout.placements) {
++    if (placement.folderId === null) continue;
++    const current = counts.get(placement.folderId);
++    if (current !== undefined) counts.set(placement.folderId, current + 1);
+   }
+-  const count = (node: DeviceFolderTreeNode): number => {
+-    node.itemCount =
+-      node.items.length + node.children.reduce((sum, child) => sum + count(child), 0);
+-    return node.itemCount;
+-  };
+-  for (const root of roots) count(root);
+-  return { roots, rootItems, byId };
+-}
+-
+-/** 条目当前所在文件夹 id；无 placement 或 placement 指向根返回 null */
+-export function findItemFolderId(
+-  layout: DeviceFolderLayout,
+-  item: DeviceFolderItemRef
+-): string | null {
+-  return (
+-    layout.placements.find((placement) => sameDeviceFolderItem(placement, item))?.folderId ?? null
+-  );
++  return counts;
+ }
+diff --git a/packages/shared/src/index.test.ts b/packages/shared/src/index.test.ts
+index b830e049..b63525af 100644
+--- a/packages/shared/src/index.test.ts
++++ b/packages/shared/src/index.test.ts
+@@ -29,15 +29,14 @@ const EXPECTED_RUNTIME_EXPORTS = [
+   'TERMINAL_THEME_LIGHT',
+   'b',
+   'basename',
+-  'buildDeviceFolderTree',
+   'collectLayoutLeaves',
+   'compareTmuxVersion',
++  'countFolderItems',
+   'decodePaneModes',
+-  'deviceFolderItemKey',
++  'deviceFolderPlacementKey',
+   'dirname',
+   'encodePaneModes',
+-  'findItemFolderId',
+-  'folderDescendantIds',
++  'findNodeFolderId',
+   'formatDate',
+   'formatDateTime',
+   'formatDisplayVersion',
+@@ -45,23 +44,21 @@ const EXPECTED_RUNTIME_EXPORTS = [
+   'getOsc11ResponseColor',
+   'getTerminalTheme',
+   'getTmuxWindowStyle',
+-  'isFolderForestValid',
++  'isDeviceFolderLayoutValid',
++  'isFolderListValid',
+   'layoutLeafPaneId',
+   'moveFolderInLayout',
+-  'moveItemInLayout',
++  'moveNodeInLayout',
+   'normalizeDeviceFolderName',
+   'normalizeFolderLayoutOrder',
+   'normalizePosixPath',
+-  'parseDeviceFolderItemKey',
+   'parseTmuxVersion',
+   'parseWindowLayout',
+-  'removeItemFromLayout',
++  'removeNodeFromLayout',
+   'reparentOnFolderDelete',
+   'rewriteWildcardBindHost',
+-  'sameDeviceFolderItem',
+   'toBCP47',
+   'validateDeviceFolderName',
+-  'wouldCreateFolderCycle',
+   'writeTextToClipboard',
+   'wsBorsh',
+ ];
