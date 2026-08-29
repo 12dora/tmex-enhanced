@@ -1,0 +1,7 @@
+- **BLOCKER** — [packages/stores/src/agent-thread.ts:202](/Users/konata/code/tmex-enhanced-wt-smell/packages/stores/src/agent-thread.ts:202): the old `switch` ignored unknown persisted roles. The new object lookup resolves inherited prototype properties. A database row with `role = "__proto__"` and record-shaped content now throws `TypeError`; the SQLite column has no role constraint. Added tests only accept `AgentMessageRole`, so they miss this case.
+
+- **MINOR** — [packages/stores/src/runtime.ts:268](/Users/konata/code/tmex-enhanced-wt-smell/packages/stores/src/runtime.ts:268): the old forwarding closures read `conn.paneSinks` on every call. The new code captures the initial registry in `sinks`. If a valid mutable `GatewayConnection` replaces `paneSinks` after `resolveRuntimeCore`, old code routes to the replacement while new code continues routing to the stale registry.
+
+- **MINOR** — [packages/ghostty-terminal/src/ghostty-wasm-core.ts:29](/Users/konata/code/tmex-enhanced-wt-smell/packages/ghostty-terminal/src/ghostty-wasm-core.ts:29): `encoder` changed from `private` to `protected`. A subclass of `GhosttyBindings` can now access it, whereas the pre-image rejected that code. This widens the class’s TypeScript surface.
+
+Verification: 844 scoped source tests passed. The full Ghostty run had four unrelated metadata tests blocked by the read-only sandbox’s `mkdtemp` restriction.
