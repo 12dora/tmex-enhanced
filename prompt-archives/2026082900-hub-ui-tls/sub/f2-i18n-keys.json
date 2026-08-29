@@ -1,0 +1,317 @@
+{
+  "en_US": {
+    "nodes": {
+      "setup": {
+        "title": "Enable hub",
+        "intro": "This machine is standalone — it is not part of a mesh yet. Pick one of the two paths below.",
+        "introDetail": "Making this machine the hub creates the first user here and lets other machines join it; it needs an address that is reachable over HTTPS. Joining an existing hub turns this machine into a node of a mesh someone else already runs. Either way the gateway writes its configuration and restarts once.",
+        "path": {
+          "becomeHub": {
+            "title": "Make this machine the hub",
+            "description": "Creates the first user here and accepts join requests from other machines. Needs a public HTTPS address."
+          },
+          "joinHub": {
+            "title": "Join an existing hub",
+            "description": "Turns this machine into a node. You need a join string issued by the hub; it is valid for 10 minutes."
+          }
+        },
+        "becomeHub": {
+          "title": "Make this machine the hub",
+          "description": "Creates the first user, issues this machine's own node certificate, then restarts the gateway with the role hub,node."
+        },
+        "joinHub": {
+          "title": "Join an existing hub",
+          "description": "Same as running `tmex-cli hub join` on this machine. After the join succeeds the gateway restarts as a node."
+        },
+        "fields": {
+          "hubPublicUrl": "Hub public address",
+          "hubPublicUrlHint": "The HTTPS address browsers and `hub join` will use, for example https://tmex.example.com. Every machine that joins must be able to reach it.",
+          "username": "Username",
+          "usernameHint": "1-64 characters: letters, digits, dot, underscore or hyphen.",
+          "password": "Password",
+          "passwordHint": "At least 8 characters. Your root key is derived from this password, so it cannot be recovered from the server.",
+          "confirmPassword": "Confirm password",
+          "hubUrl": "Hub address",
+          "hubUrlHint": "The hub's HTTPS address, for example https://tmex.example.com. HTTP redirects are rejected.",
+          "token": "Join string",
+          "tokenHint": "Issued by `tmex-cli enroll` on the hub, or from the Nodes page of any signed-in entry. Valid for 10 minutes. Whitespace and line breaks are stripped.",
+          "tokenPlaceholder": "Paste the 128-character join string",
+          "name": "Node name",
+          "nameHint": "Shown in the sidebar and on the Nodes page.",
+          "directEnable": "Enable direct connections",
+          "directEnableHint": "Downloads the native add-on for this platform so nodes can talk to each other directly instead of relaying through the hub. A failure here does not block setup.",
+          "directUnsupportedHint": "No native add-on is published for {{platform}}; traffic will relay through the hub.",
+          "insecureLocal": "Allow an http:// hub on this machine",
+          "insecureLocalHint": "Development and test only: permits http://127.0.0.1 or http://localhost as the hub address. Not available in production."
+        },
+        "precheck": {
+          "button": "Check reachability",
+          "reachableSelf": "Reachable, and it answers as this machine. The address is ready to use as the hub's public address.",
+          "reachableOther": "Reachable (HTTP {{status}}), but it answers as a different tmex instance. Check the address before continuing.",
+          "unreachable": "Not reachable: {{error}}",
+          "httpsHint": "tmex does not terminate HTTPS itself yet, so the public address has to be served by a reverse proxy or a Cloudflare Tunnel in front of this machine. Built-in HTTPS comes in a later release.",
+          "docsHint": "See docs/hub/2026082800-hub-node-operations.md, sections 「Cloudflare Tunnel 与反代」 and 「首次搭 hub」."
+        },
+        "submit": {
+          "becomeHub": "Create user and restart as hub",
+          "joinHub": "Join and restart",
+          "pending": "Working..."
+        },
+        "result": {
+          "title": "Setup finished",
+          "becomeHubDescription": "The first user and this machine's node certificate were created. The gateway is restarting.",
+          "joinDescription": "This machine joined the hub. The gateway is restarting.",
+          "fingerprint": "Root key fingerprint",
+          "hubPublicUrl": "Hub public address",
+          "hubUrl": "Hub address",
+          "username": "Username",
+          "directLabel": "Direct connections",
+          "direct": {
+            "enabled": "enabled",
+            "skipped": "skipped",
+            "failed": "failed ({{error}}) - traffic relays through the hub; you can retry later from this tab"
+          }
+        },
+        "restart": {
+          "waiting": "Waiting for the gateway to come back... {{seconds}}s",
+          "restarted": "The gateway is back. Taking you to the sign-in page.",
+          "timeout": "The service did not come back within 60 seconds. Start it manually, then reload this page:"
+        },
+        "toast": {
+          "hubCreated": "Hub created; the gateway is restarting",
+          "joined": "Joined the hub; the gateway is restarting"
+        },
+        "errors": {
+          "not_standalone": "This machine is already part of a mesh, so the setup wizard is not available.",
+          "invalid_url": "Enter a valid https:// address.",
+          "insecure_local_required": "http:// is only allowed for a hub on this machine - turn on “Allow an http:// hub on this machine”.",
+          "invalid_username": "1-64 characters: letters, digits, dot, underscore or hyphen.",
+          "weak_password": "Use at least 8 characters.",
+          "password_mismatch": "The two passwords do not match.",
+          "invalid_name": "Enter a name of 1-64 characters.",
+          "user_exists": "A user with this name already exists on this machine.",
+          "invalid_token": "That join string is not valid. Paste the whole string issued by the hub.",
+          "node_revoked": "This node identity was revoked. Re-initialize this machine to get a fresh identity before joining again.",
+          "node_exists": "The hub already has a different node registered under this identity.",
+          "hub_unreachable": "Could not reach the hub. Check the address and make sure the hub is running.",
+          "join_failed": "The hub rejected the join request.",
+          "env_write_failed": "Could not write the configuration file, so nothing was restarted. Anything already created on this machine is still there - fix the file permissions and try again.",
+          "direct_unsupported": "Direct connections are not available on this platform.",
+          "direct_download_failed": "Could not download the direct-connection add-on.",
+          "direct_failed": "Enabling direct connections failed.",
+          "unknown": "Unexpected error: {{message}}"
+        }
+      }
+    }
+  },
+  "zh_CN": {
+    "nodes": {
+      "setup": {
+        "title": "启用 hub",
+        "intro": "本机当前是 standalone（尚未加入任何 mesh）。请从下面两条路径中选一。",
+        "introDetail": "把本机变成 hub：在本机创建首个用户，其他机器再加入进来，需要一个外部可达的 HTTPS 地址。加入已有 hub：本机变成别人已经建好的 mesh 里的一个节点。两条路径都会写配置并重启一次网关。",
+        "path": {
+          "becomeHub": {
+            "title": "把本机变成 hub",
+            "description": "在本机创建首个用户，并受理其他机器的加入请求。需要对外的 HTTPS 地址。"
+          },
+          "joinHub": {
+            "title": "加入已有 hub",
+            "description": "把本机变成一个节点。需要 hub 签发的 join 串，默认 10 分钟内有效。"
+          }
+        },
+        "becomeHub": {
+          "title": "把本机变成 hub",
+          "description": "创建首个用户、签发本机的节点证书，然后以 hub,node 角色重启网关。"
+        },
+        "joinHub": {
+          "title": "加入已有 hub",
+          "description": "等价于在本机执行 `tmex-cli hub join`。加入成功后网关以 node 角色重启。"
+        },
+        "fields": {
+          "hubPublicUrl": "hub 对外地址",
+          "hubPublicUrlHint": "浏览器与 `hub join` 使用的 HTTPS 地址，如 https://tmex.example.com。所有要加入的机器都必须能访问它。",
+          "username": "用户名",
+          "usernameHint": "1-64 个字符，只能用字母、数字、点、下划线、连字符。",
+          "password": "密码",
+          "passwordHint": "至少 8 位。根钥由该密码推导，服务端无法找回。",
+          "confirmPassword": "确认密码",
+          "hubUrl": "hub 地址",
+          "hubUrlHint": "hub 的 HTTPS 地址，如 https://tmex.example.com。HTTP 重定向一律拒绝。",
+          "token": "join 串",
+          "tokenHint": "由 hub 上的 `tmex-cli enroll` 或任意已登录入口的 Nodes 页签发，默认 10 分钟内有效。粘贴时的空白与换行会自动去掉。",
+          "tokenPlaceholder": "粘贴 128 位的 join 串",
+          "name": "节点名称",
+          "nameHint": "会显示在侧边栏与 Nodes 页。",
+          "directEnable": "启用直连",
+          "directEnableHint": "下载当前平台的原生插件，让节点之间直接通信而不走 hub 中转。失败不阻断安装。",
+          "directUnsupportedHint": "{{platform}} 没有发布原生插件，流量将经由 hub 中转。",
+          "insecureLocal": "允许本机的 http:// hub",
+          "insecureLocalHint": "仅开发与测试环境：允许把 http://127.0.0.1 或 http://localhost 当作 hub 地址。production 下不可用。"
+        },
+        "precheck": {
+          "button": "检查可达性",
+          "reachableSelf": "可达，且响应的就是本机。该地址可以直接用作 hub 对外地址。",
+          "reachableOther": "可达（HTTP {{status}}），但响应的是另一个 tmex 实例。继续前请先核对地址。",
+          "unreachable": "不可达：{{error}}",
+          "httpsHint": "tmex 目前不自己终结 HTTPS，对外地址需要由本机前面的反代或 Cloudflare Tunnel 提供。内置 HTTPS 会在后续版本提供。",
+          "docsHint": "参见 docs/hub/2026082800-hub-node-operations.md 的「Cloudflare Tunnel 与反代」与「首次搭 hub」两节。"
+        },
+        "submit": {
+          "becomeHub": "创建用户并作为 hub 重启",
+          "joinHub": "加入并重启",
+          "pending": "处理中…"
+        },
+        "result": {
+          "title": "安装完成",
+          "becomeHubDescription": "首个用户与本机节点证书已创建，网关正在重启。",
+          "joinDescription": "本机已加入 hub，网关正在重启。",
+          "fingerprint": "根钥指纹",
+          "hubPublicUrl": "hub 对外地址",
+          "hubUrl": "hub 地址",
+          "username": "用户名",
+          "directLabel": "直连",
+          "direct": {
+            "enabled": "已启用",
+            "skipped": "已跳过",
+            "failed": "失败（{{error}}）——流量暂时经由 hub 中转，可稍后在本页重试"
+          }
+        },
+        "restart": {
+          "waiting": "等待网关重启完成… {{seconds}} 秒",
+          "restarted": "网关已恢复，正在跳转到登录页。",
+          "timeout": "60 秒内服务未恢复。请手动拉起服务后刷新本页："
+        },
+        "toast": {
+          "hubCreated": "hub 已创建，网关正在重启",
+          "joined": "已加入 hub，网关正在重启"
+        },
+        "errors": {
+          "not_standalone": "本机已经在 mesh 里，不再提供安装向导。",
+          "invalid_url": "请填写合法的 https:// 地址。",
+          "insecure_local_required": "http:// 只能用于本机的 hub——请先打开「允许本机的 http:// hub」。",
+          "invalid_username": "1-64 个字符，只能用字母、数字、点、下划线、连字符。",
+          "weak_password": "密码至少 8 位。",
+          "password_mismatch": "两次输入的密码不一致。",
+          "invalid_name": "请填写 1-64 个字符的名称。",
+          "user_exists": "本机已存在同名用户。",
+          "invalid_token": "join 串不合法，请完整粘贴 hub 签发的字符串。",
+          "node_revoked": "该节点身份已被吊销。需先重新初始化本机拿到新身份，再重新加入。",
+          "node_exists": "hub 上已有其他公钥占用该节点身份。",
+          "hub_unreachable": "无法访问 hub。请检查地址以及 hub 是否在运行。",
+          "join_failed": "hub 拒绝了本次加入请求。",
+          "env_write_failed": "配置文件写入失败，本次没有重启。已在本机创建的数据仍然保留——请先修复文件权限再重试。",
+          "direct_unsupported": "当前平台不支持直连。",
+          "direct_download_failed": "直连插件下载失败。",
+          "direct_failed": "启用直连失败。",
+          "unknown": "未知错误：{{message}}"
+        }
+      }
+    }
+  },
+  "ja_JP": {
+    "nodes": {
+      "setup": {
+        "title": "hub を有効化",
+        "intro": "このマシンは standalone で、まだ mesh に参加していません。下の 2 つのうち 1 つを選んでください。",
+        "introDetail": "このマシンを hub にする場合は、ここで最初のユーザーを作成し、他のマシンが参加できるようになります。HTTPS で到達できるアドレスが必要です。既存の hub に参加する場合は、このマシンがその mesh のノードになります。いずれも設定を書き込んでゲートウェイを 1 回再起動します。",
+        "path": {
+          "becomeHub": {
+            "title": "このマシンを hub にする",
+            "description": "ここで最初のユーザーを作成し、他のマシンの参加を受け付けます。公開用の HTTPS アドレスが必要です。"
+          },
+          "joinHub": {
+            "title": "既存の hub に参加する",
+            "description": "このマシンをノードにします。hub が発行した join 文字列（有効期限 10 分）が必要です。"
+          }
+        },
+        "becomeHub": {
+          "title": "このマシンを hub にする",
+          "description": "最初のユーザーとこのマシンのノード証明書を作成し、hub,node ロールでゲートウェイを再起動します。"
+        },
+        "joinHub": {
+          "title": "既存の hub に参加する",
+          "description": "このマシンで `tmex-cli hub join` を実行するのと同じです。成功するとノードとして再起動します。"
+        },
+        "fields": {
+          "hubPublicUrl": "hub の公開アドレス",
+          "hubPublicUrlHint": "ブラウザと `hub join` が使う HTTPS アドレス（例：https://tmex.example.com）。参加するすべてのマシンから到達できる必要があります。",
+          "username": "ユーザー名",
+          "usernameHint": "1〜64 文字。英数字と . _ - のみ。",
+          "password": "パスワード",
+          "passwordHint": "8 文字以上。ルート鍵はこのパスワードから導出されるため、サーバーからは復元できません。",
+          "confirmPassword": "パスワード（確認）",
+          "hubUrl": "hub のアドレス",
+          "hubUrlHint": "hub の HTTPS アドレス（例：https://tmex.example.com）。HTTP リダイレクトは拒否されます。",
+          "token": "join 文字列",
+          "tokenHint": "hub 上の `tmex-cli enroll`、またはサインイン済みのエントリの Nodes ページから発行します。有効期限は 10 分。空白と改行は自動で除去されます。",
+          "tokenPlaceholder": "128 文字の join 文字列を貼り付け",
+          "name": "ノード名",
+          "nameHint": "サイドバーと Nodes ページに表示されます。",
+          "directEnable": "直接接続を有効にする",
+          "directEnableHint": "このプラットフォーム向けのネイティブアドオンをダウンロードし、hub 中継を介さずにノード同士で通信します。失敗してもセットアップは続行します。",
+          "directUnsupportedHint": "{{platform}} 向けのネイティブアドオンは提供されていません。通信は hub 経由になります。",
+          "insecureLocal": "このマシン上の http:// hub を許可",
+          "insecureLocalHint": "開発・テスト環境専用：http://127.0.0.1 または http://localhost を hub アドレスとして許可します。production では使えません。"
+        },
+        "precheck": {
+          "button": "到達性を確認",
+          "reachableSelf": "到達でき、応答したのはこのマシンです。hub の公開アドレスとしてそのまま使えます。",
+          "reachableOther": "到達できました（HTTP {{status}}）が、別の tmex インスタンスが応答しています。進む前にアドレスを確認してください。",
+          "unreachable": "到達できません：{{error}}",
+          "httpsHint": "tmex はまだ HTTPS を自前で終端しないため、公開アドレスはこのマシンの前に置いたリバースプロキシまたは Cloudflare Tunnel で提供する必要があります。組み込み HTTPS は今後のリリースで対応します。",
+          "docsHint": "docs/hub/2026082800-hub-node-operations.md の「Cloudflare Tunnel 与反代」および「首次搭 hub」の節を参照してください。"
+        },
+        "submit": {
+          "becomeHub": "ユーザーを作成して hub として再起動",
+          "joinHub": "参加して再起動",
+          "pending": "処理中…"
+        },
+        "result": {
+          "title": "セットアップ完了",
+          "becomeHubDescription": "最初のユーザーとこのマシンのノード証明書を作成しました。ゲートウェイを再起動中です。",
+          "joinDescription": "このマシンは hub に参加しました。ゲートウェイを再起動中です。",
+          "fingerprint": "ルート鍵のフィンガープリント",
+          "hubPublicUrl": "hub の公開アドレス",
+          "hubUrl": "hub のアドレス",
+          "username": "ユーザー名",
+          "directLabel": "直接接続",
+          "direct": {
+            "enabled": "有効",
+            "skipped": "スキップ",
+            "failed": "失敗（{{error}}）——通信は hub 経由になります。あとでこのタブから再試行できます"
+          }
+        },
+        "restart": {
+          "waiting": "ゲートウェイの復帰を待機中… {{seconds}} 秒",
+          "restarted": "ゲートウェイが復帰しました。サインインページに移動します。",
+          "timeout": "60 秒以内にサービスが復帰しませんでした。手動で起動してからこのページを再読み込みしてください："
+        },
+        "toast": {
+          "hubCreated": "hub を作成しました。ゲートウェイを再起動中です",
+          "joined": "hub に参加しました。ゲートウェイを再起動中です"
+        },
+        "errors": {
+          "not_standalone": "このマシンはすでに mesh に参加しているため、セットアップウィザードは使えません。",
+          "invalid_url": "有効な https:// アドレスを入力してください。",
+          "insecure_local_required": "http:// はこのマシン上の hub にのみ使えます。「このマシン上の http:// hub を許可」をオンにしてください。",
+          "invalid_username": "1〜64 文字。英数字と . _ - のみ。",
+          "weak_password": "8 文字以上にしてください。",
+          "password_mismatch": "パスワードが一致しません。",
+          "invalid_name": "1〜64 文字の名前を入力してください。",
+          "user_exists": "同じ名前のユーザーがこのマシンにすでにあります。",
+          "invalid_token": "join 文字列が不正です。hub が発行した文字列を完全に貼り付けてください。",
+          "node_revoked": "このノード ID は失効されています。このマシンを再初期化して新しい ID を取得してから参加してください。",
+          "node_exists": "hub 上では別の公開鍵がこのノード ID を使用しています。",
+          "hub_unreachable": "hub に接続できません。アドレスと hub が稼働しているか確認してください。",
+          "join_failed": "hub が参加リクエストを拒否しました。",
+          "env_write_failed": "設定ファイルを書き込めず、再起動は行われていません。このマシンに作成済みのデータは残っています。ファイルの権限を直して再試行してください。",
+          "direct_unsupported": "このプラットフォームでは直接接続を使えません。",
+          "direct_download_failed": "直接接続用アドオンのダウンロードに失敗しました。",
+          "direct_failed": "直接接続の有効化に失敗しました。",
+          "unknown": "予期しないエラー：{{message}}"
+        }
+      }
+    }
+  }
+}
