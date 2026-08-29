@@ -1,0 +1,105 @@
+== CC >= 12 ==
+ 24   220L  packages/panels/src/device-tree/window-row.tsx:47  WindowRow
+ 21   213L  packages/panels/src/device-console/page-actions.tsx:111  DeviceConsoleActions
+ 21   169L  packages/panels/src/device-tree/pane-row.tsx:40  PaneRow
+ 17   220L  packages/panels/src/settings/files-tab.tsx:336  FileRootFormModal
+ 17    54L  packages/stores/src/tmux-device-events.ts:72  handleTmuxEvent
+ 17    82L  packages/stores/src/agent-thread.ts:102  parsePersistedMessages
+ 16    58L  packages/panels/src/settings/weixin-account-login-modal.tsx:128  <arg of useCallback>
+ 16    19L  packages/panels/src/watch/watch-rule-draft.ts:60  createWatchRuleDraft
+ 16   144L  packages/panels/src/device-tree/device-row.tsx:32  DeviceRow
+ 15   200L  packages/panels/src/watch/watch-dialog.tsx:51  WatchDialog
+ 15    51L  packages/stores/src/runtime.ts:264  resolveRuntimeCore
+ 14    40L  packages/panels/src/agent/messages/tool-call-card.tsx:148  WebSearchBody
+ 14    30L  packages/panels/src/files/file-icon.tsx:19  fileIconFor
+ 13    29L  packages/panels/src/settings/ShortcutButtonRow.tsx:53  <arg of items.map>
+ 13   368L  packages/panels/src/device-management/device-dialog.tsx:38  DeviceDialog
+ 13    40L  packages/panels/src/device-console/use-pane-size-sync.ts:91  <arg of useEffect>
+ 13    90L  packages/panels/src/agent/model-picker.tsx:29  ModelPicker
+ 12    44L  packages/panels/src/settings/weixin-account-login-modal.tsx:79  <arg of useCallback>
+ 12    34L  packages/panels/src/device-management/device-form.ts:101  buildUpdatePayload
+ 12    32L  packages/panels/src/watch/watch-rule-draft.ts:123  validateWatchRuleDraft
+ 12    22L  packages/stores/src/use-pane-agent-state.ts:12  selectPaneAgentState
+ 12    63L  apps/fe/src/pages/FilePage.tsx:186  FilePage
+
+== functions >= 100 lines ==
+ 429L  cc=  1  packages/stores/src/agent-session-actions.ts:60  createAgentSessionActions
+ 368L  cc= 13  packages/panels/src/device-management/device-dialog.tsx:38  DeviceDialog
+ 352L  cc=  1  packages/stores/src/tmux.ts:23  createTmuxStore
+ 326L  cc=  1  packages/stores/src/tmux.ts:48  <arg of create>
+ 306L  cc= 10  packages/panels/src/settings/TerminalShortcutsEditor.tsx:207  TerminalShortcutsEditor
+ 254L  cc=  9  packages/panels/src/settings/weixin-account-login-modal.tsx:36  WeixinAccountLoginModal
+ 220L  cc= 17  packages/panels/src/settings/files-tab.tsx:336  FileRootFormModal
+ 220L  cc= 24  packages/panels/src/device-tree/window-row.tsx:47  WindowRow
+ 213L  cc= 21  packages/panels/src/device-console/page-actions.tsx:111  DeviceConsoleActions
+ 213L  cc=  7  packages/panels/src/device-tree/sidebar-device-list.tsx:40  SideBarDeviceList
+ 211L  cc=  6  packages/panels/src/device-tree/device-tree-dialogs.tsx:52  useDeviceTreeDialogs
+ 206L  cc=  1  packages/panels/src/device-console/use-pane-active-follow.ts:20  usePaneActiveFollow
+ 204L  cc= 11  packages/panels/src/settings/llm-provider-form-modal.tsx:39  LlmProviderFormModal
+ 202L  cc=  9  packages/panels/src/settings/search-tab.tsx:25  SearchTab
+ 200L  cc= 15  packages/panels/src/watch/watch-dialog.tsx:51  WatchDialog
+ 199L  cc=  9  packages/panels/src/settings/webhooks-tab.tsx:37  WebhooksTab
+ 180L  cc=  3  packages/panels/src/settings/terminal-settings-panel.tsx:45  TerminalSettingsPanel
+ 178L  cc= 10  packages/panels/src/settings/weixin-account-row.tsx:21  WeixinAccountRow
+ 170L  cc=  2  packages/panels/src/settings/llm-provider-row.tsx:40  LlmProviderRow
+ 169L  cc= 21  packages/panels/src/device-tree/pane-row.tsx:40  PaneRow
+ 165L  cc=  7  packages/panels/src/settings/weixin-account-form-modal.tsx:31  WeixinAccountFormModal
+ 165L  cc=  8  packages/panels/src/device-management/device-management-panel.tsx:49  DeviceManagementPanel
+ 165L  cc=  8  packages/panels/src/watch/regex-trigger-fields.tsx:26  RegexTriggerFields
+ 164L  cc=  9  packages/panels/src/settings/telegram-bot-form-modal.tsx:24  TelegramBotFormModal
+ 150L  cc=  4  packages/panels/src/watch/watch-rule-form.tsx:31  WatchRuleForm
+ 149L  cc=  3  packages/ui/src/components/sidebar/sidebar-provider.tsx:21  SidebarProvider
+ 148L  cc=  4  packages/panels/src/settings/telegram-bot-chats-modal.tsx:27  TelegramBotChatsModal
+ 144L  cc= 16  packages/panels/src/device-tree/device-row.tsx:32  DeviceRow
+ 140L  cc=  1  apps/fe/src/pages/settings/notification-settings-tab.tsx:13  NotificationSettingsTab
+ 138L  cc=  1  packages/panels/src/device-console/use-pane-route-reconciliation.ts:12  usePaneRouteReconciliation
+ 136L  cc=  7  packages/panels/src/settings/use-version-tab.ts:32  useVersionTab
+ 135L  cc=  1  packages/panels/src/device-console/use-editor-input.ts:48  useEditorInput
+ 134L  cc=  8  packages/panels/src/settings/llm-providers-tab.tsx:86  LlmDefaultsCard
+ 124L  cc=  1  packages/panels/src/device-console/use-pane-size-sync.ts:20  usePaneSizeSync
+ 122L  cc=  5  packages/panels/src/device-console/use-pane-selection-state.ts:51  usePaneSelectionState
+ 122L  cc=  7  packages/panels/src/agent/agent-composer.tsx:13  ChatInput
+ 116L  cc= 11  packages/ui/src/components/sidebar/sidebar-layout.tsx:11  Sidebar
+ 115L  cc=  1  packages/panels/src/device-console/use-pane-selection-dispatch.ts:46  usePaneSelectionDispatch
+ 114L  cc=  4  packages/panels/src/device-console/device-console.tsx:48  DeviceConsole
+ 109L  cc=  1  packages/stores/src/tmux-selection-actions.ts:41  createTmuxSelectionActions
+ 108L  cc=  2  packages/panels/src/settings/files-tab.tsx:213  FileRootRow
+ 108L  cc=  1  packages/stores/src/agent.ts:24  createAgentStore
+ 107L  cc=  1  packages/panels/src/settings/telegram-bot-row.tsx:20  TelegramBotRow
+ 107L  cc=  2  packages/panels/src/agent/queue-chips.tsx:9  QueueChips
+ 107L  cc=  5  packages/panels/src/agent/chat-thread.tsx:34  ChatThread
+ 104L  cc=  9  packages/panels/src/files/files-tab.tsx:56  FilesTabInner
+ 103L  cc=  1  packages/stores/src/site.ts:38  createSiteStore
+ 103L  cc=  3  apps/fe/src/pages/settings/general-settings-tab.tsx:16  GeneralSettingsTab
+ 101L  cc=  9  packages/panels/src/device-management/device-card.tsx:28  DeviceCard
+ 100L  cc=  1  packages/stores/src/ui.ts:99  createUIStore
+
+== files >= 300 lines ==
+  556  packages/panels/src/settings/files-tab.tsx
+  555  apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+  513  packages/panels/src/settings/TerminalShortcutsEditor.tsx
+  489  packages/panels/src/agent/messages/tool-call-card.tsx
+  489  packages/stores/src/agent-session-actions.ts
+  430  packages/panels/src/watch/watch-dialog.tsx
+  412  packages/stores/src/agent-event-router.ts
+  406  packages/panels/src/device-management/device-dialog.tsx
+  377  packages/stores/src/tmux.ts
+  346  packages/panels/src/device-console/pane-selection-rules.ts
+  324  packages/panels/src/device-console/page-actions.tsx
+  320  packages/stores/src/runtime.ts
+  318  packages/panels/src/files/files-tab.tsx
+  300  apps/fe/src/pages/FilePage.tsx
+  581  apps/fe/tests/agent-session.spec.ts
+  567  apps/fe/tests/terminal-render-regressions.spec.ts
+  554  apps/fe/tests/mobile-terminal-interactions.spec.ts
+  485  packages/panels/src/device-console/pane-selection-rules.test.ts
+  471  packages/panels/src/watch/watch-rule-draft.test.ts
+  444  apps/fe/tests/split-selection-persistence.spec.ts
+  438  packages/stores/src/tmux-event-router.test.ts
+  427  apps/fe/tests/terminal-mouse-recovery.spec.ts
+  379  packages/stores/src/agent-event-router.test.ts
+  334  apps/fe/tests/terminal-selection-canvas.spec.ts
+  323  apps/fe/tests/ws-borsh-resize.spec.ts
+  323  apps/fe/tests/mobile-keyboard-avoidance.spec.ts
+  322  apps/fe/tests/settings-llm.spec.ts
+  304  packages/stores/src/agent-session-actions.test.ts

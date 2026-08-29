@@ -1,0 +1,73 @@
+== CC >= 12 ==
+ 33    77L  packages/ghostty-terminal/src/ghostty-wasm.ts:1177  encodeMouseEvent
+ 28    30L  packages/shared/src/ws-borsh/state-snapshot-diff.ts:161  applyPaneFields
+ 24    75L  packages/shared/src/ws-borsh/state-snapshot-diff.ts:192  applyLegacyStateSnapshotDiff
+ 19    61L  packages/shared/src/tmux-layout.ts:78  parseNode
+ 18    74L  packages/terminal-ui/src/components/touch/gesture-machine.ts:122  <anon>
+ 18    43L  packages/terminal-ui/src/components/TerminalSurface.ts:169  applyHistoryPage
+ 16    50L  packages/terminal-ui/src/components/useTerminalResize.ts:106  <arg of useCallback>
+ 16    71L  packages/ghostty-terminal/src/canvas-renderer.ts:423  drawRowForeground
+ 15    34L  packages/terminal-ui/src/utils/terminalKeySequence.ts:195  <arg of input.replace>
+ 15    32L  packages/terminal-ui/src/components/terminal-diagnostics.tsx:245  collectTerminalRenderDiagnostic
+ 15    30L  packages/shared/src/ws-borsh/state-snapshot-diff.ts:96  decodeLegacyStateSnapshotDiff
+ 15    61L  packages/ghostty-terminal/src/canvas-renderer.ts:497  drawBlockElement
+ 15    72L  packages/ghostty-terminal/src/canvas-renderer.ts:559  drawCursor
+ 14    15L  packages/shared/src/ws-borsh/state-snapshot-diff.ts:145  applyWindowFields
+ 14    60L  packages/ghostty-terminal/src/terminal-pointer.ts:112  mousedownListener
+ 13    44L  packages/terminal-ui/src/components/terminal-diagnostics.tsx:200  pixelSummary
+ 13    50L  packages/ws-client/src/state-machine.ts:335  handleLiveResume
+ 13    38L  packages/ws-client/src/state-machine.ts:510  replayDeferred
+ 12   209L  packages/terminal-ui/src/components/SplitTerminalArea.tsx:43  SplitTerminalArea
+ 12    50L  packages/terminal-ui/src/components/touch/gesture-machine.ts:197  <anon>
+ 12    80L  packages/api-client/src/upload-transfer.ts:12  uploadFileChunked
+ 12    16L  packages/api-client/src/download-transfer.ts:112  <arg of readNdjsonStream>
+ 12    27L  packages/ghostty-terminal/src/ghostty-wasm.ts:274  mouseButtonCode
+ 12    32L  packages/ghostty-terminal/src/terminal-input-bridge.ts:387  gestureToColumns
+ 12    54L  packages/ghostty-terminal/src/canvas-renderer.ts:164  render
+ 12    68L  packages/ghostty-terminal/src/canvas-renderer.ts:259  resize
+
+== functions >= 100 lines ==
+ 319L  cc=  1  packages/terminal-ui/src/components/useTerminalResize.ts:31  useTerminalResize
+ 282L  cc=  1  packages/terminal-ui/src/components/hooks/useTerminalBootSurface.ts:97  useTerminalBootSurface
+ 252L  cc=  9  packages/terminal-ui/src/components/Terminal.tsx:18  <arg of forwardRef>
+ 213L  cc=  1  packages/terminal-ui/src/components/hooks/useTerminalBootSurface.ts:136  <arg of useEffect>
+ 209L  cc= 12  packages/terminal-ui/src/components/SplitTerminalArea.tsx:43  SplitTerminalArea
+ 199L  cc=  1  packages/terminal-ui/src/hooks/use-keyboard-avoidance.ts:49  useKeyboardAvoidance
+ 194L  cc=  4  packages/ghostty-terminal/src/terminal-pointer.ts:99  bindMouseEvents
+ 190L  cc=  3  packages/terminal-ui/src/hooks/use-keyboard-avoidance.ts:55  <arg of useEffect>
+ 173L  cc=  8  packages/terminal-ui/src/components/hooks/useTerminalBootSurface.ts:165  <anon>
+ 169L  cc=  2  packages/terminal-ui/src/components/TerminalPreview.tsx:32  TerminalPreview
+ 162L  cc=  1  packages/terminal-ui/src/components/split/useSplitDragInteractions.ts:57  useSplitDragInteractions
+ 124L  cc=  1  packages/terminal-ui/src/components/TerminalPreview.tsx:42  <arg of useEffect>
+ 123L  cc=  9  packages/terminal-ui/src/components/split/SplitPaneView.tsx:72  SplitPaneView
+ 117L  cc=  1  packages/terminal-ui/src/components/hooks/usePaneSinkRegistration.ts:23  usePaneSinkRegistration
+ 103L  cc=  2  packages/terminal-ui/src/components/hooks/useTerminalInput.ts:28  useTerminalInput
+
+== files >= 300 lines ==
+ 1496  packages/ghostty-terminal/src/ghostty-wasm.ts
+  766  packages/ghostty-terminal/src/terminal.ts
+  670  packages/ghostty-terminal/src/canvas-renderer.ts
+  662  packages/ws-client/src/state-machine.ts
+  612  packages/ghostty-terminal/src/render-state.ts
+  517  packages/ws-client/src/client.ts
+  456  packages/shared/src/ws-borsh/schema.ts
+  420  packages/ghostty-terminal/src/terminal-input-bridge.ts
+  408  packages/ws-client/src/pane-sink-registry.ts
+  383  packages/shared/src/ws-borsh/canonical-state.ts
+  379  packages/terminal-ui/src/components/hooks/useTerminalBootSurface.ts
+  367  packages/shared/src/ws-borsh/convert.ts
+  363  packages/ghostty-terminal/src/selection-model.ts
+  362  packages/ws-client/src/message-builder.ts
+  359  packages/ghostty-terminal/src/terminal-dom.ts
+  350  packages/terminal-ui/src/components/useTerminalResize.ts
+  328  packages/terminal-ui/src/components/terminal-diagnostics.tsx
+  303  packages/ghostty-terminal/src/terminal-input.ts
+ 2383  packages/ghostty-terminal/src/terminal.canvas.test.ts
+  667  packages/ws-client/src/client.test.ts
+  627  packages/shared/src/ws-borsh/index.test.ts
+  578  packages/ghostty-terminal/src/test-support/fake-dom.ts
+  430  packages/shared/src/ws-borsh/convert.test.ts
+  355  packages/terminal-ui/src/components/touch/gesture-machine.test.ts
+  333  packages/ghostty-terminal/src/canvas-renderer.vcenter.test.ts
+  331  packages/ghostty-terminal/src/canvas-renderer.cursor.test.ts
+  328  packages/ws-client/src/state-machine.test.ts

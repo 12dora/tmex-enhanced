@@ -1,0 +1,179 @@
+== CC >= 12 ==
+ 52   128L  apps/gateway/src/tmux-client/pane-stream/osc-handlers.ts:23  emitOsc
+ 32   103L  apps/gateway/src/ws/error-classify.ts:1  classifySshError
+ 27   100L  apps/gateway/src/tmux-client/runtime/canonical-screen-capture.ts:48  captureInternal
+ 26    72L  apps/gateway/src/tmux-client/control-mode/metadata.ts:14  parse
+ 26    83L  apps/gateway/src/agent/tools/send-input.ts:76  execute
+ 25    74L  apps/gateway/src/tmux-client/metadata-projection.ts:146  reconcile
+ 25    48L  apps/gateway/src/tmux-client/snapshot-format.ts:150  splitSnapshotFields
+ 24   102L  apps/gateway/scripts/scan-managed-artifact.ts:53  scanManagedArtifact
+ 24    91L  apps/gateway/src/weixin/ilink/client.ts:233  start
+ 24    85L  apps/gateway/src/watch/evaluator.ts:73  evaluateWatchRule
+ 24    70L  apps/gateway/src/ws/legacy-feed-broadcaster.ts:42  broadcastTmuxEvent
+ 23    58L  apps/gateway/src/tmux/bell-context.ts:35  resolvePaneContext
+ 22    94L  apps/gateway/src/agent/supervisor.ts:572  appendApprovalResponsesIfReady
+ 21    78L  packages/app/src/commands/doctor.ts:23  runDoctor
+ 20   210L  apps/gateway/scripts/run-managed-smoke.ts:76  main
+ 20    25L  apps/gateway/src/agent/prompts/environment.ts:26  collectAgentEnvironment
+ 20    56L  apps/gateway/src/api/watch-rule-config.ts:168  buildEffectiveWatchRule
+ 19    83L  packages/app/src/lib/dep-install.ts:150  executeDependencyInstall
+ 19   120L  apps/gateway/src/tmux-client/pane-history-reader.ts:125  readPage
+ 18    75L  packages/app/src/lib/bun.ts:43  sanitizeBunPath
+ 18    96L  packages/app/src/commands/init.ts:182  runInit
+ 18    35L  apps/gateway/src/tmux-client/pane-stream-parser.ts:38  dispatchPaneStreamByte
+ 18   112L  apps/gateway/src/tmux-client/retention/subscription-coordinator.ts:34  apply
+ 18    76L  apps/gateway/src/tmux-client/metadata/hierarchy-builder.ts:29  buildDesired
+ 18    15L  apps/gateway/src/api/device-routes.ts:22  shouldReconnectPushSupervisor
+ 18    53L  apps/gateway/src/api/llm.ts:281  handleUpdateSettings
+ 17    79L  apps/gateway/src/tmux-client/pane-emulator.ts:60  create
+ 17    74L  apps/gateway/src/tmux-client/retention/replay-store.ts:181  readHistory
+ 17    41L  apps/gateway/src/agent/tools/read-screen.ts:27  execute
+ 17    50L  apps/gateway/src/agent/tools/ip-address.ts:33  parseIpv6ToBytes
+ 17    59L  apps/gateway/src/push/connection-alerts.ts:186  maybeEmitEvent
+ 17    39L  apps/gateway/src/api/device-routes.ts:108  handleUpdateDevice
+ 16    64L  apps/gateway/src/tmux-client/local-external-connection.ts:515  reconnectControlClient
+ 16    44L  apps/gateway/src/tmux-client/snapshot-format.ts:105  parsePaneSnapshotRow
+ 16    92L  apps/gateway/src/agent/tools/run-command.ts:143  executeRunCommand
+ 16    56L  apps/gateway/src/push/supervisor.ts:389  handleTmuxEvent
+ 16    34L  apps/gateway/src/db/watch.ts:37  createWatchRule
+ 16    47L  apps/gateway/src/api/tree-order.ts:31  handlePutTreeOrder
+ 15    21L  packages/app/src/lib/linux-distro.ts:52  detectPackageManager
+ 15    54L  apps/gateway/src/tmux-client/retention/policy-scheduler.ts:112  enforceBounds
+ 15    14L  apps/gateway/src/agent/tools/pane-info.ts:52  overlaySnapshotFields
+ 15    54L  apps/gateway/src/db/site-settings.ts:68  updateSiteSettings
+ 15    34L  apps/gateway/src/api/terminal-shortcuts.ts:37  <arg of body.items.map>
+ 15    26L  apps/gateway/src/api/files.ts:212  handleUploadInit
+ 15    53L  apps/gateway/src/ws/index.ts:156  handleMessage
+ 14    39L  packages/app/src/lib/install-layout.ts:40  locatePackageRoot
+ 14    34L  packages/app/src/lib/bun.ts:240  checkBunVersion
+ 14    42L  apps/gateway/src/tmux-client/control-mode/notifications.ts:184  dispatchControlModeLine
+ 14    12L  apps/gateway/src/tmux-client/metadata/types.ts:83  valueEqual
+ 14    30L  apps/gateway/src/agent/tools/terminal-encoding.ts:117  encodeCombo
+ 14    46L  apps/gateway/src/agent/tools/web.ts:357  execute
+ 14    37L  apps/gateway/src/agent/prompts/system-prompt.tsx:29  Environment
+ 14    15L  apps/gateway/src/system/semver.ts:23  compareVersions
+ 14    55L  apps/gateway/src/weixin/ilink/client.ts:157  login
+ 14    40L  apps/gateway/src/api/device-routes.ts:67  handleCreateDevice
+ 14    38L  apps/gateway/src/api/llm.ts:123  handleCreateProvider
+ 14    61L  apps/gateway/src/watch/service.ts:330  processLlmRule
+ 14    48L  apps/gateway/src/ws/tmux-command-handlers.ts:93  handleTmuxSelect
+ 14    53L  apps/gateway/src/ws/device-connection-registry.ts:268  <arg of setTimeout>
+ 13   102L  packages/app/src/commands/doctor-checks.ts:91  checkEnvironment
+ 13    61L  packages/app/src/commands/uninstall.ts:19  runUninstall
+ 13    12L  apps/gateway/scripts/build-managed.ts:64  hostTarget
+ 13    57L  apps/gateway/src/tmux-client/ssh-external-connection.ts:458  reconnectControlClient
+ 13    28L  apps/gateway/src/agent/supervisor.ts:534  resumeSessionIfNeeded
+ 13    41L  apps/gateway/src/system/managed-endpoint.ts:55  validateManagedEndpoint
+ 13    52L  apps/gateway/src/weixin/service.ts:67  doRefresh
+ 13    42L  apps/gateway/src/db/devices.ts:125  updateDevice
+ 13    31L  apps/gateway/src/db/agent.ts:109  createAgentSession
+ 13    27L  apps/gateway/src/api/system.ts:24  handleSystemApiRequest
+ 13    37L  apps/gateway/src/api/files.ts:120  handleUpdateRoot
+ 13    42L  apps/gateway/src/ws/legacy-feed-broadcaster.ts:113  extendTmuxEvent
+ 12    88L  packages/app/src/commands/init.ts:67  buildInitConfig
+ 12    31L  packages/app/src/cli-node.ts:12  main
+ 12    55L  apps/gateway/src/tmux-client/retention/replay-store.ts:256  buildReplayPlan
+ 12    56L  apps/gateway/src/tmux-client/ssh-auth-resolvers.ts:72  parseSshConfigOutput
+ 12    31L  apps/gateway/src/tmux-client/local-external-connection.ts:369  assertTmuxCompatibility
+ 12    79L  apps/gateway/src/agent/tools/run-command.ts:297  waitForCommandCompletion
+ 12    28L  apps/gateway/src/push/connection-alerts.ts:298  toBadgeKey
+ 12    34L  apps/gateway/src/files/device-storage.ts:61  checkAndNormalize
+ 12    76L  apps/gateway/src/files/ssh-command.ts:75  buildRsyncDeviceSpec
+ 12    45L  apps/gateway/src/api/watch.ts:189  handleUpdateRule
+ 12    28L  apps/gateway/src/api/watch-rule-config.ts:139  validateRuleSemantics
+ 12    73L  apps/gateway/src/ws/borsh/switch-barrier.ts:280  sendLiveResume
+
+== functions >= 100 lines ==
+ 210L  cc= 20  apps/gateway/scripts/run-managed-smoke.ts:76  main
+ 183L  cc=  1  apps/gateway/src/ws/tmux-kind-handlers.ts:4  createTmuxKindHandlers
+ 145L  cc= 10  apps/gateway/src/managed-entry.ts:96  runManagedGateway
+ 131L  cc=  1  apps/gateway/src/tmux-client/external-tmux-core.ts:106  bindCollaboratorHost
+ 130L  cc=  1  apps/gateway/src/agent/tools/send-input.ts:31  createSendInputTool
+ 128L  cc= 52  apps/gateway/src/tmux-client/pane-stream/osc-handlers.ts:23  emitOsc
+ 128L  cc=  4  apps/gateway/src/runtime.ts:53  createGatewayRuntime
+ 120L  cc= 19  apps/gateway/src/tmux-client/pane-history-reader.ts:125  readPage
+ 112L  cc= 18  apps/gateway/src/tmux-client/retention/subscription-coordinator.ts:34  apply
+ 107L  cc= 10  apps/gateway/src/ws/canonical/subscription-coordinator.ts:25  apply
+ 103L  cc= 32  apps/gateway/src/ws/error-classify.ts:1  classifySshError
+ 102L  cc= 13  packages/app/src/commands/doctor-checks.ts:91  checkEnvironment
+ 102L  cc= 24  apps/gateway/scripts/scan-managed-artifact.ts:53  scanManagedArtifact
+ 101L  cc=  4  apps/gateway/src/tmux-client/control-mode-subscription.ts:50  createControlModeSubscription
+ 100L  cc= 27  apps/gateway/src/tmux-client/runtime/canonical-screen-capture.ts:48  captureInternal
+ 100L  cc=  9  apps/gateway/src/telegram/service.ts:61  refresh
+
+== files >= 300 lines ==
+  770  apps/gateway/src/tmux-client/ssh-external-connection.ts
+  742  apps/gateway/src/tmux-client/external/session-commands.ts
+  719  apps/gateway/src/ws/index.ts
+  682  apps/gateway/src/agent/supervisor.ts
+  614  apps/gateway/src/tmux-client/local-external-connection.ts
+  564  apps/gateway/src/ws/canonical-feed-session.ts
+  560  apps/gateway/src/tmux-client/external-tmux-core.ts
+  540  apps/gateway/src/api/agent.ts
+  539  apps/gateway/src/api/messaging-routes.ts
+  518  apps/gateway/src/ws/tmux-command-handlers.ts
+  517  apps/gateway/src/api/files.ts
+  495  apps/gateway/src/ws/borsh/session-state.ts
+  495  apps/gateway/src/ws/borsh/switch-barrier.ts
+  476  apps/gateway/src/tmux-client/device-session-runtime.ts
+  453  apps/gateway/src/agent/run.ts
+  448  apps/gateway/src/push/supervisor.ts
+  447  apps/gateway/src/api/watch.ts
+  434  apps/gateway/src/db/schema.ts
+  425  apps/gateway/src/watch/service.ts
+  415  apps/gateway/src/files/device-storage.ts
+  405  apps/gateway/src/agent/tools/web.ts
+  405  apps/gateway/src/weixin/service.ts
+  393  apps/gateway/src/db/agent.ts
+  387  apps/gateway/src/tmux-client/ssh-auth-resolvers.ts
+  387  apps/gateway/src/weixin/ilink/client.ts
+  385  apps/gateway/src/agent/tools/run-command.ts
+  384  apps/gateway/src/ws/canonical/pane-stream.ts
+  364  apps/gateway/src/api/llm.ts
+  358  apps/gateway/src/ws/legacy-feed-broadcaster.ts
+  349  apps/gateway/src/ws/device-connection-registry.ts
+  346  apps/gateway/src/agent/prompts/system-prompt.tsx
+  342  apps/gateway/src/tmux-client/external/snapshot-projector.ts
+  341  packages/app/src/lib/service.ts
+  339  apps/gateway/src/tmux-client/pane-emulator.ts
+  336  apps/gateway/src/tmux-client/retention/replay-store.ts
+  328  apps/gateway/src/push/connection-alerts.ts
+  326  apps/gateway/src/tmux-client/metadata-projection.ts
+  320  apps/gateway/src/tmux-client/pane-history-reader.ts
+  317  apps/gateway/src/db/weixin.ts
+  310  apps/gateway/src/tmux-client/pane-stream/osc-handlers.ts
+  307  packages/app/src/i18n/index.ts
+  302  apps/gateway/src/files/rsync.ts
+ 1835  apps/gateway/src/tmux-client/local-external-connection.test.ts
+ 1691  apps/gateway/src/ws/index.test.ts
+ 1203  apps/gateway/src/tmux-client/ssh-external-connection.test.ts
+ 1042  apps/gateway/src/agent/supervisor.test.ts
+  830  apps/gateway/src/tmux-client/local-external-connection.integration.test.ts
+  803  apps/gateway/src/agent/run.test.ts
+  788  apps/gateway/src/watch/service.test.ts
+  661  apps/gateway/src/tmux-client/pane-stream-parser.test.ts
+  631  apps/gateway/src/tmux-client/local-external-connection.eagain.test.ts
+  607  apps/gateway/src/events/index.test.ts
+  602  apps/gateway/src/ws/canonical-feed-session.test.ts
+  585  apps/gateway/src/tmux-client/device-session-runtime.test.ts
+  554  apps/gateway/src/tmux-client/external/snapshot-projector.test.ts
+  528  apps/gateway/src/api/agent-session-config.test.ts
+  508  apps/gateway/src/tmux-client/ssh-connect-config.test.ts
+  493  apps/gateway/src/tmux-client/pane-stream-parser.golden.test.ts
+  487  apps/gateway/src/api/agent.test.ts
+  486  apps/gateway/src/api/watch-rule-config.test.ts
+  464  apps/gateway/src/api/watch.test.ts
+  452  apps/gateway/src/agent/tools/web.test.ts
+  421  apps/gateway/src/tmux-client/metadata-projection.test.ts
+  418  apps/gateway/src/api/llm.test.ts
+  402  apps/gateway/src/agent/tools/terminal.test.ts
+  401  apps/gateway/src/ws/borsh/index.test.ts
+  377  apps/gateway/src/weixin/ilink/client.test.ts
+  369  apps/gateway/src/push/connection-alerts.test.ts
+  365  apps/gateway/src/tmux-client/external/session-commands.test.ts
+  360  apps/gateway/src/agent/run-resource-scope.test.ts
+  356  apps/gateway/src/tmux-client/pane-retention.test.ts
+  333  apps/gateway/src/push/supervisor.test.ts
+  327  apps/gateway/src/db/agent-watch.test.ts
+  320  apps/gateway/src/tmux/local-shell-path.test.ts
+  303  apps/gateway/src/ws/borsh/canonical-state.test.ts
