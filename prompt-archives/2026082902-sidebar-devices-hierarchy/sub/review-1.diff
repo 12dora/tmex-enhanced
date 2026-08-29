@@ -1,0 +1,752 @@
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+index df7ddad2..37908fe0 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+@@ -4,26 +4,33 @@
+ import { useGlobalDevice } from '@/components/global-device-provider';
+ import {
+   SideBarDeviceList as DeviceTreeSideBarDeviceList,
+-  type NodeBadgeInfo,
++  shouldHideSidebarNodeSection,
++  useSidebarDeviceStats,
+ } from '@tmex/panels/device-tree';
+ import { useRuntime } from '@tmex/stores/react';
++import type { ReactNode } from 'react';
+ import { SidebarAgentSessionsProvider, useSidebarAgentAdapter } from './sidebar-agent-sessions';
+ 
++/** 聚合视图的分节外壳：分节头与设备树同生共死，没有可显示的设备时整节都不渲染。 */
++export interface SidebarNodeSectionShell {
++  testId: string;
++  header: ReactNode;
++  /** 该 node 一台设备都没有时是否仍渲染（本机保留空态引导，远端直接隐藏） */
++  keepWhenNoDevices?: boolean;
++}
++
+ export interface SideBarDeviceListForRuntimeProps {
+-  nodeBadge?: NodeBadgeInfo;
+   /** 多 node 下把 UI store 的展开态按 node 隔离；self 传 undefined 保持旧 key。 */
+   expansionKeyFor?: (deviceId: string) => string;
+   emptyLabel?: string;
+-  /** 该 node 有设备但全部未勾选显示时的提示文案 */
+-  hiddenEmptyLabel?: string;
++  /** 传了就渲染成聚合视图的一节；不传就是单 node 宿主的裸设备树。 */
++  section?: SidebarNodeSectionShell;
+ }
+ 
+-export function SideBarDeviceListForRuntime({
+-  nodeBadge,
++function DeviceTree({
+   expansionKeyFor,
+   emptyLabel,
+-  hiddenEmptyLabel,
+-}: SideBarDeviceListForRuntimeProps) {
++}: Omit<SideBarDeviceListForRuntimeProps, 'section'>) {
+   const { ensureDeviceSubscribed, connection } = useGlobalDevice();
+   const agentUi = useRuntime().features.agentUi;
+   const agentAdapter = useSidebarAgentAdapter();
+@@ -33,10 +40,8 @@ export function SideBarDeviceListForRuntime({
+       ensureDeviceSubscribed={ensureDeviceSubscribed}
+       connection={connection}
+       agent={agentUi ? agentAdapter : undefined}
+-      nodeBadge={nodeBadge}
+       expansionKeyFor={expansionKeyFor}
+       emptyLabel={emptyLabel}
+-      hiddenEmptyLabel={hiddenEmptyLabel}
+     />
+   );
+ 
+@@ -44,3 +49,31 @@ export function SideBarDeviceListForRuntime({
+   if (!agentUi) return tree;
+   return <SidebarAgentSessionsProvider>{tree}</SidebarAgentSessionsProvider>;
+ }
++
++/**
++ * 分节形态。可见性判断必须留在**挂了该 node 运行时**的组件里：设备列表是运行时作用域内的
++ * react-query（分节头在作用域外读不到），而且隐藏时本组件只是 return null、查询照样活着，
++ * 用户在「管理设备」里勾上一台，这一节会自己回来。
++ */
++function NodeSection({
++  section,
++  ...rest
++}: SideBarDeviceListForRuntimeProps & { section: SidebarNodeSectionShell }) {
++  const stats = useSidebarDeviceStats();
++  if (shouldHideSidebarNodeSection(stats, section.keepWhenNoDevices ?? false)) return null;
++
++  return (
++    <div data-testid={section.testId} className="space-y-1">
++      {section.header}
++      <DeviceTree {...rest} />
++    </div>
++  );
++}
++
++export function SideBarDeviceListForRuntime({
++  section,
++  ...rest
++}: SideBarDeviceListForRuntimeProps) {
++  if (!section) return <DeviceTree {...rest} />;
++  return <NodeSection section={section} {...rest} />;
++}
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
+index be684fd9..cf2e6ff3 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
+@@ -13,9 +13,19 @@ installWindowStorage();
+ // 同时 `src/pages/FilePage.test.tsx` 用 `mock.module` 全局替换了 `@tanstack/react-query`
+ // （假 QueryClient），真实渲染 panels 列表会被那份泄漏的 mock 打断。
+ mock.module('./sidebar-device-list-runtime', () => ({
+-  SideBarDeviceListForRuntime: ({ nodeBadge }: { nodeBadge?: { nodeId: string } }) => (
+-    <span data-testid="runtime-device-list" data-node={nodeBadge?.nodeId ?? ''} />
+-  ),
++  SideBarDeviceListForRuntime: ({
++    section,
++  }: {
++    section?: { testId: string; header: React.ReactNode };
++  }) =>
++    section ? (
++      <div data-testid={section.testId}>
++        {section.header}
++        <span data-testid="runtime-device-list" />
++      </div>
++    ) : (
++      <span data-testid="runtime-device-list" />
++    ),
+ }));
+ 
+ const { renderToStaticMarkup } = await import('react-dom/server');
+@@ -128,16 +138,22 @@ describe('SidebarNodeSection', () => {
+     };
+   }
+ 
+-  test('离线 node：远端设备默认不显示，只留分节头与提示', () => {
++  test('离线 node：已知设备默认全不显示时整节都不渲染（连分节头一起）', () => {
+     const html = render(<SidebarNodeSection node={offlineNode()} />);
+ 
+-    expect(html).toContain(`data-testid="sidebar-node-offline-${OFFLINE_NODE}"`);
+-    expect(html).toContain(`data-testid="sidebar-node-hidden-${OFFLINE_NODE}"`);
++    expect(html).not.toContain(`data-testid="sidebar-node-offline-${OFFLINE_NODE}"`);
++    expect(html).not.toContain(`data-testid="node-badge-${OFFLINE_NODE}"`);
+     expect(html).not.toContain('data-testid="sidebar-node-offline-device-d1"');
++    expect(html).not.toContain('data-testid="device-item-');
++  });
++
++  test('离线 node：一台已知设备都没有时保留分节头与提示', () => {
++    const html = render(<SidebarNodeSection node={{ ...offlineNode(), inventory: null }} />);
++
++    expect(html).toContain(`data-testid="sidebar-node-offline-${OFFLINE_NODE}"`);
+     // 徽标灰显
+     expect(html).toContain(`data-testid="node-badge-${OFFLINE_NODE}"`);
+     expect(html).toContain('data-online="false"');
+-    // 未渲染任何设备树
+     expect(html).not.toContain('data-testid="device-item-');
+   });
+ 
+@@ -149,7 +165,6 @@ describe('SidebarNodeSection', () => {
+     expect(html).toContain('data-testid="sidebar-node-offline-device-d1"');
+     expect(html).toContain(`href="/n/${OFFLINE_NODE}/devices/d1"`);
+     expect(html).toContain('书房');
+-    expect(html).not.toContain(`data-testid="sidebar-node-hidden-${OFFLINE_NODE}"`);
+     expect(html).not.toContain('data-testid="device-item-');
+   });
+ 
+@@ -161,13 +176,12 @@ describe('SidebarNodeSection', () => {
+     );
+ 
+     expect(html).toContain('data-testid="sidebar-node-offline-device-d1"');
+-    expect(html).not.toContain(`data-testid="sidebar-node-hidden-${OFFLINE_NODE}"`);
+   });
+ 
+   test('离线 node：别的 node 上选中的同名设备不算数', () => {
+     const html = render(<SidebarNodeSection node={offlineNode()} />, {}, '/devices/d1');
+     expect(html).not.toContain('data-testid="sidebar-node-offline-device-d1"');
+-    expect(html).toContain(`data-testid="sidebar-node-hidden-${OFFLINE_NODE}"`);
++    expect(html).not.toContain(`data-testid="sidebar-node-offline-${OFFLINE_NODE}"`);
+   });
+ 
+   test('在线但未登录：默认折叠成一个登录入口，不自动登录、不渲染设备树', () => {
+@@ -209,9 +223,8 @@ describe('SidebarNodeSection', () => {
+     expect(html).toContain('data-testid="sidebar-node-0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"');
+     expect(html).toContain('data-testid="node-badge-0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"');
+     expect(html).toContain('data-online="true"');
+-    // 设备树挂在该 node 的运行时下，且拿到了 node 徽标
++    // 设备树与分节头一起挂在该 node 的运行时下
+     expect(html).toContain('data-testid="runtime-device-list"');
+-    expect(html).toContain('data-node="0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"');
+   });
+ });
+ 
+@@ -242,7 +255,6 @@ describe('SideBarDeviceList', () => {
+   test('standalone / mode 未知时渲染今天的单 node 设备树：没有 node 分节也没有徽标', () => {
+     const html = render(<SideBarDeviceList />);
+     expect(html).toContain('data-testid="runtime-device-list"');
+-    expect(html).toContain('data-node=""');
+     expect(html).not.toContain('data-testid="sidebar-node-list"');
+     expect(html).not.toContain('data-testid="node-badge-');
+     expect(html).not.toContain('data-testid="sidebar-node-header-');
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+index 6e15f187..d0dba61f 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+@@ -11,7 +11,11 @@ import { loginErrorKey } from '@/auth/login-errors';
+ import { useNodeLoginGate } from '@/auth/use-node-login';
+ import { NodeRuntimeScope } from '@/node/node-runtime-scope';
+ import { SELF_NODE_ID, nodeAppPath, parseNodeIdFromPath } from '@tmex/api-client';
+-import { NodeBadge, type NodeBadgeInfo } from '@tmex/panels/device-tree';
++import {
++  NodeBadge,
++  type NodeBadgeInfo,
++  shouldHideSidebarNodeSection,
++} from '@tmex/panels/device-tree';
+ import { isSidebarDeviceVisible } from '@tmex/stores';
+ import { useUIStore } from '@tmex/stores/react';
+ import { ChevronRight, Loader2, Monitor } from 'lucide-react';
+@@ -153,6 +157,11 @@ export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
+         device.id === selectedDeviceId ||
+         isSidebarDeviceVisible(visibility, node.runtimeNodeId, device.id)
+     );
++    // 已知设备全被取消显示时整节隐藏（与在线分节同一条规则）；一台已知设备都没有的
++    // 离线 node 仍留个分节头，否则用户完全看不出它存在过。
++    if (shouldHideSidebarNodeSection({ total: knownDevices.length, visible: devices.length }, true))
++      return null;
++
+     return (
+       <div data-testid={`sidebar-node-offline-${node.runtimeNodeId}`} className="space-y-1">
+         <SectionHeader node={node} hint={t('sidebar.node.offline')} />
+@@ -160,13 +169,6 @@ export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
+           <div className="tmex-fade px-2 py-1 text-[11px] text-muted-foreground/60">
+             {t('sidebar.node.noKnownDevices')}
+           </div>
+-        ) : devices.length === 0 ? (
+-          <div
+-            data-testid={`sidebar-node-hidden-${node.runtimeNodeId}`}
+-            className="tmex-fade px-2 py-1 text-[11px] text-muted-foreground/60"
+-          >
+-            {t('sidebar.noVisibleDevices')}
+-          </div>
+         ) : (
+           devices.map((device) => (
+             <Link
+@@ -188,21 +190,23 @@ export function SidebarNodeSection({ node }: { node: SidebarNodeEntry }) {
+     return <SidebarNodeSignIn node={node} />;
+   }
+ 
++  // 分节头交给设备树一起渲染：可见设备数只有挂上该 node 运行时才读得到，
++  // 一台都不显示时整节（含分节头）都不该出现。
+   return (
+-    <div data-testid={`sidebar-node-${node.runtimeNodeId}`} className="space-y-1">
+-      <SectionHeader node={node} />
+-      <NodeRuntimeScope nodeId={node.runtimeNodeId}>
+-        <SideBarDeviceListForRuntime
+-          nodeBadge={badgeOf(node)}
+-          expansionKeyFor={
+-            node.runtimeNodeId === SELF_NODE_ID
+-              ? undefined
+-              : (deviceId) => `${node.runtimeNodeId}:${deviceId}`
+-          }
+-          emptyLabel={t('sidebar.node.noDevices')}
+-          hiddenEmptyLabel={t('sidebar.noVisibleDevices')}
+-        />
+-      </NodeRuntimeScope>
+-    </div>
++    <NodeRuntimeScope nodeId={node.runtimeNodeId}>
++      <SideBarDeviceListForRuntime
++        section={{
++          testId: `sidebar-node-${node.runtimeNodeId}`,
++          header: <SectionHeader node={node} />,
++          keepWhenNoDevices: node.isSelf,
++        }}
++        expansionKeyFor={
++          node.runtimeNodeId === SELF_NODE_ID
++            ? undefined
++            : (deviceId) => `${node.runtimeNodeId}:${deviceId}`
++        }
++        emptyLabel={t('sidebar.node.noDevices')}
++      />
++    </NodeRuntimeScope>
+   );
+ }
+diff --git a/apps/fe/tests/sidebar-device-disclosure.spec.ts b/apps/fe/tests/sidebar-device-disclosure.spec.ts
+index 1c132a3d..a1210f10 100644
+--- a/apps/fe/tests/sidebar-device-disclosure.spec.ts
++++ b/apps/fe/tests/sidebar-device-disclosure.spec.ts
+@@ -144,70 +144,3 @@ test('sidebar: device disclosure persists and tabs stay mutually exclusive', asy
+     ensureCleanSession(sessionName);
+   }
+ });
+-
+-test('sidebar: device disconnect intent hides the tree, shows the placeholder and persists across reload', async ({
+-  page,
+-  request,
+-}) => {
+-  const sessionName = `tmex-e2e-device-connect-${Date.now()}`;
+-  const { windowId } = createSinglePaneSession(sessionName);
+-  let deviceId: string | undefined;
+-
+-  try {
+-    deviceId = await createLocalDevice(request, sessionName, `e2e-device-connect-${Date.now()}`);
+-
+-    await page.goto(`/devices/${deviceId}`);
+-    await page.evaluate(() => window.localStorage.clear());
+-    await page.reload();
+-
+-    const connectButton = page.getByTestId(`device-connect-${deviceId}`);
+-    const disconnectButton = page.getByTestId(`device-disconnect-${deviceId}`);
+-    const deviceToggle = page.getByTestId(`device-expand-${deviceId}`);
+-    const deviceStatus = page.getByTestId(`device-online-status-${deviceId}`);
+-    const deviceTree = page.getByTestId(`device-tree-${deviceId}`);
+-    const windowItem = page.getByTestId(`window-item-${windowId}`);
+-    const placeholder = page.getByTestId('device-disconnected-placeholder');
+-
+-    // 进入设备路由自动订阅：电源按钮处于「断开」态，状态点在线，窗口树可见
+-    await expect(page.getByTestId('device-page')).toBeVisible();
+-    await expect(disconnectButton).toBeVisible({ timeout: 20_000 });
+-    await expect(connectButton).toHaveCount(0);
+-    await expect(deviceStatus).toHaveAttribute('data-online', 'true', { timeout: 20_000 });
+-    await expect(deviceStatus).toHaveAttribute('data-status', 'connected', { timeout: 20_000 });
+-    await expect(deviceTree).toBeVisible({ timeout: 20_000 });
+-    await expect(windowItem).toBeVisible({ timeout: 20_000 });
+-    await expect(placeholder).toHaveCount(0);
+-
+-    // 显式断开：按钮翻转为「连接」，设备收起、窗口树消失，终端区域出现占位
+-    await disconnectButton.click();
+-    await expect(connectButton).toBeVisible({ timeout: 20_000 });
+-    await expect(disconnectButton).toHaveCount(0);
+-    await expect(deviceTree).toBeHidden({ timeout: 20_000 });
+-    await expect(windowItem).toHaveCount(0);
+-    await expect(deviceToggle).toHaveAttribute('aria-expanded', 'false');
+-    await expect(deviceStatus).toHaveAttribute('data-online', 'false', { timeout: 20_000 });
+-    await expect(placeholder).toBeVisible({ timeout: 20_000 });
+-
+-    // 断开意图持久化：刷新后仍不自动订阅
+-    await page.reload();
+-    await expect(connectButton).toBeVisible({ timeout: 20_000 });
+-    await expect(disconnectButton).toHaveCount(0);
+-    await expect(deviceTree).toBeHidden({ timeout: 20_000 });
+-    await expect(deviceStatus).toHaveAttribute('data-online', 'false', { timeout: 20_000 });
+-    await expect(placeholder).toBeVisible({ timeout: 20_000 });
+-
+-    // 重新连接：窗口树回来，占位消失
+-    await connectButton.click();
+-    await expect(disconnectButton).toBeVisible({ timeout: 20_000 });
+-    await expect(connectButton).toHaveCount(0);
+-    await expect(deviceTree).toBeVisible({ timeout: 20_000 });
+-    await expect(windowItem).toBeVisible({ timeout: 20_000 });
+-    await expect(deviceStatus).toHaveAttribute('data-online', 'true', { timeout: 20_000 });
+-    await expect(placeholder).toHaveCount(0);
+-  } finally {
+-    if (deviceId) {
+-      await request.delete(`/api/devices/${deviceId}`).catch(() => undefined);
+-    }
+-    ensureCleanSession(sessionName);
+-  }
+-});
+diff --git a/packages/panels/src/device-tree/device-connection-control.test.ts b/packages/panels/src/device-tree/device-connection-control.test.ts
+index 773437a6..e87c200e 100644
+--- a/packages/panels/src/device-tree/device-connection-control.test.ts
++++ b/packages/panels/src/device-tree/device-connection-control.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, test } from 'bun:test';
+ import type { DeviceConnectionStatus } from '../device-connection';
+-import { deviceConnectionAction, deviceStatusDotClass } from './device-connection-control';
++import { deviceStatusDotClass } from './device-connection-control';
+ 
+ const allStatuses: DeviceConnectionStatus[] = [
+   'connected',
+@@ -31,17 +31,3 @@ describe('deviceStatusDotClass', () => {
+     }
+   });
+ });
+-
+-describe('deviceConnectionAction', () => {
+-  test('offers disconnect while connected or coming up', () => {
+-    for (const status of ['connected', 'connecting', 'reconnecting'] as const) {
+-      expect(deviceConnectionAction(status)).toBe('disconnect');
+-    }
+-  });
+-
+-  test('offers connect when disconnected or errored', () => {
+-    for (const status of ['disconnected', 'error'] as const) {
+-      expect(deviceConnectionAction(status)).toBe('connect');
+-    }
+-  });
+-});
+diff --git a/packages/panels/src/device-tree/device-connection-control.tsx b/packages/panels/src/device-tree/device-connection-control.tsx
+index da796858..efa82e1f 100644
+--- a/packages/panels/src/device-tree/device-connection-control.tsx
++++ b/packages/panels/src/device-tree/device-connection-control.tsx
+@@ -1,9 +1,8 @@
+-// 设备行的连接指示与开关：状态圆点 + Power 按钮。宿主未提供 connection 时只渲染圆点。
++// 设备行的连接状态指示：只有一个状态圆点，连接/断开由展开态与宿主自行驱动。
+ 
+ import { cn } from '@tmex/ui';
+-import { Power } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+-import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
++import type { DeviceConnectionStatus } from '../device-connection';
+ 
+ export function deviceStatusDotClass(status: DeviceConnectionStatus): string {
+   switch (status) {
+@@ -18,35 +17,13 @@ export function deviceStatusDotClass(status: DeviceConnectionStatus): string {
+   }
+ }
+ 
+-export function deviceConnectionAction(status: DeviceConnectionStatus): 'connect' | 'disconnect' {
+-  switch (status) {
+-    case 'connected':
+-    case 'connecting':
+-    case 'reconnecting':
+-      return 'disconnect';
+-    default:
+-      return 'connect';
+-  }
+-}
+-
+ export interface DeviceConnectionControlProps {
+   deviceId: string;
+   status: DeviceConnectionStatus;
+-  connection?: DeviceConnectionAdapter;
+-  onConnect: () => void;
+-  onDisconnect: () => void;
+ }
+ 
+-export function DeviceConnectionControl({
+-  deviceId,
+-  status,
+-  connection,
+-  onConnect,
+-  onDisconnect,
+-}: DeviceConnectionControlProps) {
++export function DeviceConnectionControl({ deviceId, status }: DeviceConnectionControlProps) {
+   const { t } = useTranslation();
+-  const action = deviceConnectionAction(status);
+-  const actionLabel = action === 'disconnect' ? t('device.disconnect') : t('device.connect');
+   const statusLabel =
+     status === 'connected'
+       ? t('device.connected')
+@@ -55,44 +32,16 @@ export function DeviceConnectionControl({
+         : t('device.disconnected');
+ 
+   return (
+-    <>
+-      <span
+-        data-testid={`device-online-status-${deviceId}`}
+-        data-status={status}
+-        data-online={status === 'connected'}
+-        aria-label={statusLabel}
+-        title={statusLabel}
+-        className={cn(
+-          'h-2 w-2 shrink-0 rounded-full transition-colors duration-(--tmex-motion-standard) ease-out motion-reduce:transition-none',
+-          deviceStatusDotClass(status)
+-        )}
+-      />
+-      {connection && (
+-        <button
+-          type="button"
+-          data-testid={`device-${action}-${deviceId}`}
+-          aria-label={actionLabel}
+-          title={actionLabel}
+-          onPointerDown={(event) => event.stopPropagation()}
+-          onMouseDown={(event) => event.stopPropagation()}
+-          onClick={(event) => {
+-            event.stopPropagation();
+-            if (action === 'disconnect') {
+-              onDisconnect();
+-            } else {
+-              onConnect();
+-            }
+-          }}
+-          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-(--tmex-motion-fast) ease-out hover:bg-accent hover:text-foreground motion-reduce:transition-none [@media(any-pointer:coarse)]:h-9 [@media(any-pointer:coarse)]:w-9"
+-        >
+-          <Power
+-            className={cn(
+-              'h-3.5 w-3.5 transition-colors duration-(--tmex-motion-standard) ease-out motion-reduce:transition-none',
+-              action === 'disconnect' ? 'text-emerald-500' : 'text-muted-foreground'
+-            )}
+-          />
+-        </button>
++    <span
++      data-testid={`device-online-status-${deviceId}`}
++      data-status={status}
++      data-online={status === 'connected'}
++      aria-label={statusLabel}
++      title={statusLabel}
++      className={cn(
++        'h-2 w-2 shrink-0 rounded-full transition-colors duration-(--tmex-motion-standard) ease-out motion-reduce:transition-none',
++        deviceStatusDotClass(status)
+       )}
+-    </>
++    />
+   );
+ }
+diff --git a/packages/panels/src/device-tree/device-row-header.tsx b/packages/panels/src/device-tree/device-row-header.tsx
+index d3648ad9..461051fa 100644
+--- a/packages/panels/src/device-tree/device-row-header.tsx
++++ b/packages/panels/src/device-tree/device-row-header.tsx
+@@ -6,21 +6,18 @@ import { DeviceStatusBadge } from '../device-status-badge';
+ import { DeviceConnectionControl } from './device-connection-control';
+ import type { SortableRow } from './device-tree-dnd';
+ import type { DeviceRowProps } from './device-tree-row-props';
+-import { NodeBadge } from './node-badge';
+ 
+ export interface DeviceRowHeaderProps extends DeviceRowProps {
+   sortable: SortableRow;
+   status: DeviceConnectionStatus;
+ }
+ 
+-/** 设备行标题条：拖拽手柄 + 名称 + 状态徽标 + 连接开关 + 展开箭头 */
++/** 设备行标题条：拖拽手柄 + 名称 + 状态徽标 + 连接状态点 + 展开箭头 */
+ export function DeviceRowHeader({
+   device,
+   isExpanded,
+   isSelected,
+   onExpandedChange,
+-  connection,
+-  nodeBadge,
+   sortable,
+   status,
+ }: DeviceRowHeaderProps) {
+@@ -47,18 +44,8 @@ export function DeviceRowHeader({
+         <DeviceIcon className="h-4 w-4 text-muted-foreground shrink-0" />
+         <span className="flex-1 truncate text-xs font-medium">{device.name}</span>
+ 
+-        {nodeBadge && <NodeBadge info={nodeBadge} />}
+         <DeviceStatusBadge deviceId={deviceId} className="shrink-0" />
+-        <DeviceConnectionControl
+-          deviceId={deviceId}
+-          status={status}
+-          connection={connection}
+-          onConnect={() => onExpandedChange(deviceId, true)}
+-          onDisconnect={() => {
+-            connection?.disconnect(deviceId);
+-            onExpandedChange(deviceId, false);
+-          }}
+-        />
++        <DeviceConnectionControl deviceId={deviceId} status={status} />
+         <button
+           type="button"
+           data-testid={`device-expand-${deviceId}`}
+diff --git a/packages/panels/src/device-tree/device-tree-row-props.ts b/packages/panels/src/device-tree/device-tree-row-props.ts
+index b257c355..0e9b3adc 100644
+--- a/packages/panels/src/device-tree/device-tree-row-props.ts
++++ b/packages/panels/src/device-tree/device-tree-row-props.ts
+@@ -3,7 +3,6 @@
+ import type { Device, TmuxPane, TmuxWindow } from '@tmex/shared';
+ import type { DeviceConnectionAdapter } from '../device-connection';
+ import type { DeviceTreeNavigation, SidebarAgentAdapter } from './agent-adapter';
+-import type { NodeBadgeInfo } from './node-badge';
+ 
+ export interface DeviceRowProps {
+   device: Device;
+@@ -22,10 +21,8 @@ export interface DeviceRowProps {
+   onWatchPane: (deviceId: string, paneId: string) => void;
+   agent?: SidebarAgentAdapter;
+   nav: DeviceTreeNavigation;
+-  /** 宿主连接管理；未传时不渲染连接开关，行为与内嵌宿主一致 */
++  /** 宿主连接管理；未传时连接态退回 tmux store 的在线判定 */
+   connection?: DeviceConnectionAdapter;
+-  /** 多 node 聚合侧边栏的 node 徽标；单 node 宿主不传。 */
+-  nodeBadge?: NodeBadgeInfo;
+ }
+ 
+ export interface PaneRowProps {
+diff --git a/packages/panels/src/device-tree/device-tree-selectors.test.ts b/packages/panels/src/device-tree/device-tree-selectors.test.ts
+index d3780a7e..15285f8a 100644
+--- a/packages/panels/src/device-tree/device-tree-selectors.test.ts
++++ b/packages/panels/src/device-tree/device-tree-selectors.test.ts
+@@ -7,6 +7,7 @@ import {
+   selectDeviceOnline,
+   selectDeviceWindows,
+   selectSidebarVisibleDevices,
++  shouldHideSidebarNodeSection,
+ } from './device-tree-selectors';
+ 
+ const makeWindow = (id: string): TmuxWindow => ({
+@@ -141,6 +142,23 @@ describe('selectSidebarVisibleDevices', () => {
+   });
+ });
+ 
++describe('shouldHideSidebarNodeSection', () => {
++  test('有可显示的设备就渲染', () => {
++    expect(shouldHideSidebarNodeSection({ total: 3, visible: 1 }, false)).toBe(false);
++    expect(shouldHideSidebarNodeSection({ total: 1, visible: 1 }, true)).toBe(false);
++  });
++
++  test('有设备但一台都没勾选显示时整节隐藏（本机也一样）', () => {
++    expect(shouldHideSidebarNodeSection({ total: 3, visible: 0 }, false)).toBe(true);
++    expect(shouldHideSidebarNodeSection({ total: 3, visible: 0 }, true)).toBe(true);
++  });
++
++  test('一台设备都没有：远端 node 隐藏，本机保留空态引导', () => {
++    expect(shouldHideSidebarNodeSection({ total: 0, visible: 0 }, false)).toBe(true);
++    expect(shouldHideSidebarNodeSection({ total: 0, visible: 0 }, true)).toBe(false);
++  });
++});
++
+ describe('mergeReorderedVisibleIds', () => {
+   test('没有隐藏设备时结果就是拖拽后的顺序', () => {
+     const all = ['a', 'b', 'c'];
+diff --git a/packages/panels/src/device-tree/device-tree-selectors.ts b/packages/panels/src/device-tree/device-tree-selectors.ts
+index 80b9c827..b9c1f9f8 100644
+--- a/packages/panels/src/device-tree/device-tree-selectors.ts
++++ b/packages/panels/src/device-tree/device-tree-selectors.ts
+@@ -69,6 +69,27 @@ export function selectSidebarVisibleDevices<T extends { id: string }>(
+   );
+ }
+ 
++export interface SidebarDeviceStats {
++  /** 该 node 下的设备总数（含未勾选显示的） */
++  total: number;
++  /** 侧边栏实际会渲染的设备数 */
++  visible: number;
++}
++
++/**
++ * 聚合侧边栏里某个 node 的分节是否整体隐藏（连分节头一起）。
++ *
++ * 一台可显示的设备都没有时隐藏：全部未勾选显示的 node 只剩一个空标题，纯属噪声。
++ * `keepWhenNoDevices` 是例外——本机分节即使一台设备都没有也要留着空态引导用户去添加。
++ */
++export function shouldHideSidebarNodeSection(
++  stats: SidebarDeviceStats,
++  keepWhenNoDevices: boolean
++): boolean {
++  if (stats.visible > 0) return false;
++  return stats.total > 0 || !keepWhenNoDevices;
++}
++
+ /**
+  * 把「只含可见设备」的拖拽结果合并回完整设备顺序。
+  *
+diff --git a/packages/panels/src/device-tree/index.ts b/packages/panels/src/device-tree/index.ts
+index 203ead94..183c9926 100644
+--- a/packages/panels/src/device-tree/index.ts
++++ b/packages/panels/src/device-tree/index.ts
+@@ -1,5 +1,10 @@
+ export { SideBarDeviceList, type SideBarDeviceListProps } from './sidebar-device-list';
+ export type { DeviceTreeNavigation, SidebarAgentAdapter } from './agent-adapter';
++export {
++  shouldHideSidebarNodeSection,
++  type SidebarDeviceStats,
++} from './device-tree-selectors';
++export { useSidebarDeviceStats } from './use-sidebar-device-stats';
+ export {
+   NodeBadge,
+   nodeBadgeAppearance,
+diff --git a/packages/panels/src/device-tree/node-badge.tsx b/packages/panels/src/device-tree/node-badge.tsx
+index c52b8d5d..9c7a7172 100644
+--- a/packages/panels/src/device-tree/node-badge.tsx
++++ b/packages/panels/src/device-tree/node-badge.tsx
+@@ -1,5 +1,4 @@
+-// 设备行上的 node 徽标（多 node 聚合侧边栏用）。单 node / standalone 宿主不传 `nodeBadge`，
+-// 渲染结果与改造前逐字节一致。
++// node 徽标（多 node 聚合侧边栏的分节头用）。单 node / standalone 宿主没有分节头，也就不渲染它。
+ 
+ import { cn } from '@tmex/ui';
+ import { Server } from 'lucide-react';
+diff --git a/packages/panels/src/device-tree/sidebar-device-list.tsx b/packages/panels/src/device-tree/sidebar-device-list.tsx
+index 0cd35586..a64e3790 100644
+--- a/packages/panels/src/device-tree/sidebar-device-list.tsx
++++ b/packages/panels/src/device-tree/sidebar-device-list.tsx
+@@ -21,7 +21,6 @@ import { useDeviceTreeDialogs } from './device-tree-dialogs';
+ import { SortableVerticalList } from './device-tree-dnd';
+ import { useDeviceTreeNavigationApi, useDeviceTreeSelection } from './device-tree-navigation';
+ import { mergeReorderedVisibleIds, selectSidebarVisibleDevices } from './device-tree-selectors';
+-import type { NodeBadgeInfo } from './node-badge';
+ 
+ type DeviceListItem = Device & {
+   lastError?: string | null;
+@@ -39,12 +38,8 @@ export interface SideBarDeviceListProps {
+   devicesQueryKey?: readonly unknown[];
+   /** agent 会话装饰；未传时不渲染任何 agent 面 */
+   agent?: SidebarAgentAdapter;
+-  /** 多 node 聚合侧边栏的 node 徽标；单 node / standalone 宿主不传，渲染结果保持原样 */
+-  nodeBadge?: NodeBadgeInfo;
+   /** 无设备时的空态文案；缺省沿用 `sidebar.noDevices` */
+   emptyLabel?: string;
+-  /** 有设备但全部被侧边栏可见性过滤掉时的提示；缺省退回 emptyLabel */
+-  hiddenEmptyLabel?: string;
+   /** 宿主连接管理；未传时不渲染连接开关，展开仍走 ensureDeviceSubscribed */
+   connection?: DeviceConnectionAdapter;
+ }
+@@ -54,9 +49,7 @@ export function SideBarDeviceList({
+   expansionKeyFor,
+   devicesQueryKey,
+   agent,
+-  nodeBadge,
+   emptyLabel,
+-  hiddenEmptyLabel,
+   connection,
+ }: SideBarDeviceListProps) {
+   const { t } = useTranslation();
+@@ -177,7 +170,7 @@ export function SideBarDeviceList({
+   const handleDeviceExpandedChange = useCallback(
+     (deviceId: string, expanded: boolean) => {
+       setSidebarDeviceExpanded(expansionKey(deviceId), expanded);
+-      // 收起只影响树的可见性，断开必须走 Power 按钮
++      // 收起只影响树的可见性，不断开连接
+       if (!expanded) return;
+       if (connection) {
+         connection.connect(deviceId);
+@@ -278,7 +271,6 @@ export function SideBarDeviceList({
+                 onWatchPane={requestWatchPane}
+                 agent={agentAdapter}
+                 nav={nav}
+-                nodeBadge={nodeBadge}
+                 connection={connection}
+               />
+             ))}
+@@ -301,14 +293,8 @@ export function SideBarDeviceList({
+                   {t('common.retry')}
+                 </Button>
+               </div>
+-            ) : devices.length > 0 ? (
+-              <div
+-                data-testid="sidebar-devices-all-hidden"
+-                className="text-center text-sm text-muted-foreground py-4"
+-              >
+-                {hiddenEmptyLabel ?? emptyLabel ?? t('sidebar.noDevices')}
+-              </div>
+-            ) : (
++            ) : // 有设备但全部未勾选显示：什么都不渲染，占位框只会白占一块地方
++            devices.length > 0 ? null : (
+               <div className="text-center text-sm text-muted-foreground py-4">
+                 {emptyLabel ?? t('sidebar.noDevices')}
+               </div>
+diff --git a/packages/panels/src/device-tree/use-sidebar-device-stats.ts b/packages/panels/src/device-tree/use-sidebar-device-stats.ts
+new file mode 100644
+index 00000000..d9f34b6e
+--- /dev/null
++++ b/packages/panels/src/device-tree/use-sidebar-device-stats.ts
+@@ -0,0 +1,32 @@
++// 聚合侧边栏的分节可见性数据源：某个 node 运行时下「共有几台设备 / 侧边栏实际会渲染几台」。
++// 与 SideBarDeviceList 用同一个 query key 与 queryFn，命中同一份 react-query 缓存，不多发请求。
++
++import { useQuery } from '@tanstack/react-query';
++import { devicesQueryKey as defaultDevicesQueryKey, fetchDevices } from '@tmex/api-client';
++import { useRuntime, useUIStore } from '@tmex/stores/react';
++import { useMemo } from 'react';
++import { useDeviceTreeSelection } from './device-tree-navigation';
++import { type SidebarDeviceStats, selectSidebarVisibleDevices } from './device-tree-selectors';
++
++export function useSidebarDeviceStats(devicesQueryKey?: readonly unknown[]): SidebarDeviceStats {
++  const runtime = useRuntime();
++  const sidebarDeviceVisibility = useUIStore((state) => state.sidebarDeviceVisibility);
++  const { selectedDeviceId } = useDeviceTreeSelection();
++
++  const devicesQuery = useQuery({
++    queryKey: devicesQueryKey ?? defaultDevicesQueryKey,
++    queryFn: () => fetchDevices(runtime.apiClient),
++    throwOnError: false,
++  });
++  const devices = devicesQuery.data?.devices;
++
++  const { nodeId } = runtime;
++  return useMemo(() => {
++    const list = devices ?? [];
++    return {
++      total: list.length,
++      visible: selectSidebarVisibleDevices(list, sidebarDeviceVisibility, nodeId, selectedDeviceId)
++        .length,
++    };
++  }, [devices, sidebarDeviceVisibility, nodeId, selectedDeviceId]);
++}
