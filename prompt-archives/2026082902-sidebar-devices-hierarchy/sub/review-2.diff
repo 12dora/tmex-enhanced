@@ -1,0 +1,3221 @@
+diff --git a/apps/fe/src/pages/devices/add-device-menu.tsx b/apps/fe/src/pages/devices/add-device-menu.tsx
+index 3f92d071..b9854a91 100644
+--- a/apps/fe/src/pages/devices/add-device-menu.tsx
++++ b/apps/fe/src/pages/devices/add-device-menu.tsx
+@@ -4,6 +4,7 @@ import { Button } from '@tmex/ui/button';
+ import {
+   DropdownMenu,
+   DropdownMenuContent,
++  DropdownMenuGroup,
+   DropdownMenuItem,
+   DropdownMenuLabel,
+   DropdownMenuTrigger,
+@@ -12,6 +13,45 @@ import { Plus } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import type { AddDeviceTarget } from './add-device-targets';
+ 
++export interface AddDeviceMenuListProps {
++  targets: AddDeviceTarget[];
++  label: string;
++  selfLabel: string;
++  itemTitle: (target: AddDeviceTarget) => string;
++}
++
++/**
++ * 下拉内容。Base UI 的 `Menu.GroupLabel` 必须挂在 `Menu.Group` 里，否则渲染即抛
++ * MenuGroupRootContext 缺失（生产包表现为 "Base UI error #31" 整页崩溃）。
++ */
++export function AddDeviceMenuList({
++  targets,
++  label,
++  selfLabel,
++  itemTitle,
++}: AddDeviceMenuListProps) {
++  return (
++    <DropdownMenuGroup>
++      <DropdownMenuLabel>{label}</DropdownMenuLabel>
++      {targets.map((target) => (
++        <DropdownMenuItem
++          key={target.runtimeNodeId}
++          data-testid={`devices-add-to-${target.runtimeNodeId}`}
++          title={itemTitle(target)}
++          onClick={target.open}
++        >
++          <span className="min-w-0 truncate">{target.name}</span>
++          {target.isSelf && (
++            <span className="ml-auto shrink-0 rounded border border-border/60 px-1 py-px text-[10px] leading-none text-muted-foreground">
++              {selfLabel}
++            </span>
++          )}
++        </DropdownMenuItem>
++      ))}
++    </DropdownMenuGroup>
++  );
++}
++
+ export function AddDeviceMenu({ targets }: { targets: AddDeviceTarget[] }) {
+   const { t } = useTranslation();
+ 
+@@ -31,22 +71,12 @@ export function AddDeviceMenu({ targets }: { targets: AddDeviceTarget[] }) {
+         <Plus className="h-4 w-4" />
+       </DropdownMenuTrigger>
+       <DropdownMenuContent align="end" className="min-w-44">
+-        <DropdownMenuLabel>{t('device.addTo.label')}</DropdownMenuLabel>
+-        {targets.map((target) => (
+-          <DropdownMenuItem
+-            key={target.runtimeNodeId}
+-            data-testid={`devices-add-to-${target.runtimeNodeId}`}
+-            title={t('devices.nodes.addDevice', { name: target.name })}
+-            onClick={target.open}
+-          >
+-            <span className="min-w-0 truncate">{target.name}</span>
+-            {target.isSelf && (
+-              <span className="ml-auto shrink-0 rounded border border-border/60 px-1 py-px text-[10px] leading-none text-muted-foreground">
+-                {t('device.addTo.self')}
+-              </span>
+-            )}
+-          </DropdownMenuItem>
+-        ))}
++        <AddDeviceMenuList
++          targets={targets}
++          label={t('device.addTo.label')}
++          selfLabel={t('device.addTo.self')}
++          itemTitle={(target) => t('devices.nodes.addDevice', { name: target.name })}
++        />
+       </DropdownMenuContent>
+     </DropdownMenu>
+   );
+diff --git a/apps/gateway/drizzle/0024_narrow_tomas.sql b/apps/gateway/drizzle/0024_narrow_tomas.sql
+new file mode 100644
+index 00000000..6568004e
+--- /dev/null
++++ b/apps/gateway/drizzle/0024_narrow_tomas.sql
+@@ -0,0 +1,24 @@
++CREATE TABLE `device_folders` (
++	`id` text PRIMARY KEY NOT NULL,
++	`name` text NOT NULL,
++	`parent_id` text,
++	`sort_order` integer DEFAULT 0 NOT NULL,
++	`created_at` text NOT NULL,
++	`updated_at` text NOT NULL
++);
++--> statement-breakpoint
++CREATE INDEX `device_folders_parent_id_idx` ON `device_folders` (`parent_id`);--> statement-breakpoint
++CREATE TABLE `device_folder_placements` (
++	`item_key` text PRIMARY KEY NOT NULL,
++	`kind` text NOT NULL,
++	`node_id` text NOT NULL,
++	`device_id` text,
++	`folder_id` text,
++	`sort_order` integer DEFAULT 0 NOT NULL,
++	`created_at` text NOT NULL,
++	`updated_at` text NOT NULL,
++	FOREIGN KEY (`folder_id`) REFERENCES `device_folders`(`id`) ON UPDATE no action ON DELETE cascade,
++	CONSTRAINT "device_folder_placements_kind_check" CHECK("device_folder_placements"."kind" in ('node', 'device'))
++);
++--> statement-breakpoint
++CREATE INDEX `device_folder_placements_folder_id_idx` ON `device_folder_placements` (`folder_id`);
+diff --git a/apps/gateway/src/api/device-folder-routes.test.ts b/apps/gateway/src/api/device-folder-routes.test.ts
+new file mode 100644
+index 00000000..22b71d3d
+--- /dev/null
++++ b/apps/gateway/src/api/device-folder-routes.test.ts
+@@ -0,0 +1,274 @@
++import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
++import { DEVICE_FOLDER_NAME_MAX_LENGTH, type DeviceFolderLayout } from '@tmex/shared';
++import type { Server } from 'bun';
++import { ensureSiteSettingsInitialized } from '../db';
++import { runMigrations } from '../db/migrate';
++import { t } from '../i18n';
++import { type SettingsNamespace, registerSettingsBroadcaster } from '../settings/broadcaster';
++import { deviceFolderRoutes } from './device-folder-routes';
++import { handleApiRequest } from './index';
++import { dispatchRoutes } from './route';
++
++beforeAll(() => {
++  runMigrations();
++  ensureSiteSettingsInitialized();
++});
++
++afterEach(() => {
++  registerSettingsBroadcaster(null);
++});
++
++async function call(
++  method: string,
++  path: string,
++  body?: unknown
++): Promise<{ status: number; json: Record<string, unknown> }> {
++  const req = new Request(`http://localhost${path}`, {
++    method,
++    headers: { 'Content-Type': 'application/json' },
++    body: body !== undefined ? JSON.stringify(body) : undefined,
++  });
++  const pathname = new URL(req.url).pathname;
++  const response = dispatchRoutes(req, pathname, deviceFolderRoutes, {
++    server: {} as never,
++    path: pathname,
++  });
++  if (!response) {
++    throw new Error(`no route matched: ${method} ${path}`);
++  }
++  const resolved = await response;
++  return { status: resolved.status, json: (await resolved.json()) as Record<string, unknown> };
++}
++
++async function getLayout(): Promise<DeviceFolderLayout> {
++  const { status, json } = await call('GET', '/api/device-folders');
++  expect(status).toBe(200);
++  return json as unknown as DeviceFolderLayout;
++}
++
++describe('POST /api/device-folders', () => {
++  test('创建成功返回 201', async () => {
++    const received: SettingsNamespace[] = [];
++    registerSettingsBroadcaster((namespace) => received.push(namespace));
++    const { status, json } = await call('POST', '/api/device-folders', { name: '  运维 组 ' });
++    expect(status).toBe(201);
++    const folder = json.folder as { name: string; parentId: string | null; id: string };
++    expect(folder.name).toBe('运维 组');
++    expect(folder.parentId).toBeNull();
++    expect(folder.id.length).toBeGreaterThan(0);
++    expect(received).toEqual(['device-folders']);
++  });
++
++  test('空名返回 400', async () => {
++    const { status, json } = await call('POST', '/api/device-folders', { name: '   ' });
++    expect(status).toBe(400);
++    expect(json).toEqual({ error: t('apiError.folderNameRequired') });
++  });
++
++  test('超长名返回 400', async () => {
++    const { status, json } = await call('POST', '/api/device-folders', {
++      name: 'x'.repeat(DEVICE_FOLDER_NAME_MAX_LENGTH + 1),
++    });
++    expect(status).toBe(400);
++    expect(json).toEqual({ error: t('apiError.folderNameTooLong') });
++  });
++});
++
++describe('PATCH /api/device-folders/:id', () => {
++  test('改名成功', async () => {
++    const created = await call('POST', '/api/device-folders', { name: 'old-name' });
++    const id = (created.json.folder as { id: string }).id;
++    const { status, json } = await call('PATCH', `/api/device-folders/${id}`, { name: 'new-name' });
++    expect(status).toBe(200);
++    expect((json.folder as { name: string }).name).toBe('new-name');
++  });
++
++  test('把文件夹挂到自己的子文件夹下成环 400', async () => {
++    const parent = await call('POST', '/api/device-folders', { name: 'cycle-parent' });
++    const parentId = (parent.json.folder as { id: string }).id;
++    const child = await call('POST', '/api/device-folders', {
++      name: 'cycle-child',
++      parentId,
++    });
++    const childId = (child.json.folder as { id: string }).id;
++    const { status, json } = await call('PATCH', `/api/device-folders/${parentId}`, {
++      parentId: childId,
++    });
++    expect(status).toBe(400);
++    expect(json).toEqual({ error: t('apiError.folderCycle') });
++  });
++});
++
++describe('DELETE /api/device-folders/:id', () => {
++  test('删除后子文件夹与 placement 上提到父级', async () => {
++    const root = await call('POST', '/api/device-folders', { name: 'del-root' });
++    const rootId = (root.json.folder as { id: string }).id;
++    const mid = await call('POST', '/api/device-folders', { name: 'del-mid', parentId: rootId });
++    const midId = (mid.json.folder as { id: string }).id;
++    const nested = await call('POST', '/api/device-folders', {
++      name: 'del-nested',
++      parentId: midId,
++    });
++    const nestedId = (nested.json.folder as { id: string }).id;
++
++    const layout = await getLayout();
++    await call('PUT', '/api/device-folders/layout', {
++      folders: layout.folders.map((folder) => ({
++        id: folder.id,
++        parentId: folder.parentId,
++        sortOrder: folder.sortOrder,
++      })),
++      placements: [
++        ...layout.placements,
++        {
++          kind: 'device',
++          nodeId: 'self',
++          deviceId: 'del-dev',
++          folderId: midId,
++          sortOrder: 0,
++        },
++      ],
++    });
++
++    const { status, json } = await call('DELETE', `/api/device-folders/${midId}`);
++    expect(status).toBe(200);
++    expect(json).toEqual({ success: true });
++
++    const after = await getLayout();
++    expect(after.folders.some((folder) => folder.id === midId)).toBe(false);
++    expect(after.folders.find((folder) => folder.id === nestedId)?.parentId).toBe(rootId);
++    expect(
++      after.placements.find((item) => item.kind === 'device' && item.deviceId === 'del-dev')
++        ?.folderId
++    ).toBe(rootId);
++  });
++});
++
++describe('PUT /api/device-folders/layout', () => {
++  test('成功替换层级', async () => {
++    const a = await call('POST', '/api/device-folders', { name: 'layout-a' });
++    const b = await call('POST', '/api/device-folders', { name: 'layout-b' });
++    const aId = (a.json.folder as { id: string }).id;
++    const bId = (b.json.folder as { id: string }).id;
++    const layout = await getLayout();
++    const { status, json } = await call('PUT', '/api/device-folders/layout', {
++      folders: layout.folders.map((folder) =>
++        folder.id === bId
++          ? { id: bId, parentId: aId, sortOrder: 0 }
++          : { id: folder.id, parentId: folder.parentId, sortOrder: folder.sortOrder }
++      ),
++      placements: layout.placements,
++    });
++    expect(status).toBe(200);
++    const next = json as unknown as DeviceFolderLayout;
++    expect(next.folders.find((folder) => folder.id === bId)?.parentId).toBe(aId);
++  });
++
++  test('id 集合不一致 400', async () => {
++    await call('POST', '/api/device-folders', { name: 'layout-mismatch' });
++    const layout = await getLayout();
++    const { status, json } = await call('PUT', '/api/device-folders/layout', {
++      folders: layout.folders.slice(1).map((folder) => ({
++        id: folder.id,
++        parentId: folder.parentId,
++        sortOrder: folder.sortOrder,
++      })),
++      placements: [],
++    });
++    expect(status).toBe(400);
++    expect(json).toEqual({ error: t('apiError.folderLayoutInvalid') });
++  });
++
++  test('成环 400', async () => {
++    const a = await call('POST', '/api/device-folders', { name: 'cycle-a' });
++    const b = await call('POST', '/api/device-folders', { name: 'cycle-b' });
++    const aId = (a.json.folder as { id: string }).id;
++    const bId = (b.json.folder as { id: string }).id;
++    const layout = await getLayout();
++    const { status, json } = await call('PUT', '/api/device-folders/layout', {
++      folders: layout.folders.map((folder) => {
++        if (folder.id === aId) return { id: aId, parentId: bId, sortOrder: 0 };
++        if (folder.id === bId) return { id: bId, parentId: aId, sortOrder: 0 };
++        return { id: folder.id, parentId: folder.parentId, sortOrder: folder.sortOrder };
++      }),
++      placements: layout.placements,
++    });
++    expect(status).toBe(400);
++    expect(json).toEqual({ error: t('apiError.folderCycle') });
++  });
++
++  test('非法 placement 400', async () => {
++    const layout = await getLayout();
++    const folders = layout.folders.map((folder) => ({
++      id: folder.id,
++      parentId: folder.parentId,
++      sortOrder: folder.sortOrder,
++    }));
++    const badKind = await call('PUT', '/api/device-folders/layout', {
++      folders,
++      placements: [{ kind: 'folder', nodeId: 'n1', deviceId: null, folderId: null, sortOrder: 0 }],
++    });
++    expect(badKind.status).toBe(400);
++    expect(badKind.json).toEqual({ error: t('apiError.folderLayoutInvalid') });
++
++    const missingDeviceId = await call('PUT', '/api/device-folders/layout', {
++      folders,
++      placements: [
++        { kind: 'device', nodeId: 'self', deviceId: null, folderId: null, sortOrder: 0 },
++      ],
++    });
++    expect(missingDeviceId.status).toBe(400);
++
++    const dup = await call('PUT', '/api/device-folders/layout', {
++      folders,
++      placements: [
++        { kind: 'node', nodeId: 'n-dup', deviceId: null, folderId: null, sortOrder: 0 },
++        { kind: 'node', nodeId: 'n-dup', deviceId: null, folderId: null, sortOrder: 1 },
++      ],
++    });
++    expect(dup.status).toBe(400);
++    expect(dup.json).toEqual({ error: t('apiError.folderLayoutInvalid') });
++  });
++});
++
++describe('GET /api/device-folders', () => {
++  test('返回 folders 与 placements 数组', async () => {
++    const { status, json } = await call('GET', '/api/device-folders');
++    expect(status).toBe(200);
++    expect(Array.isArray(json.folders)).toBe(true);
++    expect(Array.isArray(json.placements)).toBe(true);
++  });
++});
++
++describe('handleApiRequest 路由可达', () => {
++  test('GET /api/device-folders 命中生产路由表', async () => {
++    const res = await handleApiRequest(
++      new Request('http://localhost/api/device-folders'),
++      {} as Server<unknown>
++    );
++    expect(res.status).toBe(200);
++    const body = (await res.json()) as { folders: unknown; placements: unknown };
++    expect(Array.isArray(body.folders)).toBe(true);
++    expect(Array.isArray(body.placements)).toBe(true);
++  });
++
++  test('PUT /api/device-folders/layout 不被 :id 吃掉', async () => {
++    const layout = await getLayout();
++    const res = await handleApiRequest(
++      new Request('http://localhost/api/device-folders/layout', {
++        method: 'PUT',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          folders: layout.folders.map((folder) => ({
++            id: folder.id,
++            parentId: folder.parentId,
++            sortOrder: folder.sortOrder,
++          })),
++          placements: layout.placements,
++        }),
++      }),
++      {} as Server<unknown>
++    );
++    expect(res.status).toBe(200);
++  });
++});
+diff --git a/apps/gateway/src/api/device-folder-routes.ts b/apps/gateway/src/api/device-folder-routes.ts
+new file mode 100644
+index 00000000..5fc89eb5
+--- /dev/null
++++ b/apps/gateway/src/api/device-folder-routes.ts
+@@ -0,0 +1,222 @@
++import {
++  type DeviceFolderLayout,
++  type DeviceFolderNameError,
++  type DeviceFolderPlacement,
++  type UpdateDeviceFolderLayoutRequest,
++  deviceFolderItemKey,
++  isFolderForestValid,
++  validateDeviceFolderName,
++  wouldCreateFolderCycle,
++} from '@tmex/shared';
++import {
++  createDeviceFolder,
++  deleteDeviceFolder,
++  getDeviceFolderById,
++  getDeviceFolderLayout,
++  replaceDeviceFolderLayout,
++  updateDeviceFolder,
++} from '../db';
++import { t } from '../i18n';
++import { broadcastSettingsUpdate } from '../settings/broadcaster';
++import { json, readJsonObjectBody } from './http';
++import { type ApiRoute, route } from './route';
++
++function folderNameError(error: DeviceFolderNameError): Response {
++  if (error === 'empty') return json({ error: t('apiError.folderNameRequired') }, 400);
++  return json({ error: t('apiError.folderNameTooLong') }, 400);
++}
++
++function parseParentId(raw: unknown): { ok: true; value: string | null } | { ok: false } {
++  if (raw === null) return { ok: true, value: null };
++  if (typeof raw === 'string') return { ok: true, value: raw };
++  return { ok: false };
++}
++
++function handleGetLayout(): Response {
++  return json(getDeviceFolderLayout());
++}
++
++async function handleCreate(req: Request): Promise<Response> {
++  const body = await readJsonObjectBody(req);
++  if (!body || typeof body.name !== 'string') {
++    return json({ error: t('apiError.invalidRequest') }, 400);
++  }
++  const validated = validateDeviceFolderName(body.name);
++  if (!validated.ok) return folderNameError(validated.error);
++
++  let parentId: string | null = null;
++  if (body.parentId !== undefined) {
++    const parsed = parseParentId(body.parentId);
++    if (!parsed.ok) return json({ error: t('apiError.invalidRequest') }, 400);
++    parentId = parsed.value;
++    if (parentId !== null && !getDeviceFolderById(parentId)) {
++      return json({ error: t('apiError.folderNotFound') }, 404);
++    }
++  }
++
++  const folder = createDeviceFolder({
++    id: crypto.randomUUID(),
++    name: validated.name,
++    parentId,
++  });
++  broadcastSettingsUpdate('device-folders');
++  return json({ folder }, 201);
++}
++
++async function handleUpdate(req: Request, id: string): Promise<Response> {
++  const existing = getDeviceFolderById(id);
++  if (!existing) return json({ error: t('apiError.folderNotFound') }, 404);
++
++  const body = await readJsonObjectBody(req);
++  if (!body) return json({ error: t('apiError.invalidRequest') }, 400);
++
++  const patch: { name?: string; parentId?: string | null; sortOrder?: number } = {};
++  if (body.name !== undefined) {
++    if (typeof body.name !== 'string') return json({ error: t('apiError.invalidRequest') }, 400);
++    const validated = validateDeviceFolderName(body.name);
++    if (!validated.ok) return folderNameError(validated.error);
++    patch.name = validated.name;
++  }
++  if (body.parentId !== undefined) {
++    const parsed = parseParentId(body.parentId);
++    if (!parsed.ok) return json({ error: t('apiError.invalidRequest') }, 400);
++    if (parsed.value !== null && !getDeviceFolderById(parsed.value)) {
++      return json({ error: t('apiError.folderNotFound') }, 404);
++    }
++    if (wouldCreateFolderCycle(getDeviceFolderLayout().folders, id, parsed.value)) {
++      return json({ error: t('apiError.folderCycle') }, 400);
++    }
++    patch.parentId = parsed.value;
++  }
++  if (body.sortOrder !== undefined) {
++    if (typeof body.sortOrder !== 'number' || !Number.isInteger(body.sortOrder)) {
++      return json({ error: t('apiError.invalidRequest') }, 400);
++    }
++    patch.sortOrder = body.sortOrder;
++  }
++
++  const folder = updateDeviceFolder(id, patch);
++  if (!folder) return json({ error: t('apiError.folderNotFound') }, 404);
++  broadcastSettingsUpdate('device-folders');
++  return json({ folder });
++}
++
++function handleDelete(id: string): Response {
++  if (!deleteDeviceFolder(id)) return json({ error: t('apiError.folderNotFound') }, 404);
++  broadcastSettingsUpdate('device-folders');
++  return json({ success: true });
++}
++
++function parseLayoutFolder(
++  raw: unknown
++): Pick<
++  UpdateDeviceFolderLayoutRequest['folders'][number],
++  'id' | 'parentId' | 'sortOrder'
++> | null {
++  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
++  const item = raw as Record<string, unknown>;
++  if (typeof item.id !== 'string' || !item.id) return null;
++  if (item.parentId !== null && typeof item.parentId !== 'string') return null;
++  if (typeof item.sortOrder !== 'number' || !Number.isInteger(item.sortOrder)) return null;
++  return { id: item.id, parentId: item.parentId, sortOrder: item.sortOrder };
++}
++
++function parsePlacement(raw: unknown, folderIds: Set<string>): DeviceFolderPlacement | null {
++  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
++  const item = raw as Record<string, unknown>;
++  if (item.kind !== 'node' && item.kind !== 'device') return null;
++  if (typeof item.nodeId !== 'string' || !item.nodeId) return null;
++  if (typeof item.sortOrder !== 'number' || !Number.isInteger(item.sortOrder)) return null;
++  if (item.folderId !== null && typeof item.folderId !== 'string') return null;
++  if (item.folderId !== null && !folderIds.has(item.folderId)) return null;
++  const folderId = item.folderId;
++
++  if (item.kind === 'node') {
++    if (item.deviceId !== null && item.deviceId !== undefined) return null;
++    return {
++      kind: 'node',
++      nodeId: item.nodeId,
++      deviceId: null,
++      folderId,
++      sortOrder: item.sortOrder,
++    };
++  }
++  if (typeof item.deviceId !== 'string' || !item.deviceId) return null;
++  return {
++    kind: 'device',
++    nodeId: item.nodeId,
++    deviceId: item.deviceId,
++    folderId,
++    sortOrder: item.sortOrder,
++  };
++}
++
++function sameIdSet(left: readonly string[], right: readonly string[]): boolean {
++  if (left.length !== right.length) return false;
++  const leftIds = new Set(left);
++  const rightIds = new Set(right);
++  if (leftIds.size !== left.length || rightIds.size !== right.length) return false;
++  for (const id of rightIds) {
++    if (!leftIds.has(id)) return false;
++  }
++  return true;
++}
++
++async function handleReplaceLayout(req: Request): Promise<Response> {
++  const body = await readJsonObjectBody(req);
++  if (!body || !Array.isArray(body.folders) || !Array.isArray(body.placements)) {
++    return json({ error: t('apiError.invalidRequest') }, 400);
++  }
++
++  const folders: UpdateDeviceFolderLayoutRequest['folders'] = [];
++  for (const item of body.folders) {
++    const parsed = parseLayoutFolder(item);
++    if (!parsed) return json({ error: t('apiError.invalidRequest') }, 400);
++    folders.push(parsed);
++  }
++
++  const currentIds = getDeviceFolderLayout().folders.map((folder) => folder.id);
++  const requestIds = folders.map((folder) => folder.id);
++  if (!sameIdSet(currentIds, requestIds)) {
++    return json({ error: t('apiError.folderLayoutInvalid') }, 400);
++  }
++  if (!isFolderForestValid(folders)) {
++    return json({ error: t('apiError.folderCycle') }, 400);
++  }
++
++  const folderIds = new Set(requestIds);
++  const placements: DeviceFolderPlacement[] = [];
++  const seenKeys = new Set<string>();
++  for (const item of body.placements) {
++    const parsed = parsePlacement(item, folderIds);
++    if (!parsed) return json({ error: t('apiError.folderLayoutInvalid') }, 400);
++    const key = deviceFolderItemKey(parsed);
++    if (seenKeys.has(key)) return json({ error: t('apiError.folderLayoutInvalid') }, 400);
++    seenKeys.add(key);
++    placements.push(parsed);
++  }
++
++  const layout: DeviceFolderLayout = replaceDeviceFolderLayout({ folders, placements });
++  broadcastSettingsUpdate('device-folders');
++  return json(layout);
++}
++
++export const deviceFolderRoutes: ApiRoute[] = [
++  route({ method: 'GET', path: '/api/device-folders', handler: () => handleGetLayout() }),
++  route({ method: 'POST', path: '/api/device-folders', handler: (req) => handleCreate(req) }),
++  route({
++    method: 'PUT',
++    path: '/api/device-folders/layout',
++    handler: (req) => handleReplaceLayout(req),
++  }),
++  route({
++    method: 'PATCH',
++    path: '/api/device-folders/:id',
++    handler: (req, params) => handleUpdate(req, params.id),
++  }),
++  route({
++    method: 'DELETE',
++    path: '/api/device-folders/:id',
++    handler: (_req, params) => handleDelete(params.id),
++  }),
++];
+diff --git a/apps/gateway/src/api/device-routes.ts b/apps/gateway/src/api/device-routes.ts
+index 349f606d..06f01939 100644
+--- a/apps/gateway/src/api/device-routes.ts
++++ b/apps/gateway/src/api/device-routes.ts
+@@ -7,6 +7,7 @@ import {
+   getAllDevices,
+   getDeviceById,
+   getDeviceRuntimeStatus,
++  removeDeviceFolderPlacementsForDevice,
+   reorderDevices,
+   updateDevice,
+ } from '../db';
+@@ -154,6 +155,7 @@ async function handleDeleteDevice(id: string): Promise<Response> {
+   }
+ 
+   deleteDevice(id);
++  removeDeviceFolderPlacementsForDevice(id);
+   broadcastSettingsUpdate('devices');
+   pushSupervisor.remove(id);
+   connectionAlertNotifier.clear(id);
+diff --git a/apps/gateway/src/api/index.ts b/apps/gateway/src/api/index.ts
+index c4ad6203..5bdab8a3 100644
+--- a/apps/gateway/src/api/index.ts
++++ b/apps/gateway/src/api/index.ts
+@@ -1,6 +1,7 @@
+ import type { Server } from 'bun';
+ import { t } from '../i18n';
+ import { agentRoutes } from './agent';
++import { deviceFolderRoutes } from './device-folder-routes';
+ import { deviceRoutes } from './device-routes';
+ import { filesRoutes } from './files';
+ import { json } from './http';
+@@ -26,6 +27,7 @@ export type { SystemApiHandler };
+ const apiRoutes: ApiRoute[] = [
+   ...capabilitiesRoutes,
+   ...deviceRoutes,
++  ...deviceFolderRoutes,
+   ...tmuxTreeRoutes,
+   ...settingsRoutes,
+   ...telegramRoutes,
+diff --git a/apps/gateway/src/db/device-folders.test.ts b/apps/gateway/src/db/device-folders.test.ts
+new file mode 100644
+index 00000000..4ba73c1b
+--- /dev/null
++++ b/apps/gateway/src/db/device-folders.test.ts
+@@ -0,0 +1,184 @@
++import { beforeAll, describe, expect, test } from 'bun:test';
++import { DEVICE_FOLDER_SELF_NODE_ID, deviceFolderItemKey } from '@tmex/shared';
++import {
++  createDeviceFolder,
++  deleteDeviceFolder,
++  getDeviceFolderById,
++  getDeviceFolderLayout,
++  removeDeviceFolderPlacementsForDevice,
++  replaceDeviceFolderLayout,
++  updateDeviceFolder,
++} from './device-folders';
++import { runMigrations } from './migrate';
++
++beforeAll(() => {
++  runMigrations();
++});
++
++describe('device folder db helper', () => {
++  test('createDeviceFolder 同父下 sortOrder 递增', () => {
++    const a = createDeviceFolder({ id: 'df-create-a', name: 'A', parentId: null });
++    const b = createDeviceFolder({ id: 'df-create-b', name: 'B', parentId: null });
++    expect(b.sortOrder).toBe(a.sortOrder + 1);
++    expect(getDeviceFolderById('df-create-a')?.name).toBe('A');
++    const child = createDeviceFolder({
++      id: 'df-create-child',
++      name: 'Child',
++      parentId: 'df-create-a',
++    });
++    expect(child.parentId).toBe('df-create-a');
++    expect(child.sortOrder).toBe(0);
++  });
++
++  test('updateDeviceFolder 改名，改 parent 未给 sortOrder 时排到新父末尾', () => {
++    const parent = createDeviceFolder({ id: 'df-upd-p', name: 'P', parentId: null });
++    createDeviceFolder({ id: 'df-upd-sib', name: 'Sib', parentId: parent.id });
++    const moved = createDeviceFolder({ id: 'df-upd-m', name: 'M', parentId: null });
++
++    const renamed = updateDeviceFolder(moved.id, { name: 'Moved' });
++    expect(renamed?.name).toBe('Moved');
++
++    const reparented = updateDeviceFolder(moved.id, { parentId: parent.id });
++    expect(reparented?.parentId).toBe(parent.id);
++    expect(reparented?.sortOrder).toBe(1);
++    expect(updateDeviceFolder('df-missing', { name: 'x' })).toBeNull();
++  });
++
++  test('deleteDeviceFolder 把子文件夹与 placement 上提到父级', () => {
++    const root = createDeviceFolder({ id: 'df-del-root', name: 'Root', parentId: null });
++    const mid = createDeviceFolder({
++      id: 'df-del-mid',
++      name: 'Mid',
++      parentId: root.id,
++    });
++    const nested = createDeviceFolder({
++      id: 'df-del-nested',
++      name: 'Nested',
++      parentId: mid.id,
++    });
++    replaceDeviceFolderLayout({
++      folders: getDeviceFolderLayout().folders.map((folder) => ({
++        id: folder.id,
++        parentId: folder.parentId,
++        sortOrder: folder.sortOrder,
++      })),
++      placements: [
++        ...getDeviceFolderLayout().placements,
++        {
++          kind: 'device',
++          nodeId: DEVICE_FOLDER_SELF_NODE_ID,
++          deviceId: 'df-del-dev',
++          folderId: mid.id,
++          sortOrder: 0,
++        },
++        {
++          kind: 'node',
++          nodeId: 'mesh-n1',
++          deviceId: null,
++          folderId: mid.id,
++          sortOrder: 1,
++        },
++      ],
++    });
++
++    expect(deleteDeviceFolder(mid.id)).toBe(true);
++    expect(getDeviceFolderById(mid.id)).toBeNull();
++    expect(getDeviceFolderById(nested.id)?.parentId).toBe(root.id);
++
++    const layout = getDeviceFolderLayout();
++    const placement = layout.placements.find(
++      (item) => item.kind === 'device' && item.deviceId === 'df-del-dev'
++    );
++    expect(placement?.folderId).toBe(root.id);
++    const nodePlacement = layout.placements.find((item) => item.nodeId === 'mesh-n1');
++    expect(nodePlacement?.folderId).toBe(root.id);
++    expect(deleteDeviceFolder('df-del-missing')).toBe(false);
++  });
++
++  test('replaceDeviceFolderLayout 整体替换 placement 并规范化顺序', () => {
++    const fa = createDeviceFolder({ id: 'df-rep-a', name: 'RA', parentId: null });
++    const fb = createDeviceFolder({ id: 'df-rep-b', name: 'RB', parentId: null });
++    const current = getDeviceFolderLayout();
++    const next = replaceDeviceFolderLayout({
++      folders: current.folders.map((folder) =>
++        folder.id === fb.id
++          ? { id: fb.id, parentId: fa.id, sortOrder: 99 }
++          : { id: folder.id, parentId: folder.parentId, sortOrder: folder.sortOrder }
++      ),
++      placements: [
++        {
++          kind: 'node',
++          nodeId: 'rep-node',
++          deviceId: null,
++          folderId: fa.id,
++          sortOrder: 5,
++        },
++      ],
++    });
++    expect(next.folders.find((folder) => folder.id === fb.id)?.parentId).toBe(fa.id);
++    expect(next.folders.find((folder) => folder.id === fb.id)?.sortOrder).toBe(0);
++    expect(next.placements).toEqual([
++      {
++        kind: 'node',
++        nodeId: 'rep-node',
++        deviceId: null,
++        folderId: fa.id,
++        sortOrder: 0,
++      },
++    ]);
++  });
++
++  test('removeDeviceFolderPlacementsForDevice 只删 self 节点上该设备的 placement', () => {
++    const folder = createDeviceFolder({ id: 'df-rm-f', name: 'RF', parentId: null });
++    replaceDeviceFolderLayout({
++      folders: getDeviceFolderLayout().folders.map((item) => ({
++        id: item.id,
++        parentId: item.parentId,
++        sortOrder: item.sortOrder,
++      })),
++      placements: [
++        {
++          kind: 'device',
++          nodeId: DEVICE_FOLDER_SELF_NODE_ID,
++          deviceId: 'dev-keep-other',
++          folderId: folder.id,
++          sortOrder: 0,
++        },
++        {
++          kind: 'device',
++          nodeId: DEVICE_FOLDER_SELF_NODE_ID,
++          deviceId: 'dev-to-remove',
++          folderId: folder.id,
++          sortOrder: 1,
++        },
++        {
++          kind: 'device',
++          nodeId: 'mesh-other',
++          deviceId: 'dev-to-remove',
++          folderId: folder.id,
++          sortOrder: 2,
++        },
++      ],
++    });
++
++    removeDeviceFolderPlacementsForDevice('dev-to-remove');
++    const keys = getDeviceFolderLayout().placements.map((item) => deviceFolderItemKey(item));
++    expect(keys).toContain(
++      deviceFolderItemKey({
++        kind: 'device',
++        nodeId: DEVICE_FOLDER_SELF_NODE_ID,
++        deviceId: 'dev-keep-other',
++      })
++    );
++    expect(keys).toContain(
++      deviceFolderItemKey({ kind: 'device', nodeId: 'mesh-other', deviceId: 'dev-to-remove' })
++    );
++    expect(keys).not.toContain(
++      deviceFolderItemKey({
++        kind: 'device',
++        nodeId: DEVICE_FOLDER_SELF_NODE_ID,
++        deviceId: 'dev-to-remove',
++      })
++    );
++  });
++});
+diff --git a/apps/gateway/src/db/device-folders.ts b/apps/gateway/src/db/device-folders.ts
+new file mode 100644
+index 00000000..511aae11
+--- /dev/null
++++ b/apps/gateway/src/db/device-folders.ts
+@@ -0,0 +1,231 @@
++import {
++  DEVICE_FOLDER_SELF_NODE_ID,
++  type DeviceFolder,
++  type DeviceFolderLayout,
++  type DeviceFolderPlacement,
++  type UpdateDeviceFolderLayoutRequest,
++  deviceFolderItemKey,
++  normalizeFolderLayoutOrder,
++  reparentOnFolderDelete,
++} from '@tmex/shared';
++import { and, asc, eq, isNull, max } from 'drizzle-orm';
++import { getDb as getOrmDb } from './client';
++import { deviceFolderPlacements, deviceFolders } from './schema';
++
++function toFolder(row: typeof deviceFolders.$inferSelect): DeviceFolder {
++  return {
++    id: row.id,
++    name: row.name,
++    parentId: row.parentId ?? null,
++    sortOrder: row.sortOrder,
++    createdAt: row.createdAt,
++    updatedAt: row.updatedAt,
++  };
++}
++
++function toPlacement(row: typeof deviceFolderPlacements.$inferSelect): DeviceFolderPlacement {
++  return {
++    kind: row.kind === 'device' ? 'device' : 'node',
++    nodeId: row.nodeId,
++    deviceId: row.deviceId ?? null,
++    folderId: row.folderId ?? null,
++    sortOrder: row.sortOrder,
++  };
++}
++
++function maxSortOrderForParent(tx: ReturnType<typeof getOrmDb>, parentId: string | null): number {
++  const row =
++    parentId === null
++      ? tx
++          .select({ value: max(deviceFolders.sortOrder) })
++          .from(deviceFolders)
++          .where(isNull(deviceFolders.parentId))
++          .get()
++      : tx
++          .select({ value: max(deviceFolders.sortOrder) })
++          .from(deviceFolders)
++          .where(eq(deviceFolders.parentId, parentId))
++          .get();
++  return row?.value ?? -1;
++}
++
++export function getDeviceFolderLayout(): DeviceFolderLayout {
++  const orm = getOrmDb();
++  const folders = orm
++    .select()
++    .from(deviceFolders)
++    .orderBy(asc(deviceFolders.parentId), asc(deviceFolders.sortOrder))
++    .all()
++    .map(toFolder);
++  const placements = orm
++    .select()
++    .from(deviceFolderPlacements)
++    .orderBy(asc(deviceFolderPlacements.folderId), asc(deviceFolderPlacements.sortOrder))
++    .all()
++    .map(toPlacement);
++  return { folders, placements };
++}
++
++export function getDeviceFolderById(id: string): DeviceFolder | null {
++  const orm = getOrmDb();
++  const row = orm.select().from(deviceFolders).where(eq(deviceFolders.id, id)).get();
++  return row ? toFolder(row) : null;
++}
++
++export function createDeviceFolder(input: {
++  id: string;
++  name: string;
++  parentId: string | null;
++}): DeviceFolder {
++  const orm = getOrmDb();
++  const now = new Date().toISOString();
++  const sortOrder = maxSortOrderForParent(orm, input.parentId) + 1;
++  const row = {
++    id: input.id,
++    name: input.name,
++    parentId: input.parentId,
++    sortOrder,
++    createdAt: now,
++    updatedAt: now,
++  };
++  orm.insert(deviceFolders).values(row).run();
++  return toFolder(row);
++}
++
++export function updateDeviceFolder(
++  id: string,
++  patch: { name?: string; parentId?: string | null; sortOrder?: number }
++): DeviceFolder | null {
++  const current = getDeviceFolderById(id);
++  if (!current) return null;
++
++  const orm = getOrmDb();
++  const nextParentId = patch.parentId !== undefined ? patch.parentId : current.parentId;
++  const parentChanged = nextParentId !== current.parentId;
++  let nextSortOrder = current.sortOrder;
++  if (patch.sortOrder !== undefined) {
++    nextSortOrder = patch.sortOrder;
++  } else if (parentChanged) {
++    nextSortOrder = maxSortOrderForParent(orm, nextParentId) + 1;
++  }
++
++  const now = new Date().toISOString();
++  const next: DeviceFolder = {
++    ...current,
++    name: patch.name ?? current.name,
++    parentId: nextParentId,
++    sortOrder: nextSortOrder,
++    updatedAt: now,
++  };
++  orm
++    .update(deviceFolders)
++    .set({
++      name: next.name,
++      parentId: next.parentId,
++      sortOrder: next.sortOrder,
++      updatedAt: now,
++    })
++    .where(eq(deviceFolders.id, id))
++    .run();
++  return next;
++}
++
++export function deleteDeviceFolder(id: string): boolean {
++  const layout = getDeviceFolderLayout();
++  if (!layout.folders.some((folder) => folder.id === id)) return false;
++  const next = reparentOnFolderDelete(layout, id);
++  const now = new Date().toISOString();
++  const orm = getOrmDb();
++  orm.transaction((tx) => {
++    for (const folder of next.folders) {
++      tx.update(deviceFolders)
++        .set({
++          parentId: folder.parentId,
++          sortOrder: folder.sortOrder,
++          updatedAt: now,
++        })
++        .where(eq(deviceFolders.id, folder.id))
++        .run();
++    }
++    for (const placement of next.placements) {
++      tx.update(deviceFolderPlacements)
++        .set({
++          folderId: placement.folderId,
++          sortOrder: placement.sortOrder,
++          updatedAt: now,
++        })
++        .where(eq(deviceFolderPlacements.itemKey, deviceFolderItemKey(placement)))
++        .run();
++    }
++    tx.delete(deviceFolders).where(eq(deviceFolders.id, id)).run();
++  });
++  return true;
++}
++
++export function replaceDeviceFolderLayout(
++  layout: UpdateDeviceFolderLayoutRequest
++): DeviceFolderLayout {
++  const current = getDeviceFolderLayout();
++  const byId = new Map(current.folders.map((folder) => [folder.id, folder]));
++  const now = new Date().toISOString();
++  const folders: DeviceFolder[] = layout.folders.map((item) => {
++    const prev = byId.get(item.id);
++    return {
++      id: item.id,
++      name: prev?.name ?? '',
++      parentId: item.parentId,
++      sortOrder: item.sortOrder,
++      createdAt: prev?.createdAt ?? now,
++      updatedAt: now,
++    };
++  });
++  const normalized = normalizeFolderLayoutOrder({
++    folders,
++    placements: layout.placements.map((placement) => ({
++      ...placement,
++      deviceId: placement.kind === 'node' ? null : placement.deviceId,
++    })),
++  });
++  const orm = getOrmDb();
++  orm.transaction((tx) => {
++    for (const folder of normalized.folders) {
++      tx.update(deviceFolders)
++        .set({
++          parentId: folder.parentId,
++          sortOrder: folder.sortOrder,
++          updatedAt: now,
++        })
++        .where(eq(deviceFolders.id, folder.id))
++        .run();
++    }
++    tx.delete(deviceFolderPlacements).run();
++    for (const placement of normalized.placements) {
++      tx.insert(deviceFolderPlacements)
++        .values({
++          itemKey: deviceFolderItemKey(placement),
++          kind: placement.kind,
++          nodeId: placement.nodeId,
++          deviceId: placement.deviceId,
++          folderId: placement.folderId,
++          sortOrder: placement.sortOrder,
++          createdAt: now,
++          updatedAt: now,
++        })
++        .run();
++    }
++  });
++  return getDeviceFolderLayout();
++}
++
++export function removeDeviceFolderPlacementsForDevice(deviceId: string): void {
++  const orm = getOrmDb();
++  orm
++    .delete(deviceFolderPlacements)
++    .where(
++      and(
++        eq(deviceFolderPlacements.nodeId, DEVICE_FOLDER_SELF_NODE_ID),
++        eq(deviceFolderPlacements.deviceId, deviceId)
++      )
++    )
++    .run();
++}
+diff --git a/apps/gateway/src/db/index.ts b/apps/gateway/src/db/index.ts
+index fb9aaec3..5a1b592e 100644
+--- a/apps/gateway/src/db/index.ts
++++ b/apps/gateway/src/db/index.ts
+@@ -22,6 +22,16 @@ export {
+   updateDeviceRuntimeStatus,
+ } from './devices';
+ 
++export {
++  createDeviceFolder,
++  deleteDeviceFolder,
++  getDeviceFolderById,
++  getDeviceFolderLayout,
++  removeDeviceFolderPlacementsForDevice,
++  replaceDeviceFolderLayout,
++  updateDeviceFolder,
++} from './device-folders';
++
+ export { getGatewayKv, setGatewayKv } from './kv';
+ 
+ export {
+diff --git a/apps/gateway/src/db/managed-migrations.ts b/apps/gateway/src/db/managed-migrations.ts
+index 78be3871..28a4e0f7 100644
+--- a/apps/gateway/src/db/managed-migrations.ts
++++ b/apps/gateway/src/db/managed-migrations.ts
+@@ -29,6 +29,7 @@ const MIGRATIONS = [
+   '0021_tls_config.sql',
+   '0022_hub_trust.sql',
+   '0023_acme_account_directory.sql',
++  '0024_narrow_tomas.sql',
+ ] as const;
+ 
+ export interface MaterializedMigrations {
+diff --git a/apps/gateway/src/db/schema.ts b/apps/gateway/src/db/schema.ts
+index a0f7deed..a2d320ba 100644
+--- a/apps/gateway/src/db/schema.ts
++++ b/apps/gateway/src/db/schema.ts
+@@ -368,6 +368,38 @@ export const deviceTreeOrder = sqliteTable('device_tree_order', {
+   updatedAt: text('updated_at').notNull(),
+ });
+ 
++// 设备管理页文件夹层级：parent_id 自引用不加 FK（删除时手动上提子项）。
++export const deviceFolders = sqliteTable(
++  'device_folders',
++  {
++    id: text('id').primaryKey(),
++    name: text('name').notNull(),
++    parentId: text('parent_id'),
++    sortOrder: integer('sort_order').notNull().default(0),
++    createdAt: text('created_at').notNull(),
++    updatedAt: text('updated_at').notNull(),
++  },
++  (table) => [index('device_folders_parent_id_idx').on(table.parentId)]
++);
++
++export const deviceFolderPlacements = sqliteTable(
++  'device_folder_placements',
++  {
++    itemKey: text('item_key').primaryKey(),
++    kind: text('kind').notNull(),
++    nodeId: text('node_id').notNull(),
++    deviceId: text('device_id'),
++    folderId: text('folder_id').references(() => deviceFolders.id, { onDelete: 'cascade' }),
++    sortOrder: integer('sort_order').notNull().default(0),
++    createdAt: text('created_at').notNull(),
++    updatedAt: text('updated_at').notNull(),
++  },
++  (table) => [
++    check('device_folder_placements_kind_check', sql`${table.kind} in ('node', 'device')`),
++    index('device_folder_placements_folder_id_idx').on(table.folderId),
++  ]
++);
++
+ // Files Tab 可访问目录白名单（树根）。每个根绑定到一个设备（local 走本地 rsync，ssh 走 rsync over ssh），
+ // 有独立启用开关。(deviceId, path) 唯一。
+ export const fileRoots = sqliteTable(
+diff --git a/apps/gateway/src/settings/broadcaster.ts b/apps/gateway/src/settings/broadcaster.ts
+index 9f37ef38..c6b1a8c2 100644
+--- a/apps/gateway/src/settings/broadcaster.ts
++++ b/apps/gateway/src/settings/broadcaster.ts
+@@ -11,7 +11,8 @@ export type SettingsNamespace =
+   | 'telegram'
+   | 'weixin'
+   | 'devices'
+-  | 'tree-order';
++  | 'tree-order'
++  | 'device-folders';
+ 
+ type SettingsBroadcaster = (namespace: SettingsNamespace) => void;
+ 
+diff --git a/packages/api-client/src/device-folders.ts b/packages/api-client/src/device-folders.ts
+new file mode 100644
+index 00000000..e404b0c6
+--- /dev/null
++++ b/packages/api-client/src/device-folders.ts
+@@ -0,0 +1,84 @@
++// 设备文件夹 REST 端点
++
++import type {
++  CreateDeviceFolderRequest,
++  DeviceFolder,
++  DeviceFolderLayout,
++  UpdateDeviceFolderLayoutRequest,
++  UpdateDeviceFolderRequest,
++} from '@tmex/shared';
++import { type ApiClient, defaultApiClient, parseApiError } from './client';
++
++export const deviceFoldersQueryKey = ['device-folders'] as const;
++
++export async function fetchDeviceFolderLayout(
++  client: ApiClient = defaultApiClient
++): Promise<DeviceFolderLayout> {
++  const res = await client.fetch('/api/device-folders');
++  if (!res.ok) {
++    throw new Error(await parseApiError(res, 'Failed to load device folders'));
++  }
++  return (await res.json()) as DeviceFolderLayout;
++}
++
++export async function createDeviceFolder(
++  body: CreateDeviceFolderRequest,
++  errorFallback = 'Failed to create folder',
++  client: ApiClient = defaultApiClient
++): Promise<DeviceFolder> {
++  const res = await client.fetch('/api/device-folders', {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(body),
++  });
++  if (!res.ok) {
++    throw new Error(await parseApiError(res, errorFallback));
++  }
++  const payload = (await res.json()) as { folder: DeviceFolder };
++  return payload.folder;
++}
++
++export async function updateDeviceFolder(
++  id: string,
++  body: UpdateDeviceFolderRequest,
++  errorFallback = 'Failed to update folder',
++  client: ApiClient = defaultApiClient
++): Promise<DeviceFolder> {
++  const res = await client.fetch(`/api/device-folders/${id}`, {
++    method: 'PATCH',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(body),
++  });
++  if (!res.ok) {
++    throw new Error(await parseApiError(res, errorFallback));
++  }
++  const payload = (await res.json()) as { folder: DeviceFolder };
++  return payload.folder;
++}
++
++export async function deleteDeviceFolder(
++  id: string,
++  errorFallback = 'Failed to delete folder',
++  client: ApiClient = defaultApiClient
++): Promise<void> {
++  const res = await client.fetch(`/api/device-folders/${id}`, { method: 'DELETE' });
++  if (!res.ok) {
++    throw new Error(await parseApiError(res, errorFallback));
++  }
++}
++
++export async function replaceDeviceFolderLayout(
++  body: UpdateDeviceFolderLayoutRequest,
++  errorFallback = 'Failed to update folder layout',
++  client: ApiClient = defaultApiClient
++): Promise<DeviceFolderLayout> {
++  const res = await client.fetch('/api/device-folders/layout', {
++    method: 'PUT',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(body),
++  });
++  if (!res.ok) {
++    throw new Error(await parseApiError(res, errorFallback));
++  }
++  return (await res.json()) as DeviceFolderLayout;
++}
+diff --git a/packages/api-client/src/index.ts b/packages/api-client/src/index.ts
+index 2bec43ca..94845c54 100644
+--- a/packages/api-client/src/index.ts
++++ b/packages/api-client/src/index.ts
+@@ -3,6 +3,7 @@
+ export * from './agent';
+ export * from './capabilities';
+ export * from './client';
++export * from './device-folders';
+ export * from './devices';
+ export * from './file-urls';
+ export * from './files';
+diff --git a/packages/panels/src/device-management/device-card-connect-toggle.test.ts b/packages/panels/src/device-management/device-card-connect-toggle.test.ts
+new file mode 100644
+index 00000000..06ec3f4d
+--- /dev/null
++++ b/packages/panels/src/device-management/device-card-connect-toggle.test.ts
+@@ -0,0 +1,20 @@
++// 连接状态 → 卡片主按钮动作的映射。
++
++import { describe, expect, test } from 'bun:test';
++import { deviceConnectAction } from './device-card-connect-toggle';
++
++describe('deviceConnectAction', () => {
++  test('已连接可断开', () => {
++    expect(deviceConnectAction('connected')).toBe('disconnect');
++  });
++
++  test('连接中/重连中一律置为 pending（按钮禁用）', () => {
++    expect(deviceConnectAction('connecting')).toBe('pending');
++    expect(deviceConnectAction('reconnecting')).toBe('pending');
++  });
++
++  test('已断开与出错都能直接发起连接', () => {
++    expect(deviceConnectAction('disconnected')).toBe('connect');
++    expect(deviceConnectAction('error')).toBe('connect');
++  });
++});
+diff --git a/packages/panels/src/device-management/device-card-connect-toggle.tsx b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+new file mode 100644
+index 00000000..85b92511
+--- /dev/null
++++ b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+@@ -0,0 +1,71 @@
++// 卡片主按钮：真实的连接/断开开关，由宿主注入的 DeviceConnectionAdapter 驱动。
++// 点「连接」会顺带清掉持久化的「断开意图」（见 adapter 实现），所以这里只做状态映射。
++
++import { cn } from '@tmex/ui';
++import { Button } from '@tmex/ui/button';
++import { useTranslation } from 'react-i18next';
++import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
++import { deviceStatusDotClass } from '../device-tree/device-connection-control';
++
++export type DeviceConnectAction = 'connect' | 'disconnect' | 'pending';
++
++export function deviceConnectAction(status: DeviceConnectionStatus): DeviceConnectAction {
++  switch (status) {
++    case 'connected':
++      return 'disconnect';
++    case 'connecting':
++    case 'reconnecting':
++      return 'pending';
++    default:
++      return 'connect';
++  }
++}
++
++export interface DeviceCardConnectToggleProps {
++  deviceId: string;
++  connection: DeviceConnectionAdapter;
++}
++
++export function DeviceCardConnectToggle({ deviceId, connection }: DeviceCardConnectToggleProps) {
++  const { t } = useTranslation();
++  const status = connection.status(deviceId);
++  const action = deviceConnectAction(status);
++  const label =
++    action === 'disconnect'
++      ? t('device.disconnect')
++      : action === 'pending'
++        ? t('device.connecting')
++        : t('device.connect');
++
++  return (
++    <Button
++      type="button"
++      variant="outline"
++      size="sm"
++      className="shrink-0"
++      data-testid={`device-card-connect-${deviceId}`}
++      data-state={status}
++      data-action={action}
++      disabled={action === 'pending'}
++      title={label}
++      onClick={() => {
++        if (action === 'disconnect') {
++          connection.disconnect(deviceId);
++          return;
++        }
++        if (action === 'connect') {
++          connection.connect(deviceId);
++        }
++      }}
++    >
++      <span
++        aria-hidden="true"
++        className={cn(
++          'h-2 w-2 shrink-0 rounded-full transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
++          deviceStatusDotClass(status)
++        )}
++      />
++      {label}
++    </Button>
++  );
++}
+diff --git a/packages/panels/src/device-management/device-card-host.tsx b/packages/panels/src/device-management/device-card-host.tsx
+new file mode 100644
+index 00000000..2d9dab3b
+--- /dev/null
++++ b/packages/panels/src/device-management/device-card-host.tsx
+@@ -0,0 +1,59 @@
++// 单张设备卡片的宿主：把编辑对话框与删除确认的状态下放到每张卡片，
++// 这样文件夹、拖拽等外层容器可以直接复用一张「自带交互」的卡片。
++
++import type { Device } from '@tmex/shared';
++import { type CSSProperties, useState } from 'react';
++import type { DeviceConnectionAdapter } from '../device-connection';
++import { DeviceCard } from './device-card';
++import { DeviceDeleteDialog } from './device-delete-dialog';
++import { DeviceDialog } from './device-dialog';
++import type { DeviceNodeContext } from './device-node-context';
++
++export interface DeviceCardHostProps {
++  device: Device;
++  queryKey: readonly unknown[];
++  nodeContext: DeviceNodeContext;
++  connection?: DeviceConnectionAdapter;
++  style?: CSSProperties;
++  className?: string;
++}
++
++export function DeviceCardHost({
++  device,
++  queryKey,
++  nodeContext,
++  connection,
++  style,
++  className,
++}: DeviceCardHostProps) {
++  const [editing, setEditing] = useState(false);
++  const [deleteCandidate, setDeleteCandidate] = useState<Device | null>(null);
++
++  return (
++    <>
++      <DeviceCard
++        device={device}
++        nodeContext={nodeContext}
++        connection={connection}
++        style={style}
++        className={className}
++        onEdit={() => setEditing(true)}
++        onDelete={() => setDeleteCandidate(device)}
++      />
++      {editing && (
++        <DeviceDialog
++          mode="edit"
++          device={device}
++          nodeContext={nodeContext}
++          queryKey={queryKey}
++          onClose={() => setEditing(false)}
++        />
++      )}
++      <DeviceDeleteDialog
++        device={deleteCandidate}
++        queryKey={queryKey}
++        onClose={() => setDeleteCandidate(null)}
++      />
++    </>
++  );
++}
+diff --git a/packages/panels/src/device-management/device-card.test.tsx b/packages/panels/src/device-management/device-card.test.tsx
+index 689325b4..7c032b05 100644
+--- a/packages/panels/src/device-management/device-card.test.tsx
++++ b/packages/panels/src/device-management/device-card.test.tsx
+@@ -1,88 +1,232 @@
+-// 设备卡片的「显示在侧栏」开关：默认值按 node 归属（self 开、远端 node 关）。
+-// bun test 无 DOM，用 react-dom/server 静态渲染断言开关状态；静态渲染下 zustand 走
+-// `getInitialState`，所以这里只能覆盖默认值，「存过的值优先」由 stores 的单测覆盖。
++// 设备卡片：种类展示（本地 / SSH / 远端节点上的设备）、连接开关的三种状态、
++// 「显示在侧栏」开关默认值。bun test 无 DOM，用 react-dom/server 静态渲染断言 HTML；
++// 静态渲染下 zustand 走 `getInitialState`，所以侧栏开关只能覆盖默认值，
++// 「存过的值优先」由 stores 的单测覆盖。
+ 
+ import { describe, expect, test } from 'bun:test';
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+ import type { Device } from '@tmex/shared';
++import { I18N_RESOURCES } from '@tmex/shared';
+ import { createAppRuntime, sidebarDeviceVisibilityKey } from '@tmex/stores';
+ import { RuntimeProvider } from '@tmex/stores/react';
+ import { installWindowStorage } from '@tmex/stores/test-utils';
++import i18next from 'i18next';
+ import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
+ import { MemoryRouter } from 'react-router';
+-
++import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
+ import { DeviceCard } from './device-card';
++import type { DeviceNodeContext } from './device-node-context';
+ 
+ installWindowStorage();
+ 
+-const DEVICE: Device = {
++// 独立实例 + I18nextProvider：不碰 react-i18next 的全局默认实例，避免与其它测试文件互相污染。
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++const LOCAL_DEVICE: Device = {
+   id: 'dev-1',
+   name: '书房',
+   type: 'local',
+-  host: null,
+-  port: null,
+-  username: null,
+-  authMode: null,
+-  session: null,
+-  defaultWorkingDir: null,
++  authMode: 'auto',
+   sortOrder: 0,
+-  createdAt: 0,
+-  updatedAt: 0,
+-} as unknown as Device;
++  createdAt: '2026-01-01T00:00:00.000Z',
++  updatedAt: '2026-01-01T00:00:00.000Z',
++};
++
++const SSH_DEVICE: Device = {
++  ...LOCAL_DEVICE,
++  type: 'ssh',
++  authMode: 'agent',
++  host: '10.0.0.2',
++  port: 2222,
++  username: 'root',
++};
++
++const SELF_CONTEXT: DeviceNodeContext = { runtimeNodeId: 'self', name: '', isSelf: true };
++const REMOTE_CONTEXT: DeviceNodeContext = { runtimeNodeId: 'n1', name: '书房节点', isSelf: false };
++
++function stubConnection(status: DeviceConnectionStatus): DeviceConnectionAdapter {
++  return {
++    status: () => status,
++    isConnected: () => status === 'connected',
++    isIntentionallyDisconnected: () => status === 'disconnected',
++    connect: () => undefined,
++    disconnect: () => undefined,
++  };
++}
+ 
+ let storageSeq = 0;
+ 
+-function renderCard(runtimeNodeId: string): string {
++function renderCard(options: {
++  device?: Device;
++  nodeContext?: DeviceNodeContext;
++  connection?: DeviceConnectionAdapter;
++}): string {
++  const nodeContext = options.nodeContext ?? SELF_CONTEXT;
+   // 每次一个独立的 persist key：共享的内存 localStorage 不会把用例之间的偏好串起来。
+   const runtime = createAppRuntime({
+-    nodeId: runtimeNodeId,
++    nodeId: nodeContext.runtimeNodeId,
+     storagePrefix: `device-card-test-${storageSeq++}:`,
+   });
+   const html = renderToStaticMarkup(
+     <MemoryRouter>
+-      <QueryClientProvider client={new QueryClient()}>
+-        <RuntimeProvider runtime={runtime}>
+-          <DeviceCard device={DEVICE} onEdit={() => undefined} onDelete={() => undefined} />
+-        </RuntimeProvider>
+-      </QueryClientProvider>
++      <I18nextProvider i18n={i18n}>
++        <QueryClientProvider client={new QueryClient()}>
++          <RuntimeProvider runtime={runtime}>
++            <DeviceCard
++              device={options.device ?? LOCAL_DEVICE}
++              nodeContext={nodeContext}
++              connection={options.connection}
++              onEdit={() => undefined}
++              onDelete={() => undefined}
++            />
++          </RuntimeProvider>
++        </QueryClientProvider>
++      </I18nextProvider>
+     </MemoryRouter>
+   );
+   runtime.dispose();
+   return html;
+ }
+ 
++function occurrences(html: string, text: string): number {
++  return html.split(text).length - 1;
++}
++
++function tagOf(html: string, testId: string): string | null {
++  const marker = `data-testid="${testId}"`;
++  const index = html.indexOf(marker);
++  if (index === -1) return null;
++  return html.slice(html.lastIndexOf('<', index), html.indexOf('>', index) + 1);
++}
++
+ /**
+  * 开关的选中态只看 `aria-checked`：class 里同时带 `data-checked:` / `data-unchecked:`
+  * 两个 tailwind 变体前缀，按 data-* 属性匹配会永远命中。
+  */
+ function switchState(html: string): string | null {
+-  const marker = 'data-testid="device-card-sidebar-dev-1"';
+-  const index = html.indexOf(marker);
+-  if (index === -1) return null;
+-  const tag = html.slice(html.lastIndexOf('<', index), html.indexOf('>', index));
++  const tag = tagOf(html, 'device-card-sidebar-dev-1');
++  if (!tag) return null;
+   return tag.includes('aria-checked="true"') ? 'checked' : 'unchecked';
+ }
+ 
++describe('DeviceCard 的设备种类展示', () => {
++  test('本地设备的种类只出现一次，且不渲染第二行副标题', () => {
++    const html = renderCard({});
++    expect(occurrences(html, '本地设备')).toBe(1);
++    expect(html).toContain('data-device-kind="local"');
++    expect(html).not.toContain('root@');
++    expect(html).not.toContain('-@-');
++  });
++
++  test('SSH 设备第二行是 user@host:port，种类 pill 说 SSH 设备', () => {
++    const html = renderCard({ device: SSH_DEVICE });
++    expect(html).toContain('root@10.0.0.2:2222');
++    expect(occurrences(html, 'SSH 设备')).toBe(1);
++    expect(html).toContain('data-device-kind="ssh"');
++  });
++
++  test('远端节点上的本机设备说「节点 X 上的本机设备」，并带远端角标', () => {
++    const html = renderCard({ nodeContext: REMOTE_CONTEXT });
++    expect(html).toContain('节点 书房节点 上的本机设备');
++    expect(html).toContain('data-device-kind="nodeLocal"');
++    expect(html).toContain('data-testid="device-card-remote-dev-1"');
++  });
++
++  test('远端节点上的 SSH 设备说「节点 X 上的 SSH 设备」', () => {
++    const html = renderCard({ device: SSH_DEVICE, nodeContext: REMOTE_CONTEXT });
++    expect(html).toContain('节点 书房节点 上的 SSH 设备');
++    expect(html).toContain('data-device-kind="nodeSsh"');
++  });
++
++  test('本机上下文不渲染远端角标', () => {
++    expect(renderCard({})).not.toContain('data-testid="device-card-remote-dev-1"');
++  });
++});
++
++describe('DeviceCard 的连接开关', () => {
++  test('未注入 connection 时只有「打开」入口', () => {
++    const html = renderCard({});
++    expect(html).not.toContain('data-testid="device-card-connect-dev-1"');
++    const openTag = tagOf(html, 'device-card-open-dev-1');
++    expect(openTag).toContain('href="/devices/dev-1"');
++    expect(html).toContain('打开');
++  });
++
++  test('已连接显示「断开」', () => {
++    const html = renderCard({ connection: stubConnection('connected') });
++    const tag = tagOf(html, 'device-card-connect-dev-1');
++    expect(tag).toContain('data-state="connected"');
++    expect(tag).toContain('data-action="disconnect"');
++    expect(html).toContain('断开');
++  });
++
++  test('已断开显示「连接」', () => {
++    const html = renderCard({ connection: stubConnection('disconnected') });
++    const tag = tagOf(html, 'device-card-connect-dev-1');
++    expect(tag).toContain('data-state="disconnected"');
++    expect(tag).toContain('data-action="connect"');
++  });
++
++  test('出错也显示「连接」，可以直接重连', () => {
++    const tag = tagOf(
++      renderCard({ connection: stubConnection('error') }),
++      'device-card-connect-dev-1'
++    );
++    expect(tag).toContain('data-state="error"');
++    expect(tag).toContain('data-action="connect"');
++  });
++
++  test('连接中禁用按钮', () => {
++    const html = renderCard({ connection: stubConnection('connecting') });
++    const tag = tagOf(html, 'device-card-connect-dev-1');
++    expect(tag).toContain('data-action="pending"');
++    expect(tag).toContain('disabled');
++    expect(html).toContain('连接中...');
++  });
++
++  test('重连中与连接中同样禁用', () => {
++    const tag = tagOf(
++      renderCard({ connection: stubConnection('reconnecting') }),
++      'device-card-connect-dev-1'
++    );
++    expect(tag).toContain('data-state="reconnecting"');
++    expect(tag).toContain('data-action="pending"');
++  });
++
++  test('有 connection 时「打开」仍在，只是变成图标按钮', () => {
++    const html = renderCard({ connection: stubConnection('connected') });
++    expect(tagOf(html, 'device-card-open-dev-1')).toContain('href="/devices/dev-1"');
++  });
++});
++
+ describe('DeviceCard 的侧栏可见性开关', () => {
+   test('self 的设备默认开', () => {
+-    expect(switchState(renderCard('self'))).toBe('checked');
++    expect(switchState(renderCard({}))).toBe('checked');
+   });
+ 
+   test('远端 node 的设备默认关', () => {
+-    expect(switchState(renderCard('n1'))).toBe('unchecked');
++    expect(switchState(renderCard({ nodeContext: REMOTE_CONTEXT }))).toBe('unchecked');
+   });
+ 
+   test('紧凑布局仍保留 e2e 依赖的选择器', () => {
+-    const html = renderCard('self');
++    const html = renderCard({});
+     expect(html).toContain('data-testid="device-card"');
+-    expect(html).toContain('data-testid="device-card-connect-dev-1"');
++    expect(html).toContain('data-testid="device-card-open-dev-1"');
+     expect(html).toContain('data-testid="device-card-actions-dev-1"');
+     expect(html).toContain('data-testid="device-card-sidebar-dev-1"');
+   });
+ 
+   test('开关键名按 node 归属复合，不同 node 的同名 device id 互不覆盖', () => {
+-    expect(sidebarDeviceVisibilityKey('self', DEVICE.id)).not.toBe(
+-      sidebarDeviceVisibilityKey('n1', DEVICE.id)
++    expect(sidebarDeviceVisibilityKey('self', LOCAL_DEVICE.id)).not.toBe(
++      sidebarDeviceVisibilityKey('n1', LOCAL_DEVICE.id)
+     );
+   });
+ });
+diff --git a/packages/panels/src/device-management/device-card.tsx b/packages/panels/src/device-management/device-card.tsx
+index 38bc7b65..54c25b36 100644
+--- a/packages/panels/src/device-management/device-card.tsx
++++ b/packages/panels/src/device-management/device-card.tsx
+@@ -1,11 +1,13 @@
+-// 设备卡片：紧凑两行布局。第一行图标/名称/副标题 + 连接与更多菜单，第二行类型与状态徽标
+-// + 「显示在侧栏」开关（浏览器本地偏好，按 `${runtimeNodeId}:${deviceId}` 记）。
++// 设备卡片：紧凑两行布局。第一行图标/名称/SSH 目标 + 连接开关、打开与更多菜单；
++// 第二行「设备种类」pill（本地 / SSH / 节点 X 上的…，种类只在这里出现一次）、会话、
++// 状态徽标与「显示在侧栏」开关（浏览器本地偏好，按 `${runtimeNodeId}:${deviceId}` 记）。
+ 
+ import { useMutation } from '@tanstack/react-query';
+ import { testDeviceConnection } from '@tmex/api-client';
+ import type { Device } from '@tmex/shared';
+ import { hostAppPath, isSidebarDeviceVisible, sidebarDeviceVisibilityKey } from '@tmex/stores';
+ import { useRuntime, useUIStore } from '@tmex/stores/react';
++import { cn } from '@tmex/ui';
+ import { Badge } from '@tmex/ui/badge';
+ import { Button, buttonVariants } from '@tmex/ui/button';
+ import { Card, CardContent } from '@tmex/ui/card';
+@@ -17,39 +19,75 @@ import {
+   DropdownMenuTrigger,
+ } from '@tmex/ui/dropdown-menu';
+ import { Switch } from '@tmex/ui/switch';
+-import { Globe, Monitor, MoreHorizontal, Pencil, Trash2, Zap } from 'lucide-react';
++import {
++  ArrowUpRight,
++  Globe,
++  Monitor,
++  MoreHorizontal,
++  Network,
++  Pencil,
++  Trash2,
++  Zap,
++} from 'lucide-react';
+ import type { CSSProperties } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ import { toast } from 'sonner';
++import type { DeviceConnectionAdapter } from '../device-connection';
+ import { DeviceStatusBadge } from '../device-status-badge';
++import { DeviceCardConnectToggle } from './device-card-connect-toggle';
++import {
++  type DeviceNodeContext,
++  deviceDisplayKind,
++  deviceKindLabel,
++  isRemoteDeviceKind,
++} from './device-node-context';
+ 
+ export interface DeviceCardProps {
+   device: Device;
+   onEdit: () => void;
+   onDelete: () => void;
+-  /** 该设备所属 node 的运行时 id；缺省取当前运行时（`self` 即 entry 自身）。 */
+-  runtimeNodeId?: string;
++  /** 该设备所属 node 的展示上下文；由宿主（DeviceCardHost / 面板）注入 */
++  nodeContext: DeviceNodeContext;
++  /** 有它才显示真实的连接/断开开关；缺省时只留「打开」 */
++  connection?: DeviceConnectionAdapter;
+   /** 卡片根节点内联样式；列表用它挂 `--tmex-stagger-index` 做逐项入场 */
+   style?: CSSProperties;
++  className?: string;
+ }
+ 
+-export function DeviceCard({ device, onEdit, onDelete, runtimeNodeId, style }: DeviceCardProps) {
+-  const { t } = useTranslation();
+-  const runtime = useRuntime();
+-  const nodeId = runtimeNodeId ?? runtime.nodeId;
++/** SSH 目标只对 SSH 设备有信息量；本地设备不渲染第二行，种类交给底部 pill。 */
++function sshTarget(device: Device): string | null {
++  if (device.type !== 'ssh') return null;
++  return `${device.username ?? '-'}@${device.host ?? '-'}:${device.port ?? 22}`;
++}
+ 
+-  const sidebarVisible = useUIStore((state) =>
+-    isSidebarDeviceVisible(state.sidebarDeviceVisibility, nodeId, device.id)
++function DeviceCardIcon({ device, remote }: { device: Device; remote: boolean }) {
++  return (
++    <div className="relative shrink-0">
++      <div className="flex h-7 w-7 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
++        {device.type === 'local' ? <Monitor className="h-4 w-4" /> : <Globe className="h-4 w-4" />}
++      </div>
++      {remote && (
++        <span
++          aria-hidden="true"
++          data-testid={`device-card-remote-${device.id}`}
++          className="absolute -bottom-1 -right-1 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-background bg-muted text-muted-foreground"
++        >
++          <Network className="h-2.5 w-2.5" />
++        </span>
++      )}
++    </div>
+   );
+-  const setSidebarVisible = useUIStore((state) => state.setSidebarDeviceVisibility);
++}
+ 
+-  const icon =
+-    device.type === 'local' ? <Monitor className="h-4 w-4" /> : <Globe className="h-4 w-4" />;
+-  const subtitle =
+-    device.type === 'local'
+-      ? t('device.typeLocal')
+-      : `${device.username ?? '-'}@${device.host ?? '-'}:${device.port ?? 22}`;
++function DeviceCardMenu({
++  device,
++  onEdit,
++  onDelete,
++}: Pick<DeviceCardProps, 'device' | 'onEdit' | 'onDelete'>) {
++  const { t } = useTranslation();
++  const runtime = useRuntime();
+ 
+   const testConnection = useMutation({
+     mutationFn: () => testDeviceConnection(device.id, t('common.error'), runtime.apiClient),
+@@ -61,80 +99,123 @@ export function DeviceCard({ device, onEdit, onDelete, runtimeNodeId, style }: D
+     },
+   });
+ 
++  return (
++    <DropdownMenu>
++      <DropdownMenuTrigger
++        render={
++          <Button
++            variant="ghost"
++            size="icon-sm"
++            className="shrink-0"
++            data-testid={`device-card-actions-${device.id}`}
++            aria-label={t('common.edit')}
++            title={t('common.edit')}
++          />
++        }
++      >
++        <MoreHorizontal className="h-4 w-4" />
++      </DropdownMenuTrigger>
++      <DropdownMenuContent align="end">
++        <DropdownMenuItem data-testid={`device-card-edit-${device.id}`} onClick={onEdit}>
++          <Pencil className="h-4 w-4" />
++          {t('common.edit')}
++        </DropdownMenuItem>
++        {device.type === 'ssh' && (
++          <DropdownMenuItem
++            data-testid={`device-card-test-${device.id}`}
++            onClick={() => testConnection.mutate()}
++            disabled={testConnection.isPending}
++          >
++            <Zap className="h-4 w-4" />
++            {t('common.test')}
++          </DropdownMenuItem>
++        )}
++        <DropdownMenuSeparator />
++        <DropdownMenuItem
++          data-testid={`device-card-delete-${device.id}`}
++          variant="destructive"
++          onClick={onDelete}
++        >
++          <Trash2 className="h-4 w-4" />
++          {t('common.delete')}
++        </DropdownMenuItem>
++      </DropdownMenuContent>
++    </DropdownMenu>
++  );
++}
++
++export function DeviceCard({
++  device,
++  onEdit,
++  onDelete,
++  nodeContext,
++  connection,
++  style,
++  className,
++}: DeviceCardProps) {
++  const { t } = useTranslation();
++  const runtime = useRuntime();
++  const nodeId = nodeContext.runtimeNodeId;
++
++  const sidebarVisible = useUIStore((state) =>
++    isSidebarDeviceVisible(state.sidebarDeviceVisibility, nodeId, device.id)
++  );
++  const setSidebarVisible = useUIStore((state) => state.setSidebarDeviceVisibility);
++
++  const kind = deviceDisplayKind(device.type, nodeContext);
++  const kindLabel = deviceKindLabel(t, kind, nodeContext.name);
++  const target = sshTarget(device);
++
+   return (
+     <Card
+       size="sm"
+       data-testid="device-card"
+       data-device-id={device.id}
+       data-device-name={device.name}
++      data-device-kind={kind}
+       style={style}
+-      className="gap-2 overflow-hidden border-border/50 py-2.5 transition-[box-shadow,border-color] duration-(--tmex-motion-standard) ease-out hover:shadow-md hover:ring-foreground/20 motion-reduce:transition-none"
++      className={cn(
++        'gap-2 overflow-hidden border-border/50 py-2.5 transition-[box-shadow,border-color] duration-(--tmex-motion-standard) ease-out hover:shadow-md hover:ring-foreground/20 motion-reduce:transition-none',
++        className
++      )}
+     >
+       <CardContent className="flex items-center gap-2">
+-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
+-          {icon}
+-        </div>
++        <DeviceCardIcon device={device} remote={isRemoteDeviceKind(kind)} />
+         <div className="min-w-0 flex-1">
+           <div className="truncate text-sm font-medium leading-tight" title={device.name}>
+             {device.name}
+           </div>
+-          <div className="truncate text-xs leading-tight text-muted-foreground" title={subtitle}>
+-            {subtitle}
+-          </div>
++          {target && (
++            <div className="truncate text-xs leading-tight text-muted-foreground" title={target}>
++              {target}
++            </div>
++          )}
+         </div>
++        {connection && <DeviceCardConnectToggle deviceId={device.id} connection={connection} />}
+         <Link
+           to={hostAppPath(runtime.host, `/devices/${device.id}`)}
+-          data-testid={`device-card-connect-${device.id}`}
+-          className={buttonVariants({ variant: 'outline', size: 'sm', className: 'shrink-0' })}
++          data-testid={`device-card-open-${device.id}`}
++          aria-label={t('device.open')}
++          title={t('device.open')}
++          className={buttonVariants({
++            variant: connection ? 'ghost' : 'outline',
++            size: connection ? 'icon-sm' : 'sm',
++            className: 'shrink-0',
++          })}
+         >
+-          {t('device.connect')}
++          <ArrowUpRight className="h-4 w-4" />
++          {connection ? null : t('device.open')}
+         </Link>
+-        <DropdownMenu>
+-          <DropdownMenuTrigger
+-            render={
+-              <Button
+-                variant="ghost"
+-                size="icon-sm"
+-                className="shrink-0"
+-                data-testid={`device-card-actions-${device.id}`}
+-                aria-label={t('common.edit')}
+-                title={t('common.edit')}
+-              />
+-            }
+-          >
+-            <MoreHorizontal className="h-4 w-4" />
+-          </DropdownMenuTrigger>
+-          <DropdownMenuContent align="end">
+-            <DropdownMenuItem data-testid={`device-card-edit-${device.id}`} onClick={onEdit}>
+-              <Pencil className="h-4 w-4" />
+-              {t('common.edit')}
+-            </DropdownMenuItem>
+-            {device.type === 'ssh' && (
+-              <DropdownMenuItem
+-                data-testid={`device-card-test-${device.id}`}
+-                onClick={() => testConnection.mutate()}
+-                disabled={testConnection.isPending}
+-              >
+-                <Zap className="h-4 w-4" />
+-                {t('common.test')}
+-              </DropdownMenuItem>
+-            )}
+-            <DropdownMenuSeparator />
+-            <DropdownMenuItem
+-              data-testid={`device-card-delete-${device.id}`}
+-              variant="destructive"
+-              onClick={onDelete}
+-            >
+-              <Trash2 className="h-4 w-4" />
+-              {t('common.delete')}
+-            </DropdownMenuItem>
+-          </DropdownMenuContent>
+-        </DropdownMenu>
++        <DeviceCardMenu device={device} onEdit={onEdit} onDelete={onDelete} />
+       </CardContent>
+ 
+       <CardContent className="flex flex-wrap items-center gap-x-2 gap-y-1">
+-        <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
+-          {device.type === 'local' ? t('device.typeLocal') : t('device.typeSSHBadge')}
++        <Badge
++          variant="outline"
++          data-testid={`device-card-kind-${device.id}`}
++          className="max-w-full truncate px-1.5 py-0 text-[10px] font-normal"
++        >
++          {kindLabel}
+         </Badge>
+         {device.session && (
+           <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
+diff --git a/packages/panels/src/device-management/device-delete-dialog.tsx b/packages/panels/src/device-management/device-delete-dialog.tsx
+new file mode 100644
+index 00000000..f9833de2
+--- /dev/null
++++ b/packages/panels/src/device-management/device-delete-dialog.tsx
+@@ -0,0 +1,74 @@
++// 设备删除确认：删除 mutation 与确认框成对，随卡片宿主一起挂载。
++
++import { useMutation, useQueryClient } from '@tanstack/react-query';
++import { deleteDevice as deleteDeviceApi } from '@tmex/api-client';
++import type { Device } from '@tmex/shared';
++import { useRuntime } from '@tmex/stores/react';
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogMedia,
++  AlertDialogTitle,
++} from '@tmex/ui/alert-dialog';
++import { Trash2 } from 'lucide-react';
++import { useTranslation } from 'react-i18next';
++import { toast } from 'sonner';
++
++export interface DeviceDeleteDialogProps {
++  /** 为 null 时对话框关闭 */
++  device: Device | null;
++  queryKey: readonly unknown[];
++  onClose: () => void;
++}
++
++export function DeviceDeleteDialog({ device, queryKey, onClose }: DeviceDeleteDialogProps) {
++  const { t } = useTranslation();
++  const runtime = useRuntime();
++  const queryClient = useQueryClient();
++
++  const deleteDevice = useMutation({
++    mutationFn: (id: string) => deleteDeviceApi(id, t('device.deleteFailed'), runtime.apiClient),
++    onSuccess: () => {
++      queryClient.invalidateQueries({ queryKey });
++      toast.success(t('common.success'));
++    },
++    onError: (err) => {
++      toast.error(err instanceof Error ? err.message : t('common.error'));
++    },
++  });
++
++  return (
++    <AlertDialog open={device !== null} onOpenChange={(open) => !open && onClose()}>
++      <AlertDialogContent>
++        <AlertDialogHeader>
++          <AlertDialogMedia className="bg-destructive/10">
++            <Trash2 className="h-5 w-5 text-destructive" />
++          </AlertDialogMedia>
++          <AlertDialogTitle>{t('device.deleteConfirm')}</AlertDialogTitle>
++          <AlertDialogDescription>
++            {t('device.deleteDescription', { name: device?.name ?? '' })}
++          </AlertDialogDescription>
++        </AlertDialogHeader>
++        <AlertDialogFooter>
++          <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
++          <AlertDialogAction
++            variant="destructive"
++            disabled={!device || deleteDevice.isPending}
++            onClick={() => {
++              if (!device) return;
++              deleteDevice.mutate(device.id);
++              onClose();
++            }}
++          >
++            {t('common.delete')}
++          </AlertDialogAction>
++        </AlertDialogFooter>
++      </AlertDialogContent>
++    </AlertDialog>
++  );
++}
+diff --git a/packages/panels/src/device-management/device-dialog.tsx b/packages/panels/src/device-management/device-dialog.tsx
+index 6c666395..7e8d6dc1 100644
+--- a/packages/panels/src/device-management/device-dialog.tsx
++++ b/packages/panels/src/device-management/device-dialog.tsx
+@@ -1,4 +1,5 @@
+-// 设备增改对话框：组合基础/连接/认证字段与提交逻辑，成功后按注入的 queryKey 失效缓存。
++// 设备增改对话框：按设备种类（local / ssh / 远端节点上的 local / ssh）组合区块，
++// 成功后按注入的 queryKey 失效缓存。类型创建后不可改（编辑态下拉禁用，update payload 也不含 type）。
+ 
+ import type { Device } from '@tmex/shared';
+ import { Button } from '@tmex/ui/button';
+@@ -15,17 +16,26 @@ import { useTranslation } from 'react-i18next';
+ import { DeviceAuthFields } from './device-auth-fields';
+ import { DeviceBasicFields } from './device-basic-fields';
+ import { type DeviceFormValues, createDefaultFormValues } from './device-form';
++import {
++  type DeviceNodeContext,
++  deviceDisplayKind,
++  deviceKindLabel,
++  isRemoteDeviceKind,
++} from './device-node-context';
++import { DeviceRemoteInfoFields } from './device-remote-info-fields';
+ import { DeviceSshConnectionFields } from './device-ssh-connection-fields';
+ import { type DeviceDialogMode, useDeviceDialogSubmit } from './use-device-dialog-submit';
+ 
+ export interface DeviceDialogProps {
+   mode: DeviceDialogMode;
+   device?: Device;
++  /** 目标节点上下文：决定种类展示、远端只读信息块与新建时的描述文案 */
++  nodeContext: DeviceNodeContext;
+   onClose: () => void;
+   queryKey: readonly unknown[];
+ }
+ 
+-export function DeviceDialog({ mode, device, onClose, queryKey }: DeviceDialogProps) {
++export function DeviceDialog({ mode, device, nodeContext, onClose, queryKey }: DeviceDialogProps) {
+   const { t } = useTranslation();
+   const [values, setValues] = useState<DeviceFormValues>(createDefaultFormValues(device));
+   const { attempted, isSubmitting, handleSubmit } = useDeviceDialogSubmit({
+@@ -41,18 +51,41 @@ export function DeviceDialog({ mode, device, onClose, queryKey }: DeviceDialogPr
+     setValues((current) => ({ ...current, ...patch }));
+   const fieldsProps = { mode, values, attempted, onChange };
+ 
++  const kind = deviceDisplayKind(values.type, nodeContext);
++  const isRemote = isRemoteDeviceKind(kind);
++  const description = isEditMode
++    ? t('device.editDeviceDescription')
++    : isRemote
++      ? t('devices.nodes.addDevice', { name: nodeContext.name })
++      : t('device.addDeviceDescription');
++
+   return (
+     <Dialog open={true} onOpenChange={(open) => !open && onClose()}>
+-      <DialogContent data-testid="device-dialog" className="w-full max-w-2xl">
++      <DialogContent
++        data-testid="device-dialog"
++        data-device-kind={kind}
++        className="w-full max-w-2xl"
++      >
+         <DialogHeader>
+-          <DialogTitle>{isEditMode ? t('device.editDevice') : t('device.addDevice')}</DialogTitle>
+-          <DialogDescription>
+-            {isEditMode ? t('device.editDeviceDescription') : t('device.addDeviceDescription')}
+-          </DialogDescription>
++          <DialogTitle className="flex flex-wrap items-center gap-2">
++            {isEditMode ? t('device.editDevice') : t('device.addDevice')}
++            {isRemote && (
++              <span
++                data-testid="device-dialog-node-chip"
++                className="rounded border border-border/60 px-1.5 py-px text-[10px] font-normal leading-none text-muted-foreground"
++              >
++                {deviceKindLabel(t, kind, nodeContext.name)}
++              </span>
++            )}
++          </DialogTitle>
++          <DialogDescription>{description}</DialogDescription>
+         </DialogHeader>
+ 
+         <form onSubmit={handleSubmit} className="space-y-4">
+           <div className="-mr-2 max-h-[min(70dvh,720px)] space-y-5 overflow-y-auto pr-2">
++            {isEditMode && isRemote && device && (
++              <DeviceRemoteInfoFields device={device} nodeContext={nodeContext} />
++            )}
+             <DeviceBasicFields {...fieldsProps} />
+             {values.type === 'ssh' && (
+               <>
+diff --git a/packages/panels/src/device-management/device-form.test.ts b/packages/panels/src/device-management/device-form.test.ts
+new file mode 100644
+index 00000000..8ac0063c
+--- /dev/null
++++ b/packages/panels/src/device-management/device-form.test.ts
+@@ -0,0 +1,176 @@
++// 设备表单纯逻辑：默认值归一（authMode auto → agent）、create/update payload 的字段裁剪与校验。
++
++import { describe, expect, test } from 'bun:test';
++import type { Device } from '@tmex/shared';
++import {
++  type DeviceFormValues,
++  buildCreatePayload,
++  buildUpdatePayload,
++  createDefaultFormValues,
++  isValidSshPort,
++  normalizeSshAuthMode,
++  validateDeviceForm,
++} from './device-form';
++
++const BASE_DEVICE: Device = {
++  id: 'dev-1',
++  name: '书房',
++  type: 'local',
++  authMode: 'auto',
++  sortOrder: 0,
++  createdAt: '2026-01-01T00:00:00.000Z',
++  updatedAt: '2026-01-01T00:00:00.000Z',
++};
++
++function sshDevice(overrides: Partial<Device> = {}): Device {
++  return {
++    ...BASE_DEVICE,
++    type: 'ssh',
++    host: '10.0.0.2',
++    port: 2222,
++    username: 'root',
++    authMode: 'agent',
++    ...overrides,
++  };
++}
++
++function sshValues(overrides: Partial<DeviceFormValues> = {}): DeviceFormValues {
++  return {
++    name: '  书房  ',
++    type: 'ssh',
++    host: '  10.0.0.2  ',
++    port: 2222,
++    username: '  root  ',
++    sshConfigRef: '  prod  ',
++    session: '  tmex  ',
++    defaultWorkingDir: '  /srv  ',
++    authMode: 'agent',
++    password: 'pw',
++    privateKey: 'KEY',
++    privateKeyPassphrase: 'pass',
++    ...overrides,
++  };
++}
++
++describe('normalizeSshAuthMode', () => {
++  test('auto / 缺失都归一为 agent', () => {
++    expect(normalizeSshAuthMode('auto')).toBe('agent');
++    expect(normalizeSshAuthMode(undefined)).toBe('agent');
++    expect(normalizeSshAuthMode(null)).toBe('agent');
++  });
++
++  test('其余模式原样保留', () => {
++    expect(normalizeSshAuthMode('password')).toBe('password');
++    expect(normalizeSshAuthMode('key')).toBe('key');
++    expect(normalizeSshAuthMode('configRef')).toBe('configRef');
++  });
++});
++
++describe('createDefaultFormValues', () => {
++  test('新建默认是本地设备', () => {
++    const values = createDefaultFormValues();
++    expect(values.type).toBe('local');
++    expect(values.authMode).toBe('auto');
++    expect(values.session).toBe('tmex');
++  });
++
++  test('编辑 SSH 设备时 authMode=auto 归一为 agent，保证下拉有匹配项', () => {
++    expect(createDefaultFormValues(sshDevice({ authMode: 'auto' })).authMode).toBe('agent');
++  });
++
++  test('编辑 SSH 设备保留显式的认证方式', () => {
++    expect(createDefaultFormValues(sshDevice({ authMode: 'configRef' })).authMode).toBe(
++      'configRef'
++    );
++  });
++
++  test('本地设备的 authMode 永远是 auto（历史脏数据也归一）', () => {
++    expect(createDefaultFormValues(BASE_DEVICE).authMode).toBe('auto');
++    expect(createDefaultFormValues({ ...BASE_DEVICE, authMode: 'password' }).authMode).toBe('auto');
++  });
++});
++
++describe('buildCreatePayload', () => {
++  test('本地设备只发基础字段，不带任何 SSH 连接/认证字段', () => {
++    const payload = buildCreatePayload(sshValues({ type: 'local' }));
++    expect(payload).toEqual({
++      name: '书房',
++      type: 'local',
++      session: 'tmex',
++      defaultWorkingDir: '/srv',
++      authMode: 'auto',
++    });
++  });
++
++  test('SSH + agent 发连接字段，不带密码/私钥/configRef', () => {
++    const payload = buildCreatePayload(sshValues());
++    expect(payload.type).toBe('ssh');
++    expect(payload.host).toBe('10.0.0.2');
++    expect(payload.port).toBe(2222);
++    expect(payload.username).toBe('root');
++    expect(payload.password).toBeUndefined();
++    expect(payload.privateKey).toBeUndefined();
++    expect(payload.sshConfigRef).toBeUndefined();
++  });
++
++  test('按认证方式只带该模式需要的密钥字段', () => {
++    expect(buildCreatePayload(sshValues({ authMode: 'password' })).password).toBe('pw');
++    expect(buildCreatePayload(sshValues({ authMode: 'key' })).privateKey).toBe('KEY');
++    expect(buildCreatePayload(sshValues({ authMode: 'key' })).privateKeyPassphrase).toBe('pass');
++    expect(buildCreatePayload(sshValues({ authMode: 'configRef' })).sshConfigRef).toBe('prod');
++  });
++});
++
++describe('buildUpdatePayload', () => {
++  test('本地设备的更新 payload 不含 type（类型创建后不可改）', () => {
++    const payload = buildUpdatePayload(sshValues({ type: 'local' }));
++    expect(payload).not.toHaveProperty('type');
++    expect(payload).toEqual({
++      name: '书房',
++      session: 'tmex',
++      defaultWorkingDir: '/srv',
++      authMode: 'auto',
++    });
++  });
++
++  test('SSH 设备的更新 payload 同样不含 type', () => {
++    const payload = buildUpdatePayload(sshValues());
++    expect(payload).not.toHaveProperty('type');
++    expect(payload.host).toBe('10.0.0.2');
++    expect(payload.authMode).toBe('agent');
++  });
++
++  test('非 configRef 模式显式清空 sshConfigRef，清理历史脏数据', () => {
++    expect(buildUpdatePayload(sshValues({ authMode: 'agent' })).sshConfigRef).toBe('');
++    expect(buildUpdatePayload(sshValues({ authMode: 'configRef' })).sshConfigRef).toBe('prod');
++  });
++
++  test('密码/私钥留空表示不改，不进 payload', () => {
++    const payload = buildUpdatePayload(sshValues({ authMode: 'password', password: '' }));
++    expect(payload.password).toBeUndefined();
++    const keyPayload = buildUpdatePayload(sshValues({ authMode: 'key', privateKey: '' }));
++    expect(keyPayload.privateKey).toBeUndefined();
++  });
++});
++
++describe('validateDeviceForm', () => {
++  test('本地设备无需校验 SSH 字段', () => {
++    expect(validateDeviceForm(sshValues({ type: 'local', host: '' }))).toBeNull();
++  });
++
++  test('SSH 设备缺 host/port/username/configRef 时返回对应 i18n key', () => {
++    expect(validateDeviceForm(sshValues({ host: '   ' }))).toBe('validation.hostRequired');
++    expect(validateDeviceForm(sshValues({ port: Number.NaN }))).toBe('validation.portRequired');
++    expect(validateDeviceForm(sshValues({ username: '   ' }))).toBe('validation.usernameRequired');
++    expect(validateDeviceForm(sshValues({ authMode: 'configRef', sshConfigRef: ' ' }))).toBe(
++      'validation.sshConfigRequired'
++    );
++  });
++
++  test('端口边界', () => {
++    expect(isValidSshPort(0)).toBe(false);
++    expect(isValidSshPort(1)).toBe(true);
++    expect(isValidSshPort(65535)).toBe(true);
++    expect(isValidSshPort(65536)).toBe(false);
++  });
++});
+diff --git a/packages/panels/src/device-management/device-form.ts b/packages/panels/src/device-management/device-form.ts
+index 834af283..c4933881 100644
+--- a/packages/panels/src/device-management/device-form.ts
++++ b/packages/panels/src/device-management/device-form.ts
+@@ -1,6 +1,6 @@
+ // 设备表单纯逻辑：默认值、payload 构造与校验（local/ssh 四种 authMode）。
+ 
+-import type { CreateDeviceRequest, Device, UpdateDeviceRequest } from '@tmex/shared';
++import type { AuthMode, CreateDeviceRequest, Device, UpdateDeviceRequest } from '@tmex/shared';
+ 
+ export type DeviceFormValues = {
+   name: string;
+@@ -17,6 +17,12 @@ export type DeviceFormValues = {
+   privateKeyPassphrase: string;
+ };
+ 
++// 下拉里没有 `auto` 这一项：gateway 的 ssh-auth 把 auto 与 agent 同等对待，
++// 归一到 agent 才能保证编辑历史 SSH 设备时下拉总有匹配项（否则显示空白）。
++export function normalizeSshAuthMode(authMode: AuthMode | undefined | null): AuthMode {
++  return authMode && authMode !== 'auto' ? authMode : 'agent';
++}
++
+ function normalizeText(value: string): string | undefined {
+   const trimmed = value.trim();
+   return trimmed ? trimmed : undefined;
+@@ -51,7 +57,7 @@ export function createDefaultFormValues(device?: Device): DeviceFormValues {
+     sshConfigRef: device.sshConfigRef ?? '',
+     session: device.session ?? 'tmex',
+     defaultWorkingDir: device.defaultWorkingDir ?? '',
+-    authMode: device.type === 'local' ? 'auto' : device.authMode,
++    authMode: device.type === 'local' ? 'auto' : normalizeSshAuthMode(device.authMode),
+     password: '',
+     privateKey: '',
+     privateKeyPassphrase: '',
+diff --git a/packages/panels/src/device-management/device-management-panel.tsx b/packages/panels/src/device-management/device-management-panel.tsx
+index 145f7947..5c6f9a1b 100644
+--- a/packages/panels/src/device-management/device-management-panel.tsx
++++ b/packages/panels/src/device-management/device-management-panel.tsx
+@@ -1,37 +1,32 @@
+-// 设备管理面板：设备卡片网格 + 增改对话框 + 删除确认 + 空态/加载/错误态。
+-// 数据自取（fetchDevices + 注入 queryKey），REST 一律经 runtime.apiClient；
+-// 「添加设备」既可经全局事件（缺省监听，多面板宿主可关）也可经 ref 命令式打开。
++// 设备管理面板：设备卡片网格 + 新建对话框 + 空态/加载/错误态（每张卡片的编辑与删除
++// 由 DeviceCardHost 自己管）。数据自取（fetchDevices + 注入 queryKey），REST 一律经
++// runtime.apiClient；「添加设备」既可经全局事件（缺省监听，多面板宿主可关）也可经 ref 命令式打开。
+ 
+-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+-import {
+-  devicesQueryKey as defaultDevicesQueryKey,
+-  deleteDevice as deleteDeviceApi,
+-  fetchDevices,
+-} from '@tmex/api-client';
++import { useQuery } from '@tanstack/react-query';
++import { devicesQueryKey as defaultDevicesQueryKey, fetchDevices } from '@tmex/api-client';
+ import type { Device } from '@tmex/shared';
+ import { toBCP47 } from '@tmex/shared';
+ import { useRuntime, useSiteStore, useTmuxStore } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+-import {
+-  AlertDialog,
+-  AlertDialogAction,
+-  AlertDialogCancel,
+-  AlertDialogContent,
+-  AlertDialogDescription,
+-  AlertDialogFooter,
+-  AlertDialogHeader,
+-  AlertDialogMedia,
+-  AlertDialogTitle,
+-} from '@tmex/ui/alert-dialog';
+ import { Button } from '@tmex/ui/button';
+ import { Card, CardContent } from '@tmex/ui/card';
+ import { staggerItemStyle } from '@tmex/ui/motion';
+-import { Monitor, Plus, Trash2 } from 'lucide-react';
+-import { type Ref, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
++import { Monitor, Plus } from 'lucide-react';
++import {
++  Fragment,
++  type ReactNode,
++  type Ref,
++  useEffect,
++  useImperativeHandle,
++  useMemo,
++  useRef,
++  useState,
++} from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { toast } from 'sonner';
+-import { DeviceCard } from './device-card';
++import type { DeviceConnectionAdapter } from '../device-connection';
++import { DeviceCardHost } from './device-card-host';
+ import { DeviceDialog } from './device-dialog';
++import type { DeviceNodeContext } from './device-node-context';
+ import { OPEN_ADD_DEVICE_EVENT } from './events';
+ 
+ /** 首屏逐项入场的延迟档位上限（35ms/档），超出的卡片与最后一档同时进场 */
+@@ -59,6 +54,16 @@ export interface DeviceManagementPanelProps {
+   devicesQueryKey?: readonly unknown[];
+   /** 是否监听全局 OPEN_ADD_DEVICE_EVENT 打开新建对话框；多面板宿主可关掉改用 ref 控制 */
+   listenOpenAddDeviceEvent?: boolean;
++  /** 该面板所展示的 node；缺省视为 entry 自身 */
++  nodeContext?: DeviceNodeContext;
++  /** 有它卡片才显示真实连接/断开开关；没有时退化为只有「打开」 */
++  connection?: DeviceConnectionAdapter;
++  /** 这些设备不在本面板网格里渲染（已被宿主放进文件夹之类的容器） */
++  excludeDeviceIds?: ReadonlySet<string>;
++  /** 宿主在卡片外再包一层（拖拽把手等） */
++  renderCard?: (card: ReactNode, device: Device, index: number) => ReactNode;
++  /** 列表为空/全被排除时不渲染空态卡片，只留对话框 */
++  hideEmptyState?: boolean;
+   className?: string;
+   ref?: Ref<DeviceManagementPanelHandle>;
+ }
+@@ -66,17 +71,24 @@ export interface DeviceManagementPanelProps {
+ export function DeviceManagementPanel({
+   devicesQueryKey = defaultDevicesQueryKey,
+   listenOpenAddDeviceEvent = true,
++  nodeContext,
++  connection,
++  excludeDeviceIds,
++  renderCard,
++  hideEmptyState = false,
+   className,
+   ref,
+ }: DeviceManagementPanelProps) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+   const [showAddModal, setShowAddModal] = useState(false);
+-  const [editingDevice, setEditingDevice] = useState<Device | null>(null);
+-  const [deleteCandidate, setDeleteCandidate] = useState<Device | null>(null);
+-  const queryClient = useQueryClient();
+   const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
+ 
++  const resolvedNodeContext = useMemo<DeviceNodeContext>(
++    () => nodeContext ?? { runtimeNodeId: runtime.nodeId, name: '', isSelf: true },
++    [nodeContext, runtime.nodeId]
++  );
++
+   useImperativeHandle(ref, () => ({ openAddDevice: () => setShowAddModal(true) }), []);
+ 
+   useEffect(
+@@ -103,17 +115,6 @@ export function DeviceManagementPanel({
+     );
+   }, [data, hydrateDeviceErrors]);
+ 
+-  const deleteDevice = useMutation({
+-    mutationFn: (id: string) => deleteDeviceApi(id, t('device.deleteFailed'), runtime.apiClient),
+-    onSuccess: () => {
+-      queryClient.invalidateQueries({ queryKey: devicesQueryKey });
+-      toast.success(t('common.success'));
+-    },
+-    onError: (err) => {
+-      toast.error(err instanceof Error ? err.message : t('common.error'));
+-    },
+-  });
+-
+   // 卡片顺序与侧边栏 Panes Tab 一致：先 sortOrder，再按设备名 locale 感知排序
+   const devices = useMemo(() => {
+     const list = data?.devices ?? [];
+@@ -124,6 +125,12 @@ export function DeviceManagementPanel({
+     );
+   }, [data?.devices, language]);
+ 
++  const visibleDevices = useMemo(
++    () =>
++      excludeDeviceIds ? devices.filter((device) => !excludeDeviceIds.has(device.id)) : devices,
++    [devices, excludeDeviceIds]
++  );
++
+   // 逐项入场只做首屏那一批：之后 refetch/新增设备不再整列表重放（新卡片按 index 0 单独淡入）。
+   // 延迟档位封顶 STAGGER_MAX_INDEX，避免长列表拖尾。
+   const initialBatchRef = useRef<ReadonlySet<string> | null>(null);
+@@ -132,6 +139,29 @@ export function DeviceManagementPanel({
+   }
+   const initialBatch = initialBatchRef.current;
+ 
++  const emptyState = hideEmptyState ? null : (
++    <Card size="sm" className="tmex-reveal">
++      <CardContent className="space-y-3 py-8 text-center">
++        <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-muted">
++          <Monitor className="h-5 w-5 text-muted-foreground" />
++        </div>
++        <div className="space-y-0.5">
++          <h2 className="text-sm font-medium">{t('device.noDevices')}</h2>
++          <p className="text-xs text-muted-foreground">{t('device.addDevice')}</p>
++        </div>
++        <Button
++          variant="default"
++          size="sm"
++          data-testid="devices-add-empty"
++          onClick={() => setShowAddModal(true)}
++        >
++          <Plus className="h-4 w-4" />
++          {t('device.addDevice')}
++        </Button>
++      </CardContent>
++    </Card>
++  );
++
+   return (
+     <div
+       className={cn(
+@@ -152,91 +182,41 @@ export function DeviceManagementPanel({
+             {t('device.loadFailed')}
+           </CardContent>
+         </Card>
+-      ) : devices.length === 0 ? (
+-        <Card size="sm" className="tmex-reveal">
+-          <CardContent className="space-y-3 py-8 text-center">
+-            <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-muted">
+-              <Monitor className="h-5 w-5 text-muted-foreground" />
+-            </div>
+-            <div className="space-y-0.5">
+-              <h2 className="text-sm font-medium">{t('device.noDevices')}</h2>
+-              <p className="text-xs text-muted-foreground">{t('device.addDevice')}</p>
+-            </div>
+-            <Button
+-              variant="default"
+-              size="sm"
+-              data-testid="devices-add-empty"
+-              onClick={() => setShowAddModal(true)}
+-            >
+-              <Plus className="h-4 w-4" />
+-              {t('device.addDevice')}
+-            </Button>
+-          </CardContent>
+-        </Card>
++      ) : visibleDevices.length === 0 ? (
++        emptyState
+       ) : (
+         <div className="tmex-stagger grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+-          {devices.map((device, index) => (
+-            <DeviceCard
+-              key={device.id}
+-              device={device}
+-              style={
+-                initialBatch?.has(device.id)
+-                  ? staggerItemStyle(Math.min(index, STAGGER_MAX_INDEX))
+-                  : undefined
+-              }
+-              onEdit={() => setEditingDevice(device)}
+-              onDelete={() => setDeleteCandidate(device)}
+-            />
+-          ))}
++          {visibleDevices.map((device, index) => {
++            const card = (
++              <DeviceCardHost
++                device={device}
++                queryKey={devicesQueryKey}
++                nodeContext={resolvedNodeContext}
++                connection={connection}
++                style={
++                  initialBatch?.has(device.id)
++                    ? staggerItemStyle(Math.min(index, STAGGER_MAX_INDEX))
++                    : undefined
++                }
++              />
++            );
++            return (
++              <Fragment key={device.id}>
++                {renderCard ? renderCard(card, device, index) : card}
++              </Fragment>
++            );
++          })}
+         </div>
+       )}
+ 
+       {showAddModal && (
+         <DeviceDialog
+           mode="create"
++          nodeContext={resolvedNodeContext}
+           queryKey={devicesQueryKey}
+           onClose={() => setShowAddModal(false)}
+         />
+       )}
+-      {editingDevice && (
+-        <DeviceDialog
+-          mode="edit"
+-          device={editingDevice}
+-          queryKey={devicesQueryKey}
+-          onClose={() => setEditingDevice(null)}
+-        />
+-      )}
+-
+-      <AlertDialog
+-        open={deleteCandidate !== null}
+-        onOpenChange={(open) => !open && setDeleteCandidate(null)}
+-      >
+-        <AlertDialogContent>
+-          <AlertDialogHeader>
+-            <AlertDialogMedia className="bg-destructive/10">
+-              <Trash2 className="h-5 w-5 text-destructive" />
+-            </AlertDialogMedia>
+-            <AlertDialogTitle>{t('device.deleteConfirm')}</AlertDialogTitle>
+-            <AlertDialogDescription>
+-              {t('device.deleteDescription', { name: deleteCandidate?.name ?? '' })}
+-            </AlertDialogDescription>
+-          </AlertDialogHeader>
+-          <AlertDialogFooter>
+-            <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
+-            <AlertDialogAction
+-              variant="destructive"
+-              disabled={!deleteCandidate || deleteDevice.isPending}
+-              onClick={() => {
+-                if (!deleteCandidate) return;
+-                deleteDevice.mutate(deleteCandidate.id);
+-                setDeleteCandidate(null);
+-              }}
+-            >
+-              {t('common.delete')}
+-            </AlertDialogAction>
+-          </AlertDialogFooter>
+-        </AlertDialogContent>
+-      </AlertDialog>
+     </div>
+   );
+ }
+diff --git a/packages/panels/src/device-management/device-node-context.test.ts b/packages/panels/src/device-management/device-node-context.test.ts
+new file mode 100644
+index 00000000..e1ff0a9c
+--- /dev/null
++++ b/packages/panels/src/device-management/device-node-context.test.ts
+@@ -0,0 +1,47 @@
++// 设备种类：Device.type（local/ssh）× 节点上下文（self/远端）→ 四种展示种类与文案。
++
++import { describe, expect, test } from 'bun:test';
++import { I18N_RESOURCES } from '@tmex/shared';
++import i18next from 'i18next';
++import { deviceDisplayKind, deviceKindLabel, isRemoteDeviceKind } from './device-node-context';
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++});
++
++describe('deviceDisplayKind', () => {
++  test('本机上下文直接沿用设备类型', () => {
++    expect(deviceDisplayKind('local', { isSelf: true })).toBe('local');
++    expect(deviceDisplayKind('ssh', { isSelf: true })).toBe('ssh');
++  });
++
++  test('远端节点上下文加上 node 前缀', () => {
++    expect(deviceDisplayKind('local', { isSelf: false })).toBe('nodeLocal');
++    expect(deviceDisplayKind('ssh', { isSelf: false })).toBe('nodeSsh');
++  });
++});
++
++describe('isRemoteDeviceKind', () => {
++  test('只有 node* 两种算远端', () => {
++    expect(isRemoteDeviceKind('local')).toBe(false);
++    expect(isRemoteDeviceKind('ssh')).toBe(false);
++    expect(isRemoteDeviceKind('nodeLocal')).toBe(true);
++    expect(isRemoteDeviceKind('nodeSsh')).toBe(true);
++  });
++});
++
++describe('deviceKindLabel', () => {
++  test('本机两种不带节点名', () => {
++    expect(deviceKindLabel(i18n.t, 'local', '书房节点')).toBe('本地设备');
++    expect(deviceKindLabel(i18n.t, 'ssh', '书房节点')).toBe('SSH 设备');
++  });
++
++  test('远端两种插入节点名', () => {
++    expect(deviceKindLabel(i18n.t, 'nodeLocal', '书房节点')).toBe('节点 书房节点 上的本机设备');
++    expect(deviceKindLabel(i18n.t, 'nodeSsh', '书房节点')).toBe('节点 书房节点 上的 SSH 设备');
++  });
++});
+diff --git a/packages/panels/src/device-management/device-node-context.ts b/packages/panels/src/device-management/device-node-context.ts
+new file mode 100644
+index 00000000..22001986
+--- /dev/null
++++ b/packages/panels/src/device-management/device-node-context.ts
+@@ -0,0 +1,43 @@
++// 设备的「所属节点」渲染上下文。`Device.type` 只有 local | ssh，「是否属于远端 mesh 节点」
++// 是宿主按运行时注入的展示信息，不落在数据里。
++
++import type { DeviceType } from '@tmex/shared';
++import type { TFunction } from 'i18next';
++
++export interface DeviceNodeContext {
++  /** 运行时 / 路由 id：entry 自身为 `self`，远端为 mesh node id */
++  runtimeNodeId: string;
++  /** 展示名（self 也给真实主机名，可为空串） */
++  name: string;
++  isSelf: boolean;
++}
++
++export type DeviceDisplayKind = 'local' | 'ssh' | 'nodeLocal' | 'nodeSsh';
++
++export function deviceDisplayKind(
++  deviceType: DeviceType,
++  ctx: Pick<DeviceNodeContext, 'isSelf'>
++): DeviceDisplayKind {
++  if (ctx.isSelf) {
++    return deviceType;
++  }
++  return deviceType === 'local' ? 'nodeLocal' : 'nodeSsh';
++}
++
++/** 远端节点上的设备：连接参数由该节点自己管，本地只做展示与可见性偏好。 */
++export function isRemoteDeviceKind(kind: DeviceDisplayKind): boolean {
++  return kind === 'nodeLocal' || kind === 'nodeSsh';
++}
++
++export function deviceKindLabel(t: TFunction, kind: DeviceDisplayKind, nodeName: string): string {
++  switch (kind) {
++    case 'local':
++      return t('device.kind.local');
++    case 'ssh':
++      return t('device.kind.ssh');
++    case 'nodeLocal':
++      return t('device.kind.nodeLocal', { node: nodeName });
++    default:
++      return t('device.kind.nodeSsh', { node: nodeName });
++  }
++}
+diff --git a/packages/panels/src/device-management/device-remote-info-fields.tsx b/packages/panels/src/device-management/device-remote-info-fields.tsx
+new file mode 100644
+index 00000000..69fd09a5
+--- /dev/null
++++ b/packages/panels/src/device-management/device-remote-info-fields.tsx
+@@ -0,0 +1,64 @@
++// 远端节点上的设备：只读的归属信息（节点名 / 节点 id / 设备 id）+「显示在侧栏」偏好。
++// 连接参数由该节点自己管理，这里不提供任何可写的连接字段。
++
++import type { Device } from '@tmex/shared';
++import { isSidebarDeviceVisible, sidebarDeviceVisibilityKey } from '@tmex/stores';
++import { useUIStore } from '@tmex/stores/react';
++import { Switch } from '@tmex/ui/switch';
++import { useTranslation } from 'react-i18next';
++import { SectionHeading } from './device-field-primitives';
++import type { DeviceNodeContext } from './device-node-context';
++
++function InfoRow({ label, value }: { label: string; value: string }) {
++  return (
++    <div className="flex items-baseline gap-2">
++      <span className="w-20 shrink-0 text-xs text-muted-foreground">{label}</span>
++      <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground" title={value}>
++        {value}
++      </span>
++    </div>
++  );
++}
++
++export interface DeviceRemoteInfoFieldsProps {
++  device: Device;
++  nodeContext: DeviceNodeContext;
++}
++
++export function DeviceRemoteInfoFields({ device, nodeContext }: DeviceRemoteInfoFieldsProps) {
++  const { t } = useTranslation();
++  const sidebarVisible = useUIStore((state) =>
++    isSidebarDeviceVisible(state.sidebarDeviceVisibility, nodeContext.runtimeNodeId, device.id)
++  );
++  const setSidebarVisible = useUIStore((state) => state.setSidebarDeviceVisibility);
++
++  return (
++    <section className="space-y-2.5" data-testid="device-dialog-remote-info">
++      <SectionHeading>{t('device.remoteInfo.title')}</SectionHeading>
++      <div className="space-y-1.5 rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
++        <InfoRow label={t('device.remoteInfo.node')} value={nodeContext.name} />
++        <InfoRow label={t('device.remoteInfo.nodeId')} value={nodeContext.runtimeNodeId} />
++        <InfoRow label={t('device.remoteInfo.deviceId')} value={device.id} />
++        <p className="pt-0.5 text-[11px] text-muted-foreground">{t('device.remoteInfo.hint')}</p>
++      </div>
++      <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2">
++        <div className="min-w-0">
++          <div className="text-xs font-medium text-foreground">{t('device.sidebar.show')}</div>
++          <p className="text-[11px] text-muted-foreground">{t('device.sidebar.hint')}</p>
++        </div>
++        <Switch
++          size="sm"
++          checked={sidebarVisible}
++          data-testid={`device-dialog-sidebar-${device.id}`}
++          aria-label={t('device.sidebar.show')}
++          onCheckedChange={(checked) =>
++            setSidebarVisible(
++              sidebarDeviceVisibilityKey(nodeContext.runtimeNodeId, device.id),
++              Boolean(checked)
++            )
++          }
++        />
++      </div>
++    </section>
++  );
++}
+diff --git a/packages/panels/src/device-management/index.ts b/packages/panels/src/device-management/index.ts
+index 68fef390..9dae6732 100644
+--- a/packages/panels/src/device-management/index.ts
++++ b/packages/panels/src/device-management/index.ts
+@@ -8,5 +8,14 @@ export {
+   type DeviceManagementPanelProps,
+ } from './device-management-panel';
+ export { DeviceCard, type DeviceCardProps } from './device-card';
++export { DeviceCardHost, type DeviceCardHostProps } from './device-card-host';
++export { DeviceDeleteDialog, type DeviceDeleteDialogProps } from './device-delete-dialog';
+ export { DeviceDialog, type DeviceDialogProps } from './device-dialog';
++export {
++  type DeviceDisplayKind,
++  type DeviceNodeContext,
++  deviceDisplayKind,
++  deviceKindLabel,
++  isRemoteDeviceKind,
++} from './device-node-context';
+ export { OPEN_ADD_DEVICE_EVENT } from './events';
+diff --git a/packages/shared/src/contracts/device-folders.ts b/packages/shared/src/contracts/device-folders.ts
+new file mode 100644
+index 00000000..3dacc72d
+--- /dev/null
++++ b/packages/shared/src/contracts/device-folders.ts
+@@ -0,0 +1,55 @@
++// 设备管理页文件夹层级契约：文件夹可任意嵌套；节点 / 设备通过 placement 落到某个文件夹
++// （或 folderId=null 的根层显式排序）；没有 placement 的条目在根层按默认顺序排在最后。
++// 数据只存在**提供 UI 的节点**（entry / self）自己的库里；self 节点的 nodeId 固定为 'self'，
++// 远端 mesh 节点用其 mesh node id。
++
++export type DeviceFolderItemKind = 'node' | 'device';
++
++export interface DeviceFolder {
++  id: string;
++  name: string;
++  parentId: string | null;
++  sortOrder: number;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface DeviceFolderItemRef {
++  kind: DeviceFolderItemKind;
++  nodeId: string;
++  /** kind='node' 时为 null */
++  deviceId: string | null;
++}
++
++export interface DeviceFolderPlacement extends DeviceFolderItemRef {
++  /** null = 根层（带显式顺序） */
++  folderId: string | null;
++  sortOrder: number;
++}
++
++export interface DeviceFolderLayout {
++  folders: DeviceFolder[];
++  placements: DeviceFolderPlacement[];
++}
++
++export interface CreateDeviceFolderRequest {
++  name: string;
++  parentId?: string | null;
++}
++
++export interface UpdateDeviceFolderRequest {
++  name?: string;
++  parentId?: string | null;
++  sortOrder?: number;
++}
++
++export interface UpdateDeviceFolderLayoutRequest {
++  /** 必须与库中现有文件夹 id 集合完全一致（只改层级 / 顺序，不增删） */
++  folders: Array<Pick<DeviceFolder, 'id' | 'parentId' | 'sortOrder'>>;
++  /** 整体替换全部 placement */
++  placements: DeviceFolderPlacement[];
++}
++
++export const DEVICE_FOLDER_NAME_MAX_LENGTH = 64;
++/** standalone / entry 自身在 placement 里的 nodeId */
++export const DEVICE_FOLDER_SELF_NODE_ID = 'self';
+diff --git a/packages/shared/src/device-folders.ts b/packages/shared/src/device-folders.ts
+new file mode 100644
+index 00000000..0b785282
+--- /dev/null
++++ b/packages/shared/src/device-folders.ts
+@@ -0,0 +1,290 @@
++// 设备文件夹树的纯逻辑：gateway 校验与前端乐观更新共用，保证两侧对「合法布局」的判断一致。
++
++import {
++  DEVICE_FOLDER_NAME_MAX_LENGTH,
++  type DeviceFolder,
++  type DeviceFolderItemRef,
++  type DeviceFolderLayout,
++  type DeviceFolderPlacement,
++} from './contracts/device-folders';
++
++export type DeviceFolderNameError = 'empty' | 'tooLong';
++
++export function normalizeDeviceFolderName(name: string): string {
++  return name.trim().replace(/\s+/g, ' ');
++}
++
++export function validateDeviceFolderName(
++  name: string
++): { ok: true; name: string } | { ok: false; error: DeviceFolderNameError } {
++  const normalized = normalizeDeviceFolderName(name);
++  if (!normalized) return { ok: false, error: 'empty' };
++  if ([...normalized].length > DEVICE_FOLDER_NAME_MAX_LENGTH)
++    return { ok: false, error: 'tooLong' };
++  return { ok: true, name: normalized };
++}
++
++export function deviceFolderItemKey(ref: DeviceFolderItemRef): string {
++  return ref.kind === 'node' ? `node:${ref.nodeId}` : `device:${ref.nodeId}:${ref.deviceId ?? ''}`;
++}
++
++export function parseDeviceFolderItemKey(key: string): DeviceFolderItemRef | null {
++  const parts = key.split(':');
++  if (parts[0] === 'node' && parts.length === 2 && parts[1]) {
++    return { kind: 'node', nodeId: parts[1], deviceId: null };
++  }
++  if (parts[0] === 'device' && parts.length === 3 && parts[1] && parts[2]) {
++    return { kind: 'device', nodeId: parts[1], deviceId: parts[2] };
++  }
++  return null;
++}
++
++export function sameDeviceFolderItem(a: DeviceFolderItemRef, b: DeviceFolderItemRef): boolean {
++  return (
++    a.kind === b.kind && a.nodeId === b.nodeId && (a.deviceId ?? null) === (b.deviceId ?? null)
++  );
++}
++
++type FolderLink = Pick<DeviceFolder, 'id' | 'parentId'>;
++
++/** 含自身在内的全部后代 id */
++export function folderDescendantIds(folders: readonly FolderLink[], folderId: string): Set<string> {
++  const childrenOf = new Map<string | null, string[]>();
++  for (const folder of folders) {
++    const list = childrenOf.get(folder.parentId) ?? [];
++    list.push(folder.id);
++    childrenOf.set(folder.parentId, list);
++  }
++  const result = new Set<string>([folderId]);
++  const queue = [folderId];
++  while (queue.length > 0) {
++    const current = queue.shift() as string;
++    for (const child of childrenOf.get(current) ?? []) {
++      if (!result.has(child)) {
++        result.add(child);
++        queue.push(child);
++      }
++    }
++  }
++  return result;
++}
++
++/** 把 folderId 挂到 newParentId 下会不会成环（挂到自己或自己的后代下） */
++export function wouldCreateFolderCycle(
++  folders: readonly FolderLink[],
++  folderId: string,
++  newParentId: string | null
++): boolean {
++  if (newParentId === null) return false;
++  return folderDescendantIds(folders, folderId).has(newParentId);
++}
++
++/** 整个文件夹集合是否无环且 parentId 都指向存在的文件夹 */
++export function isFolderForestValid(folders: readonly FolderLink[]): boolean {
++  const ids = new Set(folders.map((folder) => folder.id));
++  if (ids.size !== folders.length) return false;
++  const parentOf = new Map(folders.map((folder) => [folder.id, folder.parentId] as const));
++  for (const folder of folders) {
++    if (folder.parentId !== null && !ids.has(folder.parentId)) return false;
++    const seen = new Set<string>();
++    let cursor: string | null = folder.id;
++    while (cursor !== null) {
++      if (seen.has(cursor)) return false;
++      seen.add(cursor);
++      cursor = parentOf.get(cursor) ?? null;
++    }
++  }
++  return true;
++}
++
++function byOrder<T extends { sortOrder: number }>(a: T, b: T): number {
++  return a.sortOrder - b.sortOrder;
++}
++
++/** 同一容器内按 sortOrder 重编号为 0..n-1（文件夹与条目各自独立编号） */
++export function normalizeFolderLayoutOrder(layout: DeviceFolderLayout): DeviceFolderLayout {
++  const renumber = <T extends { sortOrder: number }>(
++    list: readonly T[],
++    keyOf: (item: T) => string | null
++  ): T[] => {
++    const groups = new Map<string | null, T[]>();
++    for (const item of list) {
++      const group = groups.get(keyOf(item)) ?? [];
++      group.push(item);
++      groups.set(keyOf(item), group);
++    }
++    const out: T[] = [];
++    for (const group of groups.values()) {
++      group.sort(byOrder).forEach((item, index) => out.push({ ...item, sortOrder: index }));
++    }
++    return out;
++  };
++  return {
++    folders: renumber(layout.folders, (folder) => folder.parentId),
++    placements: renumber(layout.placements, (placement) => placement.folderId),
++  };
++}
++
++/**
++ * 删除文件夹：子文件夹与其中条目全部上提到被删文件夹的父级（父级为根时条目保留为根层
++ * 显式排序），排在父级现有内容之后。
++ */
++export function reparentOnFolderDelete(
++  layout: DeviceFolderLayout,
++  folderId: string
++): DeviceFolderLayout {
++  const target = layout.folders.find((folder) => folder.id === folderId);
++  if (!target) return layout;
++  const parentId = target.parentId;
++  const siblingFolderMax = Math.max(
++    -1,
++    ...layout.folders
++      .filter((folder) => folder.parentId === parentId && folder.id !== folderId)
++      .map((folder) => folder.sortOrder)
++  );
++  const siblingItemMax = Math.max(
++    -1,
++    ...layout.placements
++      .filter((placement) => placement.folderId === parentId)
++      .map((placement) => placement.sortOrder)
++  );
++  const folders = layout.folders
++    .filter((folder) => folder.id !== folderId)
++    .map((folder) =>
++      folder.parentId === folderId
++        ? { ...folder, parentId, sortOrder: siblingFolderMax + 1 + folder.sortOrder }
++        : folder
++    );
++  const placements = layout.placements.map((placement) =>
++    placement.folderId === folderId
++      ? { ...placement, folderId: parentId, sortOrder: siblingItemMax + 1 + placement.sortOrder }
++      : placement
++  );
++  return normalizeFolderLayoutOrder({ folders, placements });
++}
++
++function insertAt<T extends { sortOrder: number }>(
++  siblings: readonly T[],
++  moved: T,
++  index: number | null
++): T[] {
++  const sorted = [...siblings].sort(byOrder);
++  const at = index === null ? sorted.length : Math.max(0, Math.min(index, sorted.length));
++  sorted.splice(at, 0, moved);
++  return sorted.map((item, i) => ({ ...item, sortOrder: i }));
++}
++
++/**
++ * 移动文件夹到 targetParentId 下的 index 位置（null = 末尾）。成环返回 null。
++ */
++export function moveFolderInLayout(
++  layout: DeviceFolderLayout,
++  folderId: string,
++  targetParentId: string | null,
++  index: number | null
++): DeviceFolderLayout | null {
++  const target = layout.folders.find((folder) => folder.id === folderId);
++  if (!target) return null;
++  if (wouldCreateFolderCycle(layout.folders, folderId, targetParentId)) return null;
++  if (targetParentId !== null && !layout.folders.some((folder) => folder.id === targetParentId)) {
++    return null;
++  }
++  const others = layout.folders.filter((folder) => folder.id !== folderId);
++  const siblings = others.filter((folder) => folder.parentId === targetParentId);
++  const rest = others.filter((folder) => folder.parentId !== targetParentId);
++  const placed = insertAt(siblings, { ...target, parentId: targetParentId }, index);
++  return normalizeFolderLayoutOrder({
++    folders: [...rest, ...placed],
++    placements: layout.placements,
++  });
++}
++
++/**
++ * 移动条目到 targetFolderId（null = 根层显式排序）下的 index 位置（null = 末尾）。
++ * 条目原先没有 placement（隐式根层）时视为新增。目标文件夹不存在返回 null。
++ */
++export function moveItemInLayout(
++  layout: DeviceFolderLayout,
++  item: DeviceFolderItemRef,
++  targetFolderId: string | null,
++  index: number | null
++): DeviceFolderLayout | null {
++  if (targetFolderId !== null && !layout.folders.some((folder) => folder.id === targetFolderId)) {
++    return null;
++  }
++  const others = layout.placements.filter((placement) => !sameDeviceFolderItem(placement, item));
++  const siblings = others.filter((placement) => placement.folderId === targetFolderId);
++  const rest = others.filter((placement) => placement.folderId !== targetFolderId);
++  const moved: DeviceFolderPlacement = {
++    kind: item.kind,
++    nodeId: item.nodeId,
++    deviceId: item.kind === 'node' ? null : (item.deviceId ?? null),
++    folderId: targetFolderId,
++    sortOrder: 0,
++  };
++  const placed = insertAt(siblings, moved, index);
++  return normalizeFolderLayoutOrder({ folders: layout.folders, placements: [...rest, ...placed] });
++}
++
++/** 把条目从任何文件夹里拿出来，回到隐式根层（删除其 placement） */
++export function removeItemFromLayout(
++  layout: DeviceFolderLayout,
++  item: DeviceFolderItemRef
++): DeviceFolderLayout {
++  return {
++    folders: layout.folders,
++    placements: layout.placements.filter((placement) => !sameDeviceFolderItem(placement, item)),
++  };
++}
++
++export interface DeviceFolderTreeNode {
++  folder: DeviceFolder;
++  children: DeviceFolderTreeNode[];
++  items: DeviceFolderPlacement[];
++  /** 含全部后代的条目数 */
++  itemCount: number;
++}
++
++export interface DeviceFolderTree {
++  roots: DeviceFolderTreeNode[];
++  /** 根层显式排序的条目（folderId=null） */
++  rootItems: DeviceFolderPlacement[];
++  byId: Map<string, DeviceFolderTreeNode>;
++}
++
++export function buildDeviceFolderTree(layout: DeviceFolderLayout): DeviceFolderTree {
++  const byId = new Map<string, DeviceFolderTreeNode>();
++  for (const folder of layout.folders) {
++    byId.set(folder.id, { folder, children: [], items: [], itemCount: 0 });
++  }
++  const roots: DeviceFolderTreeNode[] = [];
++  for (const folder of [...layout.folders].sort(byOrder)) {
++    const node = byId.get(folder.id) as DeviceFolderTreeNode;
++    const parent = folder.parentId === null ? null : byId.get(folder.parentId);
++    if (parent) parent.children.push(node);
++    else roots.push(node);
++  }
++  const rootItems: DeviceFolderPlacement[] = [];
++  for (const placement of [...layout.placements].sort(byOrder)) {
++    const node = placement.folderId === null ? null : byId.get(placement.folderId);
++    if (node) node.items.push(placement);
++    else rootItems.push(placement);
++  }
++  const count = (node: DeviceFolderTreeNode): number => {
++    node.itemCount =
++      node.items.length + node.children.reduce((sum, child) => sum + count(child), 0);
++    return node.itemCount;
++  };
++  for (const root of roots) count(root);
++  return { roots, rootItems, byId };
++}
++
++/** 条目当前所在文件夹 id；无 placement 或 placement 指向根返回 null */
++export function findItemFolderId(
++  layout: DeviceFolderLayout,
++  item: DeviceFolderItemRef
++): string | null {
++  return (
++    layout.placements.find((placement) => sameDeviceFolderItem(placement, item))?.folderId ?? null
++  );
++}
