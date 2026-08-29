@@ -34,3 +34,12 @@
 | 自签信任 | 本地私有 CA 签发 + join 串带 CA 指纹；UI 提供 CA 下载 |
 | ACME 验证 | HTTP-01 + DNS-01（Cloudflare） |
 | TLS 适用角色 | 所有角色含 standalone |
+
+## 2026-08-29 第二轮需求
+
+> 任务：
+> 1. 重写hub/node页所有文案, 使文案简洁专业易懂, 就像大型软件里的文案一样; 删除冗余/啰嗦文案. 例如"join串", 普通用户就很难看懂
+> 2. 直连插件, 安装/删除用另外一个按钮, 而不是和开关绑定, 但是该按钮要和开关联动
+> 3. 将远端服务器设为hub,另加本机,docker容器node, 总共3个node,我要进行测试
+
+补充：grok 后续改为 cursor-agent（`cursor-grok-4.6-high`）调用；远程测试机 43.248.129.233:10022（经 `ai.jiefakj.com` 访问）；Cloudflare 测试域 `konata.tv`（凭据见用户消息，不落档）。
