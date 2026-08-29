@@ -1,0 +1,53 @@
+{
+  "en_US": {
+    "devices": {
+      "nodes": {
+        "status": {
+          "online": "Online",
+          "offline": "Offline",
+          "signedOut": "Not signed in",
+          "hub": "Hub"
+        },
+        "version": "Version {{version}}",
+        "signInToManage": "Sign in to manage devices on this node.",
+        "lastKnownDevices": "Last known devices",
+        "noKnownDevices": "No devices were known when this node was last online.",
+        "addDevice": "Add a device on {{name}}"
+      }
+    }
+  },
+  "zh_CN": {
+    "devices": {
+      "nodes": {
+        "status": {
+          "online": "在线",
+          "offline": "离线",
+          "signedOut": "未登录",
+          "hub": "Hub"
+        },
+        "version": "版本 {{version}}",
+        "signInToManage": "登录该节点后才能管理它的设备。",
+        "lastKnownDevices": "最近一次已知的设备",
+        "noKnownDevices": "该节点最近一次在线时没有已知设备。",
+        "addDevice": "在 {{name}} 上添加设备"
+      }
+    }
+  },
+  "ja_JP": {
+    "devices": {
+      "nodes": {
+        "status": {
+          "online": "オンライン",
+          "offline": "オフライン",
+          "signedOut": "未サインイン",
+          "hub": "ハブ"
+        },
+        "version": "バージョン {{version}}",
+        "signInToManage": "このノードのデバイスを管理するにはサインインしてください。",
+        "lastKnownDevices": "最後に確認されたデバイス",
+        "noKnownDevices": "このノードが最後にオンラインだったとき、既知のデバイスはありませんでした。",
+        "addDevice": "{{name}} にデバイスを追加"
+      }
+    }
+  }
+}
