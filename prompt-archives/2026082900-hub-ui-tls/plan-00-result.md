@@ -92,3 +92,18 @@ worktree `../tmex-enhanced-wt-merge`，分支 `chore/merge-hub-tabs`，base `e97
 - Linux 用户级 systemd 无法绑 80/443，UI 只提示端口映射（远程实测即靠 nginx 转发 challenge）。
 - CA 轮换（10 年后）会使已加入 node 的 pin 失效，需重新 join（已写入运维文档）。
 - 前端三处重启轮询已合并为 `restart/wait-for-restart.ts`；`setup-api.ts` 的 `readHealthStartedAt` 仍保留供测试。
+
+## 第二、三轮（2026-08-29 下午，测试反馈）
+
+| commit | 内容 |
+|---|---|
+| `98c2c1e` | 直连插件安装/删除按钮与启用开关分离（`TMEX_DIRECT_ENABLED`），二者联动 |
+| `100ef05` | 三语文案重写（`sub/f6-result.md` 含词汇表：join 串→加入码、Hub 保留英文等） |
+| `fa7f91e` | 登录流程重构、品牌统一组件、设备管理按节点分组、修复切换节点面板的 React #185 |
+
+- 登录：只登本机并立即进入；密码错误显示"密码错误"；登录页仅保留用户名/密码/验证码/登录/通行密钥登录；通行密钥注册只在账号安全页。其他节点在进入 `/n/:id` 或点击侧边栏"登录该节点"时静默登录（`useNodeLoginGate`，单飞）；TOTP 账号的按需登录需回登录页输码（浏览器不持有 TOTP 密钥）。
+- React #185 根因：`/` 与 `/n/:id` 复用同一棵树，切换节点时 react-query 观察者仍绑定旧 `QueryClient`，两个 DeviceProvider 互相 connect/disconnect；修复为 `RuntimeProvider` 按运行时实例 key 重挂子树（`packages/stores/src/react.tsx`，回归测试 `react.test.tsx`）。
+- 品牌：`@tmex/shared` `PRODUCT_NAME` / `BRAND_LOGO_SRC` + `apps/fe/src/components/brand.tsx`；无侧边栏页面顶栏显示 logo 与名称；`PageWrapper` 抽为 `page-wrapper.tsx`。
+- 设备管理：mesh 下按节点分组（离线只读清单 / 未登录提示 / 已登录挂 `NodeRuntimeScope` 面板），只有 self 面板响应全局"添加设备"。
+- 实测（本机生产 9883 已升级）：登录 192 ms 进入；点"登录该节点"约 10 s 完成并展开；打开远程 pane 正常渲染 xterm，无错误。遗留：节点静默登录期间运行时已开始连接，`/api/mesh/connection`、`/api/rtc/authorize` 先返回一次 401 后才成功（无功能影响，可在登录完成后再建连接）。
+- 用户测试环境：远程 hub `https://ai.jiefakj.com:18443`（admin）、本机 `konata-mac`、容器 `docker-node`，三者均已升级到本轮构建。
