@@ -1,0 +1,12 @@
+You are a read-only code explorer for the tmex monorepo (Bun runtime; apps/gateway backend, apps/fe React frontend, packages/panels device-console UI, packages/terminal-ui split-pane layout, packages/stores zustand stores, packages/ws-client gateway WebSocket client). Do NOT modify files. Deliver your report as your FINAL MESSAGE in Markdown (it is captured automatically); do not try to write files.
+
+## Bug to diagnose
+On the terminal page, the top-right "split" button creates a new tmux window and shows it in a split-pane layout next to the current one. When the user then CLOSES those terminal windows from the split view (the close control on a split pane / closing the tmux window), the UI sometimes gets stuck showing the "connecting to device" (连接设备中 / connecting) state for a while (seconds to tens of seconds) before recovering.
+
+## What to find (with file:line evidence and code excerpts)
+1. The split button handler: what it does (window creation API/ws command, layout store update, navigation) and how the split layout store (packages/terminal-ui or packages/stores) tracks pane slots.
+2. The close path from the split view: what runs on close (kill-window / kill-pane command, layout slot removal, navigation to another pane, unsubscribe of the terminal stream), in what order, and which async steps exist.
+3. Where the "connecting to device" state is derived (device-console, `deviceConnected`, tmux store, connection indicator, `packages/panels/src/device-connection.ts`, `device-status-badge.tsx`) and every code path that can set it back to a "connecting"/not-ready value — especially: stream (un)subscribe / resubscribe logic in packages/ws-client + packages/stores (tmux-event-router, subscription manager), snapshot invalidation when a window disappears, route changes to a pane that no longer exists, and any timers/backoff (reconnect, resubscribe retry, heartbeat) that could explain a delay of several seconds before recovery.
+4. Formulate the most likely root cause(s) for the stall (e.g. closing navigates to a stale pane id whose subscription gets a NOT_FOUND and the client enters a retry/backoff; or the layout keeps a slot for a killed window and its stream subscription waits for a snapshot that never comes; or deviceConnected is flipped false by an event for the killed window) — rank them, show the exact code, and say how to confirm each with a test or a log.
+5. Suggest a minimal, robust fix for each candidate, listing files to change, plus which existing tests cover the area.
+Keep the report under ~300 lines.

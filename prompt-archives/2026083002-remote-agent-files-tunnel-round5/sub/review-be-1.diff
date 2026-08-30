@@ -1,0 +1,2085 @@
+diff --git a/apps/gateway/drizzle/0026_acoustic_roughhouse.sql b/apps/gateway/drizzle/0026_acoustic_roughhouse.sql
+new file mode 100644
+index 00000000..2b01ec6d
+--- /dev/null
++++ b/apps/gateway/drizzle/0026_acoustic_roughhouse.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE `agent_sessions` ADD `node_id` text;--> statement-breakpoint
++CREATE INDEX `agent_sessions_node_id_idx` ON `agent_sessions` (`node_id`);
+\ No newline at end of file
+diff --git a/apps/gateway/drizzle/0027_tunnel_config.sql b/apps/gateway/drizzle/0027_tunnel_config.sql
+new file mode 100644
+index 00000000..3c31d7bc
+--- /dev/null
++++ b/apps/gateway/drizzle/0027_tunnel_config.sql
+@@ -0,0 +1,11 @@
++CREATE TABLE `tunnel_config` (
++	`id` text PRIMARY KEY NOT NULL,
++	`mode` text DEFAULT 'off' NOT NULL,
++	`hostname` text,
++	`tunnel_name` text,
++	`tunnel_id` text,
++	`auto_start` integer DEFAULT false NOT NULL,
++	`updated_at` text NOT NULL,
++	CONSTRAINT "tunnel_config_singleton_check" CHECK("tunnel_config"."id" = 'default'),
++	CONSTRAINT "tunnel_config_mode_check" CHECK("tunnel_config"."mode" in ('off', 'quick', 'named'))
++);
+diff --git a/apps/gateway/drizzle/0028_magical_doctor_doom.sql b/apps/gateway/drizzle/0028_magical_doctor_doom.sql
+new file mode 100644
+index 00000000..b5500005
+--- /dev/null
++++ b/apps/gateway/drizzle/0028_magical_doctor_doom.sql
+@@ -0,0 +1,31 @@
++PRAGMA foreign_keys=OFF;--> statement-breakpoint
++CREATE TABLE `__new_agent_sessions` (
++	`id` text PRIMARY KEY NOT NULL,
++	`title` text NOT NULL,
++	`node_id` text,
++	`device_id` text,
++	`pane_id` text,
++	`provider_id` text,
++	`model_id` text NOT NULL,
++	`system_prompt` text,
++	`write_mode` text DEFAULT 'confirm' NOT NULL,
++	`use_provider_web_search` integer DEFAULT false NOT NULL,
++	`provider_hosted_tools` text DEFAULT '[]' NOT NULL,
++	`allow_control_chars` integer DEFAULT false NOT NULL,
++	`origin_pane_title` text,
++	`origin_process_name` text,
++	`status` text DEFAULT 'idle' NOT NULL,
++	`last_error` text,
++	`max_steps_per_turn` integer DEFAULT 25 NOT NULL,
++	`created_at` text NOT NULL,
++	`updated_at` text NOT NULL,
++	FOREIGN KEY (`provider_id`) REFERENCES `llm_providers`(`id`) ON UPDATE no action ON DELETE set null,
++	CONSTRAINT "agent_sessions_write_mode_check" CHECK("write_mode" in ('confirm', 'auto')),
++	CONSTRAINT "agent_sessions_status_check" CHECK("status" in ('idle', 'running', 'waiting_confirmation', 'stopped', 'error'))
++);
++--> statement-breakpoint
++INSERT INTO `__new_agent_sessions`("id", "title", "node_id", "device_id", "pane_id", "provider_id", "model_id", "system_prompt", "write_mode", "use_provider_web_search", "provider_hosted_tools", "allow_control_chars", "origin_pane_title", "origin_process_name", "status", "last_error", "max_steps_per_turn", "created_at", "updated_at") SELECT "id", "title", "node_id", "device_id", "pane_id", "provider_id", "model_id", "system_prompt", "write_mode", "use_provider_web_search", "provider_hosted_tools", "allow_control_chars", "origin_pane_title", "origin_process_name", "status", "last_error", "max_steps_per_turn", "created_at", "updated_at" FROM `agent_sessions`;--> statement-breakpoint
++DROP TABLE `agent_sessions`;--> statement-breakpoint
++ALTER TABLE `__new_agent_sessions` RENAME TO `agent_sessions`;--> statement-breakpoint
++PRAGMA foreign_keys=ON;--> statement-breakpoint
++CREATE INDEX `agent_sessions_node_id_idx` ON `agent_sessions` (`node_id`);
+\ No newline at end of file
+diff --git a/apps/gateway/drizzle/meta/_journal.json b/apps/gateway/drizzle/meta/_journal.json
+index efb1e38a..fd90fc4b 100644
+--- a/apps/gateway/drizzle/meta/_journal.json
++++ b/apps/gateway/drizzle/meta/_journal.json
+@@ -183,6 +183,27 @@
+       "when": 1788019200000,
+       "tag": "0025_flat_device_groups",
+       "breakpoints": true
++    },
++    {
++      "idx": 26,
++      "version": "6",
++      "when": 1788096275411,
++      "tag": "0026_acoustic_roughhouse",
++      "breakpoints": true
++    },
++    {
++      "idx": 27,
++      "version": "6",
++      "when": 1788096412021,
++      "tag": "0027_tunnel_config",
++      "breakpoints": true
++    },
++    {
++      "idx": 28,
++      "version": "6",
++      "when": 1788096754880,
++      "tag": "0028_magical_doctor_doom",
++      "breakpoints": true
+     }
+   ]
+ }
+\ No newline at end of file
+diff --git a/apps/gateway/src/agent/node-offline-bus.test.ts b/apps/gateway/src/agent/node-offline-bus.test.ts
+new file mode 100644
+index 00000000..48e9c30b
+--- /dev/null
++++ b/apps/gateway/src/agent/node-offline-bus.test.ts
+@@ -0,0 +1,17 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { notifyNodeOffline, registerNodeOfflineListener } from './node-offline-bus';
++
++describe('node-offline-bus', () => {
++  afterEach(() => {
++    registerNodeOfflineListener(null);
++  });
++
++  test('notifies the registered listener', () => {
++    const seen: string[] = [];
++    registerNodeOfflineListener((nodeId) => {
++      seen.push(nodeId);
++    });
++    notifyNodeOffline('peer-a');
++    expect(seen).toEqual(['peer-a']);
++  });
++});
+diff --git a/apps/gateway/src/agent/node-offline-bus.ts b/apps/gateway/src/agent/node-offline-bus.ts
+new file mode 100644
+index 00000000..679e7e9e
+--- /dev/null
++++ b/apps/gateway/src/agent/node-offline-bus.ts
+@@ -0,0 +1,11 @@
++type NodeOfflineListener = (nodeId: string) => void;
++
++let listener: NodeOfflineListener | null = null;
++
++export function registerNodeOfflineListener(fn: NodeOfflineListener | null): void {
++  listener = fn;
++}
++
++export function notifyNodeOffline(nodeId: string): void {
++  listener?.(nodeId);
++}
+diff --git a/apps/gateway/src/agent/outcome-resolver.test.ts b/apps/gateway/src/agent/outcome-resolver.test.ts
+index 9fe784a3..52bb3b8b 100644
+--- a/apps/gateway/src/agent/outcome-resolver.test.ts
++++ b/apps/gateway/src/agent/outcome-resolver.test.ts
+@@ -63,6 +63,12 @@ describe('resolveRunOnceOutcome 优先级', () => {
+       message: PANE_LOST_FALLBACK_MESSAGE,
+     });
+     expect(resolveRunOnceOutcome(base({ stopReason: 'manual' }))).toEqual({ kind: 'stopped' });
++    expect(
++      resolveRunOnceOutcome(base({ stopReason: 'node_offline', terminalFatalMessage: '' }))
++    ).toEqual({
++      kind: 'pane-lost-error',
++      message: 'NODE_OFFLINE',
++    });
+   });
+ 
+   test('steerRequested 压过 aborted（含 terminalFatal）/ streamError / approval / queue', () => {
+diff --git a/apps/gateway/src/agent/outcome-resolver.ts b/apps/gateway/src/agent/outcome-resolver.ts
+index 9175d390..fe1c15e3 100644
+--- a/apps/gateway/src/agent/outcome-resolver.ts
++++ b/apps/gateway/src/agent/outcome-resolver.ts
+@@ -1,4 +1,4 @@
+-export type AgentStopReason = 'manual' | 'shutdown' | 'pane_lost';
++export type AgentStopReason = 'manual' | 'shutdown' | 'pane_lost' | 'node_offline';
+ 
+ export interface RunOnceSignals {
+   stalled: boolean;
+@@ -24,6 +24,7 @@ export type RunOnceDecision =
+   | { kind: 'idle' };
+ 
+ export const PANE_LOST_FALLBACK_MESSAGE = 'terminal connection lost: pane/device unavailable';
++export const NODE_OFFLINE_ERROR = 'NODE_OFFLINE';
+ 
+ function resolveAborted(signals: RunOnceSignals): RunOnceDecision {
+   if (signals.terminalFatal) {
+@@ -38,6 +39,9 @@ function resolveAborted(signals: RunOnceSignals): RunOnceDecision {
+       message: signals.terminalFatalMessage || PANE_LOST_FALLBACK_MESSAGE,
+     };
+   }
++  if (signals.stopReason === 'node_offline') {
++    return { kind: 'pane-lost-error', message: NODE_OFFLINE_ERROR };
++  }
+   return { kind: 'stopped' };
+ }
+ 
+diff --git a/apps/gateway/src/agent/remote-pane-runtime.test.ts b/apps/gateway/src/agent/remote-pane-runtime.test.ts
+new file mode 100644
+index 00000000..90c15a69
+--- /dev/null
++++ b/apps/gateway/src/agent/remote-pane-runtime.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, test } from 'bun:test';
++import { RemotePaneRuntime, RemotePaneUnreachableError } from './remote-pane-runtime';
++
++const PANE_INFO = {
++  cols: 80,
++  rows: 24,
++  cursorX: 1,
++  cursorY: 2,
++  alternateScreen: false,
++  currentCommand: 'nvim',
++  title: 'edit',
++};
++
++describe('RemotePaneRuntime', () => {
++  test('pane-info / capture / send-input 走 forwarder 路径', async () => {
++    const calls: Array<{ path: string; body: unknown }> = [];
++    const runtime = new RemotePaneRuntime('peer-1', 'dev-1', async (nodeId, path, body) => {
++      expect(nodeId).toBe('peer-1');
++      calls.push({ path, body });
++      if (path.endsWith('/pane-info')) {
++        return Response.json({
++          info: PANE_INFO,
++          snapshot: {
++            title: 'edit',
++            currentPath: '/tmp',
++            windowName: 'main',
++            windowId: '@1',
++            sessionId: '$0',
++            sessionName: 'tmex',
++            splitPaneCount: 1,
++          },
++          snapshotExists: true,
++        });
++      }
++      if (path.endsWith('/capture')) {
++        return Response.json({ text: 'screen' });
++      }
++      return Response.json({ ok: true });
++    });
++
++    const info = await runtime.getPaneInfo('%2');
++    expect(info.currentCommand).toBe('nvim');
++    const lookup = runtime.findPaneInSnapshot('%2');
++    expect(lookup.found).toBe(true);
++    if (lookup.found) {
++      expect(lookup.context.currentPath).toBe('/tmp');
++    }
++    expect(await runtime.capturePaneText('%2', { historyLines: 10 })).toBe('screen');
++    await runtime.sendInput('%2', 'ls\n');
++    expect(calls.map((c) => c.path)).toEqual([
++      '/api/mesh-internal/tmux/pane-info',
++      '/api/mesh-internal/tmux/capture',
++      '/api/mesh-internal/tmux/send-input',
++    ]);
++    expect(calls[2]?.body).toEqual({ deviceId: 'dev-1', paneId: '%2', data: 'ls\n' });
++  });
++
++  test('503 / getLink 失败映射为 NODE_UNREACHABLE', async () => {
++    const unreachable = new RemotePaneRuntime('peer-down', 'dev', async () => {
++      return new Response(JSON.stringify({ code: 'NODE_UNREACHABLE' }), { status: 503 });
++    });
++    await expect(unreachable.capturePaneText('%1')).rejects.toBeInstanceOf(
++      RemotePaneUnreachableError
++    );
++
++    const throwing = new RemotePaneRuntime('peer-down', 'dev', async () => {
++      throw new Error('link down');
++    });
++    await expect(throwing.sendInput('%1', 'x')).rejects.toMatchObject({ code: 'NODE_UNREACHABLE' });
++  });
++});
+diff --git a/apps/gateway/src/agent/remote-pane-runtime.ts b/apps/gateway/src/agent/remote-pane-runtime.ts
+new file mode 100644
+index 00000000..4c0db3d0
+--- /dev/null
++++ b/apps/gateway/src/agent/remote-pane-runtime.ts
+@@ -0,0 +1,112 @@
++import type { InternalHttpForwarder } from '../mesh/mesh-agent-bridge';
++import { NodeUnreachableError } from '../mesh/types';
++import type { PaneInfo } from '../tmux-client/capture-history';
++import type { PaneSnapshotLookup, SnapshotPaneContext } from './tools/pane-info';
++import type { TerminalRuntimeLike } from './tools/terminal-context';
++
++export interface RemotePaneInfoPayload {
++  info: PaneInfo;
++  snapshot: SnapshotPaneContext | null;
++  snapshotExists: boolean;
++}
++
++export class RemotePaneUnreachableError extends Error {
++  readonly code = 'NODE_UNREACHABLE';
++  readonly nodeId: string;
++
++  constructor(nodeId: string, cause?: unknown) {
++    super(`NODE_UNREACHABLE: remote node ${nodeId} is not reachable`);
++    this.name = 'RemotePaneUnreachableError';
++    this.nodeId = nodeId;
++    if (cause instanceof Error) {
++      this.cause = cause;
++    }
++  }
++}
++
++export class RemotePaneRuntime implements TerminalRuntimeLike {
++  private lastSnapshot: { paneId: string; lookup: PaneSnapshotLookup } | null = null;
++
++  constructor(
++    private readonly nodeId: string,
++    private readonly deviceId: string,
++    private readonly forward: InternalHttpForwarder
++  ) {}
++
++  async sendInput(paneId: string, data: string): Promise<void> {
++    const payload = await this.rpc<{ ok?: boolean }>('/api/mesh-internal/tmux/send-input', {
++      deviceId: this.deviceId,
++      paneId,
++      data,
++    });
++    if (!payload.ok) {
++      throw new Error('remote send-input failed');
++    }
++  }
++
++  async capturePaneText(paneId: string, opts?: { historyLines?: number }): Promise<string> {
++    const payload = await this.rpc<{ text?: string }>('/api/mesh-internal/tmux/capture', {
++      deviceId: this.deviceId,
++      paneId,
++      ...(opts?.historyLines !== undefined ? { historyLines: opts.historyLines } : {}),
++    });
++    return payload.text ?? '';
++  }
++
++  async getPaneInfo(paneId: string): Promise<PaneInfo> {
++    const payload = await this.fetchPaneInfo(paneId);
++    return payload.info;
++  }
++
++  findPaneInSnapshot(paneId: string): PaneSnapshotLookup {
++    if (this.lastSnapshot?.paneId === paneId) {
++      return this.lastSnapshot.lookup;
++    }
++    return { found: false, snapshotExists: false };
++  }
++
++  private async fetchPaneInfo(paneId: string): Promise<RemotePaneInfoPayload> {
++    const payload = await this.rpc<RemotePaneInfoPayload>('/api/mesh-internal/tmux/pane-info', {
++      deviceId: this.deviceId,
++      paneId,
++    });
++    this.lastSnapshot = {
++      paneId,
++      lookup: payload.snapshot
++        ? { found: true, context: payload.snapshot }
++        : { found: false, snapshotExists: Boolean(payload.snapshotExists) },
++    };
++    return payload;
++  }
++
++  private async rpc<T>(path: string, body: unknown): Promise<T> {
++    let response: Response;
++    try {
++      response = await this.forward(this.nodeId, path, body);
++    } catch (error) {
++      if (error instanceof NodeUnreachableError || error instanceof RemotePaneUnreachableError) {
++        throw error instanceof RemotePaneUnreachableError
++          ? error
++          : new RemotePaneUnreachableError(this.nodeId, error);
++      }
++      throw new RemotePaneUnreachableError(this.nodeId, error);
++    }
++    if (response.status === 503) {
++      throw new RemotePaneUnreachableError(this.nodeId);
++    }
++    if (!response.ok) {
++      const message = await readErrorMessage(response);
++      throw new Error(message);
++    }
++    return (await response.json()) as T;
++  }
++}
++
++async function readErrorMessage(response: Response): Promise<string> {
++  try {
++    const body = (await response.json()) as { error?: string; code?: string };
++    return body.error ?? body.code ?? `remote pane rpc failed (${response.status})`;
++  } catch {
++    return `remote pane rpc failed (${response.status})`;
++  }
++}
+diff --git a/apps/gateway/src/agent/run-deps.ts b/apps/gateway/src/agent/run-deps.ts
+index dac2cefa..f3e06450 100644
+--- a/apps/gateway/src/agent/run-deps.ts
++++ b/apps/gateway/src/agent/run-deps.ts
+@@ -9,7 +9,9 @@ import {
+   resolveProviderHostedTools,
+   resolveProviderWebSearchTool,
+ } from '../llm/provider-registry';
++import { getMeshAgentBridge } from '../mesh/mesh-agent-bridge';
+ import { tmuxRuntimeRegistry } from '../tmux-client/registry';
++import { RemotePaneRuntime, RemotePaneUnreachableError } from './remote-pane-runtime';
+ import type { TerminalRuntimeLike } from './tools/terminal';
+ import { createFetchUrlTool, createWebSearchTool } from './tools/web';
+ import { agentWsHub } from './ws-hub';
+@@ -25,8 +27,12 @@ export interface AgentRunDeps {
+   createFetchUrlTool: () => Tool;
+   hasQueuedMessages: (sessionId: string) => boolean;
+   drainQueuedMessages: (sessionId: string) => string[];
+-  acquireRuntime: (deviceId: string) => Promise<TerminalRuntimeLike>;
+-  releaseRuntime: (deviceId: string, runtime?: TerminalRuntimeLike) => Promise<void>;
++  acquireRuntime: (nodeId: string | null, deviceId: string) => Promise<TerminalRuntimeLike>;
++  releaseRuntime: (
++    nodeId: string | null,
++    deviceId: string,
++    runtime?: TerminalRuntimeLike
++  ) => Promise<void>;
+   broadcast: <K extends keyof AgentEventPayloadMap>(
+     sessionId: string,
+     eventType: K,
+@@ -63,8 +69,22 @@ export const defaultAgentRunDeps: AgentRunDeps = {
+     agentWsHub.broadcastAgentEvent(sessionId, wsBorsh.AGENT_EVENT_QUEUE_UPDATED, { queued: [] }, 0);
+     return items.map((item) => item.text);
+   },
+-  acquireRuntime: (deviceId) => tmuxRuntimeRegistry.acquire(deviceId),
+-  releaseRuntime: (deviceId, runtime) => tmuxRuntimeRegistry.release(deviceId, runtime),
++  acquireRuntime: async (nodeId, deviceId) => {
++    if (nodeId) {
++      const bridge = getMeshAgentBridge();
++      if (!bridge) {
++        throw new RemotePaneUnreachableError(nodeId);
++      }
++      return new RemotePaneRuntime(nodeId, deviceId, bridge.forwardInternalHttp);
++    }
++    return tmuxRuntimeRegistry.acquire(deviceId);
++  },
++  releaseRuntime: async (nodeId, deviceId, runtime) => {
++    if (nodeId || runtime instanceof RemotePaneRuntime) {
++      return;
++    }
++    await tmuxRuntimeRegistry.release(deviceId, runtime);
++  },
+   broadcast: (sessionId, eventType, payload, seq) =>
+     agentWsHub.broadcastAgentEvent(sessionId, eventType, payload, seq),
+   notify: (eventType, event) => eventNotifier.notify(eventType, event),
+diff --git a/apps/gateway/src/agent/run-finish.test.ts b/apps/gateway/src/agent/run-finish.test.ts
+index bc214f1e..2bdb20bc 100644
+--- a/apps/gateway/src/agent/run-finish.test.ts
++++ b/apps/gateway/src/agent/run-finish.test.ts
+@@ -13,6 +13,7 @@ function fakeSession(overrides: Partial<AgentSessionRecord> = {}): AgentSessionR
+   return {
+     id: 'sess-1',
+     title: 'Test',
++    nodeId: null,
+     deviceId: null,
+     paneId: null,
+     providerId: null,
+@@ -100,6 +101,10 @@ describe('run-finish', () => {
+     expect(finishAbortedRun(paneLost.sink, session)).toBe('error');
+     expect(paneLost.events.some((e) => e.includes('pane/device unavailable'))).toBe(true);
+ 
++    const nodeOffline = fakeSink('', { stopReason: 'node_offline' });
++    expect(finishAbortedRun(nodeOffline.sink, session)).toBe('error');
++    expect(nodeOffline.events).toContain('status:error:NODE_OFFLINE');
++
+     const stopped = fakeSink('', { stopReason: 'manual' });
+     expect(finishAbortedRun(stopped.sink, session)).toBe('stopped');
+     expect(stopped.events).toContain('status:stopped:');
+diff --git a/apps/gateway/src/agent/run-finish.ts b/apps/gateway/src/agent/run-finish.ts
+index 1bbbf9a4..e8a6544d 100644
+--- a/apps/gateway/src/agent/run-finish.ts
++++ b/apps/gateway/src/agent/run-finish.ts
+@@ -3,6 +3,7 @@ import { wsBorsh } from '@tmex/shared';
+ import { type AgentSessionRecord, appendAgentMessage, createAgentConfirmation } from '../db/agent';
+ import { t } from '../i18n';
+ import type { AgentStopReason } from './outcome-resolver';
++import { NODE_OFFLINE_ERROR } from './outcome-resolver';
+ import type { PendingApproval } from './run-stream-handlers';
+ 
+ export type AgentRunOutcome = 'idle' | 'waiting_confirmation' | 'stopped' | 'interrupted' | 'error';
+@@ -130,6 +131,9 @@ export function finishAbortedRun(
+       sink.terminalFatalMessage || 'terminal connection lost: pane/device unavailable'
+     );
+   }
++  if (sink.stopReason === 'node_offline') {
++    return finishErrorRun(sink, session, NODE_OFFLINE_ERROR);
++  }
+   sink.setStatus('stopped');
+   sink.broadcast(wsBorsh.AGENT_EVENT_TURN_FINISHED, {
+     sessionStatus: 'stopped',
+diff --git a/apps/gateway/src/agent/run-resource-scope.ts b/apps/gateway/src/agent/run-resource-scope.ts
+index bbb59d3f..5463017b 100644
+--- a/apps/gateway/src/agent/run-resource-scope.ts
++++ b/apps/gateway/src/agent/run-resource-scope.ts
+@@ -23,9 +23,10 @@ export function asEmulatorSource(runtime: unknown): EmulatorStreamSource | null
+ }
+ 
+ export interface AcquireRunResourcesParams {
++  nodeId?: string | null;
+   deviceId: string | null;
+   paneId: string | null;
+-  acquireRuntime: (deviceId: string) => Promise<TerminalRuntimeLike>;
++  acquireRuntime: (nodeId: string | null, deviceId: string) => Promise<TerminalRuntimeLike>;
+   acquireEmulator?: (
+     deviceId: string,
+     paneId: string,
+@@ -52,7 +53,7 @@ export async function acquireRunResources(
+ 
+   let runtime: TerminalRuntimeLike;
+   try {
+-    runtime = await params.acquireRuntime(params.deviceId);
++    runtime = await params.acquireRuntime(params.nodeId ?? null, params.deviceId);
+   } catch (error) {
+     return {
+       runtime: null,
+@@ -115,9 +116,14 @@ export async function releaseHeldPaneEmulator(
+ export interface ReleaseRunResourcesParams {
+   emulator: PaneEmulator | null;
+   runtime: TerminalRuntimeLike | null;
++  nodeId?: string | null;
+   deviceId: string | null;
+   paneId: string | null;
+-  releaseRuntime: (deviceId: string, runtime?: TerminalRuntimeLike) => Promise<void>;
++  releaseRuntime: (
++    nodeId: string | null,
++    deviceId: string,
++    runtime?: TerminalRuntimeLike
++  ) => Promise<void>;
+   releaseEmulator?: (deviceId: string, paneId: string) => Promise<number>;
+   destroyEmulator?: (deviceId: string, paneId: string) => Promise<void>;
+ }
+@@ -138,7 +144,7 @@ export async function releaseRunResources(params: ReleaseRunResourcesParams): Pr
+ 
+   if (params.runtime && params.deviceId) {
+     try {
+-      await params.releaseRuntime(params.deviceId, params.runtime);
++      await params.releaseRuntime(params.nodeId ?? null, params.deviceId, params.runtime);
+     } catch (error) {
+       console.error(`[agent-run] failed to release runtime ${params.deviceId}:`, error);
+     }
+diff --git a/apps/gateway/src/agent/run.ts b/apps/gateway/src/agent/run.ts
+index f8687d0b..9e5e4637 100644
+--- a/apps/gateway/src/agent/run.ts
++++ b/apps/gateway/src/agent/run.ts
+@@ -126,6 +126,7 @@ export class AgentRun {
+     this.runtimePaneId = session.paneId;
+     try {
+       const acquired = await acquireRunResources({
++        nodeId: session.nodeId,
+         deviceId: runtimeDeviceId,
+         paneId: session.paneId,
+         acquireRuntime: this.deps.acquireRuntime,
+@@ -143,6 +144,7 @@ export class AgentRun {
+       await releaseRunResources({
+         emulator,
+         runtime,
++        nodeId: session.nodeId,
+         deviceId: runtimeDeviceId,
+         paneId: session.paneId,
+         releaseRuntime: this.deps.releaseRuntime,
+diff --git a/apps/gateway/src/agent/supervisor.test.ts b/apps/gateway/src/agent/supervisor.test.ts
+index bfa7dac9..e0fa7806 100644
+--- a/apps/gateway/src/agent/supervisor.test.ts
++++ b/apps/gateway/src/agent/supervisor.test.ts
+@@ -871,6 +871,67 @@ describe('AgentSupervisor - stop 语义', () => {
+     expect(mine?.status).toBe('error');
+     expect(others?.status).toBe('running');
+   });
++
++  test('stopSessionsForNode：无活动 run 时 running 落 error NODE_OFFLINE 并广播', async () => {
++    const NODE_ID = 'peer-offline-1';
++    const harness = createSupervisorHarness({
++      baseUrl: 'http://unused',
++      sessionStatus: 'running',
++    });
++    updateAgentSession(harness.session.id, { nodeId: NODE_ID });
++
++    const other = createAgentSession({
++      title: 'Other node',
++      deviceId: TEST_DEVICE_ID,
++      paneId: '%2',
++      modelId: 'mock-model',
++      nodeId: 'other-peer',
++    });
++    updateAgentSession(other.id, { status: 'running' });
++
++    const beforeCount = harness.broadcasts.length;
++    harness.supervisor.stopSessionsForNode(NODE_ID);
++
++    expect(getAgentSessionById(harness.session.id)?.status).toBe('error');
++    expect(getAgentSessionById(harness.session.id)?.lastError).toBe('NODE_OFFLINE');
++    expect(getAgentSessionById(other.id)?.status).toBe('running');
++
++    const newEvents = harness.broadcasts
++      .slice(beforeCount)
++      .filter(
++        (b) =>
++          b.sessionId === harness.session.id &&
++          b.payload !== null &&
++          typeof b.payload === 'object' &&
++          (b.payload as { lastError?: string }).lastError === 'NODE_OFFLINE'
++      );
++    expect(newEvents.length).toBeGreaterThan(0);
++  });
++
++  test('stopSessionsForNode：活动 run 被 abort 且 lastError=NODE_OFFLINE', async () => {
++    const NODE_ID = 'peer-offline-run';
++    const mock = createMockChatServer(() =>
++      slowSseResponse(
++        [
++          chunk({ role: 'assistant', content: 'working ' }),
++          chunk({ content: 'more ' }),
++          chunk({}, 'stop'),
++        ],
++        50
++      )
++    );
++    const harness = createSupervisorHarness({ baseUrl: mock.baseUrl });
++    updateAgentSession(harness.session.id, { nodeId: NODE_ID });
++    await harness.supervisor.start();
++    harness.supervisor.submitUserMessage(harness.session.id, 'talk');
++    await new Promise((r) => setTimeout(r, 80));
++    harness.supervisor.stopSessionsForNode(NODE_ID);
++    await harness.waitForIdle();
++    const session = getAgentSessionById(harness.session.id);
++    expect(session?.status).toBe('error');
++    expect(session?.lastError).toBe('NODE_OFFLINE');
++    expect(harness.supervisor.isSessionActive(harness.session.id)).toBe(false);
++  });
+ });
+ 
+ describe('AgentSupervisor - 重启恢复', () => {
+diff --git a/apps/gateway/src/agent/supervisor.ts b/apps/gateway/src/agent/supervisor.ts
+index 43437459..866bcf60 100644
+--- a/apps/gateway/src/agent/supervisor.ts
++++ b/apps/gateway/src/agent/supervisor.ts
+@@ -36,7 +36,8 @@ import {
+   findApprovalRequests,
+ } from './approval-response-reconciler';
+ import { registerDeviceCloseListener } from './device-close-bus';
+-import type { AgentStopReason } from './run';
++import { registerNodeOfflineListener } from './node-offline-bus';
++import { type AgentStopReason, NODE_OFFLINE_ERROR } from './outcome-resolver';
+ import { AgentRun, type AgentRunDeps } from './run';
+ import { detectSecrets } from './secret-scan';
+ import { type AgentWsHub, agentWsHub } from './ws-hub';
+@@ -95,9 +96,15 @@ export type SubmitUserMessageResult =
+   | { kind: 'message'; record: AgentMessageRecord }
+   | { kind: 'queued'; record: AgentQueuedMessageRecord };
+ 
+-/** 会话是否孤立：绑定设备被删 / 缺失（后端可靠判定；pane 关闭但设备在线由前端判定屏蔽） */
++/** 会话是否孤立：本机绑定设备被删；远端 node 的 device 不在本机库，不算 orphan */
+ function isSessionOrphan(session: AgentSessionRecord): boolean {
+-  return !session.deviceId || !getDeviceById(session.deviceId);
++  if (!session.deviceId) {
++    return true;
++  }
++  if (session.nodeId) {
++    return false;
++  }
++  return !getDeviceById(session.deviceId);
+ }
+ 
+ function toQueuedWire(record: AgentQueuedMessageRecord): {
+@@ -115,6 +122,7 @@ interface ActiveRun {
+   stale: boolean;
+   resumeSuppressed: boolean;
+   deviceId: string | null;
++  nodeId: string | null;
+ }
+ 
+ interface AgentSupervisorDeps {
+@@ -134,6 +142,7 @@ export class AgentSupervisor {
+   private readonly staleSessionIds = new Set<string>();
+   private readonly resumeSuppressedSessionIds = new Set<string>();
+   private readonly lostDeviceIds = new Set<string>();
++  private readonly lostNodeIds = new Set<string>();
+   private started = false;
+   private stopping = false;
+ 
+@@ -213,6 +222,7 @@ export class AgentSupervisor {
+ 
+     // 订阅设备关闭事件：设备 runtime 断开时主动停止绑定该设备的 session
+     registerDeviceCloseListener((deviceId) => this.stopSessionsForDevice(deviceId, 'pane_lost'));
++    registerNodeOfflineListener((nodeId) => this.stopSessionsForNode(nodeId));
+   }
+ 
+   async stop(): Promise<void> {
+@@ -427,6 +437,41 @@ export class AgentSupervisor {
+     }
+   }
+ 
++  /**
++   * mesh peer 离线时停止绑定该 node 的 session：
++   * 活动 run 一律 abort；无活动 run 的 running/waiting 直接落 error，lastError=NODE_OFFLINE。
++   */
++  stopSessionsForNode(nodeId: string): void {
++    this.lostNodeIds.add(nodeId);
++    for (const [sessionId, entry] of this.activeRuns) {
++      const boundNodeId = entry.nodeId ?? getAgentSessionById(sessionId)?.nodeId ?? null;
++      if (boundNodeId !== nodeId) {
++        continue;
++      }
++      this.suppressResume(sessionId);
++      entry.run.requestStop('node_offline');
++    }
++
++    const sessions = [
++      ...getAgentSessionsByStatus('running'),
++      ...getAgentSessionsByStatus('waiting_confirmation'),
++    ].filter((s) => s.nodeId === nodeId);
++
++    for (const session of sessions) {
++      this.suppressResume(session.id);
++      if (this.activeRuns.has(session.id)) {
++        continue;
++      }
++      updateAgentSession(session.id, { status: 'error', lastError: NODE_OFFLINE_ERROR });
++      this.deps.hub.broadcastAgentEvent(
++        session.id,
++        wsBorsh.AGENT_EVENT_STATUS,
++        { status: 'error', lastError: NODE_OFFLINE_ERROR },
++        0
++      );
++    }
++  }
++
+   resolveConfirmation(
+     confirmationId: string,
+     approved: boolean,
+@@ -507,10 +552,15 @@ export class AgentSupervisor {
+     }
+ 
+     this.resumeSuppressedSessionIds.delete(sessionId);
+-    const deviceId = getAgentSessionById(sessionId)?.deviceId ?? null;
++    const session = getAgentSessionById(sessionId);
++    const deviceId = session?.deviceId ?? null;
++    const nodeId = session?.nodeId ?? null;
+     if (deviceId) {
+       this.lostDeviceIds.delete(deviceId);
+     }
++    if (nodeId) {
++      this.lostNodeIds.delete(nodeId);
++    }
+     const run = this.deps.createRun(sessionId);
+     const entry: ActiveRun = {
+       run,
+@@ -518,6 +568,7 @@ export class AgentSupervisor {
+       stale: false,
+       resumeSuppressed: false,
+       deviceId,
++      nodeId,
+     };
+     entry.promise = run
+       .execute()
+@@ -557,6 +608,9 @@ export class AgentSupervisor {
+     if (session.deviceId && this.lostDeviceIds.has(session.deviceId)) {
+       return;
+     }
++    if (session.nodeId && this.lostNodeIds.has(session.nodeId)) {
++      return;
++    }
+     if (session.status === 'stopped') {
+       return;
+     }
+diff --git a/apps/gateway/src/agent/tools/pane-info.ts b/apps/gateway/src/agent/tools/pane-info.ts
+index 283e896d..43c50b67 100644
+--- a/apps/gateway/src/agent/tools/pane-info.ts
++++ b/apps/gateway/src/agent/tools/pane-info.ts
+@@ -10,7 +10,7 @@ import {
+   toToolErrorMessage,
+ } from './terminal-context';
+ 
+-interface SnapshotPaneContext {
++export interface SnapshotPaneContext {
+   title: string | null;
+   currentPath: string | null;
+   windowName: string | null;
+@@ -20,10 +20,11 @@ interface SnapshotPaneContext {
+   splitPaneCount: number | null;
+ }
+ 
+-export function findPaneInSnapshot(
+-  deviceId: string,
+-  paneId: string
+-): { found: true; context: SnapshotPaneContext } | { found: false; snapshotExists: boolean } {
++export type PaneSnapshotLookup =
++  | { found: true; context: SnapshotPaneContext }
++  | { found: false; snapshotExists: boolean };
++
++export function findPaneInSnapshot(deviceId: string, paneId: string): PaneSnapshotLookup {
+   const snapshot = getDeviceSnapshot(deviceId);
+   const session = snapshot?.session;
+   if (!snapshot || !session) {
+@@ -95,7 +96,8 @@ export function createGetPaneInfoTool(ctx: TerminalToolContext): Tool {
+         const info = await runtime.getPaneInfo(ctx.paneId);
+         const emulator = liveEmulator(ctx);
+         const alternateScreen = emulator ? emulator.isAlternateScreen() : info.alternateScreen;
+-        const lookup = findPaneInSnapshot(ctx.deviceId, ctx.paneId);
++        const lookup =
++          runtime.findPaneInSnapshot?.(ctx.paneId) ?? findPaneInSnapshot(ctx.deviceId, ctx.paneId);
+         if (!lookup.found && lookup.snapshotExists) {
+           return failTool(ctx, 'Bound pane no longer exists in snapshot.');
+         }
+diff --git a/apps/gateway/src/agent/tools/run-command-spawn.test.ts b/apps/gateway/src/agent/tools/run-command-spawn.test.ts
+index e1feadd8..f5877811 100644
+--- a/apps/gateway/src/agent/tools/run-command-spawn.test.ts
++++ b/apps/gateway/src/agent/tools/run-command-spawn.test.ts
+@@ -101,7 +101,9 @@ describe('applyDisablePaging', () => {
+     await applyDisablePaging({
+       mode: 'posix',
+       disablePagingCommand: 'terminal length 0',
+-      sendInput: (data) => sent.push(data),
++      sendInput: (data) => {
++        sent.push(data);
++      },
+       sleepMs: async () => {},
+       resetBuffer: () => {
+         throw new Error('should not reset');
+@@ -110,7 +112,9 @@ describe('applyDisablePaging', () => {
+     await applyDisablePaging({
+       mode: 'cli',
+       disablePagingCommand: undefined,
+-      sendInput: (data) => sent.push(data),
++      sendInput: (data) => {
++        sent.push(data);
++      },
+       sleepMs: async () => {},
+       resetBuffer: () => {
+         throw new Error('should not reset');
+@@ -126,7 +130,9 @@ describe('applyDisablePaging', () => {
+     await applyDisablePaging({
+       mode: 'cli',
+       disablePagingCommand: 'terminal length 0',
+-      sendInput: (data) => sent.push(data),
++      sendInput: (data) => {
++        sent.push(data);
++      },
+       sleepMs: async (ms) => {
+         slept.push(ms);
+       },
+diff --git a/apps/gateway/src/agent/tools/run-command-spawn.ts b/apps/gateway/src/agent/tools/run-command-spawn.ts
+index 37be0df0..e9678c40 100644
+--- a/apps/gateway/src/agent/tools/run-command-spawn.ts
++++ b/apps/gateway/src/agent/tools/run-command-spawn.ts
+@@ -64,12 +64,12 @@ export function attachRunCommandTap(
+ export async function applyDisablePaging(input: {
+   mode: RunCommandMode;
+   disablePagingCommand: string | undefined;
+-  sendInput: (data: string) => void;
++  sendInput: (data: string) => void | Promise<void>;
+   sleepMs: (ms: number) => Promise<void>;
+   resetBuffer: () => void;
+ }): Promise<void> {
+   if (input.mode !== 'cli' || !input.disablePagingCommand) return;
+-  input.sendInput(`${input.disablePagingCommand}\r`);
++  await input.sendInput(`${input.disablePagingCommand}\r`);
+   await input.sleepMs(200);
+   input.resetBuffer();
+ }
+diff --git a/apps/gateway/src/agent/tools/run-command.ts b/apps/gateway/src/agent/tools/run-command.ts
+index 8fd1acbe..c82e080d 100644
+--- a/apps/gateway/src/agent/tools/run-command.ts
++++ b/apps/gateway/src/agent/tools/run-command.ts
+@@ -64,9 +64,11 @@ export interface RunCommandParams {
+   disablePagingCommand?: string;
+ }
+ 
++export type RunCommandSendInput = (data: string) => void | Promise<void>;
++
+ export interface RunCommandDeps {
+   emulator: RunCommandEmulator;
+-  sendInput: (data: string) => void;
++  sendInput: RunCommandSendInput;
+   sleepMs?: (ms: number) => Promise<void>;
+   /** 注入 nonce（默认基于计数器；避免直接用 Math.random，便于测试） */
+   makeNonce?: () => string;
+@@ -139,7 +141,7 @@ export async function executeRunCommand(
+     });
+     const promptRegex = resolvePromptRegex(args, deps.emulator.render());
+     if (args.usePosix) nonce = runtime.makeNonce();
+-    deps.sendInput(
++    await deps.sendInput(
+       buildRunCommandPayload({
+         command: args.command,
+         usePosix: args.usePosix,
+@@ -165,9 +167,9 @@ export async function executeRunCommand(
+   }
+ }
+ 
+-function checkPager(cleanedNow: string, sendInput: (data: string) => void): boolean {
++async function checkPager(cleanedNow: string, sendInput: RunCommandSendInput): Promise<boolean> {
+   if (MORE_MARKERS.some((re) => re.test(cleanedNow.slice(-200)))) {
+-    sendInput(' ');
++    await sendInput(' ');
+     return true;
+   }
+   return false;
+@@ -214,7 +216,7 @@ function checkPromptCompletion(
+ 
+ interface CommandWaitParams {
+   emulator: RunCommandEmulator;
+-  sendInput: (data: string) => void;
++  sendInput: RunCommandSendInput;
+   sleepMs: (ms: number) => Promise<void>;
+   now: () => number;
+   deadline: number;
+@@ -266,7 +268,7 @@ async function waitForCommandCompletion(params: CommandWaitParams): Promise<RunC
+     );
+     if (posix) return posix;
+ 
+-    if (checkPager(cleanedNow, params.sendInput)) {
++    if (await checkPager(cleanedNow, params.sendInput)) {
+       idleStableSince = 0;
+       continue;
+     }
+diff --git a/apps/gateway/src/agent/tools/send-input.ts b/apps/gateway/src/agent/tools/send-input.ts
+index 6c5b701b..20b5fe6d 100644
+--- a/apps/gateway/src/agent/tools/send-input.ts
++++ b/apps/gateway/src/agent/tools/send-input.ts
+@@ -106,7 +106,7 @@ export function createSendInputTool(ctx: TerminalToolContext): Tool {
+             },
+           });
+           try {
+-            runtime.sendInput(ctx.paneId, data);
++            await runtime.sendInput(ctx.paneId, data);
+             await ctx.sleepMs(SEND_INPUT_SETTLE_MS);
+           } finally {
+             untap();
+@@ -138,7 +138,7 @@ export function createSendInputTool(ctx: TerminalToolContext): Tool {
+           };
+         }
+ 
+-        runtime.sendInput(ctx.paneId, data);
++        await runtime.sendInput(ctx.paneId, data);
+         await ctx.sleepMs(SEND_INPUT_SETTLE_MS);
+         const [screen, info] = await Promise.all([
+           runtime.capturePaneText(ctx.paneId, { historyLines: 0 }),
+diff --git a/apps/gateway/src/agent/tools/terminal-context.ts b/apps/gateway/src/agent/tools/terminal-context.ts
+index af8201b1..58d341e8 100644
+--- a/apps/gateway/src/agent/tools/terminal-context.ts
++++ b/apps/gateway/src/agent/tools/terminal-context.ts
+@@ -1,10 +1,12 @@
+ import type { PaneInfo } from '../../tmux-client/capture-history';
+ import type { PaneEmulator } from '../../tmux-client/pane-emulator';
++import type { PaneSnapshotLookup } from './pane-info';
+ 
+ export interface TerminalRuntimeLike {
+-  sendInput(paneId: string, data: string): void;
++  sendInput(paneId: string, data: string): void | Promise<void>;
+   capturePaneText(paneId: string, opts?: { historyLines?: number }): Promise<string>;
+   getPaneInfo(paneId: string): Promise<PaneInfo>;
++  findPaneInSnapshot?(paneId: string): PaneSnapshotLookup;
+   /** runtime 已终止（设备连接断开等）时为 true；用于主动停止 run 而非等工具超时 */
+   readonly isTerminated?: boolean;
+ }
+diff --git a/apps/gateway/src/api/agent-dtos.ts b/apps/gateway/src/api/agent-dtos.ts
+index 01672f86..b7be223d 100644
+--- a/apps/gateway/src/api/agent-dtos.ts
++++ b/apps/gateway/src/api/agent-dtos.ts
+@@ -26,6 +26,7 @@ export function toSessionDto(record: AgentSessionRecord): AgentSessionDto {
+   return {
+     id: record.id,
+     title: record.title,
++    nodeId: record.nodeId,
+     deviceId: record.deviceId,
+     paneId: record.paneId,
+     providerId: record.providerId,
+diff --git a/apps/gateway/src/api/agent-session-routes.ts b/apps/gateway/src/api/agent-session-routes.ts
+index cd847f7e..055cd2d7 100644
+--- a/apps/gateway/src/api/agent-session-routes.ts
++++ b/apps/gateway/src/api/agent-session-routes.ts
+@@ -1,4 +1,5 @@
+ import { DEFAULT_AGENT_SESSION_TITLE } from '@tmex/shared';
++import { RemotePaneRuntime } from '../agent/remote-pane-runtime';
+ import type { AgentSupervisor } from '../agent/supervisor';
+ import { getDeviceById } from '../db';
+ import {
+@@ -10,6 +11,7 @@ import {
+   updateAgentSession,
+ } from '../db/agent';
+ import { t } from '../i18n';
++import { getMeshAgentBridge } from '../mesh/mesh-agent-bridge';
+ import { tmuxRuntimeRegistry } from '../tmux-client/registry';
+ import { mapSupervisorError, toSessionDto } from './agent-dtos';
+ import { parseAgentSessionConfig } from './agent-session-config';
+@@ -36,6 +38,20 @@ const SESSION_IDENTITY_FIELDS: ConfigFieldSpec<unknown>[] = [
+   },
+ ];
+ 
++function parseSessionNodeId(raw: unknown): { ok: true; value: string | null } | { ok: false } {
++  if (raw === undefined || raw === null || raw === '' || raw === 'self') {
++    return { ok: true, value: null };
++  }
++  if (typeof raw !== 'string') {
++    return { ok: false };
++  }
++  const value = raw.trim();
++  if (!value || value === 'self') {
++    return { ok: true, value: null };
++  }
++  return { ok: true, value };
++}
++
+ /**
+  * 创建会话时采集起源元数据（D1）：进程名经 tmux runtime 的 getPaneInfo 取 currentCommand；
+  * 标题用前端传入的 snapshot 标题兜底（PaneInfo 不含标题）。任何失败静默降级为 null，不阻塞建会话。
+@@ -43,16 +59,26 @@ const SESSION_IDENTITY_FIELDS: ConfigFieldSpec<unknown>[] = [
+ async function captureSessionOrigin(
+   deviceId: string,
+   paneId: string,
+-  fallbackTitle: string | null
++  fallbackTitle: string | null,
++  nodeId: string | null
+ ): Promise<{ title: string | null; processName: string | null }> {
+   let processName: string | null = null;
+   try {
+-    const runtime = await tmuxRuntimeRegistry.acquire(deviceId);
+-    try {
+-      const info = await runtime.getPaneInfo(paneId);
+-      processName = info.currentCommand ?? null;
+-    } finally {
+-      await tmuxRuntimeRegistry.release(deviceId, runtime);
++    if (nodeId) {
++      const bridge = getMeshAgentBridge();
++      if (bridge) {
++        const runtime = new RemotePaneRuntime(nodeId, deviceId, bridge.forwardInternalHttp);
++        const info = await runtime.getPaneInfo(paneId);
++        processName = info.currentCommand ?? info.title ?? null;
++      }
++    } else {
++      const runtime = await tmuxRuntimeRegistry.acquire(deviceId);
++      try {
++        const info = await runtime.getPaneInfo(paneId);
++        processName = info.currentCommand ?? null;
++      } finally {
++        await tmuxRuntimeRegistry.release(deviceId, runtime);
++      }
+     }
+   } catch (error) {
+     console.warn(`[api/agent] capture session origin failed for ${deviceId}/${paneId}:`, error);
+@@ -62,10 +88,11 @@ async function captureSessionOrigin(
+ 
+ async function handleListSessions(req: Request): Promise<Response> {
+   const url = new URL(req.url);
++  const nodeId = url.searchParams.get('nodeId') ?? undefined;
+   const deviceId = url.searchParams.get('deviceId');
+   const paneId = url.searchParams.get('paneId');
+ 
+-  let sessions = getAllAgentSessions();
++  let sessions = getAllAgentSessions(nodeId ? { nodeId } : {});
+   if (deviceId) {
+     sessions = sessions.filter((s) => s.deviceId === deviceId);
+   }
+@@ -82,13 +109,29 @@ async function handleCreateSession(req: Request): Promise<Response> {
+     return json({ error: t('apiError.invalidRequest') }, 400);
+   }
+ 
++  const nodeIdParsed = parseSessionNodeId(raw.nodeId);
++  if (!nodeIdParsed.ok) {
++    return json({ error: t('apiError.invalidRequest') }, 400);
++  }
++  const nodeId = nodeIdParsed.value;
++
+   const deviceId = typeof raw.deviceId === 'string' ? raw.deviceId.trim() : '';
+   if (!deviceId) {
+     return json({ error: t('apiError.agentDeviceRequired') }, 400);
+   }
+-  if (!getDeviceById(deviceId)) {
++  if (!nodeId && !getDeviceById(deviceId)) {
+     return json({ error: t('apiError.deviceNotFound') }, 404);
+   }
++  if (nodeId) {
++    const bridge = getMeshAgentBridge();
++    const status = bridge?.lookupNode(nodeId) ?? 'unknown';
++    if (status === 'unknown') {
++      return json({ error: 'NODE_NOT_FOUND' }, 404);
++    }
++    if (status === 'offline') {
++      return json({ error: 'NODE_UNREACHABLE' }, 503);
++    }
++  }
+ 
+   const paneId = typeof raw.paneId === 'string' ? raw.paneId.trim() : '';
+   if (!paneId) {
+@@ -103,11 +146,13 @@ async function handleCreateSession(req: Request): Promise<Response> {
+   const origin = await captureSessionOrigin(
+     deviceId,
+     paneId,
+-    typeof raw.originPaneTitle === 'string' ? raw.originPaneTitle : null
++    typeof raw.originPaneTitle === 'string' ? raw.originPaneTitle : null,
++    nodeId
+   );
+ 
+   const session = createAgentSession({
+     title: DEFAULT_AGENT_SESSION_TITLE,
++    nodeId,
+     deviceId,
+     paneId,
+     ...parsed.config,
+diff --git a/apps/gateway/src/api/agent.test.ts b/apps/gateway/src/api/agent.test.ts
+index 5e8ef0b7..1ac09c25 100644
+--- a/apps/gateway/src/api/agent.test.ts
++++ b/apps/gateway/src/api/agent.test.ts
+@@ -20,6 +20,7 @@ import {
+ } from '../db/agent';
+ import { getDb as getOrmDb } from '../db/client';
+ import { createLlmProvider } from '../db/llm';
++import { setMeshAgentBridge } from '../mesh/mesh-agent-bridge';
+ import { createAgentRoutes } from './agent';
+ import { dispatchRoutes } from './route';
+ 
+@@ -220,6 +221,64 @@ describe('POST /api/agent/sessions', () => {
+     expect(session.writeMode).toBe('confirm');
+     expect(session.status).toBe('idle');
+     expect(session.paneId).toBe('%7');
++    expect(session.nodeId).toBeNull();
++  });
++
++  test('nodeId 缺省/null/self 均落库为 null', async () => {
++    for (const nodeId of [undefined, null, 'self'] as const) {
++      const { status, json } = await call('POST', '/api/agent/sessions', {
++        deviceId: TEST_DEVICE_ID,
++        paneId: '%self-node',
++        modelId: 'mock-model',
++        ...(nodeId === undefined ? {} : { nodeId }),
++      });
++      expect(status).toBe(201);
++      expect((json.session as { nodeId: string | null }).nodeId).toBeNull();
++    }
++  });
++
++  test('远端 nodeId：未知 → 404，离线 → 503，在线跳过本机 device 校验', async () => {
++    setMeshAgentBridge({
++      lookupNode(nodeId) {
++        if (nodeId === 'online-peer') return 'online';
++        if (nodeId === 'offline-peer') return 'offline';
++        return 'unknown';
++      },
++      forwardInternalHttp: async () => new Response(JSON.stringify({ info: {} }), { status: 200 }),
++    });
++    try {
++      expect(
++        (
++          await call('POST', '/api/agent/sessions', {
++            nodeId: 'ghost-peer',
++            deviceId: 'remote-device',
++            paneId: '%1',
++            modelId: 'm',
++          })
++        ).status
++      ).toBe(404);
++      expect(
++        (
++          await call('POST', '/api/agent/sessions', {
++            nodeId: 'offline-peer',
++            deviceId: 'remote-device',
++            paneId: '%1',
++            modelId: 'm',
++          })
++        ).status
++      ).toBe(503);
++      const { status, json } = await call('POST', '/api/agent/sessions', {
++        nodeId: 'online-peer',
++        deviceId: 'remote-device',
++        paneId: '%9',
++        modelId: 'm',
++      });
++      expect(status).toBe(201);
++      expect((json.session as { nodeId: string; deviceId: string }).nodeId).toBe('online-peer');
++      expect((json.session as { deviceId: string }).deviceId).toBe('remote-device');
++    } finally {
++      setMeshAgentBridge(null);
++    }
+   });
+ });
+ 
+@@ -234,6 +293,21 @@ describe('GET /api/agent/sessions', () => {
+     const sessions = json.sessions as Array<{ id: string }>;
+     expect(sessions.map((s) => s.id)).toEqual([target.id]);
+   });
++
++  test('按 nodeId=self / 远端 nodeId 过滤', async () => {
++    const selfSession = createTestSession({ paneId: '%node-self', nodeId: null });
++    const remoteSession = createTestSession({ paneId: '%node-remote', nodeId: 'peer-node-1' });
++    const selfList = await call('GET', '/api/agent/sessions?nodeId=self');
++    expect(selfList.status).toBe(200);
++    const selfIds = (selfList.json.sessions as Array<{ id: string }>).map((s) => s.id);
++    expect(selfIds).toContain(selfSession.id);
++    expect(selfIds).not.toContain(remoteSession.id);
++
++    const remoteList = await call('GET', '/api/agent/sessions?nodeId=peer-node-1');
++    expect(remoteList.status).toBe(200);
++    const remoteIds = (remoteList.json.sessions as Array<{ id: string }>).map((s) => s.id);
++    expect(remoteIds).toEqual([remoteSession.id]);
++  });
+ });
+ 
+ describe('GET/PATCH/DELETE /api/agent/sessions/:id', () => {
+@@ -267,6 +341,19 @@ describe('GET/PATCH/DELETE /api/agent/sessions/:id', () => {
+     expect(updated.maxStepsPerTurn).toBe(10);
+   });
+ 
++  test('PATCH 不能改 nodeId', async () => {
++    const session = createTestSession({ nodeId: null });
++    const { status, json } = await call('PATCH', `/api/agent/sessions/${session.id}`, {
++      nodeId: 'peer-should-ignore',
++      title: 'Keep node',
++    });
++    expect(status).toBe(200);
++    const updated = json.session as { nodeId: string | null; title: string };
++    expect(updated.nodeId).toBeNull();
++    expect(updated.title).toBe('Keep node');
++    expect(getAgentSessionById(session.id)?.nodeId).toBeNull();
++  });
++
+   test('PATCH 空 title → 400；非法 writeMode → 400', async () => {
+     const session = createTestSession();
+     expect((await call('PATCH', `/api/agent/sessions/${session.id}`, { title: '  ' })).status).toBe(
+diff --git a/apps/gateway/src/db/agent-sessions-node-id.migration.test.ts b/apps/gateway/src/db/agent-sessions-node-id.migration.test.ts
+new file mode 100644
+index 00000000..042a82b4
+--- /dev/null
++++ b/apps/gateway/src/db/agent-sessions-node-id.migration.test.ts
+@@ -0,0 +1,32 @@
++import { Database } from 'bun:sqlite';
++import { describe, expect, test } from 'bun:test';
++import { resolve } from 'node:path';
++import { drizzle } from 'drizzle-orm/bun-sqlite';
++import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
++
++const migrationsFolder = resolve(import.meta.dir, '../../drizzle');
++
++describe('0026 agent_sessions.node_id', () => {
++  test('fresh db migration adds nullable node_id', () => {
++    const sqlite = new Database(':memory:');
++    sqlite.run('PRAGMA foreign_keys = ON');
++    migrate(drizzle(sqlite), { migrationsFolder });
++    const cols = sqlite.query('PRAGMA table_info(agent_sessions)').all() as Array<{
++      name: string;
++      notnull: number;
++    }>;
++    const nodeId = cols.find((c) => c.name === 'node_id');
++    expect(nodeId).toBeDefined();
++    expect(nodeId?.notnull).toBe(0);
++    const indexes = sqlite
++      .query('SELECT name FROM sqlite_master WHERE type = ? AND name = ?')
++      .get('index', 'agent_sessions_node_id_idx') as { name: string } | null;
++    expect(indexes?.name).toBe('agent_sessions_node_id_idx');
++    const fks = sqlite.query('PRAGMA foreign_key_list(agent_sessions)').all() as Array<{
++      from: string;
++      table: string;
++    }>;
++    expect(fks.some((fk) => fk.from === 'device_id' && fk.table === 'devices')).toBe(false);
++    sqlite.close();
++  });
++});
+diff --git a/apps/gateway/src/db/agent.ts b/apps/gateway/src/db/agent.ts
+index 06bbbe76..b60b7367 100644
+--- a/apps/gateway/src/db/agent.ts
++++ b/apps/gateway/src/db/agent.ts
+@@ -1,4 +1,4 @@
+-import { and, asc, desc, eq, gt, max, sql } from 'drizzle-orm';
++import { and, asc, desc, eq, gt, isNull, max, sql } from 'drizzle-orm';
+ import { getDb as getOrmDb } from './client';
+ import {
+   type AgentConfirmationStatus,
+@@ -92,6 +92,7 @@ export function updateAgentSettings(
+ 
+ export interface CreateAgentSessionInput {
+   title: string;
++  nodeId?: string | null;
+   deviceId?: string | null;
+   paneId?: string | null;
+   providerId?: string | null;
+@@ -112,6 +113,7 @@ export function createAgentSession(input: CreateAgentSessionInput): AgentSession
+   const row: typeof agentSessions.$inferInsert = {
+     id: crypto.randomUUID(),
+     title: input.title,
++    nodeId: input.nodeId ?? null,
+     deviceId: input.deviceId ?? null,
+     paneId: input.paneId ?? null,
+     providerId: input.providerId ?? null,
+@@ -143,9 +145,19 @@ export function getAgentSessionById(id: string): AgentSessionRecord | null {
+   return orm.select().from(agentSessions).where(eq(agentSessions.id, id)).get() ?? null;
+ }
+ 
+-export function getAllAgentSessions(): AgentSessionRecord[] {
++export function getAllAgentSessions(filter: { nodeId?: string } = {}): AgentSessionRecord[] {
+   const orm = getOrmDb();
+-  return orm.select().from(agentSessions).orderBy(desc(agentSessions.updatedAt)).all();
++  const query = orm.select().from(agentSessions);
++  if (filter.nodeId === 'self') {
++    return query.where(isNull(agentSessions.nodeId)).orderBy(desc(agentSessions.updatedAt)).all();
++  }
++  if (filter.nodeId) {
++    return query
++      .where(eq(agentSessions.nodeId, filter.nodeId))
++      .orderBy(desc(agentSessions.updatedAt))
++      .all();
++  }
++  return query.orderBy(desc(agentSessions.updatedAt)).all();
+ }
+ 
+ export function getAgentSessionsByStatus(status: AgentSessionStatus): AgentSessionRecord[] {
+@@ -169,6 +181,7 @@ export function updateAgentSession(
+ 
+   for (const key of [
+     'title',
++    'nodeId',
+     'deviceId',
+     'paneId',
+     'providerId',
+diff --git a/apps/gateway/src/db/schema.ts b/apps/gateway/src/db/schema.ts
+index a2d320ba..a5c014aa 100644
+--- a/apps/gateway/src/db/schema.ts
++++ b/apps/gateway/src/db/schema.ts
+@@ -204,7 +204,10 @@ export const agentSessions = sqliteTable(
+   {
+     id: text('id').primaryKey(),
+     title: text('title').notNull(),
+-    deviceId: text('device_id').references(() => devices.id, { onDelete: 'set null' }),
++    /** 绑定 pane 所在 mesh node；null 表示本 gateway（self） */
++    nodeId: text('node_id'),
++    // 无 FK：远端 node 的 deviceId 不在本机 devices 表
++    deviceId: text('device_id'),
+     paneId: text('pane_id'),
+     providerId: text('provider_id').references(() => llmProviders.id, { onDelete: 'set null' }),
+     modelId: text('model_id').notNull(),
+@@ -235,6 +238,7 @@ export const agentSessions = sqliteTable(
+       'agent_sessions_status_check',
+       sql`${table.status} in ('idle', 'running', 'waiting_confirmation', 'stopped', 'error')`
+     ),
++    index('agent_sessions_node_id_idx').on(table.nodeId),
+   ]
+ );
+ 
+@@ -711,6 +715,23 @@ export const hubTrust = sqliteTable('hub_trust', {
+   createdAt: integer('created_at').notNull(),
+ });
+ 
++export const tunnelConfig = sqliteTable(
++  'tunnel_config',
++  {
++    id: text('id').primaryKey(),
++    mode: text('mode').notNull().default('off'),
++    hostname: text('hostname'),
++    tunnelName: text('tunnel_name'),
++    tunnelId: text('tunnel_id'),
++    autoStart: integer('auto_start', { mode: 'boolean' }).notNull().default(false),
++    updatedAt: text('updated_at').notNull(),
++  },
++  (table) => [
++    check('tunnel_config_singleton_check', sql`${table.id} = 'default'`),
++    check('tunnel_config_mode_check', sql`${table.mode} in ('off', 'quick', 'named')`),
++  ]
++);
++
+ export type UserRow = typeof users.$inferSelect;
+ export type UserKeyRow = typeof userKeys.$inferSelect;
+ export type UserKeyLogRow = typeof userKeyLog.$inferSelect;
+@@ -722,3 +743,4 @@ export type NodeIdentityRow = typeof nodeIdentity.$inferSelect;
+ export type PeerCacheRow = typeof peerCache.$inferSelect;
+ export type TlsConfigRow = typeof tlsConfig.$inferSelect;
+ export type HubTrustRow = typeof hubTrust.$inferSelect;
++export type TunnelConfigRow = typeof tunnelConfig.$inferSelect;
+diff --git a/apps/gateway/src/mesh/forwarder.ts b/apps/gateway/src/mesh/forwarder.ts
+index 931b7fff..3dad8569 100644
+--- a/apps/gateway/src/mesh/forwarder.ts
++++ b/apps/gateway/src/mesh/forwarder.ts
+@@ -134,6 +134,9 @@ export class Forwarder {
+       return this.handleRemoteWs(req, server, parsed.nodeId);
+     }
+     if (parsed.rest === '/api' || parsed.rest.startsWith('/api/')) {
++      if (parsed.rest.startsWith('/api/mesh-internal')) {
++        return jsonError('FORBIDDEN', 403);
++      }
+       return this.handleRemoteHttp(req, parsed.nodeId, parsed.rest, url.search);
+     }
+     return null;
+@@ -193,6 +196,41 @@ export class Forwarder {
+     this.bindStream(pump, stream, meta?.transport ?? null);
+   }
+ 
++  async forwardInternalHttp(
++    nodeId: string,
++    path: string,
++    body: unknown,
++    signal?: AbortSignal
++  ): Promise<Response> {
++    const abort = signal ?? new AbortController().signal;
++    const payload = typeof body === 'string' ? body : JSON.stringify(body ?? {});
++    const bytes = new TextEncoder().encode(payload);
++    const streamBody = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(bytes);
++        controller.close();
++      },
++    });
++    try {
++      const link = await this.deps.peers.getLink(nodeId);
++      return await this.deps.streams.openHttpStream(
++        link,
++        {
++          method: 'POST',
++          path,
++          query: '',
++          headers: { 'content-type': 'application/json' },
++          origin: 'http://localhost',
++          auth: null,
++        },
++        streamBody,
++        abort
++      );
++    } catch {
++      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
++    }
++  }
++
+   private bindStream(
+     pump: ForwardPump,
+     stream: OpenedWsStream,
+diff --git a/apps/gateway/src/mesh/mesh-agent-bridge.ts b/apps/gateway/src/mesh/mesh-agent-bridge.ts
+new file mode 100644
+index 00000000..8e4a4b4c
+--- /dev/null
++++ b/apps/gateway/src/mesh/mesh-agent-bridge.ts
+@@ -0,0 +1,23 @@
++export type RemoteNodeLookupResult = 'online' | 'offline' | 'unknown';
++
++export type InternalHttpForwarder = (
++  nodeId: string,
++  path: string,
++  body: unknown,
++  signal?: AbortSignal
++) => Promise<Response>;
++
++export interface MeshAgentBridge {
++  lookupNode(nodeId: string): RemoteNodeLookupResult;
++  forwardInternalHttp: InternalHttpForwarder;
++}
++
++let bridge: MeshAgentBridge | null = null;
++
++export function setMeshAgentBridge(next: MeshAgentBridge | null): void {
++  bridge = next;
++}
++
++export function getMeshAgentBridge(): MeshAgentBridge | null {
++  return bridge;
++}
+diff --git a/apps/gateway/src/mesh/mesh-http.test.ts b/apps/gateway/src/mesh/mesh-http.test.ts
+index 5d1bfcb0..57909118 100644
+--- a/apps/gateway/src/mesh/mesh-http.test.ts
++++ b/apps/gateway/src/mesh/mesh-http.test.ts
+@@ -7,7 +7,9 @@ import {
+   type MeshServerWebSocket,
+   WS_CLOSE_LOGIN_REQUIRED,
+   WS_SESSION_VERIFY_MS,
++  setMeshRequestContext,
+ } from './mesh-deps';
++import { X_TMEX_MESH_PEER } from './peer-request-marker';
+ 
+ describe('mesh-http', () => {
+   test('standalone localUiGuard always passes', async () => {
+@@ -195,4 +197,68 @@ describe('mesh-http', () => {
+       mesh.close();
+     }
+   });
++
++  test('mesh-internal 无标记 → 403；外部伪造标记被剥掉仍 403', async () => {
++    const mesh = await bootMesh();
++    try {
++      const denied = await mesh.runtime.handleRequest(
++        new Request('http://localhost/api/mesh-internal/tmux/pane-info', {
++          method: 'POST',
++          headers: { 'content-type': 'application/json' },
++          body: JSON.stringify({ deviceId: 'd', paneId: '%1' }),
++        }),
++        dummyServer
++      );
++      expect(denied instanceof Response ? denied.status : 0).toBe(403);
++
++      const spoofed = await mesh.runtime.handleRequest(
++        new Request('http://localhost/api/mesh-internal/tmux/pane-info', {
++          method: 'POST',
++          headers: {
++            'content-type': 'application/json',
++            'x-tmex-mesh-peer': 'forged-peer',
++          },
++          body: JSON.stringify({ deviceId: 'd', paneId: '%1' }),
++        }),
++        dummyServer
++      );
++      expect(spoofed instanceof Response ? spoofed.status : 0).toBe(403);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('peer inbound 保留标记，mesh-internal 不因缺 cookie 返回 403', async () => {
++    const mesh = await bootMesh();
++    try {
++      const req = new Request('http://localhost/api/mesh-internal/tmux/pane-info', {
++        method: 'POST',
++        headers: {
++          'content-type': 'application/json',
++          [X_TMEX_MESH_PEER]: 'entry-peer',
++        },
++        body: JSON.stringify({ deviceId: 'missing', paneId: '%1' }),
++      });
++      setMeshRequestContext(req, { via: 'entry-peer', clientIp: 'peer:entry-peer' });
++      const res = await mesh.runtime.handleRequest(req, dummyServer);
++      expect(res instanceof Response).toBe(true);
++      if (res instanceof Response) {
++        expect(res.status).not.toBe(403);
++        expect(res.status).not.toBe(401);
++      }
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('localUiGuard 不拦截 /api/mesh-internal（由标记鉴权）', async () => {
++    const mesh = await bootMesh();
++    try {
++      expect(
++        mesh.runtime.localUiGuard(new Request('http://localhost/api/mesh-internal/tmux/pane-info'))
++      ).toBeNull();
++    } finally {
++      mesh.close();
++    }
++  });
+ });
+diff --git a/apps/gateway/src/mesh/mesh-http.ts b/apps/gateway/src/mesh/mesh-http.ts
+index e67076f0..7d4ff9d1 100644
+--- a/apps/gateway/src/mesh/mesh-http.ts
++++ b/apps/gateway/src/mesh/mesh-http.ts
+@@ -24,7 +24,9 @@ import {
+   X_TMEX_CONNECTION,
+   isStandaloneRoles,
+ } from './mesh-deps';
++import { handleMeshInternalTmuxRequest, isMeshInternalPath } from './mesh-internal-tmux-routes';
+ import { MeshRoutes } from './mesh-routes';
++import { isPeerInboundRequest, stripMeshPeerMarkerFromRequest } from './peer-request-marker';
+ import {
+   type SessionMiddlewareDeps,
+   authenticateRequest,
+@@ -146,11 +148,16 @@ export class MeshHttpRuntime {
+   }
+ 
+   async handleRequest(req: Request, server: MeshUpgradeServer): Promise<MeshHandleResult> {
+-    const forwarded = await this.forwarder.handle(req, server);
++    const safeReq = isPeerInboundRequest(req) ? req : stripMeshPeerMarkerFromRequest(req);
++    const path = new URL(safeReq.url).pathname;
++    if (isMeshInternalPath(path)) {
++      return handleMeshInternalTmuxRequest(safeReq);
++    }
++    const forwarded = await this.forwarder.handle(safeReq, server);
+     if (forwarded !== null) {
+-      return this.finalizeHandle(req, forwarded);
++      return this.finalizeHandle(safeReq, forwarded);
+     }
+-    return this.finalizeHandle(req, await this.dispatchLocal(req, server));
++    return this.finalizeHandle(safeReq, await this.dispatchLocal(safeReq, server));
+   }
+ 
+   guardGatewayWebSocket(req: Request, server: MeshUpgradeServer): Response | null | undefined {
+@@ -327,6 +334,9 @@ export class MeshHttpRuntime {
+     if (isStaticAsset(path)) {
+       return null;
+     }
++    if (isMeshInternalPath(path)) {
++      return null;
++    }
+     if (PUBLIC_API.has(path)) {
+       return null;
+     }
+diff --git a/apps/gateway/src/mesh/mesh-internal-tmux-routes.test.ts b/apps/gateway/src/mesh/mesh-internal-tmux-routes.test.ts
+new file mode 100644
+index 00000000..1289d90a
+--- /dev/null
++++ b/apps/gateway/src/mesh/mesh-internal-tmux-routes.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, test } from 'bun:test';
++import { handleMeshInternalTmuxRequest } from './mesh-internal-tmux-routes';
++import { X_TMEX_MESH_PEER } from './peer-request-marker';
++
++describe('mesh-internal tmux routes', () => {
++  test('无 peer 标记 → 403 且不要求 cookie', async () => {
++    const res = await handleMeshInternalTmuxRequest(
++      new Request('http://localhost/api/mesh-internal/tmux/pane-info', {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ deviceId: 'd', paneId: '%1' }),
++      })
++    );
++    expect(res.status).toBe(403);
++    expect(await res.json()).toEqual({ code: 'FORBIDDEN' });
++  });
++
++  test('有标记但缺字段 → 400', async () => {
++    const res = await handleMeshInternalTmuxRequest(
++      new Request('http://localhost/api/mesh-internal/tmux/pane-info', {
++        method: 'POST',
++        headers: {
++          'content-type': 'application/json',
++          [X_TMEX_MESH_PEER]: 'peer-1',
++        },
++        body: JSON.stringify({ deviceId: '', paneId: '' }),
++      })
++    );
++    expect(res.status).toBe(400);
++  });
++});
+diff --git a/apps/gateway/src/mesh/mesh-internal-tmux-routes.ts b/apps/gateway/src/mesh/mesh-internal-tmux-routes.ts
+new file mode 100644
+index 00000000..9b4d26a8
+--- /dev/null
++++ b/apps/gateway/src/mesh/mesh-internal-tmux-routes.ts
+@@ -0,0 +1,146 @@
++import { findPaneInSnapshot } from '../agent/tools/pane-info';
++import { json, readJsonObjectBody } from '../api/http';
++import { type ApiRoute, dispatchRoutes, route } from '../api/route';
++import { tmuxRuntimeRegistry } from '../tmux-client/registry';
++import { readMeshPeerMarker } from './peer-request-marker';
++import { jsonError } from './session-middleware';
++
++export const MESH_INTERNAL_TMUX_PREFIX = '/api/mesh-internal/tmux';
++
++function requirePeerMarker(req: Request): Response | null {
++  if (readMeshPeerMarker(req)) {
++    return null;
++  }
++  return jsonError('FORBIDDEN', 403);
++}
++
++function readRequiredIds(
++  raw: Record<string, unknown>
++): { deviceId: string; paneId: string } | Response {
++  const deviceId = typeof raw.deviceId === 'string' ? raw.deviceId.trim() : '';
++  const paneId = typeof raw.paneId === 'string' ? raw.paneId.trim() : '';
++  if (!deviceId || !paneId) {
++    return json({ error: 'invalid_request' }, 400);
++  }
++  return { deviceId, paneId };
++}
++
++async function withDeviceRuntime<T>(
++  deviceId: string,
++  fn: (runtime: Awaited<ReturnType<typeof tmuxRuntimeRegistry.acquire>>) => Promise<T>
++): Promise<T> {
++  const runtime = await tmuxRuntimeRegistry.acquire(deviceId);
++  try {
++    return await fn(runtime);
++  } finally {
++    await tmuxRuntimeRegistry.release(deviceId, runtime);
++  }
++}
++
++async function handlePaneInfo(req: Request): Promise<Response> {
++  const raw = await readJsonObjectBody(req);
++  if (!raw) {
++    return json({ error: 'invalid_request' }, 400);
++  }
++  const ids = readRequiredIds(raw);
++  if (ids instanceof Response) {
++    return ids;
++  }
++  try {
++    const info = await withDeviceRuntime(ids.deviceId, (runtime) =>
++      runtime.getPaneInfo(ids.paneId)
++    );
++    const snapshot = findPaneInSnapshot(ids.deviceId, ids.paneId);
++    return json({
++      info,
++      snapshot: snapshot.found ? snapshot.context : null,
++      snapshotExists: snapshot.found || snapshot.snapshotExists,
++    });
++  } catch (error) {
++    return json({ error: error instanceof Error ? error.message : 'pane_info_failed' }, 502);
++  }
++}
++
++async function handleCapture(req: Request): Promise<Response> {
++  const raw = await readJsonObjectBody(req);
++  if (!raw) {
++    return json({ error: 'invalid_request' }, 400);
++  }
++  const ids = readRequiredIds(raw);
++  if (ids instanceof Response) {
++    return ids;
++  }
++  const historyLines =
++    typeof raw.historyLines === 'number' && Number.isFinite(raw.historyLines)
++      ? raw.historyLines
++      : undefined;
++  try {
++    const text = await withDeviceRuntime(ids.deviceId, (runtime) =>
++      runtime.capturePaneText(ids.paneId, historyLines === undefined ? undefined : { historyLines })
++    );
++    return json({ text });
++  } catch (error) {
++    return json({ error: error instanceof Error ? error.message : 'capture_failed' }, 502);
++  }
++}
++
++async function handleSendInput(req: Request): Promise<Response> {
++  const raw = await readJsonObjectBody(req);
++  if (!raw) {
++    return json({ error: 'invalid_request' }, 400);
++  }
++  const ids = readRequiredIds(raw);
++  if (ids instanceof Response) {
++    return ids;
++  }
++  if (typeof raw.data !== 'string') {
++    return json({ error: 'invalid_request' }, 400);
++  }
++  try {
++    await withDeviceRuntime(ids.deviceId, async (runtime) => {
++      await runtime.sendInput(ids.paneId, raw.data as string);
++    });
++    return json({ ok: true });
++  } catch (error) {
++    return json({ error: error instanceof Error ? error.message : 'send_input_failed' }, 502);
++  }
++}
++
++export function createMeshInternalTmuxRoutes(): ApiRoute[] {
++  return [
++    route({
++      method: 'POST',
++      path: `${MESH_INTERNAL_TMUX_PREFIX}/pane-info`,
++      handler: (req) => handlePaneInfo(req),
++    }),
++    route({
++      method: 'POST',
++      path: `${MESH_INTERNAL_TMUX_PREFIX}/capture`,
++      handler: (req) => handleCapture(req),
++    }),
++    route({
++      method: 'POST',
++      path: `${MESH_INTERNAL_TMUX_PREFIX}/send-input`,
++      handler: (req) => handleSendInput(req),
++    }),
++  ];
++}
++
++const meshInternalTmuxRoutes = createMeshInternalTmuxRoutes();
++
++export async function handleMeshInternalTmuxRequest(req: Request): Promise<Response> {
++  const denied = requirePeerMarker(req);
++  if (denied) {
++    return denied;
++  }
++  const path = new URL(req.url).pathname;
++  const matched = dispatchRoutes(req, path, meshInternalTmuxRoutes, { path });
++  if (matched) {
++    return matched;
++  }
++  return jsonError('NOT_FOUND', 404);
++}
++
++export function isMeshInternalPath(path: string): boolean {
++  return path === '/api/mesh-internal' || path.startsWith('/api/mesh-internal/');
++}
+diff --git a/apps/gateway/src/mesh/mesh-runtime.ts b/apps/gateway/src/mesh/mesh-runtime.ts
+index ea4b9b9f..81cd9a37 100644
+--- a/apps/gateway/src/mesh/mesh-runtime.ts
++++ b/apps/gateway/src/mesh/mesh-runtime.ts
+@@ -1,6 +1,7 @@
+ import os from 'node:os';
+ import { canonicalHubUrl, encodeBase64url } from '@tmex/shared/auth';
+ import { type LinkSession, createInMemoryLinkPair } from '@tmex/shared/link';
++import { notifyNodeOffline } from '../agent/node-offline-bus';
+ import { filesBulkHooks } from '../api/files';
+ import {
+   ChallengeStore,
+@@ -23,7 +24,9 @@ import type { HubTlsInfoProvider } from '../hub/hub-runtime';
+ import type { GatewayRuntime } from '../runtime';
+ import { getDisplayVersion } from '../system/version';
+ import type { GatewaySession } from '../ws/gateway-session';
++import { isPeerReachable } from './address-class';
+ import { defaultScheduler, encodeJsonBytes } from './ctl';
++import { setMeshAgentBridge } from './mesh-agent-bridge';
+ import {
+   type CachedRtcConfig,
+   type ConnectionLookupResult,
+@@ -582,6 +585,9 @@ async function constructMeshDeps(opts: CreateMeshRuntimeOptions) {
+     hubGeneration: 0,
+   };
+   const emitNodeEvent = (event: NodeEventPayload) => {
++    if (event.status === 'offline' || event.status === 'revoked') {
++      notifyNodeOffline(event.nodeId);
++    }
+     for (const cb of nodeEvents) {
+       try {
+         cb(event);
+@@ -814,6 +820,8 @@ function wireMeshEventsAndSessions(d: Awaited<ReturnType<typeof constructMeshDep
+           nodeId: node.id,
+           status: node.online ? 'online' : 'offline',
+           reach: reach.get(node.id) ?? null,
++          transport: d.peerHolder.manager?.transportOf(node.id) ?? null,
++          rttMs: d.peerHolder.manager?.rttOf(node.id) ?? null,
+           inventory:
+             typeof node.inventory === 'string'
+               ? node.inventory
+@@ -838,6 +846,8 @@ function wireMeshEventsAndSessions(d: Awaited<ReturnType<typeof constructMeshDep
+             nodeId: hubId,
+             status: 'online',
+             reach: reach.get(hubId) ?? null,
++            transport: d.peerHolder.manager?.transportOf(hubId) ?? null,
++            rttMs: d.peerHolder.manager?.rttOf(hubId) ?? null,
+             name: list.hub?.name,
+           });
+         }
+@@ -920,6 +930,22 @@ function wireMeshEventsAndSessions(d: Awaited<ReturnType<typeof constructMeshDep
+       d.startBrowserAcceptHolder.fn(signal.rtcSession);
+     },
+     ensureDcSession: ensureDc,
++    onLinkInfo: (info) => {
++      const listed = state.lastNodeList?.nodes.find((node) => node.id === info.nodeId);
++      const peer = userStore.listPeers().find((row) => row.nodeId === info.nodeId);
++      const hubOnline = listed?.online === true;
++      d.emitListNodeEvent({
++        nodeId: info.nodeId,
++        status: isPeerReachable(info.reach) || hubOnline ? 'online' : 'offline',
++        reach: info.reach,
++        transport: info.transport,
++        rttMs: info.rttMs,
++        inventory: peer?.inventoryJson ?? null,
++        version: listed?.version ?? undefined,
++        direct_capable: peer?.directCapable,
++        name: listed?.name,
++      });
++    },
+   });
+   d.peerHolder.manager = peerManager;
+   uplink.onStateChange((liveState) => {
+@@ -929,7 +955,7 @@ function wireMeshEventsAndSessions(d: Awaited<ReturnType<typeof constructMeshDep
+       for (const node of state.lastNodeList.nodes) {
+         if (node.id === identity.nodeIdHex || !node.online) continue;
+         const r = reach.get(node.id);
+-        if (r === 'lan' || r === 'relay') continue;
++        if (isPeerReachable(r)) continue;
+         d.emitSyntheticOffline(node.id);
+       }
+     }
+@@ -1060,6 +1086,7 @@ function wireMeshHttp(
+     getLink: (nodeId) => peerManager.getLink(nodeId),
+     listReach: () => peerManager.listReach(),
+     transportOf: (nodeId) => peerManager.transportOf(nodeId),
++    rttOf: (nodeId) => peerManager.rttOf(nodeId),
+     listHubOnline: () => {
+       const ids = new Set<string>();
+       if (!state.hubPresenceLive || uplink.state !== 'online' || !state.lastNodeList) return ids;
+@@ -1139,6 +1166,15 @@ function wireMeshHttp(
+   });
+   http.auth.setTlsInfo(d.opts.tlsInfo);
+   d.httpHolder.runtime = http;
++  setMeshAgentBridge({
++    lookupNode(nodeId) {
++      const reach = peers.listReach();
++      if (!reach.has(nodeId)) return 'unknown';
++      return reach.get(nodeId) == null ? 'offline' : 'online';
++    },
++    forwardInternalHttp: (nodeId, path, body, signal) =>
++      http.forwarder.forwardInternalHttp(nodeId, path, body, signal),
++  });
+   return http;
+ }
+ 
+@@ -1229,6 +1265,7 @@ function assembleMeshRuntime(
+       if (stopPromise) return stopPromise;
+       stopPromise = (async () => {
+         d.nodeEventDedupe.clear();
++        setMeshAgentBridge(null);
+         await stopQuietly([
+           ['peer', () => peerManager.stop()],
+           ['uplink', () => uplink.stop()],
+diff --git a/apps/gateway/src/mesh/peer-request-marker.test.ts b/apps/gateway/src/mesh/peer-request-marker.test.ts
+new file mode 100644
+index 00000000..b634ed3b
+--- /dev/null
++++ b/apps/gateway/src/mesh/peer-request-marker.test.ts
+@@ -0,0 +1,34 @@
++import { describe, expect, test } from 'bun:test';
++import { setMeshRequestContext } from './mesh-deps';
++import {
++  X_TMEX_MESH_PEER,
++  attachMeshPeerMarker,
++  isPeerInboundRequest,
++  readMeshPeerMarker,
++  stripMeshPeerMarkerFromRequest,
++} from './peer-request-marker';
++
++describe('peer-request-marker', () => {
++  test('strip 去掉外部请求上的伪造标记', () => {
++    const req = new Request('http://localhost/api/mesh-internal/tmux/pane-info', {
++      headers: { [X_TMEX_MESH_PEER]: 'forged' },
++    });
++    expect(readMeshPeerMarker(req)).toBe('forged');
++    const stripped = stripMeshPeerMarkerFromRequest(req);
++    expect(readMeshPeerMarker(stripped)).toBeNull();
++  });
++
++  test('attach 写入 fromNodeId', () => {
++    const headers = attachMeshPeerMarker({ accept: '*/*' }, 'peer-a');
++    expect(headers[X_TMEX_MESH_PEER]).toBe('peer-a');
++  });
++
++  test('clientIp peer: 前缀视为 inbound', () => {
++    const req = new Request('http://localhost/api/x');
++    setMeshRequestContext(req, { via: 'peer-a', clientIp: 'peer:peer-a' });
++    expect(isPeerInboundRequest(req)).toBe(true);
++    const ext = new Request('http://localhost/api/x');
++    setMeshRequestContext(ext, { via: 'self', clientIp: '127.0.0.1' });
++    expect(isPeerInboundRequest(ext)).toBe(false);
++  });
++});
+diff --git a/apps/gateway/src/mesh/peer-request-marker.ts b/apps/gateway/src/mesh/peer-request-marker.ts
+new file mode 100644
+index 00000000..ab90b2b8
+--- /dev/null
++++ b/apps/gateway/src/mesh/peer-request-marker.ts
+@@ -0,0 +1,39 @@
++import { getMeshRequestContext } from './mesh-deps';
++
++export const X_TMEX_MESH_PEER = 'x-tmex-mesh-peer';
++
++export function readMeshPeerMarker(req: Request): string | null {
++  const raw = req.headers.get(X_TMEX_MESH_PEER)?.trim() ?? '';
++  return raw || null;
++}
++
++export function attachMeshPeerMarker(
++  headers: Record<string, string>,
++  fromNodeId: string
++): Record<string, string> {
++  return { ...headers, [X_TMEX_MESH_PEER]: fromNodeId };
++}
++
++export function isPeerInboundRequest(req: Request): boolean {
++  return (getMeshRequestContext(req).clientIp ?? '').startsWith('peer:');
++}
++
++export function stripMeshPeerMarkerFromRequest(req: Request): Request {
++  if (!req.headers.has(X_TMEX_MESH_PEER)) {
++    return req;
++  }
++  const headers = new Headers();
++  req.headers.forEach((value, key) => {
++    if (key.toLowerCase() !== X_TMEX_MESH_PEER) {
++      headers.append(key, value);
++    }
++  });
++  const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
++  return new Request(req.url, {
++    method: req.method,
++    headers,
++    redirect: req.redirect,
++    signal: req.signal,
++    ...(hasBody ? { body: req.body, duplex: 'half' as const } : {}),
++  });
++}
+diff --git a/apps/gateway/src/mesh/stream-targets.test.ts b/apps/gateway/src/mesh/stream-targets.test.ts
+index b56d22e3..30533490 100644
+--- a/apps/gateway/src/mesh/stream-targets.test.ts
++++ b/apps/gateway/src/mesh/stream-targets.test.ts
+@@ -409,6 +409,33 @@ describe('http/ws stream targets', () => {
+     expect(seen.viaNodeId).toBe('entry-1');
+   });
+ 
++  test('acceptHttpStream 写入 x-tmex-mesh-peer 并覆盖 OPEN 里的伪造值', async () => {
++    const [a, b] = createInMemoryLinkPair();
++    const seen = { peer: null as string | null };
++    b.onStream((stream) => {
++      void acceptHttpStream(stream, {
++        peerNodeId: 'entry-1',
++        sessionStore: {
++          verify: () => ({
++            ok: true,
++            session: { userId: 'user-1' },
++          }),
++        } as unknown as NodeSessionStore,
++        async dispatchHttp(req) {
++          seen.peer = req.headers.get('x-tmex-mesh-peer');
++          return new Response('ok');
++        },
++      });
++    });
++    await openHttpStream(a, {
++      method: 'POST',
++      path: '/api/mesh-internal/tmux/pane-info',
++      origin: 'http://localhost',
++      headers: { 'x-tmex-mesh-peer': 'forged-node' },
++    });
++    expect(seen.peer).toBe('entry-1');
++  });
++
+   test('dispatchRoutes attaches mesh from requestDispatchContext', async () => {
+     const req = new Request('http://localhost/api/x');
+     requestDispatchContext.set(req, { uid: 'user-1', viaNodeId: 'node-a' });
+diff --git a/apps/gateway/src/mesh/stream-targets.ts b/apps/gateway/src/mesh/stream-targets.ts
+index 251a627c..ef013ef4 100644
+--- a/apps/gateway/src/mesh/stream-targets.ts
++++ b/apps/gateway/src/mesh/stream-targets.ts
+@@ -7,6 +7,7 @@ import { encodeJsonBytes, isRecord } from './ctl';
+ import { LinkStreamCarrier } from './link-stream-carrier';
+ import { X_TMEX_SESSION_RENEWED } from './mesh-deps';
+ import { parseOpenPayload } from './peer-protocol';
++import { X_TMEX_MESH_PEER, attachMeshPeerMarker } from './peer-request-marker';
+ import { pumpToLink } from './stream-pump';
+ import type { DispatchHttp, HttpStreamOpenPayload, WsStreamOpenPayload } from './types';
+ 
+@@ -21,6 +22,7 @@ const BLOCKED_REQUEST_HEADERS = new Set([
+   'connection',
+   'upgrade',
+   'x-tmex-via',
++  X_TMEX_MESH_PEER,
+ ]);
+ 
+ export type StreamAuthContext = {
+@@ -31,7 +33,7 @@ export type StreamAuthContext = {
+ 
+ export function isAuthSkippedPath(path: string): boolean {
+   const bare = path.split('?')[0] ?? path;
+-  return AUTH_SKIP_PATHS.has(bare);
++  return AUTH_SKIP_PATHS.has(bare) || bare.startsWith('/api/mesh-internal/');
+ }
+ 
+ export function stripForwardedRequestHeaders(
+@@ -171,7 +173,10 @@ export async function acceptHttpStream(
+   const path = str(open.path, '/');
+   const query = str(open.query);
+   const origin = str(open.origin, 'http://localhost');
+-  const headers = stripForwardedRequestHeaders(stringHeaders(open.headers));
++  const headers = attachMeshPeerMarker(
++    stripForwardedRequestHeaders(stringHeaders(open.headers)),
++    opts.peerNodeId
++  );
+   const auth = str(open.auth) || null;
+   const verified = verifyAuth(auth, path, opts);
+   if (!verified.ok) {
+diff --git a/packages/api-client/src/agent.ts b/packages/api-client/src/agent.ts
+index b7e7bb46..6a61dcc2 100644
+--- a/packages/api-client/src/agent.ts
++++ b/packages/api-client/src/agent.ts
+@@ -10,6 +10,8 @@ import type {
+ import { type ApiClient, defaultApiClient, parseApiError } from './client';
+ 
+ export interface CreateAgentSessionRequest {
++  /** 绑定 pane 所在的 mesh node；缺省 / null / 'self' 均表示本 gateway */
++  nodeId?: string | null;
+   deviceId: string;
+   paneId: string;
+   providerId?: string | null;
+@@ -28,10 +30,16 @@ export interface UpdateAgentSessionPatch {
+   paneId?: string;
+ }
+ 
++/**
++ * 列出 agent sessions。`nodeId` 缺省返回全部；`'self'` 只返回绑定本 gateway pane 的；
++ * 其他值只返回绑定该远端 node 的。
++ */
+ export async function fetchAgentSessions(
+-  client: ApiClient = defaultApiClient
++  client: ApiClient = defaultApiClient,
++  options: { nodeId?: string } = {}
+ ): Promise<AgentSessionDto[]> {
+-  const res = await client.fetch('/api/agent/sessions');
++  const query = options.nodeId ? `?nodeId=${encodeURIComponent(options.nodeId)}` : '';
++  const res = await client.fetch(`/api/agent/sessions${query}`);
+   if (!res.ok) {
+     throw new Error(await parseApiError(res, 'Failed to load agent sessions'));
+   }
+diff --git a/packages/shared/src/contracts/agent.ts b/packages/shared/src/contracts/agent.ts
+index 641481ef..107be754 100644
+--- a/packages/shared/src/contracts/agent.ts
++++ b/packages/shared/src/contracts/agent.ts
+@@ -14,6 +14,8 @@ export const DEFAULT_AGENT_SESSION_TITLE = 'New Session';
+ export interface AgentSessionDto {
+   id: string;
+   title: string;
++  /** 绑定 pane 所在的 mesh node；null 表示拥有该 session 的 gateway 自身（self） */
++  nodeId: string | null;
+   deviceId: string | null;
+   paneId: string | null;
+   providerId: string | null;
+@@ -70,6 +72,8 @@ export interface ListAgentSessionsResponse {
+ }
+ 
+ export interface CreateAgentSessionRequest {
++  /** 远端 node id；缺省 / null / 'self' 均表示本 gateway */
++  nodeId?: string | null;
+   deviceId: string;
+   paneId: string;
+   providerId?: string | null;

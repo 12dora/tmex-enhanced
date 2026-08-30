@@ -1,0 +1,35 @@
+== apps/gateway
+ 2500 pass
+ 0 fail
+Ran 2500 tests across 257 files. [107.13s]
+tsc: 21
+== apps/fe
+ 671 pass
+ 0 fail
+Ran 671 tests across 52 files. [1154.00ms]
+tsc: 0
+== packages/panels
+ 507 pass
+ 0 fail
+Ran 507 tests across 38 files. [439.00ms]
+tsc: 0
+== packages/stores
+ 282 pass
+ 0 fail
+Ran 282 tests across 27 files. [110.00ms]
+tsc: 1
+== packages/shared
+ 365 pass
+ 0 fail
+Ran 365 tests across 36 files. [1474.00ms]
+tsc: 0
+== packages/api-client
+ 132 pass
+ 0 fail
+Ran 132 tests across 12 files. [62.00ms]
+tsc: 5
+== packages/ui
+ 47 pass
+ 0 fail
+Ran 47 tests across 5 files. [39.00ms]
+tsc: 0

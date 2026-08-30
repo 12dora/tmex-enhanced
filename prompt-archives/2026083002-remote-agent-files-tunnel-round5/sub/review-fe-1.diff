@@ -1,0 +1,2685 @@
+diff --git a/apps/fe/src/components/page-layouts/components/agent-session-row.tsx b/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
+index 5ca77326..45515fd6 100644
+--- a/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
++++ b/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
+@@ -102,10 +102,13 @@ function SessionActionsMenu({
+ export function PaneSessionRow({
+   session,
+   isActive,
++  paused = false,
+   onSelect,
+ }: {
+   session: AgentSessionDto;
+   isActive: boolean;
++  /** 所在 node 离线：灰显且不可点入（点进去只会得到一屏请求错误） */
++  paused?: boolean;
+   onSelect: (session: AgentSessionDto) => void;
+ }) {
+   const { isMobile } = useSidebar();
+@@ -114,11 +117,17 @@ export function PaneSessionRow({
+       <button
+         type="button"
+         data-testid={`agent-session-item-${session.id}`}
++        disabled={paused}
++        data-paused={paused ? '' : undefined}
+         onClick={() => onSelect(session)}
+         className={cn(
+           'w-full flex items-center gap-1.5 px-2 py-1 pr-7 rounded-md text-left transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none [@media(any-pointer:coarse)]:min-h-11 [@media(any-pointer:coarse)]:py-2 [@media(any-pointer:coarse)]:pr-12',
+           isMobile && 'min-h-11 py-2 pr-12',
+-          isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30 text-muted-foreground'
++          paused
++            ? 'text-muted-foreground/60'
++            : isActive
++              ? 'bg-primary/10 text-primary'
++              : 'hover:bg-accent/30 text-muted-foreground'
+         )}
+       >
+         <Bot className="size-3 shrink-0 opacity-70" />
+@@ -135,10 +144,13 @@ export function PaneSessionRow({
+ export function OrphanSessionRow({
+   session,
+   isActive,
++  paused = false,
+   onSelect,
+ }: {
+   session: AgentSessionDto;
+   isActive: boolean;
++  /** 所在 node 离线：灰显且不可点入 */
++  paused?: boolean;
+   onSelect: (session: AgentSessionDto) => void;
+ }) {
+   const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
+@@ -153,10 +165,16 @@ export function OrphanSessionRow({
+       <button
+         type="button"
+         data-testid={`agent-orphan-session-${session.id}`}
++        disabled={paused}
++        data-paused={paused ? '' : undefined}
+         onClick={() => onSelect(session)}
+         className={cn(
+           'w-full flex flex-col gap-0.5 px-2 py-1.5 pr-7 rounded-lg text-left transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
+-          isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30'
++          paused
++            ? 'text-muted-foreground/60'
++            : isActive
++              ? 'bg-primary/10 text-primary'
++              : 'hover:bg-accent/30'
+         )}
+       >
+         <span className="flex items-center gap-1.5">
+diff --git a/apps/fe/src/components/page-layouts/components/app-sidebar.test.ts b/apps/fe/src/components/page-layouts/components/app-sidebar.test.ts
+new file mode 100644
+index 00000000..1522f343
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/app-sidebar.test.ts
+@@ -0,0 +1,35 @@
++// 侧边栏「文件」页的离线判定：路由所在 node 掉线时文件树整块换成一行提示。
++
++import { describe, expect, test } from 'bun:test';
++import { SELF_NODE_ID } from '@tmex/api-client';
++import type { MeshNode } from '@tmex/api-client/auth/index';
++import { isRouteNodeOffline } from './app-sidebar';
++
++const ENTRY_ID = '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a';
++const REMOTE_ID = '0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b';
++
++function node(id: string, online: boolean): MeshNode {
++  return { id, name: id, online } as MeshNode;
++}
++
++describe('isRouteNodeOffline', () => {
++  test('standalone / 列表还没回来时按在线算', () => {
++    expect(isRouteNodeOffline([], null, SELF_NODE_ID)).toBe(false);
++    expect(isRouteNodeOffline([], ENTRY_ID, SELF_NODE_ID)).toBe(false);
++  });
++
++  test('self 路由查的是 entry 自身那条', () => {
++    expect(isRouteNodeOffline([node(ENTRY_ID, false)], ENTRY_ID, SELF_NODE_ID)).toBe(true);
++    expect(isRouteNodeOffline([node(ENTRY_ID, true)], ENTRY_ID, SELF_NODE_ID)).toBe(false);
++  });
++
++  test('远端路由查它自己那条，不受 entry 状态影响', () => {
++    const nodes = [node(ENTRY_ID, true), node(REMOTE_ID, false)];
++    expect(isRouteNodeOffline(nodes, ENTRY_ID, REMOTE_ID)).toBe(true);
++    expect(isRouteNodeOffline(nodes, ENTRY_ID, ENTRY_ID)).toBe(false);
++  });
++
++  test('名单里没有这个 node 时按在线算', () => {
++    expect(isRouteNodeOffline([node(ENTRY_ID, true)], ENTRY_ID, REMOTE_ID)).toBe(false);
++  });
++});
+diff --git a/apps/fe/src/components/page-layouts/components/app-sidebar.tsx b/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
+index 8ce16700..b0ed2ca4 100644
+--- a/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
++++ b/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
+@@ -2,8 +2,12 @@ import { Bot, FolderClosed, Monitor, PanelsTopLeft } from 'lucide-react';
+ import { type ComponentProps, Suspense, lazy } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
++import { useMeshNodes } from '@/node/mesh-nodes';
+ import { useRouteNodeId } from '@/node/node-runtime-boundary';
+ import { NodeRuntimeScope } from '@/node/node-runtime-scope';
++import { selfAgentStore } from '@/node/self-agent-store';
++import { SELF_NODE_ID } from '@tmex/api-client';
++import type { MeshNode } from '@tmex/api-client/auth/index';
+ import { useUIStore } from '@tmex/stores/react';
+ import { Reveal } from '@tmex/ui/motion';
+ import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader } from '@tmex/ui/sidebar';
+@@ -17,6 +21,30 @@ import { SidebarTitle } from './sidebar-title';
+ const AgentTab = lazy(() => import('@tmex/panels/agent').then((m) => ({ default: m.AgentTab })));
+ const FilesTab = lazy(() => import('@tmex/panels/files').then((m) => ({ default: m.FilesTab })));
+ 
++/**
++ * 路由所在 node 是否离线。名单里没有这个 node（standalone、mesh 列表还没回来）时按在线算，
++ * 行为与今天一致。
++ */
++export function isRouteNodeOffline(
++  nodes: MeshNode[],
++  entryNodeId: string | null,
++  routeNodeId: string
++): boolean {
++  const targetId = routeNodeId === SELF_NODE_ID ? entryNodeId : routeNodeId;
++  if (!targetId) return false;
++  const node = nodes.find((item) => item.id === targetId);
++  return node ? !node.online : false;
++}
++
++/**
++ * `enabled: false` 只订阅宿主级 mesh 快照，不发 `/api/mesh/*` 也不订阅事件流
++ * ——拉取与订阅是设备区 `SideBarDeviceList` 的活。
++ */
++function useRouteNodeOffline(routeNodeId: string): boolean {
++  const { nodes, entryNodeId } = useMeshNodes({ enabled: false });
++  return isRouteNodeOffline(nodes, entryNodeId, routeNodeId);
++}
++
+ const navMainItems = [
+   {
+     title: 'nav.manageDevices',
+@@ -32,6 +60,7 @@ export function AppSidebar({ ...props }: ComponentProps<typeof Sidebar>) {
+   // 外壳常驻在 self 运行时下；智能体 / 文件两个标签服务的是当前路由所在的 node，
+   // 单独套一层该 node 的运行时（切 node 时这两块重挂是预期的，设备树不受影响）
+   const routeNodeId = useRouteNodeId();
++  const routeNodeOffline = useRouteNodeOffline(routeNodeId);
+ 
+   return (
+     <Sidebar variant="inset" {...props}>
+@@ -85,7 +114,13 @@ export function AppSidebar({ ...props }: ComponentProps<typeof Sidebar>) {
+           <Reveal key={`${sidebarTab}:${routeNodeId}`} className="flex min-h-0 flex-1 flex-col">
+             <NodeRuntimeScope nodeId={routeNodeId}>
+               <Suspense fallback={null}>
+-                {sidebarTab === 'agent' ? <AgentTab /> : <FilesTab />}
++                {sidebarTab === 'agent' ? (
++                  /* 智能体状态固定由 entry（self）网关提供：绑远端 pane 的会话也由它运行，
++                     路由 node 只决定展示哪一批会话、以及设备树/快照来自谁。 */
++                  <AgentTab agentStore={selfAgentStore()} nodeOffline={routeNodeOffline} />
++                ) : (
++                  <FilesTab nodeOffline={routeNodeOffline} />
++                )}
+               </Suspense>
+             </NodeRuntimeScope>
+           </Reveal>
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx b/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+index 00c42e27..8b50724a 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+@@ -1,9 +1,11 @@
+ // 侧边栏设备树的 agent 会话装饰：会话分支/孤立会话区/对话框与「新建会话」动作，
+ // 经 SidebarAgentAdapter 注入 @tmex/panels/device-tree（包内零 agent 依赖）。
+ 
++import { selfAgentStore } from '@/node/self-agent-store';
+ import type { DeviceTreeNavigation, SidebarAgentAdapter } from '@tmex/panels/device-tree';
+ import type { AgentSessionDto, TmuxPane } from '@tmex/shared';
+ import type { AppRuntime } from '@tmex/stores';
++import { normalizeAgentNodeId } from '@tmex/stores';
+ import { useRuntime, useTmuxStore, useUIStore } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@tmex/ui/collapsible';
+@@ -16,6 +18,7 @@ import {
+   SidebarAgentSessionsContext,
+   collectKnownPaneIds,
+   isSessionAttached,
++  isSessionPaused,
+   paneKey,
+   useSidebarAgentSessions,
+   useSidebarAgentSessionsController,
+@@ -36,7 +39,7 @@ function useSelectSession(nav: DeviceTreeNavigation) {
+   const setSidebarTab = useUIStore((state) => state.setSidebarTab);
+   return useCallback(
+     (session: AgentSessionDto) => {
+-      runtime.stores.agent.getState().setActiveSession(session.id);
++      selfAgentStore().getState().setActiveSession(session.id);
+       setSidebarTab('agent');
+       if (session.deviceId && session.paneId) {
+         const windows =
+@@ -53,6 +56,7 @@ function useSelectSession(nav: DeviceTreeNavigation) {
+   );
+ }
+ 
++// 会话由 entry（self）网关持有并运行，草稿只是带上目标 pane 所在的 node
+ function createSessionForPane(
+   runtime: AppRuntime,
+   nav: DeviceTreeNavigation,
+@@ -61,7 +65,14 @@ function createSessionForPane(
+   pane: TmuxPane
+ ) {
+   nav.navigateToPane(deviceId, windowId, pane.id, { keepSidebarOpen: true });
+-  runtime.stores.agent.getState().startDraft(deviceId, pane.id, pane.title ?? null);
++  selfAgentStore()
++    .getState()
++    .startDraft({
++      nodeId: normalizeAgentNodeId(runtime.nodeId),
++      deviceId,
++      paneId: pane.id,
++      paneTitle: pane.title ?? null,
++    });
+   runtime.stores.ui.getState().setSidebarTab('agent');
+ }
+ 
+@@ -74,7 +85,7 @@ function AgentPaneSessions({
+   deviceId: string;
+   paneId: string;
+ }) {
+-  const { sessionsByPane, activeSessionId } = useSidebarAgentSessions();
++  const { sessionsByPane, activeSessionId, nodeOffline } = useSidebarAgentSessions();
+   const handleSelectSession = useSelectSession(nav);
+   const sessions = sessionsByPane.get(paneKey(deviceId, paneId));
+   return (
+@@ -84,6 +95,7 @@ function AgentPaneSessions({
+           key={session.id}
+           session={session}
+           isActive={session.id === activeSessionId}
++          paused={isSessionPaused(session, nodeOffline)}
+           onSelect={handleSelectSession}
+         />
+       ))}
+@@ -102,7 +114,7 @@ function AgentOrphanSessions({
+ }) {
+   const { t } = useTranslation();
+   const [open, setOpen] = useState(false);
+-  const { orderedSessions, activeSessionId } = useSidebarAgentSessions();
++  const { orderedSessions, activeSessionId, nodeOffline } = useSidebarAgentSessions();
+   const handleSelectSession = useSelectSession(nav);
+   const snapshots = useTmuxStore((state) => state.snapshots);
+ 
+@@ -143,6 +155,7 @@ function AgentOrphanSessions({
+             key={session.id}
+             session={session}
+             isActive={session.id === activeSessionId}
++            paused={isSessionPaused(session, nodeOffline)}
+             onSelect={handleSelectSession}
+           />
+         ))}
+diff --git a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
+index 3b84fd2e..63466fa0 100644
+--- a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
++++ b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
+@@ -1,10 +1,14 @@
+ import { describe, expect, test } from 'bun:test';
++import type { MeshNode } from '@tmex/api-client/auth/index';
+ import type { AgentSessionDto, StateSnapshotPayload, TmuxPane, TmuxWindow } from '@tmex/shared';
++import { isSessionOnNode } from '@tmex/stores';
+ import {
+   collectKnownPaneIds,
+   compareSessions,
+   groupSessionsByPane,
++  isNodeOffline,
+   isSessionAttached,
++  isSessionPaused,
+   orderSessions,
+   paneKey,
+ } from './use-sidebar-agent-sessions';
+@@ -12,6 +16,7 @@ import {
+ function session(partial: Partial<AgentSessionDto> & { id: string }): AgentSessionDto {
+   return {
+     title: partial.id,
++    nodeId: null,
+     deviceId: null,
+     paneId: null,
+     providerId: null,
+@@ -199,3 +204,59 @@ describe('isSessionAttached', () => {
+     expect(isSessionAttached(session({ id: 'b' }), new Set(), new Map(), false)).toBe(false);
+   });
+ });
++
++const NODE_A = 'a'.repeat(32);
++const ENTRY = 'e'.repeat(32);
++
++function meshNode(id: string, online: boolean): MeshNode {
++  return { id, name: id, publicKey: '', online, loggedIn: true } as MeshNode;
++}
++
++describe('per-node session filtering', () => {
++  const local = session({ id: 'local', deviceId: 'd1', paneId: '%1' });
++  const remote = session({ id: 'remote', nodeId: NODE_A, deviceId: 'd1', paneId: '%1' });
++  const all = [local, remote];
++
++  test('a node section only lists the sessions bound to it', () => {
++    expect(all.filter((item) => isSessionOnNode(item, null))).toEqual([local]);
++    expect(all.filter((item) => isSessionOnNode(item, NODE_A))).toEqual([remote]);
++  });
++
++  test('grouping by pane stays per node, so identical device:pane keys do not collide', () => {
++    const selfGroups = groupSessionsByPane(all.filter((item) => isSessionOnNode(item, null)));
++    const remoteGroups = groupSessionsByPane(all.filter((item) => isSessionOnNode(item, NODE_A)));
++    expect(selfGroups.get(paneKey('d1', '%1'))).toEqual([local]);
++    expect(remoteGroups.get(paneKey('d1', '%1'))).toEqual([remote]);
++  });
++});
++
++describe('isNodeOffline', () => {
++  const nodes = [meshNode(ENTRY, true), meshNode(NODE_A, false)];
++
++  test('maps the entry node onto the self runtime id', () => {
++    expect(isNodeOffline(nodes, ENTRY, 'self')).toBe(false);
++  });
++
++  test('reports a remote node that went offline', () => {
++    expect(isNodeOffline(nodes, ENTRY, NODE_A)).toBe(true);
++  });
++
++  test('unknown rows (standalone / list not loaded) count as online', () => {
++    expect(isNodeOffline([], null, 'self')).toBe(false);
++    expect(isNodeOffline(nodes, ENTRY, 'c'.repeat(32))).toBe(false);
++  });
++});
++
++describe('isSessionPaused', () => {
++  test('paused while the node is offline', () => {
++    expect(isSessionPaused(session({ id: 'a' }), true)).toBe(true);
++  });
++
++  test('paused when the backend propagated NODE_OFFLINE', () => {
++    expect(isSessionPaused(session({ id: 'a', lastError: 'NODE_OFFLINE' }), false)).toBe(true);
++  });
++
++  test('not paused for an online node with an unrelated error', () => {
++    expect(isSessionPaused(session({ id: 'a', lastError: 'boom' }), false)).toBe(false);
++  });
++});
+diff --git a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
+index f3af8fcc..f7369b22 100644
+--- a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
++++ b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
+@@ -1,9 +1,16 @@
+ // 侧边栏 agent 会话装饰的控制器：bootstrap、排序/分组派生、重命名与删除对话框状态。
+ 
++import { toRuntimeNodeId, useMeshNodes } from '@/node/mesh-nodes';
++import { selfAgentStore } from '@/node/self-agent-store';
++import type { MeshNode } from '@tmex/api-client/auth/index';
+ import type { AgentSessionDto, StateSnapshotPayload } from '@tmex/shared';
+-import { useAgentStore, useRuntime } from '@tmex/stores/react';
++import { isSessionOnNode, normalizeAgentNodeId } from '@tmex/stores';
++import { useRuntime } from '@tmex/stores/react';
+ import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+ 
++/** 后端在 node 离线传播时写入会话的 lastError */
++export const NODE_OFFLINE_ERROR = 'NODE_OFFLINE';
++
+ const PANE_KEY_SEPARATOR = '\u0000';
+ 
+ export function paneKey(deviceId: string, paneId: string): string {
+@@ -79,6 +86,9 @@ export function collectKnownPaneIds(
+  * 设备快照尚未加载（设备离线/未订阅）时按「仍挂载」处理，防止快照到达前后在孤立区闪现。
+  * devicesReady 为 false（设备列表 pending/失败）时 knownDeviceIds 为空，此时不做设备存在性判定，
+  * 否则加载中所有绑定会话都会被误判为孤立，请求失败时更会永久误判。
++ *
++ * 传入的会话已按 node 过滤（见控制器），因此这里比对的快照/设备一定属于该会话所在的 node，
++ * 不会拿当前路由 node 的快照去判定别的 node 上的会话。
+  */
+ export function isSessionAttached(
+   session: AgentSessionDto,
+@@ -94,10 +104,41 @@ export function isSessionAttached(
+   return panes.has(session.paneId);
+ }
+ 
++/**
++ * 该 node 是否离线。mesh 列表里没有这一行（standalone、列表尚未加载）一律按在线处理：
++ * 宁可让用户点进去看到请求错误，也不要把本机会话灰掉。
++ */
++export function isNodeOffline(
++  nodes: readonly MeshNode[],
++  entryNodeId: string | null,
++  runtimeNodeId: string
++): boolean {
++  const row = nodes.find((node) => toRuntimeNodeId(node.id, entryNodeId) === runtimeNodeId);
++  return row ? !row.online : false;
++}
++
++/** 会话是否因所在 node 离线而暂停（灰显、不可点入） */
++export function isSessionPaused(session: AgentSessionDto, nodeOffline: boolean): boolean {
++  return nodeOffline || session.lastError === NODE_OFFLINE_ERROR;
++}
++
++/**
++ * `enabled: false` 只读宿主级 mesh 快照：不发 `/api/mesh/*`、不订阅事件流
++ * ——拉取与订阅是设备区自己的活。
++ */
++function useNodeOffline(runtimeNodeId: string): boolean {
++  const { nodes, entryNodeId } = useMeshNodes({ enabled: false });
++  return isNodeOffline(nodes, entryNodeId, runtimeNodeId);
++}
++
+ export interface SidebarAgentSessionsContextValue {
+   orderedSessions: AgentSessionDto[];
+   sessionsByPane: ReadonlyMap<string, AgentSessionDto[]>;
+   activeSessionId: string | null;
++  /** 本分节所属 node（null 即 entry 自身）；新建会话与过滤都用它 */
++  nodeId: string | null;
++  /** 本分节所属 node 是否离线：行灰显且不可点入 */
++  nodeOffline: boolean;
+   sessionRenameCandidate: AgentSessionDto | null;
+   sessionRenameValue: string;
+   setSessionRenameValue: (value: string) => void;
+@@ -124,20 +165,28 @@ export function useSidebarAgentSessions(): SidebarAgentSessionsContextValue {
+ 
+ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContextValue {
+   const runtime = useRuntime();
++  // 会话状态一律来自 entry（self）网关，与本分节挂的是哪个 node 的运行时无关
++  const agentStore = selfAgentStore();
++  const nodeId = normalizeAgentNodeId(runtime.nodeId);
++  const nodeOffline = useNodeOffline(runtime.nodeId);
++
+   // AgentTab 挂载时也会拉列表，这里只在列表尚未加载过时兜底，避免切换侧边栏 tab 反复全量拉取
+   useEffect(() => {
+-    const store = runtime.stores.agent.getState();
++    const store = agentStore.getState();
+     store.ensureInitialized();
+     if (!store.sessionsLoaded) void store.loadSessions();
+-  }, [runtime]);
++  }, [agentStore]);
+ 
+-  const sessions = useAgentStore((state) => state.sessions);
+-  const sessionOrder = useAgentStore((state) => state.sessionOrder);
+-  const activeSessionId = useAgentStore((state) => state.activeSessionId);
++  const sessions = agentStore((state) => state.sessions);
++  const sessionOrder = agentStore((state) => state.sessionOrder);
++  const activeSessionId = agentStore((state) => state.activeSessionId);
+ 
++  // 单一列表按 node 过滤：本分节只展示绑在自己这个 node 上的会话，
++  // 于是 isSessionAttached 比对的快照也一定是该会话所在 node 的快照。
+   const orderedSessions = useMemo(
+-    () => orderSessions(sessions, sessionOrder),
+-    [sessions, sessionOrder]
++    () =>
++      orderSessions(sessions, sessionOrder).filter((session) => isSessionOnNode(session, nodeId)),
++    [sessions, sessionOrder, nodeId]
+   );
+   const sessionsByPane = useMemo(() => groupSessionsByPane(orderedSessions), [orderedSessions]);
+ 
+@@ -158,9 +207,9 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+     if (!sessionRenameCandidate) return;
+     const trimmed = sessionRenameValue.trim();
+     if (!trimmed) return;
+-    void runtime.stores.agent.getState().renameSession(sessionRenameCandidate.id, trimmed);
++    void agentStore.getState().renameSession(sessionRenameCandidate.id, trimmed);
+     setSessionRenameCandidate(null);
+-  }, [runtime, sessionRenameCandidate, sessionRenameValue]);
++  }, [agentStore, sessionRenameCandidate, sessionRenameValue]);
+ 
+   const requestDeleteSession = useCallback((session: AgentSessionDto) => {
+     setSessionDeleteCandidate(session);
+@@ -168,9 +217,9 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+ 
+   const confirmDeleteSession = useCallback(() => {
+     if (!sessionDeleteCandidate) return;
+-    void runtime.stores.agent.getState().deleteSession(sessionDeleteCandidate.id);
++    void agentStore.getState().deleteSession(sessionDeleteCandidate.id);
+     setSessionDeleteCandidate(null);
+-  }, [runtime, sessionDeleteCandidate]);
++  }, [agentStore, sessionDeleteCandidate]);
+ 
+   const closeRenameDialog = useCallback(() => setSessionRenameCandidate(null), []);
+   const closeDeleteDialog = useCallback(() => setSessionDeleteCandidate(null), []);
+@@ -180,6 +229,8 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+       orderedSessions,
+       sessionsByPane,
+       activeSessionId,
++      nodeId,
++      nodeOffline,
+       sessionRenameCandidate,
+       sessionRenameValue,
+       setSessionRenameValue,
+@@ -195,6 +246,8 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+       orderedSessions,
+       sessionsByPane,
+       activeSessionId,
++      nodeId,
++      nodeOffline,
+       sessionRenameCandidate,
+       sessionRenameValue,
+       closeRenameDialog,
+diff --git a/apps/fe/src/node/device-node-badges.test.tsx b/apps/fe/src/node/device-node-badges.test.tsx
+new file mode 100644
+index 00000000..cdce9216
+--- /dev/null
++++ b/apps/fe/src/node/device-node-badges.test.tsx
+@@ -0,0 +1,202 @@
++// 设备页链路徽标：取值矩阵（直连优先，其次到达路径，RTT 测不到就不带后缀）与诊断浮层的行。
++// 无 DOM 测试环境，渲染用 react-dom/server；未初始化 i18n 时 `t()` 原样返回 key。
++
++import { afterEach, describe, expect, test } from 'bun:test';
++import type { MeshNode } from '@tmex/api-client/auth/index';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++import type { DirectDiagnostics } from '@tmex/ws-client/direct/types';
++import type { NodeLink } from './direct-diagnostics';
++
++installWindowStorage();
++
++const { renderToStaticMarkup } = await import('react-dom/server');
++const { resetMeshNodesStateForTest, setMeshNodesStateForTest } = await import('./mesh-nodes');
++const {
++  DeviceNodeBadges,
++  NodeLinkDiagnostics,
++  formatLinkBadgeLabel,
++  reachLabelKey,
++  resolveLinkBadge,
++  transportLabelKey,
++} = await import('./device-node-badges');
++
++function link(overrides: Partial<NodeLink> = {}): NodeLink {
++  return { reach: 'lan', transport: 'ws-secure', rttMs: null, ...overrides };
++}
++
++function diagnostics(overrides: Partial<DirectDiagnostics> = {}): DirectDiagnostics {
++  return { path: 'primary', route: null, rtt: null, ice: null, ...overrides };
++}
++
++/** 徽标最终展示的那串文本（未初始化 i18n 时 key 即译文）。 */
++function badgeLabel(input: Parameters<typeof resolveLinkBadge>[0]): string {
++  const badge = resolveLinkBadge(input);
++  return formatLinkBadgeLabel(badge.labelKey, badge.rttMs);
++}
++
++function meshNode(overrides: Partial<MeshNode> & { id: string }): MeshNode {
++  return {
++    name: overrides.id,
++    publicKey: '',
++    online: true,
++    reach: 'lan',
++    version: null,
++    direct_capable: false,
++    loggedIn: true,
++    ...overrides,
++  };
++}
++
++afterEach(() => {
++  resetMeshNodesStateForTest();
++});
++
++describe('resolveLinkBadge', () => {
++  test('直连活着时以 WebRTC RTT 为准，且压过 entry 侧的到达路径', () => {
++    const badge = resolveLinkBadge({
++      path: 'direct',
++      directRttMs: 8.6,
++      link: link({ reach: 'relay', transport: 'relay', rttMs: 180 }),
++    });
++    expect(badge).toEqual({ labelKey: 'nodes.badge.direct', rttMs: 8.6, tone: 'ok' });
++    expect(formatLinkBadgeLabel(badge.labelKey, badge.rttMs)).toBe('nodes.badge.direct · 9ms');
++  });
++
++  test('到达路径矩阵：标签、色调与延迟后缀', () => {
++    expect(
++      resolveLinkBadge({ path: 'primary', directRttMs: null, link: link({ rttMs: 12 }) })
++    ).toEqual({ labelKey: 'nodes.reach.lan', rttMs: 12, tone: 'ok' });
++    expect(
++      resolveLinkBadge({
++        path: 'primary',
++        directRttMs: null,
++        link: link({ reach: 'wan', rttMs: 37.2 }),
++      })
++    ).toEqual({ labelKey: 'nodes.reach.wan', rttMs: 37.2, tone: 'ok' });
++    expect(
++      resolveLinkBadge({
++        path: 'primary',
++        directRttMs: null,
++        link: link({ reach: 'relay', transport: 'relay', rttMs: 210 }),
++      })
++    ).toEqual({ labelKey: 'nodes.reach.relay', rttMs: 210, tone: 'muted' });
++    expect(
++      resolveLinkBadge({
++        path: 'primary',
++        directRttMs: null,
++        link: link({ reach: null, transport: null }),
++      })
++    ).toEqual({ labelKey: 'nodes.reach.none', rttMs: null, tone: 'muted' });
++  });
++
++  test('RTT 未测得就不带后缀（不再显示「延迟未知」）', () => {
++    expect(badgeLabel({ path: 'primary', directRttMs: null, link: link() })).toBe(
++      'nodes.reach.lan'
++    );
++    expect(badgeLabel({ path: 'direct', directRttMs: null, link: link() })).toBe(
++      'nodes.badge.direct'
++    );
++    expect(badgeLabel({ path: 'primary', directRttMs: null, link: link({ rttMs: 37.2 }) })).toBe(
++      'nodes.reach.lan · 37ms'
++    );
++  });
++
++  test('负数 / NaN 的 RTT 当作未测得', () => {
++    expect(badgeLabel({ path: 'primary', directRttMs: null, link: link({ rttMs: -1 }) })).toBe(
++      'nodes.reach.lan'
++    );
++    expect(badgeLabel({ path: 'direct', directRttMs: Number.NaN, link: link() })).toBe(
++      'nodes.badge.direct'
++    );
++  });
++});
++
++describe('reachLabelKey / transportLabelKey', () => {
++  test('到达路径四态各有 key', () => {
++    expect(reachLabelKey('lan')).toBe('nodes.reach.lan');
++    expect(reachLabelKey('wan')).toBe('nodes.reach.wan');
++    expect(reachLabelKey('relay')).toBe('nodes.reach.relay');
++    expect(reachLabelKey(null)).toBe('nodes.reach.none');
++  });
++
++  test('承载三态各有 key，未知为 null', () => {
++    expect(transportLabelKey('ws-secure')).toBe('nodes.badge.transportWs');
++    expect(transportLabelKey('dc')).toBe('nodes.badge.transportDc');
++    expect(transportLabelKey('relay')).toBe('nodes.badge.transportRelay');
++    expect(transportLabelKey(null)).toBeNull();
++  });
++});
++
++describe('NodeLinkDiagnostics', () => {
++  test('浮层带到达路径与承载两行；没有直连时给出占位说明', () => {
++    const html = renderToStaticMarkup(
++      <NodeLinkDiagnostics
++        diagnostics={diagnostics()}
++        link={link({ reach: 'relay', transport: 'relay' })}
++      />
++    );
++    expect(html).toContain('data-testid="ice-diagnostics"');
++    expect(html).toContain('nodes.badge.reachRow');
++    expect(html).toContain('nodes.reach.relay');
++    expect(html).toContain('nodes.badge.transportRow');
++    expect(html).toContain('nodes.badge.transportRelay');
++    expect(html).toContain('nodes.badge.icePlaceholder');
++  });
++
++  test('有 ICE 明细时照常列出候选对，不再出占位说明', () => {
++    const html = renderToStaticMarkup(
++      <NodeLinkDiagnostics
++        diagnostics={diagnostics({
++          path: 'direct',
++          rtt: 9,
++          ice: {
++            connectionState: 'connected',
++            iceConnectionState: 'completed',
++            localCandidateType: 'host',
++            remoteCandidateType: 'srflx',
++            selectedPair: 'host → srflx',
++          },
++        })}
++        link={link({ reach: 'wan', transport: 'dc' })}
++      />
++    );
++    expect(html).toContain('connected');
++    expect(html).toContain('host → srflx');
++    expect(html).toContain('nodes.badge.transportDc');
++    expect(html).not.toContain('nodes.badge.icePlaceholder');
++  });
++
++  test('承载未知时该行落到「未知」', () => {
++    const html = renderToStaticMarkup(
++      <NodeLinkDiagnostics diagnostics={diagnostics()} link={link({ transport: null })} />
++    );
++    expect(html).toContain('nodes.badge.unknown');
++  });
++});
++
++const REMOTE_NODE_ID = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
++
++describe('DeviceNodeBadges', () => {
++  test('self 不显示徽标（浏览器连的就是 entry 自己）', () => {
++    expect(renderToStaticMarkup(<DeviceNodeBadges nodeId="self" />)).toBe('');
++  });
++
++  test('远端 node 只渲染一枚徽标，文本取到达路径与 entry 侧 RTT', () => {
++    setMeshNodesStateForTest({
++      entryNodeId: 'entry',
++      nodes: [meshNode({ id: REMOTE_NODE_ID, reach: 'wan', transport: 'ws-secure', rttMs: 21.4 })],
++    });
++    const html = renderToStaticMarkup(<DeviceNodeBadges nodeId={REMOTE_NODE_ID} />);
++    expect(html).toContain('data-testid="badge-node-link"');
++    expect(html).toContain('nodes.reach.wan · 21ms');
++    expect(html).not.toContain('nodes.badge.rttUnknown');
++    // 浮层默认收起
++    expect(html).not.toContain('data-testid="ice-diagnostics"');
++  });
++
++  test('列表里没有这一行时按不可达渲染', () => {
++    setMeshNodesStateForTest({ entryNodeId: 'entry', nodes: [] });
++    const html = renderToStaticMarkup(<DeviceNodeBadges nodeId={REMOTE_NODE_ID} />);
++    expect(html).toContain('nodes.reach.none');
++  });
++});
+diff --git a/apps/fe/src/node/device-node-badges.tsx b/apps/fe/src/node/device-node-badges.tsx
+index c5148496..ba66c7b2 100644
+--- a/apps/fe/src/node/device-node-badges.tsx
++++ b/apps/fe/src/node/device-node-badges.tsx
+@@ -1,15 +1,71 @@
+-// 设备页头部的两枚可见性徽标（设计 §4「可见性」）：
+-//   1. 浏览器 ↔ node 的承载（primary / direct）与 RTT；
+-//   2. entry ↔ node 的到达路径（lan / relay / 不可达）。
+-// `self` 时两枚都不显示（浏览器直接连的就是 entry 自己，没有第二跳）。
+-// 点击展开 ICE 诊断浮层——F3-1 之前诊断值恒为 null，浮层显示占位说明。
++// 设备页头部的链路徽标（设计 §4「可见性」）：一枚徽标说清「现在这条链路怎么走、多快」。
++// 浏览器直连（WebRTC）活着时以直连为准，否则用 entry ↔ node 的到达路径（局域网 / 公网 /
++// 经 Hub 中转 / 不可达）。`self` 不显示——浏览器直接连的就是 entry 自己，没有第二跳。
++// 点击展开诊断浮层：到达路径、承载，以及直连的 ICE 明细。
+ 
+ import { SELF_NODE_ID } from '@tmex/api-client';
++import type { MeshNodeReach, MeshNodeTransport } from '@tmex/api-client/auth/index';
+ import { cn } from '@tmex/ui';
+-import { Activity, Route } from 'lucide-react';
++import type { DirectCarrierPath, DirectDiagnostics } from '@tmex/ws-client/direct/types';
++import { Activity } from 'lucide-react';
+ import { useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { useDirectDiagnostics, useNodeReach } from './direct-diagnostics';
++import { type NodeLink, useDirectDiagnostics, useNodeLink } from './direct-diagnostics';
++
++const REACH_LABEL_KEYS = {
++  lan: 'nodes.reach.lan',
++  wan: 'nodes.reach.wan',
++  relay: 'nodes.reach.relay',
++} as const;
++
++const TRANSPORT_LABEL_KEYS = {
++  'ws-secure': 'nodes.badge.transportWs',
++  dc: 'nodes.badge.transportDc',
++  relay: 'nodes.badge.transportRelay',
++} as const;
++
++export function reachLabelKey(reach: MeshNodeReach): string {
++  return reach ? REACH_LABEL_KEYS[reach] : 'nodes.reach.none';
++}
++
++export function transportLabelKey(transport: MeshNodeTransport): string | null {
++  return transport ? TRANSPORT_LABEL_KEYS[transport] : null;
++}
++
++export interface LinkBadgeDescriptor {
++  labelKey: string;
++  /** 展示用的往返毫秒数；未测得为 `null`，此时徽标不带延迟后缀。 */
++  rttMs: number | null;
++  tone: 'ok' | 'muted';
++}
++
++/**
++ * 徽标取值。直连活着时 RTT 取 WebRTC `getStats()` 的候选对；否则取 entry ↔ node 的 peer
++ * ping RTT。测不到就不带后缀——写「延迟未知」只会让人以为链路出了问题。
++ */
++export function resolveLinkBadge(input: {
++  path: DirectCarrierPath;
++  directRttMs: number | null;
++  link: NodeLink;
++}): LinkBadgeDescriptor {
++  if (input.path === 'direct') {
++    return { labelKey: 'nodes.badge.direct', rttMs: finiteRtt(input.directRttMs), tone: 'ok' };
++  }
++  const { reach, rttMs } = input.link;
++  return {
++    labelKey: reachLabelKey(reach),
++    rttMs: finiteRtt(rttMs),
++    tone: reach === 'lan' || reach === 'wan' ? 'ok' : 'muted',
++  };
++}
++
++export function formatLinkBadgeLabel(label: string, rttMs: number | null): string {
++  return rttMs == null ? label : `${label} · ${Math.round(rttMs)}ms`;
++}
++
++function finiteRtt(rttMs: number | null): number | null {
++  return typeof rttMs === 'number' && Number.isFinite(rttMs) && rttMs >= 0 ? rttMs : null;
++}
+ 
+ function Badge({
+   icon: Icon,
+@@ -18,7 +74,7 @@ function Badge({
+   onClick,
+   testId,
+ }: {
+-  icon: typeof Route;
++  icon: typeof Activity;
+   label: string;
+   tone: 'ok' | 'muted';
+   onClick?: () => void;
+@@ -53,7 +109,7 @@ export interface DeviceNodeBadgesProps {
+ export function DeviceNodeBadges({ nodeId }: DeviceNodeBadgesProps) {
+   const { t } = useTranslation();
+   const diagnostics = useDirectDiagnostics(nodeId);
+-  const reach = useNodeReach(nodeId);
++  const link = useNodeLink(nodeId);
+   const [open, setOpen] = useState(false);
+   const containerRef = useRef<HTMLDivElement | null>(null);
+ 
+@@ -68,16 +124,7 @@ export function DeviceNodeBadges({ nodeId }: DeviceNodeBadgesProps) {
+ 
+   if (nodeId === SELF_NODE_ID) return null;
+ 
+-  const pathLabel =
+-    diagnostics.path === 'direct' ? t('nodes.badge.direct') : t('nodes.badge.primary');
+-  const rttLabel =
+-    diagnostics.rtt == null ? t('nodes.badge.rttUnknown') : `${Math.round(diagnostics.rtt)}ms`;
+-  const reachLabel =
+-    reach === 'lan'
+-      ? t('nodes.reach.lan')
+-      : reach === 'relay'
+-        ? t('nodes.reach.relay')
+-        : t('nodes.reach.none');
++  const badge = resolveLinkBadge({ path: diagnostics.path, directRttMs: diagnostics.rtt, link });
+ 
+   return (
+     <div
+@@ -87,60 +134,84 @@ export function DeviceNodeBadges({ nodeId }: DeviceNodeBadgesProps) {
+     >
+       <Badge
+         icon={Activity}
+-        label={`${pathLabel} · ${rttLabel}`}
+-        tone={diagnostics.path === 'direct' ? 'ok' : 'muted'}
++        label={formatLinkBadgeLabel(t(badge.labelKey), badge.rttMs)}
++        tone={badge.tone}
+         onClick={() => setOpen((value) => !value)}
+-        testId="badge-browser-to-node"
++        testId="badge-node-link"
+       />
+-      <Badge
+-        icon={Route}
+-        label={reachLabel}
+-        tone={reach ? 'ok' : 'muted'}
+-        testId="badge-entry-to-node"
+-      />
+-      {open && (
+-        <div
+-          className="absolute right-0 top-full z-20 mt-1 w-64 rounded-md border border-border bg-popover p-2 text-xs shadow-md animate-in fade-in-0 zoom-in-95 duration-(--tmex-motion-fast) ease-out motion-reduce:animate-none"
+-          data-testid="ice-diagnostics"
+-        >
+-          <div className="mb-1 font-semibold">{t('nodes.badge.iceTitle')}</div>
+-          <dl className="space-y-0.5">
+-            <DiagnosticRow
+-              label={t('nodes.badge.connectionState')}
+-              value={diagnostics.ice?.connectionState}
+-            />
+-            <DiagnosticRow
+-              label={t('nodes.badge.iceState')}
+-              value={diagnostics.ice?.iceConnectionState}
+-            />
+-            <DiagnosticRow
+-              label={t('nodes.badge.localCandidate')}
+-              value={diagnostics.ice?.localCandidateType}
+-            />
+-            <DiagnosticRow
+-              label={t('nodes.badge.remoteCandidate')}
+-              value={diagnostics.ice?.remoteCandidateType}
+-            />
+-            <DiagnosticRow
+-              label={t('nodes.badge.selectedPair')}
+-              value={diagnostics.ice?.selectedPair}
+-            />
+-          </dl>
+-          {!diagnostics.ice && (
+-            <p className="mt-1 text-muted-foreground">{t('nodes.badge.icePlaceholder')}</p>
+-          )}
+-        </div>
++      {open && <NodeLinkDiagnostics diagnostics={diagnostics} link={link} />}
++    </div>
++  );
++}
++
++export function NodeLinkDiagnostics({
++  diagnostics,
++  link,
++}: {
++  diagnostics: DirectDiagnostics;
++  link: NodeLink;
++}) {
++  const { t } = useTranslation();
++  const transportKey = transportLabelKey(link.transport);
++  return (
++    <div
++      className="absolute right-0 top-full z-20 mt-1 w-64 rounded-md border border-border bg-popover p-2 text-xs shadow-md animate-in fade-in-0 zoom-in-95 duration-(--tmex-motion-fast) ease-out motion-reduce:animate-none"
++      data-testid="ice-diagnostics"
++    >
++      <div className="mb-1 font-semibold">{t('nodes.badge.iceTitle')}</div>
++      <dl className="space-y-0.5">
++        <DiagnosticRow
++          label={t('nodes.badge.reachRow')}
++          value={t(reachLabelKey(link.reach))}
++          mono={false}
++        />
++        <DiagnosticRow
++          label={t('nodes.badge.transportRow')}
++          value={transportKey ? t(transportKey) : null}
++          mono={false}
++        />
++        <DiagnosticRow
++          label={t('nodes.badge.connectionState')}
++          value={diagnostics.ice?.connectionState}
++        />
++        <DiagnosticRow
++          label={t('nodes.badge.iceState')}
++          value={diagnostics.ice?.iceConnectionState}
++        />
++        <DiagnosticRow
++          label={t('nodes.badge.localCandidate')}
++          value={diagnostics.ice?.localCandidateType}
++        />
++        <DiagnosticRow
++          label={t('nodes.badge.remoteCandidate')}
++          value={diagnostics.ice?.remoteCandidateType}
++        />
++        <DiagnosticRow
++          label={t('nodes.badge.selectedPair')}
++          value={diagnostics.ice?.selectedPair}
++        />
++      </dl>
++      {!diagnostics.ice && (
++        <p className="mt-1 text-muted-foreground">{t('nodes.badge.icePlaceholder')}</p>
+       )}
+     </div>
+   );
+ }
+ 
+-function DiagnosticRow({ label, value }: { label: string; value?: string | null }) {
++function DiagnosticRow({
++  label,
++  value,
++  mono = true,
++}: {
++  label: string;
++  value?: string | null;
++  mono?: boolean;
++}) {
+   const { t } = useTranslation();
+   return (
+     <div className="flex items-baseline justify-between gap-2">
+       <dt className="text-muted-foreground">{label}</dt>
+-      <dd className="truncate font-mono">{value ?? t('nodes.badge.unknown')}</dd>
++      <dd className={cn('truncate', mono && 'font-mono')}>{value ?? t('nodes.badge.unknown')}</dd>
+     </div>
+   );
+ }
+diff --git a/apps/fe/src/node/direct-diagnostics.ts b/apps/fe/src/node/direct-diagnostics.ts
+index dba3c284..6419fc96 100644
+--- a/apps/fe/src/node/direct-diagnostics.ts
++++ b/apps/fe/src/node/direct-diagnostics.ts
+@@ -5,6 +5,8 @@
+ // 不可用）时 `resolveDirectDiagnostics()` 回落到恒为 `primary` 的桩，契约与桩都在
+ // `packages/ws-client/src/direct/types.ts`。
+ 
++import { SELF_NODE_ID } from '@tmex/api-client';
++import type { MeshNodeReach, MeshNodeTransport } from '@tmex/api-client/auth/index';
+ import type { DirectDiagnostics } from '@tmex/ws-client/direct/types';
+ import { resolveDirectDiagnostics } from '@tmex/ws-client/direct/types';
+ import { useMemo, useSyncExternalStore } from 'react';
+@@ -20,12 +22,35 @@ export function useDirectDiagnostics(nodeId: string): DirectDiagnostics {
+   return useSyncExternalStore(source.subscribe, source.get, source.get);
+ }
+ 
+-/** entry ↔ 该 node 的到达路径（`lan` / `relay` / null）。 */
+-export function useNodeReach(nodeId: string): 'lan' | 'relay' | null {
++/** entry ↔ 该 node 的链路：到达路径、承载与 ping/pong 往返时延。 */
++export interface NodeLink {
++  reach: MeshNodeReach;
++  transport: MeshNodeTransport;
++  /** entry ↔ node 的往返毫秒数；未测得为 `null`。 */
++  rttMs: number | null;
++}
++
++const UNREACHABLE_LINK: NodeLink = { reach: null, transport: null, rttMs: null };
++
++export function useNodeLink(nodeId: string): NodeLink {
+   const state = useSyncExternalStore(subscribeMeshNodes, getMeshNodesState, getMeshNodesState);
+   const node = state.nodes.find(
+-    (row) => row.id === nodeId || (state.entryNodeId === row.id && nodeId === 'self')
++    (row) => row.id === nodeId || (state.entryNodeId === row.id && nodeId === SELF_NODE_ID)
+   );
+-  const reach = node?.reach ?? null;
+-  return reach === 'lan' || reach === 'relay' ? reach : null;
++  if (!node) return UNREACHABLE_LINK;
++  return {
++    reach: normalizeReach(node.reach),
++    transport: normalizeTransport(node.transport),
++    rttMs: typeof node.rttMs === 'number' && Number.isFinite(node.rttMs) ? node.rttMs : null,
++  };
++}
++
++function normalizeReach(reach: string | null | undefined): MeshNodeReach {
++  return reach === 'lan' || reach === 'wan' || reach === 'relay' ? reach : null;
++}
++
++function normalizeTransport(transport: string | null | undefined): MeshNodeTransport {
++  return transport === 'ws-secure' || transport === 'relay' || transport === 'dc'
++    ? transport
++    : null;
+ }
+diff --git a/apps/fe/src/node/mesh-events.test.ts b/apps/fe/src/node/mesh-events.test.ts
+index 5e9bc6f4..042ccaed 100644
+--- a/apps/fe/src/node/mesh-events.test.ts
++++ b/apps/fe/src/node/mesh-events.test.ts
+@@ -112,6 +112,8 @@ describe('decodeMeshFrame', () => {
+         nodeId: 'node-a',
+         status: 'online',
+         reach: 'relay',
++        transport: null,
++        rttMs: null,
+         inventory: { version: '1.0.0' },
+         version: null,
+         direct_capable: null,
+@@ -134,6 +136,8 @@ describe('decodeMeshFrame', () => {
+         nodeId: 'legacy-node',
+         status: 'online',
+         reach: 'lan',
++        transport: null,
++        rttMs: null,
+         inventory: null,
+         version: null,
+         direct_capable: null,
+@@ -142,6 +146,28 @@ describe('decodeMeshFrame', () => {
+     });
+   });
+ 
++  test('reach=wan 解得出来（老前端只认 lan/relay，新 node 会发 wan）', () => {
++    const frame = nodeEventFrame({
++      nodeId: 'a',
++      status: wsBorsh.NODE_EVENT_STATUS_ONLINE,
++      reach: 'wan',
++      inventory: null,
++    });
++    const decoded = decodeMeshFrame(frame);
++    expect(decoded?.kind === 'node-event' && decoded.payload.reach).toBe('wan');
++  });
++
++  test('未知 reach 归一成 null', () => {
++    const frame = nodeEventFrame({
++      nodeId: 'a',
++      status: wsBorsh.NODE_EVENT_STATUS_ONLINE,
++      reach: 'quantum',
++      inventory: null,
++    });
++    const decoded = decodeMeshFrame(frame);
++    expect(decoded?.kind === 'node-event' && decoded.payload.reach).toBeNull();
++  });
++
+   test('offline / revoked 枚举映射', () => {
+     const offline = decodeMeshFrame(
+       nodeEventFrame({
+diff --git a/apps/fe/src/node/mesh-events.ts b/apps/fe/src/node/mesh-events.ts
+index 7b8f0142..0e7d685f 100644
+--- a/apps/fe/src/node/mesh-events.ts
++++ b/apps/fe/src/node/mesh-events.ts
+@@ -3,7 +3,11 @@
+ //
+ // 该连接**只属于 entry（self）**：mesh 事件是入口对整张 mesh 的视图，不按 node 分身。
+ 
+-import { handleGlobalUnauthorized } from '@tmex/api-client/auth/index';
++import {
++  type MeshNodeReach,
++  type MeshNodeTransport,
++  handleGlobalUnauthorized,
++} from '@tmex/api-client/auth/index';
+ import { wsBorsh } from '@tmex/shared';
+ import { encodeBase64url } from '@tmex/shared/auth';
+ 
+@@ -11,12 +15,17 @@ import { encodeBase64url } from '@tmex/shared/auth';
+ export const WS_UNAUTHORIZED_CLOSE_CODE = 4401;
+ 
+ export type NodeEventStatus = 'online' | 'offline' | 'revoked';
+-export type NodeReach = 'lan' | 'relay' | null;
++export type NodeReach = MeshNodeReach;
++export type NodeTransport = MeshNodeTransport;
+ 
+ export interface NodeEventPayload {
+   nodeId: string;
+   status: NodeEventStatus;
+   reach: NodeReach;
++  /** peer link 的实际承载；老 node 的帧里没有这一段，解出为 `undefined`。 */
++  transport?: NodeTransport;
++  /** entry ↔ node 最近一次 ping/pong 往返毫秒数；未测得为 `null`，帧里没有为 `undefined`。 */
++  rttMs?: number | null;
+   /** node.status 上报的 inventory（JSON 字符串已解析）；不可解析时保留原串。 */
+   inventory: unknown;
+   version?: string | null;
+@@ -71,7 +80,21 @@ function fromFromWire(from: number): 'browser' | 'node' | null {
+ }
+ 
+ function reachFromWire(reach: string | null): NodeReach {
+-  return reach === 'lan' || reach === 'relay' ? reach : null;
++  return reach === 'lan' || reach === 'wan' || reach === 'relay' ? reach : null;
++}
++
++// 老 node 的帧里没有这两段，解出 `undefined`——与「新帧明确报告没有」（null）区分开，
++// 投影时才知道该保留上一次轮询到的值还是清掉。
++function transportFromWire(transport: unknown): NodeTransport | undefined {
++  if (transport === undefined) return undefined;
++  return transport === 'ws-secure' || transport === 'relay' || transport === 'dc'
++    ? transport
++    : null;
++}
++
++function rttFromWire(rttMs: unknown): number | null | undefined {
++  if (rttMs === undefined) return undefined;
++  return typeof rttMs === 'number' && Number.isFinite(rttMs) && rttMs >= 0 ? rttMs : null;
+ }
+ 
+ function parseInventory(raw: string | null): unknown {
+@@ -92,7 +115,10 @@ export function decodeMeshFrame(data: Uint8Array): MeshFrame | null {
+     const envelope = wsBorsh.decodeEnvelope(data);
+     if (envelope.version !== wsBorsh.CURRENT_VERSION) return null;
+     if (envelope.kind === wsBorsh.KIND_NODE_EVENT) {
+-      const payload = wsBorsh.decodeNodeEvent(envelope.payload);
++      // `transport` / `rttMs` 是后加的线上字段：老 node 发来的帧里没有，解出为 undefined。
++      const payload = wsBorsh.decodeNodeEvent(envelope.payload) as ReturnType<
++        typeof wsBorsh.decodeNodeEvent
++      > & { transport?: unknown; rttMs?: unknown };
+       const status = statusFromWire(payload.status);
+       if (!status) return null;
+       return {
+@@ -101,6 +127,8 @@ export function decodeMeshFrame(data: Uint8Array): MeshFrame | null {
+           nodeId: payload.nodeId,
+           status,
+           reach: reachFromWire(payload.reach),
++          transport: transportFromWire(payload.transport),
++          rttMs: rttFromWire(payload.rttMs),
+           inventory: parseInventory(payload.inventory),
+           version: payload.version,
+           direct_capable: payload.directCapable,
+diff --git a/apps/fe/src/node/mesh-nodes.test.ts b/apps/fe/src/node/mesh-nodes.test.ts
+index 88e090ab..19bdf4c4 100644
+--- a/apps/fe/src/node/mesh-nodes.test.ts
++++ b/apps/fe/src/node/mesh-nodes.test.ts
+@@ -97,6 +97,51 @@ describe('patchNodesWithEvent', () => {
+     expect(next).toBe(nodes);
+   });
+ 
++  test('online 事件带上 transport 与 rttMs，offline 一并清掉', () => {
++    const online = patchNodesWithEvent(nodes, {
++      nodeId: 'a',
++      status: 'online',
++      reach: 'wan',
++      transport: 'ws-secure',
++      rttMs: 42,
++      inventory: null,
++    });
++    expect(online[0].reach).toBe('wan');
++    expect(online[0].transport).toBe('ws-secure');
++    expect(online[0].rttMs).toBe(42);
++
++    const offline = patchNodesWithEvent(online, {
++      nodeId: 'a',
++      status: 'offline',
++      reach: 'wan',
++      transport: 'ws-secure',
++      rttMs: 42,
++      inventory: null,
++    });
++    expect(offline[0].reach).toBeNull();
++    expect(offline[0].transport).toBeNull();
++    expect(offline[0].rttMs).toBeNull();
++  });
++
++  test('事件没带 transport / rttMs 时保留列表里已有的值', () => {
++    const base = patchNodesWithEvent(nodes, {
++      nodeId: 'b',
++      status: 'online',
++      reach: 'lan',
++      transport: 'dc',
++      rttMs: 7,
++      inventory: null,
++    });
++    const next = patchNodesWithEvent(base, {
++      nodeId: 'b',
++      status: 'online',
++      reach: 'lan',
++      inventory: null,
++    });
++    expect(next[1].transport).toBe('dc');
++    expect(next[1].rttMs).toBe(7);
++  });
++
+   test('NODE_EVENT 更新 version / direct_capable / name', () => {
+     const next = patchNodesWithEvent(nodes, {
+       nodeId: 'a',
+@@ -184,6 +229,38 @@ describe('mergeNodes', () => {
+     expect(rows[1].reach).toBeNull();
+   });
+ 
++  test('transport 与 rttMs 原样带进行；未知取值归一成 null', () => {
++    // 线上可能来自更新的 node，出现前端还不认识的枚举值，一律归一成 null 而不是照单全收
++    const weird = {
++      ...node({ id: 'weird' }),
++      reach: 'nonsense',
++      transport: 'quic',
++      rttMs: -1,
++    } as unknown as MeshNode;
++    const rows = mergeNodes(
++      [
++        node({ id: 'entry', reach: 'wan', transport: 'ws-secure', rttMs: 12.4 }),
++        node({ id: 'dc', reach: 'lan', transport: 'dc', rttMs: null }),
++        weird,
++      ],
++      null,
++      { entryNodeId: 'entry', hubNodeId: null }
++    );
++    const byId = new Map(rows.map((row) => [row.id, row]));
++    expect(byId.get('entry')).toMatchObject({ reach: 'wan', transport: 'ws-secure', rttMs: 12.4 });
++    expect(byId.get('dc')).toMatchObject({ reach: 'lan', transport: 'dc', rttMs: null });
++    expect(byId.get('weird')).toMatchObject({ reach: null, transport: null, rttMs: null });
++  });
++
++  test('mesh 行不带 transport / rttMs 时补 null', () => {
++    const rows = mergeNodes([node({ id: 'legacy' })], null, {
++      entryNodeId: null,
++      hubNodeId: null,
++    });
++    expect(rows[0].transport).toBeNull();
++    expect(rows[0].rttMs).toBeNull();
++  });
++
+   test('hub 列表里多出来的 node 不会凭空出现在表里', () => {
+     const rows = mergeNodes(meshNodes, [...hubNodes, { ...hubNodes[0], id: 'ghost' }], {
+       entryNodeId: 'entry',
+diff --git a/apps/fe/src/node/mesh-nodes.ts b/apps/fe/src/node/mesh-nodes.ts
+index 997260ba..723d0fdc 100644
+--- a/apps/fe/src/node/mesh-nodes.ts
++++ b/apps/fe/src/node/mesh-nodes.ts
+@@ -7,7 +7,13 @@
+ 
+ import { isAuthTransitionActive } from '@/auth/auth-transition';
+ import { SELF_NODE_ID } from '@tmex/api-client';
+-import type { AuthApi, AuthModeResponse, MeshNode } from '@tmex/api-client/auth/index';
++import type {
++  AuthApi,
++  AuthModeResponse,
++  MeshNode,
++  MeshNodeReach,
++  MeshNodeTransport,
++} from '@tmex/api-client/auth/index';
+ import { defaultAuthApi } from '@tmex/api-client/auth/index';
+ import { bytesToHex, decodeBase64url, sha256 } from '@tmex/shared/auth';
+ import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+@@ -48,6 +54,8 @@ export function patchNodesWithEvent(nodes: MeshNode[], event: NodeEventPayload):
+       ...node,
+       online,
+       reach: online ? event.reach : null,
++      transport: online ? pick(event.transport, node.transport) : null,
++      rttMs: online ? pick(event.rttMs, node.rttMs) : null,
+       inventory: event.inventory ?? node.inventory,
+       version: event.version ?? versionOf(event.inventory) ?? node.version,
+       direct_capable: event.direct_capable ?? node.direct_capable,
+@@ -57,6 +65,12 @@ export function patchNodesWithEvent(nodes: MeshNode[], event: NodeEventPayload):
+   return changed ? next : nodes;
+ }
+ 
++/** 事件里没带这一段（老 node 的帧）时保留上一次列表里的值，别把已知信息清成未知。 */
++function pick<T>(fromEvent: T | undefined, previous: T | undefined): T | null {
++  if (fromEvent !== undefined) return fromEvent;
++  return previous ?? null;
++}
++
+ function versionOf(inventory: unknown): string | null {
+   if (!inventory || typeof inventory !== 'object') return null;
+   const value = (inventory as { version?: unknown }).version;
+@@ -89,7 +103,11 @@ export interface NodeRow {
+   publicKey: string;
+   fingerprint: string;
+   online: boolean;
+-  reach: 'lan' | 'relay' | null;
++  reach: MeshNodeReach;
++  /** peer link 的实际承载；未知为 `null`。 */
++  transport: MeshNodeTransport;
++  /** entry ↔ node 的 ping/pong 往返毫秒数；未测得为 `null`。 */
++  rttMs: number | null;
+   version: string | null;
+   directCapable: boolean;
+   loggedIn: boolean;
+@@ -104,8 +122,18 @@ export interface NodeRow {
+   certSig: string | null;
+ }
+ 
+-function reachOf(reach: string | null): 'lan' | 'relay' | null {
+-  return reach === 'lan' || reach === 'relay' ? reach : null;
++function reachOf(reach: string | null | undefined): MeshNodeReach {
++  return reach === 'lan' || reach === 'wan' || reach === 'relay' ? reach : null;
++}
++
++function transportOf(transport: string | null | undefined): MeshNodeTransport {
++  return transport === 'ws-secure' || transport === 'relay' || transport === 'dc'
++    ? transport
++    : null;
++}
++
++function rttOf(rttMs: number | null | undefined): number | null {
++  return typeof rttMs === 'number' && Number.isFinite(rttMs) && rttMs >= 0 ? rttMs : null;
+ }
+ 
+ /**
+@@ -128,6 +156,8 @@ export function mergeNodes(
+       fingerprint: publicKeyFingerprint(node.publicKey),
+       online: node.online,
+       reach: reachOf(node.reach),
++      transport: transportOf(node.transport),
++      rttMs: rttOf(node.rttMs),
+       version: node.version ?? hub?.version ?? null,
+       directCapable: node.direct_capable || (hub?.direct_capable ?? false),
+       loggedIn: node.loggedIn,
+diff --git a/apps/fe/src/node/self-agent-store.ts b/apps/fe/src/node/self-agent-store.ts
+new file mode 100644
+index 00000000..2b1aac21
+--- /dev/null
++++ b/apps/fe/src/node/self-agent-store.ts
+@@ -0,0 +1,18 @@
++// entry（self）网关的 agent store：mesh 下 agent 会话——含绑定远端 pane 的那些——
++// 全部由 entry 持有并运行，所以侧边栏与 Agent 标签无论挂在哪个 node 的运行时下，
++// 读写的都必须是这一份 store（node 维度靠 session.nodeId 过滤，见 `sessionsForNode`）。
++//
++// `appNodeRuntimes.get()` 不改引用计数；self 运行时由宿主根（`AppRoot`）长期持有，
++// 这里永远拿得到同一个实例。
++
++import { SELF_NODE_ID } from '@tmex/api-client';
++import type { AgentStore } from '@tmex/stores';
++import { setAgentHostStore } from '@tmex/stores';
++import { appNodeRuntimes } from './node-runtimes';
++
++export function selfAgentStore(): AgentStore {
++  return appNodeRuntimes.get(SELF_NODE_ID).runtime.stores.agent;
++}
++
++// 包内（panels）只拿得到自己所在的路由 runtime，经解析器把 self 的 store 递进去。
++setAgentHostStore(selfAgentStore);
+diff --git a/packages/panels/src/agent/agent-binding-status.tsx b/packages/panels/src/agent/agent-binding-status.tsx
+index 023f5a71..a71c7636 100644
+--- a/packages/panels/src/agent/agent-binding-status.tsx
++++ b/packages/panels/src/agent/agent-binding-status.tsx
+@@ -71,7 +71,9 @@ export function AgentBindingStatus({
+             disabled={newSessionDisabled}
+             onClick={onNewSession}
+             aria-label={t('agent.session.new')}
+-            title={newSessionDisabled ? t('agent.session.selectPaneHint') : t('agent.session.new')}
++            title={
++              newSessionDisabled ? t('agent.session.createDisabledNoPane') : t('agent.session.new')
++            }
+           >
+             <PlusIcon />
+           </Button>
+diff --git a/packages/panels/src/agent/agent-node-offline.test.ts b/packages/panels/src/agent/agent-node-offline.test.ts
+new file mode 100644
+index 00000000..af8bfecb
+--- /dev/null
++++ b/packages/panels/src/agent/agent-node-offline.test.ts
+@@ -0,0 +1,59 @@
++import { describe, expect, test } from 'bun:test';
++import { matchPath } from 'react-router';
++
++import { createBrowserHostServices, hostAppPath } from '@tmex/stores';
++
++import { NODE_OFFLINE_ERROR, isNodePaused } from './agent-node-offline';
++import { AGENT_PANE_ROUTE_PATH } from './use-agent-tab-state';
++
++const NODE_A = 'a'.repeat(32);
++
++describe('isNodePaused', () => {
++  test('follows the mesh signal when the host provides one', () => {
++    expect(isNodePaused(true, null)).toBe(true);
++    expect(isNodePaused(false, null)).toBe(false);
++  });
++
++  test('a node back online resumes input even while the session still holds NODE_OFFLINE', () => {
++    expect(isNodePaused(false, NODE_OFFLINE_ERROR)).toBe(false);
++  });
++
++  test('falls back to the session error when the host has no mesh state', () => {
++    expect(isNodePaused(undefined, NODE_OFFLINE_ERROR)).toBe(true);
++    expect(isNodePaused(undefined, 'rate limited')).toBe(false);
++    expect(isNodePaused(undefined, null)).toBe(false);
++  });
++});
++
++// useMatch 先对 pathname 整体解码再匹配，测试里用同样的形状喂 matchPath
++describe('pane route pattern', () => {
++  test('matches the plain route for the self host', () => {
++    const host = createBrowserHostServices();
++    const pattern = hostAppPath(host, AGENT_PANE_ROUTE_PATH);
++    const match = matchPath(pattern, '/devices/d1/windows/@1/panes/%1');
++    expect(match?.params.deviceId).toBe('d1');
++    expect(match?.params.paneId).toBe('%1');
++  });
++
++  test('matches the /n/:nodeId route for a remote host', () => {
++    const host = createBrowserHostServices({
++      nodeId: NODE_A,
++      appPath: (path) => `/n/${NODE_A}${path}`,
++    });
++    const pattern = hostAppPath(host, AGENT_PANE_ROUTE_PATH);
++    expect(pattern).toBe(`/n/${NODE_A}/devices/:deviceId/windows/:windowId/panes/:paneId`);
++
++    const match = matchPath(pattern, `/n/${NODE_A}/devices/d1/windows/@1/panes/%1`);
++    expect(match?.params.deviceId).toBe('d1');
++    expect(match?.params.windowId).toBe('@1');
++    expect(match?.params.paneId).toBe('%1');
++
++    // 没有前缀的旧路由不应命中远端 pattern
++    expect(matchPath(pattern, '/devices/d1/windows/@1/panes/%1')).toBeNull();
++  });
++
++  test('the plain pattern does not match a /n/:nodeId route', () => {
++    const pattern = hostAppPath(createBrowserHostServices(), AGENT_PANE_ROUTE_PATH);
++    expect(matchPath(pattern, `/n/${NODE_A}/devices/d1/windows/@1/panes/%1`)).toBeNull();
++  });
++});
+diff --git a/packages/panels/src/agent/agent-node-offline.ts b/packages/panels/src/agent/agent-node-offline.ts
+new file mode 100644
+index 00000000..e497db87
+--- /dev/null
++++ b/packages/panels/src/agent/agent-node-offline.ts
+@@ -0,0 +1,17 @@
++// 路由 node 离线时的会话暂停判定：纯函数，供派生态与测试共用。
++
++/** node 离线传播时后端写入会话的 lastError */
++export const NODE_OFFLINE_ERROR = 'NODE_OFFLINE';
++
++/**
++ * 路由 node 是否处于「离线暂停」：mesh 状态是权威信号，node 回到在线即恢复输入
++ * （会话本身仍停在 error，由用户下一次发送清除）。宿主拿不到 mesh 状态（standalone）时，
++ * 退回用会话上的 NODE_OFFLINE 兜底。
++ */
++export function isNodePaused(
++  nodeOffline: boolean | undefined,
++  lastError: string | null | undefined
++): boolean {
++  if (nodeOffline !== undefined) return nodeOffline;
++  return lastError === NODE_OFFLINE_ERROR;
++}
+diff --git a/packages/panels/src/agent/agent-status-banners.tsx b/packages/panels/src/agent/agent-status-banners.tsx
+index e7e6823d..78d5a200 100644
+--- a/packages/panels/src/agent/agent-status-banners.tsx
++++ b/packages/panels/src/agent/agent-status-banners.tsx
+@@ -3,9 +3,10 @@ import { useTranslation } from 'react-i18next';
+ import { Button } from '@tmex/ui/button';
+ import { CircleAlertIcon } from 'lucide-react';
+ 
+-/** 孤立会话 / pane 绑定不一致 / 运行错误三条状态横幅 */
++/** 节点离线 / 孤立会话 / pane 绑定不一致 / 运行错误四条状态横幅 */
+ export function AgentStatusBanners({
+   isOrphan,
++  showNodeOffline,
+   showPaneMismatch,
+   bindingValid,
+   canRebind,
+@@ -17,6 +18,7 @@ export function AgentStatusBanners({
+   onRetry,
+ }: {
+   isOrphan: boolean;
++  showNodeOffline: boolean;
+   showPaneMismatch: boolean;
+   bindingValid: boolean;
+   canRebind: boolean;
+@@ -31,6 +33,16 @@ export function AgentStatusBanners({
+ 
+   return (
+     <>
++      {showNodeOffline && (
++        <div
++          data-testid="agent-node-offline-banner"
++          className="bg-muted/50 text-muted-foreground mx-3 mb-1.5 flex shrink-0 items-start gap-2 rounded-lg px-2 py-1.5 text-xs"
++        >
++          <CircleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
++          <span className="min-w-0 flex-1">{t('agent.node.offlinePaused')}</span>
++        </div>
++      )}
++
+       {isOrphan && (
+         <div
+           data-testid="agent-orphan-banner"
+diff --git a/packages/panels/src/agent/agent-tab-view.test.ts b/packages/panels/src/agent/agent-tab-view.test.ts
+index faf75ac6..841eaabf 100644
+--- a/packages/panels/src/agent/agent-tab-view.test.ts
++++ b/packages/panels/src/agent/agent-tab-view.test.ts
+@@ -28,6 +28,7 @@ function session(overrides: Partial<AgentSessionDto> = {}): AgentSessionDto {
+   return {
+     id: 's1',
+     title: 'session',
++    nodeId: null,
+     deviceId: 'd1',
+     paneId: '%1',
+     providerId: null,
+@@ -52,6 +53,8 @@ function state(overrides: Partial<AgentTabState> = {}): AgentTabState {
+   return {
+     agentStore: {} as AgentStoreHandle,
+     snapshots: snapshots('%1'),
++    nodeId: null,
++    nodeOffline: undefined,
+     devices,
+     devicesLoading: false,
+     devicesError: false,
+@@ -116,3 +119,57 @@ describe('deriveAgentTabView rebind eligibility', () => {
+     expect(view.canRebind).toBe(false);
+   });
+ });
++
++describe('deriveAgentTabView node offline', () => {
++  test('shows the offline banner and disables input while the route node is offline', () => {
++    const view = deriveAgentTabView(state({ nodeOffline: true }));
++    expect(view.showNodeOffline).toBe(true);
++    expect(view.inputDisabled).toBe(true);
++  });
++
++  test('re-enables input once the node is back online, session error notwithstanding', () => {
++    const view = deriveAgentTabView(
++      state({
++        nodeOffline: false,
++        activeSession: session({ status: 'error', lastError: 'NODE_OFFLINE' }),
++      })
++    );
++    expect(view.showNodeOffline).toBe(false);
++    expect(view.inputDisabled).toBe(false);
++    // 节点已回来，错误条如实回显直到用户重发
++    expect(view.errorText).toBe('NODE_OFFLINE');
++  });
++
++  test('replaces the raw NODE_OFFLINE error with the offline banner while offline', () => {
++    const view = deriveAgentTabView(
++      state({
++        nodeOffline: true,
++        activeSession: session({ status: 'error', lastError: 'NODE_OFFLINE' }),
++      })
++    );
++    expect(view.showNodeOffline).toBe(true);
++    expect(view.errorText).toBeNull();
++  });
++
++  test('falls back to the session error when the host has no mesh state', () => {
++    const view = deriveAgentTabView(
++      state({
++        nodeOffline: undefined,
++        activeSession: session({ status: 'error', lastError: 'NODE_OFFLINE' }),
++      })
++    );
++    expect(view.showNodeOffline).toBe(true);
++    expect(view.inputDisabled).toBe(true);
++  });
++
++  test('leaves unrelated errors alone', () => {
++    const view = deriveAgentTabView(
++      state({
++        nodeOffline: false,
++        activeSession: session({ status: 'error', lastError: 'boom' }),
++      })
++    );
++    expect(view.showNodeOffline).toBe(false);
++    expect(view.errorText).toBe('boom');
++  });
++});
+diff --git a/packages/panels/src/agent/agent-tab-view.ts b/packages/panels/src/agent/agent-tab-view.ts
+index 45b8533d..3b97780b 100644
+--- a/packages/panels/src/agent/agent-tab-view.ts
++++ b/packages/panels/src/agent/agent-tab-view.ts
+@@ -5,6 +5,7 @@ import type { DraftSession } from '@tmex/stores';
+ import { lastUserMessageText } from '@tmex/stores';
+ 
+ import { type BindingInfo, resolveBinding } from './agent-binding';
++import { NODE_OFFLINE_ERROR, isNodePaused } from './agent-node-offline';
+ import { canRebindToRoute } from './agent-route-sync';
+ import type { AgentTabState } from './use-agent-tab-state';
+ 
+@@ -21,6 +22,8 @@ export interface AgentTabView {
+   showNewSession: boolean;
+   newSessionDisabled: boolean;
+   showPaneMismatch: boolean;
++  /** 路由 node 离线：会话暂停，输入禁用 */
++  showNodeOffline: boolean;
+   canRebind: boolean;
+   inputDisabled: boolean;
+   sending: boolean;
+@@ -57,7 +60,12 @@ function hasPaneMismatch(state: AgentTabState): boolean {
+   return activeSession.paneId !== routePaneId || activeSession.deviceId !== routeDeviceId;
+ }
+ 
+-function deriveComposerView(state: AgentTabState, isOrphan: boolean, hasContext: boolean) {
++function deriveComposerView(
++  state: AgentTabState,
++  isOrphan: boolean,
++  hasContext: boolean,
++  nodeOffline: boolean
++) {
+   const { activeSession, draft, sending } = state;
+   return {
+     modelProviderId: activeSession ? activeSession.providerId : (draft?.providerId ?? null),
+@@ -68,6 +76,7 @@ function deriveComposerView(state: AgentTabState, isOrphan: boolean, hasContext:
+     // 草稿物化在途时同样禁用输入，避免同一草稿被重复提交
+     inputDisabled:
+       isOrphan ||
++      nodeOffline ||
+       !hasContext ||
+       activeSession?.status === 'waiting_confirmation' ||
+       Boolean(sending) ||
+@@ -76,16 +85,19 @@ function deriveComposerView(state: AgentTabState, isOrphan: boolean, hasContext:
+   };
+ }
+ 
+-function deriveStatusView(state: AgentTabState, isOrphan: boolean) {
++function deriveStatusView(state: AgentTabState, isOrphan: boolean, nodeOffline: boolean) {
+   const { activeSession, messages, routeDeviceId, routePaneId } = state;
++  // 离线横幅已经解释了 NODE_OFFLINE，不再叠一条原样回显 lastError 的错误条
++  const lastError = activeSession?.status === 'error' ? activeSession.lastError : null;
+   return {
+     running: activeSession?.status === 'running',
+     // 新建按钮仅在「有内容的活动会话」时显示；草稿态/空会话本身即新会话，隐藏之
+     showNewSession: Boolean(activeSession && (messages?.length ?? 0) > 0),
+     newSessionDisabled: !routeDeviceId || !routePaneId,
+     showPaneMismatch: Boolean(activeSession && !isOrphan && hasPaneMismatch(state)),
++    showNodeOffline: nodeOffline,
+     canRebind: canRebindToRoute(activeSession, { deviceId: routeDeviceId, paneId: routePaneId }),
+-    errorText: activeSession?.status === 'error' ? activeSession.lastError : null,
++    errorText: nodeOffline && lastError === NODE_OFFLINE_ERROR ? null : lastError,
+     retryText: lastUserMessageText(messages),
+   };
+ }
+@@ -95,6 +107,7 @@ export function deriveAgentTabView(state: AgentTabState): AgentTabView {
+   const binding = deriveBinding(state);
+   const isOrphan = isOrphanSession(state, binding);
+   const hasContext = Boolean(activeSession || draft);
++  const nodeOffline = isNodePaused(state.nodeOffline, activeSession?.lastError ?? null);
+   return {
+     activeSession,
+     draft,
+@@ -103,7 +116,7 @@ export function deriveAgentTabView(state: AgentTabState): AgentTabView {
+     isOrphan,
+     hasContext,
+     draftEmpty: Boolean(draft && !activeSession),
+-    ...deriveStatusView(state, isOrphan),
+-    ...deriveComposerView(state, isOrphan, hasContext),
++    ...deriveStatusView(state, isOrphan, nodeOffline),
++    ...deriveComposerView(state, isOrphan, hasContext, nodeOffline),
+   };
+ }
+diff --git a/packages/panels/src/agent/agent-tab.tsx b/packages/panels/src/agent/agent-tab.tsx
+index ca1f569f..8b9089fc 100644
+--- a/packages/panels/src/agent/agent-tab.tsx
++++ b/packages/panels/src/agent/agent-tab.tsx
+@@ -6,10 +6,11 @@ import { AgentStatusBanners } from './agent-status-banners';
+ import { ChatThread } from './chat-thread';
+ import { QueueChips } from './queue-chips';
+ import { useAgentTabModel } from './use-agent-tab-model';
++import type { AgentTabHost } from './use-agent-tab-state';
+ 
+-export function AgentTab() {
++export function AgentTab(host: AgentTabHost = {}) {
+   const { t } = useTranslation();
+-  const model = useAgentTabModel();
++  const model = useAgentTabModel(host);
+ 
+   return (
+     <div data-testid="agent-tab" className="flex h-full min-h-0 flex-col">
+@@ -25,6 +26,7 @@ export function AgentTab() {
+ 
+       <AgentStatusBanners
+         isOrphan={model.isOrphan}
++        showNodeOffline={model.showNodeOffline}
+         showPaneMismatch={model.showPaneMismatch}
+         bindingValid={model.binding?.state === 'valid'}
+         canRebind={model.canRebind}
+diff --git a/packages/panels/src/agent/index.ts b/packages/panels/src/agent/index.ts
+index c7172810..093de484 100644
+--- a/packages/panels/src/agent/index.ts
++++ b/packages/panels/src/agent/index.ts
+@@ -1,2 +1,3 @@
+ export { AgentTab } from './agent-tab';
++export type { AgentTabHost } from './use-agent-tab-state';
+ export { ChatThread } from './chat-thread';
+diff --git a/packages/panels/src/agent/messages/assistant-message.tsx b/packages/panels/src/agent/messages/assistant-message.tsx
+index d3f9dec6..6fa30cd4 100644
+--- a/packages/panels/src/agent/messages/assistant-message.tsx
++++ b/packages/panels/src/agent/messages/assistant-message.tsx
+@@ -1,5 +1,5 @@
+-import { StreamingMarkdown } from '../../markdown/streaming-markdown';
+ import { cn } from '@tmex/ui';
++import { StreamingMarkdown } from '../../markdown/streaming-markdown';
+ 
+ export function AssistantMessage({
+   text,
+diff --git a/packages/panels/src/agent/use-agent-tab-actions.ts b/packages/panels/src/agent/use-agent-tab-actions.ts
+index b02ee2d9..1064cdfa 100644
+--- a/packages/panels/src/agent/use-agent-tab-actions.ts
++++ b/packages/panels/src/agent/use-agent-tab-actions.ts
+@@ -4,7 +4,9 @@ import type { NavigateFunction } from 'react-router';
+ import { useNavigate } from 'react-router';
+ 
+ import type { AgentSessionDto, AgentWriteMode } from '@tmex/shared';
+-import { useUIStore } from '@tmex/stores/react';
++import type { HostServices } from '@tmex/stores';
++import { encodePaneIdForUrl, hostAppPath } from '@tmex/stores';
++import { useRuntime, useUIStore } from '@tmex/stores/react';
+ 
+ import type { BindingInfo } from './agent-binding';
+ import { canRebindToRoute } from './agent-route-sync';
+@@ -29,25 +31,30 @@ export interface AgentTabActions {
+   onAllowControlCharsChange: (allow: boolean) => void;
+ }
+ 
++// 会话绑定的 pane 属于本 tab 所在的 node，跳转必须带上该 node 的路由前缀
+ function navigateToBinding(
+   navigate: NavigateFunction,
++  host: HostServices,
+   activeSession: AgentSessionDto | undefined,
+   binding: BindingInfo | null
+ ): void {
+   if (!activeSession?.deviceId) return;
+   if (binding?.state === 'valid' && binding.windowId && activeSession.paneId) {
+     navigate(
+-      `/devices/${activeSession.deviceId}/windows/${binding.windowId}/panes/${encodeURIComponent(activeSession.paneId)}`
++      hostAppPath(
++        host,
++        `/devices/${activeSession.deviceId}/windows/${binding.windowId}/panes/${encodePaneIdForUrl(activeSession.paneId)}`
++      )
+     );
+     return;
+   }
+   if (binding?.state === 'unknown') {
+-    navigate(`/devices/${activeSession.deviceId}`);
++    navigate(hostAppPath(host, `/devices/${activeSession.deviceId}`));
+   }
+ }
+ 
+ function createSessionActions(state: AgentTabState, view: AgentTabView) {
+-  const { agentStore, activeSession, activeSessionId, draft } = state;
++  const { agentStore, activeSession, activeSessionId, draft, nodeId } = state;
+   const { routeDeviceId, routePaneId, routePaneTitle } = state;
+   return {
+     onDecide: (confirmationId: string, approved: boolean) => {
+@@ -56,7 +63,12 @@ function createSessionActions(state: AgentTabState, view: AgentTabView) {
+     },
+     onNewSession: () => {
+       if (!routeDeviceId || !routePaneId) return;
+-      agentStore.getState().startDraft(routeDeviceId, routePaneId, routePaneTitle);
++      agentStore.getState().startDraft({
++        nodeId,
++        deviceId: routeDeviceId,
++        paneId: routePaneId,
++        paneTitle: routePaneTitle,
++      });
+     },
+     onStop: () => {
+       if (!activeSession) return;
+@@ -159,6 +171,7 @@ function createSettingActions(state: AgentTabState) {
+ 
+ export function useAgentTabActions(state: AgentTabState, view: AgentTabView): AgentTabActions {
+   const navigate = useNavigate();
++  const { host } = useRuntime();
+   const setSidebarTab = useUIStore((uiState) => uiState.setSidebarTab);
+   return {
+     ...createSessionActions(state, view),
+@@ -166,7 +179,7 @@ export function useAgentTabActions(state: AgentTabState, view: AgentTabView): Ag
+     ...createQueueActions(state, view),
+     ...createSettingActions(state),
+     onBindingClick: () => {
+-      navigateToBinding(navigate, state.activeSession, view.binding);
++      navigateToBinding(navigate, host, state.activeSession, view.binding);
+     },
+     onSwitchSession: () => {
+       setSidebarTab('panes');
+diff --git a/packages/panels/src/agent/use-agent-tab-model.ts b/packages/panels/src/agent/use-agent-tab-model.ts
+index b7c76d16..5d4427b0 100644
+--- a/packages/panels/src/agent/use-agent-tab-model.ts
++++ b/packages/panels/src/agent/use-agent-tab-model.ts
+@@ -7,7 +7,7 @@ import type { UiThreadBlock } from '@tmex/stores';
+ import { type AgentTabView, deriveAgentTabView } from './agent-tab-view';
+ import { buildBlocksWithConfirmations, buildConfirmationMap } from './agent-thread-blocks';
+ import { type AgentTabActions, useAgentTabActions } from './use-agent-tab-actions';
+-import { useAgentTabState } from './use-agent-tab-state';
++import { type AgentTabHost, useAgentTabState } from './use-agent-tab-state';
+ 
+ export { type BindingInfo, resolveBinding } from './agent-binding';
+ 
+@@ -16,8 +16,8 @@ export interface AgentTabModel extends AgentTabView, AgentTabActions {
+   confirmationByToolCallId: Map<string, string>;
+ }
+ 
+-export function useAgentTabModel(): AgentTabModel {
+-  const state = useAgentTabState();
++export function useAgentTabModel(host: AgentTabHost = {}): AgentTabModel {
++  const state = useAgentTabState(host);
+   const { messages, inProgress, pendingConfirmations } = state;
+ 
+   const confirmationByToolCallId = useMemo(
+diff --git a/packages/panels/src/agent/use-agent-tab-state.ts b/packages/panels/src/agent/use-agent-tab-state.ts
+index c2dba085..bb569206 100644
+--- a/packages/panels/src/agent/use-agent-tab-state.ts
++++ b/packages/panels/src/agent/use-agent-tab-state.ts
+@@ -13,18 +13,40 @@ import type {
+   Device,
+ } from '@tmex/shared';
+ import type {
++  AgentState,
+   AppRuntime,
+   DraftSession,
++  HostServices,
+   PendingConfirmationUi,
+   SessionInProgress,
+ } from '@tmex/stores';
+-import { useAgentStore, useRuntime, useTmuxStore } from '@tmex/stores/react';
++import {
++  hostAppPath,
++  isSessionOnNode,
++  normalizeAgentNodeId,
++  resolveAgentStore,
++} from '@tmex/stores';
++import { useRuntime, useTmuxStore } from '@tmex/stores/react';
+ 
+ import { type SnapshotMap, findPaneTitle } from './agent-binding';
+ import { shouldRedraftForRoute } from './agent-route-sync';
+ 
+ export type AgentStoreHandle = AppRuntime['stores']['agent'];
+ 
++/** 路由 pane 的匹配 pattern；多 node 宿主经 host.appPath 带上 `/n/<id>` 前缀。 */
++export const AGENT_PANE_ROUTE_PATH = '/devices/:deviceId/windows/:windowId/panes/:paneId';
++
++/**
++ * 宿主注入面。多 node 宿主里 agent 状态一律由 entry（self）网关提供：
++ * 远端 pane 的会话也由它持有并运行，所以 store 与路由 runtime 是分开的两件事。
++ */
++export interface AgentTabHost {
++  /** 服务 agent 状态的 store；缺省用当前 runtime 的（单 node 宿主行为不变） */
++  agentStore?: AgentStoreHandle;
++  /** 路由 node 是否离线；`undefined` 表示宿主没有 mesh 状态 */
++  nodeOffline?: boolean;
++}
++
+ interface RoutePane {
+   routeDeviceId: string | null;
+   routePaneId: string | null;
+@@ -56,10 +78,13 @@ interface DevicesSlice {
+ export interface AgentTabState extends RoutePane, AgentSessionSlice, DevicesSlice {
+   agentStore: AgentStoreHandle;
+   snapshots: SnapshotMap;
++  /** 本 tab 服务的 node（null 即 entry 自身）；创建/草稿一律带上它 */
++  nodeId: string | null;
++  nodeOffline: boolean | undefined;
+ }
+ 
+-function useRoutePane(snapshots: SnapshotMap): RoutePane {
+-  const paneMatch = useMatch('/devices/:deviceId/windows/:windowId/panes/:paneId');
++function useRoutePane(snapshots: SnapshotMap, host: HostServices): RoutePane {
++  const paneMatch = useMatch(hostAppPath(host, AGENT_PANE_ROUTE_PATH));
+   const routeDeviceId = paneMatch?.params.deviceId ?? null;
+   const routePaneId = paneMatch?.params.paneId ?? null;
+   const routePaneTitle = useMemo(
+@@ -69,31 +94,52 @@ function useRoutePane(snapshots: SnapshotMap): RoutePane {
+   return { routeDeviceId, routePaneId, routePaneTitle };
+ }
+ 
+-function useAgentSessionSlice(): AgentSessionSlice {
+-  const sessions = useAgentStore((state) => state.sessions);
+-  const activeSessionId = useAgentStore((state) => state.activeSessionId);
+-  const draft = useAgentStore((state) => state.draft);
+-  const messages = useAgentStore((state) =>
+-    state.activeSessionId ? state.messages[state.activeSessionId] : undefined
+-  );
+-  const inProgress = useAgentStore((state) =>
+-    state.activeSessionId ? state.inProgress[state.activeSessionId] : undefined
+-  );
+-  const pendingConfirmations = useAgentStore((state) =>
+-    state.activeSessionId ? state.pendingConfirmations[state.activeSessionId] : undefined
+-  );
+-  const sending = useAgentStore((state) =>
+-    state.activeSessionId ? state.sending[state.activeSessionId] : undefined
+-  );
+-  const materializingDraft = useAgentStore((state) => state.materializingDraft);
+-  const queued = useAgentStore((state) =>
+-    state.activeSessionId ? state.queued[state.activeSessionId] : undefined
++/** 会话列表是全 node 共用的一份，本 tab 只认绑定在自己这个 node 上的活动会话 */
++function activeSessionIdOnNode(state: AgentState, nodeId: string | null): string | null {
++  const { activeSessionId } = state;
++  if (!activeSessionId) return null;
++  const session = state.sessions[activeSessionId];
++  return session && isSessionOnNode(session, nodeId) ? activeSessionId : null;
++}
++
++function useAgentSessionSlice(
++  agentStore: AgentStoreHandle,
++  nodeId: string | null
++): AgentSessionSlice {
++  const activeSessionId = agentStore((state) => activeSessionIdOnNode(state, nodeId));
++  const activeSession = agentStore((state) => {
++    const id = activeSessionIdOnNode(state, nodeId);
++    return id ? state.sessions[id] : undefined;
++  });
++  const draft = agentStore((state) =>
++    state.draft && normalizeAgentNodeId(state.draft.nodeId) === nodeId ? state.draft : null
+   );
+-  const defaultWriteMode = useAgentStore((state) => state.defaultWriteMode);
++  const messages = agentStore((state) => {
++    const id = activeSessionIdOnNode(state, nodeId);
++    return id ? state.messages[id] : undefined;
++  });
++  const inProgress = agentStore((state) => {
++    const id = activeSessionIdOnNode(state, nodeId);
++    return id ? state.inProgress[id] : undefined;
++  });
++  const pendingConfirmations = agentStore((state) => {
++    const id = activeSessionIdOnNode(state, nodeId);
++    return id ? state.pendingConfirmations[id] : undefined;
++  });
++  const sending = agentStore((state) => {
++    const id = activeSessionIdOnNode(state, nodeId);
++    return id ? state.sending[id] : undefined;
++  });
++  const materializingDraft = agentStore((state) => state.materializingDraft);
++  const queued = agentStore((state) => {
++    const id = activeSessionIdOnNode(state, nodeId);
++    return id ? state.queued[id] : undefined;
++  });
++  const defaultWriteMode = agentStore((state) => state.defaultWriteMode);
+ 
+   return {
+     activeSessionId,
+-    activeSession: activeSessionId ? sessions[activeSessionId] : undefined,
++    activeSession,
+     draft,
+     messages,
+     inProgress,
+@@ -125,6 +171,7 @@ function useSessionsBootstrap(agentStore: AgentStoreHandle): void {
+ /** 空态即草稿态：进入 agent tab 且有路由 pane 但无会话/草稿时自动起草 */
+ function useAutoDraft(
+   agentStore: AgentStoreHandle,
++  nodeId: string | null,
+   activeSession: AgentSessionDto | undefined,
+   draft: DraftSession | null,
+   route: RoutePane
+@@ -132,9 +179,14 @@ function useAutoDraft(
+   const { routeDeviceId, routePaneId, routePaneTitle } = route;
+   useEffect(() => {
+     if (!activeSession && !draft && routeDeviceId && routePaneId) {
+-      agentStore.getState().startDraft(routeDeviceId, routePaneId, routePaneTitle);
++      agentStore.getState().startDraft({
++        nodeId,
++        deviceId: routeDeviceId,
++        paneId: routePaneId,
++        paneTitle: routePaneTitle,
++      });
+     }
+-  }, [activeSession, draft, routeDeviceId, routePaneId, routePaneTitle, agentStore]);
++  }, [activeSession, draft, nodeId, routeDeviceId, routePaneId, routePaneTitle, agentStore]);
+ }
+ 
+ /**
+@@ -143,6 +195,7 @@ function useAutoDraft(
+  */
+ function useSyncDraftToRoute(
+   agentStore: AgentStoreHandle,
++  nodeId: string | null,
+   activeSession: AgentSessionDto | undefined,
+   draft: DraftSession | null,
+   route: RoutePane
+@@ -156,23 +209,36 @@ function useSyncDraftToRoute(
+       Boolean(activeSession)
+     );
+     if (!redraft) return;
+-    agentStore
+-      .getState()
+-      .startDraft(routeDeviceId, routePaneId, routePaneTitle, draft?.prompt ?? null);
+-  }, [activeSession, draft, routeDeviceId, routePaneId, routePaneTitle, agentStore]);
++    agentStore.getState().startDraft({
++      nodeId,
++      deviceId: routeDeviceId,
++      paneId: routePaneId,
++      paneTitle: routePaneTitle,
++      prompt: draft?.prompt ?? null,
++    });
++  }, [activeSession, draft, nodeId, routeDeviceId, routePaneId, routePaneTitle, agentStore]);
+ }
+ 
+-export function useAgentTabState(): AgentTabState {
++export function useAgentTabState(host: AgentTabHost = {}): AgentTabState {
+   const runtime = useRuntime();
+-  const agentStore = runtime.stores.agent;
++  const agentStore = host.agentStore ?? resolveAgentStore(runtime.stores.agent);
++  const nodeId = normalizeAgentNodeId(runtime.nodeId);
+   const snapshots = useTmuxStore((state) => state.snapshots);
+   const devices = useDevices(runtime);
+-  const route = useRoutePane(snapshots);
+-  const session = useAgentSessionSlice();
++  const route = useRoutePane(snapshots, runtime.host);
++  const session = useAgentSessionSlice(agentStore, nodeId);
+ 
+   useSessionsBootstrap(agentStore);
+-  useAutoDraft(agentStore, session.activeSession, session.draft, route);
+-  useSyncDraftToRoute(agentStore, session.activeSession, session.draft, route);
++  useAutoDraft(agentStore, nodeId, session.activeSession, session.draft, route);
++  useSyncDraftToRoute(agentStore, nodeId, session.activeSession, session.draft, route);
+ 
+-  return { agentStore, snapshots, ...devices, ...route, ...session };
++  return {
++    agentStore,
++    snapshots,
++    nodeId,
++    nodeOffline: host.nodeOffline,
++    ...devices,
++    ...route,
++    ...session,
++  };
+ }
+diff --git a/packages/panels/src/device-console/use-terminal-shortcut-actions.ts b/packages/panels/src/device-console/use-terminal-shortcut-actions.ts
+index 5698f3fd..f7a3f759 100644
+--- a/packages/panels/src/device-console/use-terminal-shortcut-actions.ts
++++ b/packages/panels/src/device-console/use-terminal-shortcut-actions.ts
+@@ -2,7 +2,12 @@
+ // send 与 paste / newAgentSession 才需要有效设备与 pane。
+ 
+ import type { TerminalShortcutAction, TerminalShortcutItem } from '@tmex/shared';
+-import { type AppRuntime, bridgeOpenMobileSidebar } from '@tmex/stores';
++import {
++  type AppRuntime,
++  bridgeOpenMobileSidebar,
++  normalizeAgentNodeId,
++  resolveAgentStore,
++} from '@tmex/stores';
+ import { useRuntime } from '@tmex/stores/react';
+ import type { TerminalRef } from '@tmex/terminal-ui';
+ import { type RefObject, useCallback } from 'react';
+@@ -88,7 +93,14 @@ export function useTerminalShortcutActions({
+       }
+       // agent UI 关闭时按钮已在渲染前过滤，这里再兜底一次
+       if (item.action === 'newAgentSession' && runtime.features.agentUi) {
+-        runtime.stores.agent.getState().startDraft(deviceId, resolvedPaneId, null);
++        resolveAgentStore(runtime.stores.agent)
++          .getState()
++          .startDraft({
++            nodeId: normalizeAgentNodeId(runtime.nodeId),
++            deviceId,
++            paneId: resolvedPaneId,
++            paneTitle: null,
++          });
+         runtime.stores.ui.getState().setSidebarCollapsed(false);
+         bridgeOpenMobileSidebar();
+         runtime.stores.ui.getState().setSidebarTab('agent');
+diff --git a/packages/panels/src/files/rsync-install-flow.ts b/packages/panels/src/files/rsync-install-flow.ts
+index bafd4d0d..7c098366 100644
+--- a/packages/panels/src/files/rsync-install-flow.ts
++++ b/packages/panels/src/files/rsync-install-flow.ts
+@@ -1,6 +1,11 @@
+-import i18next from 'i18next';
+ import type { AppRuntime } from '@tmex/stores';
+-import { encodePaneIdForUrl, hostAppPath } from '@tmex/stores';
++import {
++  encodePaneIdForUrl,
++  hostAppPath,
++  normalizeAgentNodeId,
++  resolveAgentStore,
++} from '@tmex/stores';
++import i18next from 'i18next';
+ import { toast } from 'sonner';
+ 
+ const CONNECT_TIMEOUT_MS = 12_000;
+@@ -87,7 +92,15 @@ export async function openAgentInNewWindowWithPrompt(
+     }
+ 
+     // 3. 先起草（含预填 prompt）→ 再导航 → 切 agent → 手机强开 sidebar
+-    runtime.stores.agent.getState().startDraft(deviceId, win.paneId, win.paneTitle, promptText);
++    resolveAgentStore(runtime.stores.agent)
++      .getState()
++      .startDraft({
++        nodeId: normalizeAgentNodeId(runtime.nodeId),
++        deviceId,
++        paneId: win.paneId,
++        paneTitle: win.paneTitle,
++        prompt: promptText,
++      });
+     runtime.host.navigate(
+       hostAppPath(
+         runtime.host,
+diff --git a/packages/stores/src/agent-event-router.test.ts b/packages/stores/src/agent-event-router.test.ts
+index 85b01e12..f1f15bea 100644
+--- a/packages/stores/src/agent-event-router.test.ts
++++ b/packages/stores/src/agent-event-router.test.ts
+@@ -28,6 +28,7 @@ function makeSession(overrides: Partial<AgentSessionDto> = {}): AgentSessionDto
+   return {
+     id: 's1',
+     title: 'session',
++    nodeId: null,
+     deviceId: 'd1',
+     paneId: '%1',
+     providerId: null,
+diff --git a/packages/stores/src/agent-host-store.ts b/packages/stores/src/agent-host-store.ts
+new file mode 100644
+index 00000000..1ba9a5bb
+--- /dev/null
++++ b/packages/stores/src/agent-host-store.ts
+@@ -0,0 +1,19 @@
++// 宿主级 agent store 解析：mesh 下 agent 状态一律由 entry（self）网关持有，
++// 远端 pane 的会话也由它运行，因此**所有** node 的界面都要读同一份 store。
++//
++// 包内组件只拿得到自己所在的路由 runtime，所以由宿主注册一次解析器（模式同
++// `setSiteFallbackReader`）；未注册（standalone / 测试）时回落到调用方自己的 store，
++// 单 node 宿主行为完全不变。
++
++import type { AgentStore } from './agent';
++
++let resolver: (() => AgentStore) | null = null;
++
++/** 宿主注册「服务全部 node 的 agent store」；传 null 注销。 */
++export function setAgentHostStore(next: (() => AgentStore) | null): void {
++  resolver = next;
++}
++
++export function resolveAgentStore(fallback: AgentStore): AgentStore {
++  return resolver?.() ?? fallback;
++}
+diff --git a/packages/stores/src/agent-session-actions.test.ts b/packages/stores/src/agent-session-actions.test.ts
+index fe7bc54c..f576dc62 100644
+--- a/packages/stores/src/agent-session-actions.test.ts
++++ b/packages/stores/src/agent-session-actions.test.ts
+@@ -16,6 +16,7 @@ function makeSession(id: string, updatedAt: string): AgentSessionDto {
+   return {
+     id,
+     title: id,
++    nodeId: null,
+     deviceId: 'd1',
+     paneId: '%1',
+     providerId: null,
+@@ -184,7 +185,9 @@ function createDraftHarness(options: { gateCreate?: boolean } = {}): DraftHarnes
+ describe('materializeDraft', () => {
+   test('concurrent calls share one create request and both messages land in one session', async () => {
+     const harness = createDraftHarness();
+-    harness.state().startDraft('d1', '%1', 'pane one');
++    harness
++      .state()
++      .startDraft({ nodeId: null, deviceId: 'd1', paneId: '%1', paneTitle: 'pane one' });
+ 
+     const submit = async (text: string): Promise<void> => {
+       const session = await harness.state().materializeDraft();
+@@ -214,7 +217,7 @@ describe('materializeDraft', () => {
+ 
+   test('repeated calls on the same draft return the identical in-flight promise', () => {
+     const harness = createDraftHarness({ gateCreate: true });
+-    harness.state().startDraft('d1', '%1', null);
++    harness.state().startDraft({ nodeId: null, deviceId: 'd1', paneId: '%1', paneTitle: null });
+ 
+     const first = harness.state().materializeDraft();
+     const second = harness.state().materializeDraft();
+@@ -228,11 +231,15 @@ describe('materializeDraft', () => {
+ 
+   test('a stale materialization does not take over a newer draft', async () => {
+     const harness = createDraftHarness({ gateCreate: true });
+-    harness.state().startDraft('d1', '%1', 'pane one');
++    harness
++      .state()
++      .startDraft({ nodeId: null, deviceId: 'd1', paneId: '%1', paneTitle: 'pane one' });
+     const pending = harness.state().materializeDraft();
+ 
+     // 请求在途时用户切到另一个 pane 的新草稿
+-    harness.state().startDraft('d1', '%2', 'pane two');
++    harness
++      .state()
++      .startDraft({ nodeId: null, deviceId: 'd1', paneId: '%2', paneTitle: 'pane two' });
+     expect(harness.state().materializingDraft).toBe(false);
+ 
+     harness.releaseCreate();
+diff --git a/packages/stores/src/agent-session-crud-actions.test.ts b/packages/stores/src/agent-session-crud-actions.test.ts
+index 71db9344..b05330e5 100644
+--- a/packages/stores/src/agent-session-crud-actions.test.ts
++++ b/packages/stores/src/agent-session-crud-actions.test.ts
+@@ -16,6 +16,7 @@ function makeSession(id: string, updatedAt: string, title = id): AgentSessionDto
+   return {
+     id,
+     title,
++    nodeId: null,
+     deviceId: 'd1',
+     paneId: '%1',
+     providerId: null,
+diff --git a/packages/stores/src/agent-session-crud-actions.ts b/packages/stores/src/agent-session-crud-actions.ts
+index 24d6424c..ec2926a1 100644
+--- a/packages/stores/src/agent-session-crud-actions.ts
++++ b/packages/stores/src/agent-session-crud-actions.ts
+@@ -43,6 +43,7 @@ export async function createSessionRequest(
+       {
+         deviceId,
+         paneId,
++        ...(options?.nodeId ? { nodeId: options.nodeId } : {}),
+         ...(options?.providerId !== undefined ? { providerId: options.providerId } : {}),
+         ...(options?.modelId !== undefined && options.modelId !== null
+           ? { modelId: options.modelId }
+diff --git a/packages/stores/src/agent-session-draft-actions.ts b/packages/stores/src/agent-session-draft-actions.ts
+index 826d5451..752fa954 100644
+--- a/packages/stores/src/agent-session-draft-actions.ts
++++ b/packages/stores/src/agent-session-draft-actions.ts
+@@ -29,6 +29,7 @@ export function createAgentSessionDraftActions(
+ 
+   async function materializeDraftRequest(draft: DraftSession): Promise<AgentSessionDto | null> {
+     const session = await createSessionRequest(deps, draft.deviceId, draft.paneId, {
++      nodeId: draft.nodeId,
+       providerId: draft.providerId,
+       modelId: draft.modelId,
+       originPaneTitle: draft.paneTitle,
+@@ -42,7 +43,7 @@ export function createAgentSessionDraftActions(
+   }
+ 
+   return {
+-    startDraft(deviceId, paneId, paneTitle, prompt) {
++    startDraft(input) {
+       const previous = get().activeSessionId;
+       if (previous) {
+         unsubscribe(previous);
+@@ -54,12 +55,13 @@ export function createAgentSessionDraftActions(
+         materializingDraft: false,
+         draft: {
+           key: `draft-${draftSequence}`,
+-          deviceId,
+-          paneId,
++          nodeId: input.nodeId,
++          deviceId: input.deviceId,
++          paneId: input.paneId,
+           providerId: null,
+           modelId: null,
+-          paneTitle,
+-          prompt: prompt ?? null,
++          paneTitle: input.paneTitle,
++          prompt: input.prompt ?? null,
+         },
+       });
+     },
+diff --git a/packages/stores/src/agent-session-map.ts b/packages/stores/src/agent-session-map.ts
+index 7e7c571b..33da1b8d 100644
+--- a/packages/stores/src/agent-session-map.ts
++++ b/packages/stores/src/agent-session-map.ts
+@@ -1,5 +1,6 @@
+ // sessions 映射的纯函数工具：排序、派生 sessionOrder、列表拉取结果与本地写入的合并。
+ 
++import { SELF_NODE_ID } from '@tmex/api-client';
+ import type { AgentSessionDto } from '@tmex/shared';
+ 
+ export type SessionMap = Record<string, AgentSessionDto | undefined>;
+@@ -61,3 +62,12 @@ export function mergeFetchedSessions(
+ 
+   return merged;
+ }
++
++/** session 绑定 node 的规范形态：`self` / 空值一律折叠成 null（持有该 session 的 gateway 自身）。 */
++export function normalizeAgentNodeId(nodeId: string | null | undefined): string | null {
++  return !nodeId || nodeId === SELF_NODE_ID ? null : nodeId;
++}
++
++export function isSessionOnNode(session: AgentSessionDto, nodeId: string | null): boolean {
++  return normalizeAgentNodeId(session.nodeId) === normalizeAgentNodeId(nodeId);
++}
+diff --git a/packages/stores/src/agent-session-node.test.ts b/packages/stores/src/agent-session-node.test.ts
+new file mode 100644
+index 00000000..995af7a2
+--- /dev/null
++++ b/packages/stores/src/agent-session-node.test.ts
+@@ -0,0 +1,142 @@
++import { describe, expect, test } from 'bun:test';
++
++import { ApiClient, type FetchLike } from '@tmex/api-client';
++import { noopNotificationSink } from '@tmex/notifications';
++import type { AgentSessionDto } from '@tmex/shared';
++import { createAgentSessionActions } from './agent-session-actions';
++import { isSessionOnNode, normalizeAgentNodeId } from './agent-session-map';
++import {
++  type AgentGetState,
++  type AgentSetState,
++  type AgentState,
++  createInitialAgentStateData,
++} from './agent-state';
++
++function makeSession(id: string, nodeId: string | null): AgentSessionDto {
++  return {
++    id,
++    title: id,
++    nodeId,
++    deviceId: 'd1',
++    paneId: '%1',
++    providerId: null,
++    modelId: 'model',
++    systemPrompt: null,
++    writeMode: 'confirm',
++    useProviderWebSearch: false,
++    providerHostedTools: [],
++    allowControlChars: false,
++    originPaneTitle: null,
++    originProcessName: null,
++    status: 'idle',
++    lastError: null,
++    maxStepsPerTurn: 10,
++    createdAt: '2026-01-01T00:00:00.000Z',
++    updatedAt: '2026-01-01T00:00:00.000Z',
++  };
++}
++
++const NODE_A = 'a'.repeat(32);
++const NODE_B = 'b'.repeat(32);
++
++describe('normalizeAgentNodeId', () => {
++  test('collapses self / empty values to null', () => {
++    expect(normalizeAgentNodeId(undefined)).toBeNull();
++    expect(normalizeAgentNodeId(null)).toBeNull();
++    expect(normalizeAgentNodeId('')).toBeNull();
++    expect(normalizeAgentNodeId('self')).toBeNull();
++    expect(normalizeAgentNodeId(NODE_A)).toBe(NODE_A);
++  });
++});
++
++describe('isSessionOnNode', () => {
++  test('matches self sessions against self / null / undefined route ids', () => {
++    const session = makeSession('s1', null);
++    expect(isSessionOnNode(session, null)).toBe(true);
++    expect(isSessionOnNode(session, 'self')).toBe(true);
++    expect(isSessionOnNode(session, NODE_A)).toBe(false);
++  });
++
++  test('matches remote sessions only against their own node', () => {
++    const session = makeSession('s1', NODE_A);
++    expect(isSessionOnNode(session, NODE_A)).toBe(true);
++    expect(isSessionOnNode(session, NODE_B)).toBe(false);
++    expect(isSessionOnNode(session, null)).toBe(false);
++  });
++});
++
++describe('filtering a shared session list by node', () => {
++  const local = makeSession('local', null);
++  const remoteA = makeSession('remoteA', NODE_A);
++  const remoteB = makeSession('remoteB', NODE_B);
++  const all = [remoteB, local, remoteA];
++
++  test('keeps only the sessions bound to the given node, in list order', () => {
++    expect(all.filter((s) => isSessionOnNode(s, null))).toEqual([local]);
++    expect(all.filter((s) => isSessionOnNode(s, 'self'))).toEqual([local]);
++    expect(all.filter((s) => isSessionOnNode(s, NODE_A))).toEqual([remoteA]);
++    expect(all.filter((s) => isSessionOnNode(s, NODE_B))).toEqual([remoteB]);
++  });
++});
++
++interface CreateHarness {
++  state: () => AgentState;
++  bodies: () => Array<Record<string, unknown>>;
++}
++
++function createHarness(): CreateHarness {
++  const bodies: Array<Record<string, unknown>> = [];
++  const transport: FetchLike = async (url, init) => {
++    if (url === '/api/agent/sessions' && (init?.method ?? 'GET') === 'POST') {
++      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
++      bodies.push(body);
++      return new Response(
++        JSON.stringify({
++          session: makeSession('created', (body.nodeId as string | null | undefined) ?? null),
++        }),
++        { status: 200, headers: { 'content-type': 'application/json' } }
++      );
++    }
++    throw new Error(`unexpected request ${init?.method ?? 'GET'} ${url}`);
++  };
++
++  let state: AgentState;
++  const set: AgentSetState = (partial) => {
++    const next = typeof partial === 'function' ? partial(state) : partial;
++    state = { ...state, ...next };
++  };
++  const get: AgentGetState = () => state;
++
++  const actions = createAgentSessionActions({
++    apiClient: new ApiClient('', transport),
++    notifications: noopNotificationSink,
++    set,
++    get,
++    history: { loadHistory: async () => {}, scheduleFetch: () => {}, clearSession: () => {} },
++    subscribe: () => {},
++    unsubscribe: () => {},
++    clearSessionRuntime: () => {},
++  });
++
++  state = { ...createInitialAgentStateData(), ...actions, ensureInitialized: () => {} };
++  return { state: () => state, bodies: () => bodies };
++}
++
++describe('createSession carries the bound node', () => {
++  test('omits nodeId for self sessions', async () => {
++    const harness = createHarness();
++    await harness.state().createSession('d1', '%1', { nodeId: null });
++    expect(harness.bodies()[0]).not.toHaveProperty('nodeId');
++  });
++
++  test('sends the remote nodeId when the draft is bound to another node', async () => {
++    const harness = createHarness();
++    harness.state().startDraft({ nodeId: NODE_A, deviceId: 'd1', paneId: '%1', paneTitle: 'vim' });
++    expect(harness.state().draft?.nodeId).toBe(NODE_A);
++
++    const session = await harness.state().materializeDraft();
++
++    expect(harness.bodies()[0]?.nodeId).toBe(NODE_A);
++    expect(session?.nodeId).toBe(NODE_A);
++  });
++});
+diff --git a/packages/stores/src/agent-state.ts b/packages/stores/src/agent-state.ts
+index 19e15cc2..50689a67 100644
+--- a/packages/stores/src/agent-state.ts
++++ b/packages/stores/src/agent-state.ts
+@@ -20,6 +20,8 @@ export interface PendingConfirmationUi {
+ export interface DraftSession {
+   /** 草稿代际标识：物化结果回填前用它判定草稿是否已被新的草稿取代 */
+   key: string;
++  /** 绑定 pane 所在的 mesh node；null 表示持有该会话的 gateway 自身 */
++  nodeId: string | null;
+   deviceId: string;
+   paneId: string;
+   providerId: string | null;
+@@ -32,6 +34,8 @@ export interface DraftSession {
+ 
+ /** 创建会话的可选参数（草稿物化时传入） */
+ export interface CreateSessionOptions {
++  /** 绑定 pane 所在的 mesh node；缺省 / null 表示本 gateway */
++  nodeId?: string | null;
+   providerId?: string | null;
+   modelId?: string | null;
+   providerHostedTools?: string[];
+@@ -88,17 +92,24 @@ export interface AgentActions {
+     reason?: string
+   ) => Promise<void>;
+   // 草稿会话
+-  startDraft: (
+-    deviceId: string,
+-    paneId: string,
+-    paneTitle: string | null,
+-    prompt?: string | null
+-  ) => void;
++  startDraft: (input: StartDraftInput) => void;
+   updateDraft: (patch: Partial<Pick<DraftSession, 'providerId' | 'modelId'>>) => void;
+   clearDraft: () => void;
+   materializeDraft: () => Promise<AgentSessionDto | null>;
+ }
+ 
++/** 起草参数：node + pane 定位，加上起源元数据与预填 prompt */
++export interface StartDraftInput {
++  /** 绑定 pane 所在的 mesh node；null 表示本 gateway */
++  nodeId: string | null;
++  deviceId: string;
++  paneId: string;
++  /** snapshot 中该 pane 的标题，作为起源元数据兜底 */
++  paneTitle: string | null;
++  /** 预填到输入框的草稿 prompt（如 rsync 自动安装流程），由 ChatInput 消费一次 */
++  prompt?: string | null;
++}
++
+ export interface AgentState extends AgentStateData, AgentActions {}
+ 
+ export type AgentSetState = (
+diff --git a/packages/stores/src/agent.ts b/packages/stores/src/agent.ts
+index aef51312..4b4c10be 100644
+--- a/packages/stores/src/agent.ts
++++ b/packages/stores/src/agent.ts
+@@ -19,6 +19,7 @@ export type {
+   CreateSessionOptions,
+   DraftSession,
+   PendingConfirmationUi,
++  StartDraftInput,
+ } from './agent-state';
+ 
+ export function createAgentStore(core: RuntimeCore, disposers: Array<() => void> = []) {
+diff --git a/packages/stores/src/index.ts b/packages/stores/src/index.ts
+index 42f9d226..5066e863 100644
+--- a/packages/stores/src/index.ts
++++ b/packages/stores/src/index.ts
+@@ -30,6 +30,7 @@ export {
+ export { createUIStore, type KeyboardBehaviorMode, type SidebarTab, type UIStore } from './ui';
+ export {
+   isSidebarDeviceVisible,
++  isSidebarFilesVisible,
+   sidebarDeviceVisibilityKey,
+ } from './sidebar-device-visibility';
+ export { createSiteStore, type SiteStore } from './site';
+@@ -39,8 +40,12 @@ export {
+   type AgentStore,
+   type CreateSessionOptions,
+   type DraftSession,
++  type AgentState,
+   type PendingConfirmationUi,
++  type StartDraftInput,
+ } from './agent';
++export { resolveAgentStore, setAgentHostStore } from './agent-host-store';
++export { isSessionOnNode, normalizeAgentNodeId, type SessionMap } from './agent-session-map';
+ export { createFileTreeStore, fileNodeKey, type FileTreeStore } from './file-tree';
+ 
+ export * from './agent-thread';
+diff --git a/packages/stores/src/sidebar-device-visibility.test.ts b/packages/stores/src/sidebar-device-visibility.test.ts
+index e0d4ca79..258bf957 100644
+--- a/packages/stores/src/sidebar-device-visibility.test.ts
++++ b/packages/stores/src/sidebar-device-visibility.test.ts
+@@ -1,5 +1,9 @@
+ import { describe, expect, test } from 'bun:test';
+-import { isSidebarDeviceVisible, sidebarDeviceVisibilityKey } from './sidebar-device-visibility';
++import {
++  isSidebarDeviceVisible,
++  isSidebarFilesVisible,
++  sidebarDeviceVisibilityKey,
++} from './sidebar-device-visibility';
+ 
+ const NODE_A = '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a';
+ 
+@@ -27,3 +31,24 @@ describe('isSidebarDeviceVisible', () => {
+     expect(isSidebarDeviceVisible(map, NODE_A, 'd1')).toBe(true);
+   });
+ });
++
++describe('isSidebarFilesVisible', () => {
++  test('无记录时跟随「该设备是否配了目录」，本机与远端一致', () => {
++    expect(isSidebarFilesVisible({}, 'self', 'd1', true)).toBe(true);
++    expect(isSidebarFilesVisible({}, NODE_A, 'd1', true)).toBe(true);
++    expect(isSidebarFilesVisible({}, 'self', 'd1', false)).toBe(false);
++    expect(isSidebarFilesVisible({}, NODE_A, 'd1', false)).toBe(false);
++  });
++
++  test('显式记录优先于默认值（两个方向都生效）', () => {
++    expect(isSidebarFilesVisible({ 'self:d1': false }, 'self', 'd1', true)).toBe(false);
++    expect(isSidebarFilesVisible({ [`${NODE_A}:d1`]: true }, NODE_A, 'd1', false)).toBe(true);
++  });
++
++  test('与终端页共用复合键，但读的是各自的表', () => {
++    const filesMap = { 'self:d1': true };
++    expect(isSidebarFilesVisible(filesMap, 'self', 'd1', false)).toBe(true);
++    expect(isSidebarDeviceVisible({}, 'self', 'd1')).toBe(true);
++    expect(isSidebarFilesVisible({}, NODE_A, 'd1', false)).toBe(false);
++  });
++});
+diff --git a/packages/stores/src/sidebar-device-visibility.ts b/packages/stores/src/sidebar-device-visibility.ts
+index 9e56c44f..07e72686 100644
+--- a/packages/stores/src/sidebar-device-visibility.ts
++++ b/packages/stores/src/sidebar-device-visibility.ts
+@@ -18,3 +18,19 @@ export function isSidebarDeviceVisible(
+   const stored = map[sidebarDeviceVisibilityKey(runtimeNodeId, deviceId)];
+   return stored ?? runtimeNodeId === SELF_NODE_ID;
+ }
++
++/**
++ * 侧边栏「文件」页的设备可见性，与终端页分开记（同一套复合键，另一张表）。
++ *
++ * 缺省规则与终端页不同：配了目录就默认显示（本机与远端一视同仁）——目录是用户逐个手工配上去的，
++ * 配完还要再去开一次开关纯属多余；没配目录时无从显示，缺省即关。显式写入的值永远优先。
++ */
++export function isSidebarFilesVisible(
++  map: Record<string, boolean>,
++  runtimeNodeId: string,
++  deviceId: string,
++  hasRoots: boolean
++): boolean {
++  const stored = map[sidebarDeviceVisibilityKey(runtimeNodeId, deviceId)];
++  return stored ?? hasRoots;
++}
+diff --git a/packages/stores/src/ui.test.ts b/packages/stores/src/ui.test.ts
+index e0fba1cc..2dd14200 100644
+--- a/packages/stores/src/ui.test.ts
++++ b/packages/stores/src/ui.test.ts
+@@ -118,6 +118,41 @@ describe('sidebar tab state', () => {
+     });
+   });
+ 
++  test('persists sidebar files visibility separately from the terminal switch', () => {
++    const prefix = `ui-sidebar-files-visibility-${Date.now()}-`;
++    const store = createUIStore({ storagePrefix: prefix });
++
++    expect(store.getState().sidebarFilesVisibility).toEqual({});
++
++    store.getState().setSidebarFilesVisibility('node-a:device-1', false);
++    store.getState().setSidebarDeviceVisibility('node-a:device-1', true);
++    expect(store.getState().sidebarFilesVisibility).toEqual({ 'node-a:device-1': false });
++    expect(store.getState().sidebarDeviceVisibility).toEqual({ 'node-a:device-1': true });
++
++    const persisted = JSON.parse(storage.getItem(`${prefix}tmex-ui`) ?? '{}') as {
++      state?: { sidebarFilesVisibility?: Record<string, boolean> };
++    };
++    expect(persisted.state?.sidebarFilesVisibility).toEqual({ 'node-a:device-1': false });
++
++    const rehydrated = createUIStore({ storagePrefix: prefix });
++    expect(rehydrated.getState().sidebarFilesVisibility).toEqual({ 'node-a:device-1': false });
++  });
++
++  test('normalizes invalid persisted files visibility', () => {
++    const prefix = `ui-sidebar-invalid-files-visibility-${Date.now()}-`;
++    storage.setItem(
++      `${prefix}tmex-ui`,
++      JSON.stringify({
++        state: { sidebarFilesVisibility: { 'node-a:device-1': 1, 'node-a:device-2': false } },
++        version: 0,
++      })
++    );
++
++    expect(createUIStore({ storagePrefix: prefix }).getState().sidebarFilesVisibility).toEqual({
++      'node-a:device-2': false,
++    });
++  });
++
+   test('normalizes invalid persisted device visibility', () => {
+     const prefix = `ui-sidebar-invalid-visibility-${Date.now()}-`;
+     storage.setItem(
+diff --git a/packages/stores/src/ui.ts b/packages/stores/src/ui.ts
+index 4480311e..c98d93dd 100644
+--- a/packages/stores/src/ui.ts
++++ b/packages/stores/src/ui.ts
+@@ -96,8 +96,10 @@ export interface UIState {
+   sidebarCollapsed: boolean;
+   sidebarTab: SidebarTab;
+   sidebarDeviceExpanded: Record<string, boolean>;
+-  /** 设备是否出现在侧边栏；key 为 `${runtimeNodeId}:${deviceId}`（见 sidebar-device-visibility.ts） */
++  /** 设备是否出现在侧边栏终端页；key 为 `${runtimeNodeId}:${deviceId}`（见 sidebar-device-visibility.ts） */
+   sidebarDeviceVisibility: Record<string, boolean>;
++  /** 设备的目录是否出现在侧边栏文件页；同一套复合键，缺省跟随「该设备是否配了目录」 */
++  sidebarFilesVisibility: Record<string, boolean>;
+   /** 设备管理页文件夹的展开态；key 为文件夹 id，缺键视为展开 */
+   deviceFolderExpanded: Record<string, boolean>;
+   /** 侧边栏 node 分节的手工顺序（mesh node id）；未列出的 node 按 API 顺序排在后面 */
+@@ -118,6 +120,8 @@ export interface UIState {
+   setSidebarDeviceExpanded: (deviceId: string, expanded: boolean) => void;
+   /** key 由 `sidebarDeviceVisibilityKey(runtimeNodeId, deviceId)` 生成 */
+   setSidebarDeviceVisibility: (key: string, visible: boolean) => void;
++  /** key 由 `sidebarDeviceVisibilityKey(runtimeNodeId, deviceId)` 生成 */
++  setSidebarFilesVisibility: (key: string, visible: boolean) => void;
+   setDeviceFolderExpanded: (folderId: string, expanded: boolean) => void;
+   setSidebarNodeOrder: (nodeIds: string[]) => void;
+   setInputMode: (mode: 'direct' | 'editor') => void;
+@@ -145,6 +149,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+         sidebarTab: 'panes',
+         sidebarDeviceExpanded: {},
+         sidebarDeviceVisibility: {},
++        sidebarFilesVisibility: {},
+         deviceFolderExpanded: {},
+         sidebarNodeOrder: [],
+         inputMode: 'direct',
+@@ -168,6 +173,10 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+           set((state) => ({
+             sidebarDeviceVisibility: { ...state.sidebarDeviceVisibility, [key]: visible },
+           })),
++        setSidebarFilesVisibility: (key, visible) =>
++          set((state) => ({
++            sidebarFilesVisibility: { ...state.sidebarFilesVisibility, [key]: visible },
++          })),
+         setDeviceFolderExpanded: (folderId, expanded) =>
+           set((state) => ({
+             deviceFolderExpanded: { ...state.deviceFolderExpanded, [folderId]: expanded },
+@@ -227,6 +236,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+           sidebarCollapsed: state.sidebarCollapsed,
+           sidebarDeviceExpanded: state.sidebarDeviceExpanded,
+           sidebarDeviceVisibility: state.sidebarDeviceVisibility,
++          sidebarFilesVisibility: state.sidebarFilesVisibility,
+           deviceFolderExpanded: state.deviceFolderExpanded,
+           sidebarNodeOrder: state.sidebarNodeOrder,
+           inputMode: state.inputMode,
+@@ -247,6 +257,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+             sidebarSections: _legacySections,
+             sidebarDeviceExpanded,
+             sidebarDeviceVisibility,
++            sidebarFilesVisibility,
+             deviceFolderExpanded,
+             sidebarNodeOrder,
+             themePreset,
+@@ -259,6 +270,7 @@ export function createUIStore(core: Pick<RuntimeCore, 'storagePrefix'>) {
+             ...rest,
+             sidebarDeviceExpanded: normalizeBooleanMap(sidebarDeviceExpanded),
+             sidebarDeviceVisibility: normalizeBooleanMap(sidebarDeviceVisibility),
++            sidebarFilesVisibility: normalizeBooleanMap(sidebarFilesVisibility),
+             deviceFolderExpanded: normalizeBooleanMap(deviceFolderExpanded),
+             sidebarNodeOrder: normalizeIdList(sidebarNodeOrder),
+             themePreset: normalizeThemePreset(themePreset),

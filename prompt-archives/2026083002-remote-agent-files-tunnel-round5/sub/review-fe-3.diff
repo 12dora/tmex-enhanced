@@ -1,0 +1,4226 @@
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+index 47dd572a..c9dacf50 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+@@ -5,6 +5,9 @@
+ //   - 在线但未登录：折叠，只给一个「登录」入口，**不**自动登录也**不**建立连接；
+ //     用户点开才用内存里的会话钥静默登录，登不上再退回「登录此节点」按钮；
+ //   - 离线：灰显最近一次已知 inventory 里的设备名，不建连接、不发请求。
++//
++// 三种形态都受同一条门槛约束：远端 node 至少要有一台设备被打开侧边栏显示，整节才出现
++// （self 分节不受此限）。登录别的 node 一律走「管理设备」，侧边栏不做未开启 node 的登录入口。
+ 
+ import { NodeLoginButton } from '@/auth/NodeLoginButton';
+ import { loginErrorKey } from '@/auth/login-errors';
+@@ -82,6 +85,23 @@ export function selectedDeviceIdForNode(pathname: string, runtimeNodeId: string)
+   }
+ }
+ 
++/**
++ * 该 node 下是否至少有一台设备被打开了侧边栏显示。
++ *
++ * 未登录的 node 读不到它的设备列表（mesh 的 inventory 只带版本号），只能反过来看开关本身：
++ * 远端设备缺省隐藏，用户在「管理设备」里打开时才显式写入 `true`，按复合键前缀数一遍即可。
++ */
++export function hasSidebarVisibleDeviceForNode(
++  visibility: Record<string, boolean>,
++  runtimeNodeId: string
++): boolean {
++  const prefix = `${runtimeNodeId}:`;
++  for (const [key, visible] of Object.entries(visibility)) {
++    if (visible && key.startsWith(prefix)) return true;
++  }
++  return false;
++}
++
+ function badgeOf(node: SidebarNodeEntry): NodeBadgeInfo {
+   return {
+     nodeId: node.runtimeNodeId,
+@@ -127,18 +147,28 @@ function SectionHeader({
+  * 在线但还没有该 node 会话：默认折叠，一个请求都不发。用户点开才触发静默登录
+  * （`useNodeLoginGate` 用内存里的会话钥），登录期间显示转圈，失败退回「登录此节点」按钮
+  * ——会话钥已经没了的话那个按钮会带 `?node=` 去登录页。
++ *
++ * 一台设备都没开侧边栏显示的 node 整节不出现：登录进去也只剩一个空标题，那条登录入口反而
++ * 像是「登完就消失」。开启过设备的 node 才留这条紧凑行，供用户重新登录回来；正在浏览该 node
++ * 某台设备时同样保留，否则页面上就没有登录入口可点了。
+  */
+ function SidebarNodeSignIn({ node, drag }: { node: SidebarNodeEntry; drag?: SidebarNodeSortable }) {
+   const { t } = useTranslation();
+   const [expanded, setExpanded] = useState(false);
+   const gate = useNodeLoginGate(node.runtimeNodeId, { enabled: expanded });
++  const visibility = useUIStore((state) => state.sidebarDeviceVisibility);
++  const selectedDeviceId = selectedDeviceIdForNode(useLocation().pathname, node.runtimeNodeId);
++  const present =
++    selectedDeviceId !== null || hasSidebarVisibleDeviceForNode(visibility, node.runtimeNodeId);
++  const presence = useSectionPresence(present, null);
++  if (!presence.rendered) return null;
+ 
+   return (
+     <div
+       ref={drag?.sortable.setNodeRef}
+       style={drag?.sortable.style}
+       data-testid={`sidebar-node-login-${node.runtimeNodeId}`}
+-      className={cn('space-y-0.5', drag?.sortable.isDragging && 'opacity-60')}
++      className={cn('space-y-0.5', presence.className, drag?.sortable.isDragging && 'opacity-60')}
+     >
+       <SectionHeader node={node} drag={drag} />
+       <div className="px-1 pb-0.5">
+diff --git a/apps/fe/src/pages/settings/remote-access/access-model.test.ts b/apps/fe/src/pages/settings/remote-access/access-model.test.ts
+new file mode 100644
+index 00000000..7b76c023
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/access-model.test.ts
+@@ -0,0 +1,196 @@
++// Access 规则草稿的校验与归一、可应用性判断与步骤标签。
++
++import { describe, expect, test } from 'bun:test';
++import type { TunnelStatusResponse } from '@tmex/shared';
++import {
++  type AccessRuleDraft,
++  accessRulesValid,
++  accessStepTag,
++  accessTargetHostname,
++  canApplyAccess,
++  canSyncAccess,
++  isValidRuleValue,
++  ruleDraftError,
++  ruleDraftsFrom,
++  shouldOfferAccessSync,
++  toAccessRules,
++} from './access-model';
++
++function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResponse {
++  return {
++    supported: true,
++    platform: 'darwin-arm64',
++    binary: { installed: true, version: '2026.1.0', path: '/data/cloudflared', source: 'managed' },
++    auth: { loggedIn: true, loginUrl: null },
++    config: {
++      mode: 'named',
++      hostname: 'tmex.example.com',
++      tunnelName: 'tmex',
++      tunnelId: 'd8e1f0aa',
++      autoStart: false,
++      externallyManaged: false,
++      originPort: 9883,
++    },
++    process: {
++      state: 'running',
++      pid: 42,
++      startedAt: '2026-08-30T00:00:00.000Z',
++      publicUrl: 'https://tmex.example.com',
++      lastError: null,
++      restarts: 0,
++    },
++    access: {
++      hasCredentials: false,
++      accountId: null,
++      teamDomain: null,
++      configured: false,
++      appId: null,
++      aud: null,
++      hostname: null,
++      rules: [],
++      enforceJwt: true,
++      lastError: null,
++    },
++    external: {
++      detected: false,
++      source: null,
++      configPath: null,
++      tunnelId: null,
++      tunnelName: null,
++      hostnames: [],
++      hasOriginCert: false,
++      running: false,
++    },
++    loginEnforced: true,
++    exposureProtected: true,
++    job: null,
++    trustProxy: false,
++    configuredTrustProxy: false,
++    restartRequired: false,
++    log: [],
++    ...overrides,
++  };
++}
++
++function draft(kind: AccessRuleDraft['kind'], value: string): AccessRuleDraft {
++  return { key: `k-${value}`, kind, value };
++}
++
++describe('isValidRuleValue', () => {
++  test('邮箱要完整', () => {
++    expect(isValidRuleValue('email', 'you@example.com')).toBe(true);
++    expect(isValidRuleValue('email', 'a.b+tag@sub.example.co.uk')).toBe(true);
++    expect(isValidRuleValue('email', 'example.com')).toBe(false);
++    expect(isValidRuleValue('email', 'you@example')).toBe(false);
++    expect(isValidRuleValue('email', 'you @example.com')).toBe(false);
++    expect(isValidRuleValue('email', '')).toBe(false);
++  });
++
++  test('邮箱域至少两级且不能带 @', () => {
++    expect(isValidRuleValue('email_domain', 'example.com')).toBe(true);
++    expect(isValidRuleValue('email_domain', 'mail.example.co.uk')).toBe(true);
++    expect(isValidRuleValue('email_domain', 'example')).toBe(false);
++    expect(isValidRuleValue('email_domain', 'you@example.com')).toBe(false);
++    expect(isValidRuleValue('email_domain', ' ')).toBe(false);
++  });
++
++  test('两侧空白不算错', () => {
++    expect(isValidRuleValue('email', '  you@example.com  ')).toBe(true);
++  });
++});
++
++describe('ruleDraftError / accessRulesValid', () => {
++  test('空值与非法值分开报', () => {
++    expect(ruleDraftError(draft('email', ''))).toBe('empty');
++    expect(ruleDraftError(draft('email', 'nope'))).toBe('invalid');
++    expect(ruleDraftError(draft('email', 'you@example.com'))).toBeNull();
++  });
++
++  test('至少一条且每条都合法才算可提交', () => {
++    expect(accessRulesValid([])).toBe(false);
++    expect(accessRulesValid([draft('email', '')])).toBe(false);
++    expect(accessRulesValid([draft('email', 'you@example.com'), draft('email_domain', 'x')])).toBe(
++      false
++    );
++    expect(
++      accessRulesValid([draft('email', 'you@example.com'), draft('email_domain', 'example.com')])
++    ).toBe(true);
++  });
++});
++
++describe('toAccessRules / ruleDraftsFrom', () => {
++  test('提交前去空白并转小写', () => {
++    expect(toAccessRules([draft('email', '  You@Example.COM ')])).toEqual([
++      { kind: 'email', value: 'you@example.com' },
++    ]);
++  });
++
++  test('服务端规则转草稿时键稳定且不改值', () => {
++    expect(ruleDraftsFrom([{ kind: 'email_domain', value: 'example.com' }])).toEqual([
++      { key: 'saved-0', kind: 'email_domain', value: 'example.com' },
++    ]);
++  });
++});
++
++describe('目标主机名与可应用性', () => {
++  test('优先用 Access 应用已覆盖的主机名，其次用隧道配置的', () => {
++    expect(accessTargetHostname(status())).toBe('tmex.example.com');
++    expect(
++      accessTargetHostname(status({ access: { ...status().access, hostname: 'old.example.com' } }))
++    ).toBe('old.example.com');
++    expect(
++      accessTargetHostname(status({ config: { ...status().config, mode: 'off', hostname: null } }))
++    ).toBeNull();
++  });
++
++  test('凭证、主机名、规则三者齐全才能应用', () => {
++    const rules = [draft('email', 'you@example.com')];
++    expect(canApplyAccess(status(), rules)).toBe(false);
++    const withCreds = status({ access: { ...status().access, hasCredentials: true } });
++    expect(canApplyAccess(withCreds, rules)).toBe(true);
++    expect(canApplyAccess(withCreds, [])).toBe(false);
++    expect(
++      canApplyAccess(
++        status({
++          access: { ...status().access, hasCredentials: true },
++          config: { ...status().config, mode: 'off', hostname: null },
++        }),
++        rules
++      )
++    ).toBe(false);
++  });
++
++  test('同步比应用宽松：没有隧道主机名时也能匹配探测到的系统隧道主机名', () => {
++    const noHostname = status({
++      access: { ...status().access, hasCredentials: true },
++      config: { ...status().config, mode: 'off', hostname: null },
++    });
++    expect(canSyncAccess(noHostname)).toBe(false);
++    expect(
++      canSyncAccess({
++        ...noHostname,
++        external: { ...noHostname.external, detected: true, hostnames: ['tmex.example.com'] },
++      })
++    ).toBe(true);
++    // 没保存凭证时依然不能同步。
++    expect(canSyncAccess(status())).toBe(false);
++  });
++
++  test('凭证在、主机名在、应用还没有时提示先同步', () => {
++    expect(shouldOfferAccessSync(status())).toBe(false);
++    const withCreds = status({ access: { ...status().access, hasCredentials: true } });
++    expect(shouldOfferAccessSync(withCreds)).toBe(true);
++    expect(
++      shouldOfferAccessSync(
++        status({ access: { ...status().access, hasCredentials: true, configured: true } })
++      )
++    ).toBe(false);
++  });
++});
++
++describe('accessStepTag', () => {
++  test('没有登录体系时标推荐，有登录时标可选', () => {
++    expect(accessStepTag(status({ loginEnforced: false }))).toBe('recommended');
++    expect(accessStepTag(status({ loginEnforced: true }))).toBe('optional');
++  });
++});
+diff --git a/apps/fe/src/pages/settings/remote-access/access-model.ts b/apps/fe/src/pages/settings/remote-access/access-model.ts
+new file mode 100644
+index 00000000..85d4586c
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/access-model.ts
+@@ -0,0 +1,85 @@
++// Cloudflare Access 区块的纯推导：规则草稿的校验与归一、可用性判断、步骤标签。
++
++import type { TunnelAccessPolicyRule, TunnelStatusResponse } from '@tmex/shared';
++
++export type AccessRuleKind = TunnelAccessPolicyRule['kind'];
++
++export interface AccessRuleDraft {
++  /** 列表渲染用的稳定键，与后端无关。 */
++  key: string;
++  kind: AccessRuleKind;
++  value: string;
++}
++
++const EMAIL = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
++const DOMAIN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
++
++export function isValidRuleValue(kind: AccessRuleKind, value: string): boolean {
++  const trimmed = value.trim();
++  if (trimmed.length === 0 || trimmed.length > 253) return false;
++  return kind === 'email' ? EMAIL.test(trimmed) : DOMAIN.test(trimmed);
++}
++
++export type AccessRuleError = 'empty' | 'invalid';
++
++export function ruleDraftError(draft: AccessRuleDraft): AccessRuleError | null {
++  if (draft.value.trim().length === 0) return 'empty';
++  return isValidRuleValue(draft.kind, draft.value) ? null : 'invalid';
++}
++
++/** 至少一条规则，且每一条都合法——空策略等于谁都进不来，Cloudflare 也会拒绝。 */
++export function accessRulesValid(drafts: AccessRuleDraft[]): boolean {
++  return drafts.length > 0 && drafts.every((draft) => ruleDraftError(draft) === null);
++}
++
++/** 提交前归一：去空白并统一小写（Cloudflare 侧邮箱与域名都不区分大小写）。 */
++export function toAccessRules(drafts: AccessRuleDraft[]): TunnelAccessPolicyRule[] {
++  return drafts.map((draft) => ({ kind: draft.kind, value: draft.value.trim().toLowerCase() }));
++}
++
++export function ruleDraftsFrom(rules: TunnelAccessPolicyRule[]): AccessRuleDraft[] {
++  return rules.map((rule, index) => ({
++    key: `saved-${index}`,
++    kind: rule.kind,
++    value: rule.value,
++  }));
++}
++
++/**
++ * Access 应用绑在主机名上：`configure_access` / `sync_access` 都不带主机名参数，
++ * 服务端用的是已保存的那个，所以没有主机名之前这两个动作都无从谈起。
++ */
++export function accessTargetHostname(status: TunnelStatusResponse): string | null {
++  return status.access.hostname ?? status.config.hostname;
++}
++
++export function canApplyAccess(status: TunnelStatusResponse, drafts: AccessRuleDraft[]): boolean {
++  return (
++    status.access.hasCredentials &&
++    accessTargetHostname(status) !== null &&
++    accessRulesValid(drafts)
++  );
++}
++
++/**
++ * 同步比应用宽松一档：后端在没有隧道主机名时会退回探测到的系统隧道主机名，
++ * 所以只要有一个可匹配的主机名就允许同步。
++ */
++export function canSyncAccess(status: TunnelStatusResponse): boolean {
++  return (
++    status.access.hasCredentials &&
++    (accessTargetHostname(status) !== null || status.external.hostnames.length > 0)
++  );
++}
++
++/** 凭证已保存但本地还没有应用：先让用户从 Cloudflare 同步，避免重复建应用。 */
++export function shouldOfferAccessSync(status: TunnelStatusResponse): boolean {
++  return status.access.hasCredentials && !status.access.configured && canSyncAccess(status);
++}
++
++export type AccessStepTag = 'recommended' | 'optional';
++
++/** 没有登录体系时 Access 是唯一的鉴权层，标「推荐」；有登录时只是加固，标「可选」。 */
++export function accessStepTag(status: TunnelStatusResponse): AccessStepTag {
++  return status.loginEnforced ? 'optional' : 'recommended';
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/access-step.tsx b/apps/fe/src/pages/settings/remote-access/access-step.tsx
+new file mode 100644
+index 00000000..bea01d27
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/access-step.tsx
+@@ -0,0 +1,486 @@
++// 访问控制（Cloudflare Access）：凭证 → 允许访问的用户 → 应用状态。
++//
++// Access 是可选的加固层：没有它隧道照样能开，只是任何人都能打到 tmex 的登录页（或裸界面）。
++// API token 与 account id 只往服务端送一次，状态里永远只回「是否已保存」。
++
++import type { TunnelStatusResponse } from '@tmex/shared';
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogTitle,
++} from '@tmex/ui/alert-dialog';
++import { Button } from '@tmex/ui/button';
++import { Input } from '@tmex/ui/input';
++import { Loader2, Plus, RefreshCw, Trash2, Upload, X } from 'lucide-react';
++import { useRef, useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { FormField, SetupNotice, SwitchRow } from '../nodes/setup/form-parts';
++import {
++  type AccessRuleDraft,
++  type AccessRuleKind,
++  accessTargetHostname,
++  canApplyAccess,
++  canSyncAccess,
++  ruleDraftError,
++  ruleDraftsFrom,
++  shouldOfferAccessSync,
++  toAccessRules,
++} from './access-model';
++import { DetailRow, JobProgress } from './step-shell';
++import type { TunnelActions } from './tunnel-actions';
++
++export function AccessStep({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  const access = status.access;
++
++  return (
++    <div className="space-y-4" data-testid="remote-access-access">
++      {access.lastError && (
++        <SetupNotice tone="error" testId="remote-access-access-last-error">
++          {t('settings.remoteAccess.access.lastError', { message: access.lastError })}
++        </SetupNotice>
++      )}
++
++      {access.hasCredentials ? (
++        <SavedCredentials status={status} actions={actions} />
++      ) : (
++        <CredentialsForm actions={actions} />
++      )}
++
++      {access.hasCredentials && (
++        <RulesEditor
++          // 应用 / 同步回来的规则是服务端真值：一变就重挂，丢掉过期的本地草稿。
++          key={access.rules.map((rule) => `${rule.kind}:${rule.value}`).join(',')}
++          status={status}
++          actions={actions}
++        />
++      )}
++
++      {access.configured && <AccessAppStatus status={status} actions={actions} />}
++    </div>
++  );
++}
++
++function CredentialsForm({ actions }: { actions: TunnelActions }) {
++  const { t } = useTranslation();
++  const [apiToken, setApiToken] = useState('');
++  const [accountId, setAccountId] = useState('');
++  const ready = apiToken.trim().length > 0 && accountId.trim().length > 0;
++
++  return (
++    <div className="space-y-3" data-testid="remote-access-access-credentials">
++      <SectionTitle text={t('settings.remoteAccess.access.credentials.title')} />
++      <FormField
++        id="remote-access-access-token"
++        label={t('settings.remoteAccess.access.credentials.apiToken')}
++        hint={t('settings.remoteAccess.access.credentials.apiTokenHint')}
++      >
++        <Input
++          id="remote-access-access-token"
++          data-testid="remote-access-access-token"
++          type="password"
++          autoComplete="off"
++          value={apiToken}
++          disabled={actions.busy}
++          onChange={(event) => setApiToken(event.target.value)}
++        />
++      </FormField>
++      <FormField
++        id="remote-access-access-account"
++        label={t('settings.remoteAccess.access.credentials.accountId')}
++        hint={t('settings.remoteAccess.access.credentials.accountIdHint')}
++      >
++        <Input
++          id="remote-access-access-account"
++          data-testid="remote-access-access-account"
++          value={accountId}
++          disabled={actions.busy}
++          onChange={(event) => setAccountId(event.target.value)}
++        />
++      </FormField>
++      <div className="flex justify-end">
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy || !ready}
++          onClick={() =>
++            actions.run({
++              action: 'set_access_credentials',
++              apiToken: apiToken.trim(),
++              accountId: accountId.trim(),
++            })
++          }
++          data-testid="remote-access-access-save-credentials"
++        >
++          {actions.pending === 'set_access_credentials' ? (
++            <Loader2 className="animate-spin" />
++          ) : null}
++          {t('settings.remoteAccess.access.credentials.save')}
++        </Button>
++      </div>
++    </div>
++  );
++}
++
++function SavedCredentials({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  return (
++    <div className="space-y-2" data-testid="remote-access-access-credentials-saved">
++      <SectionTitle text={t('settings.remoteAccess.access.credentials.title')} />
++      <SetupNotice tone="success">
++        {t('settings.remoteAccess.access.credentials.saved')}
++      </SetupNotice>
++      <div className="space-y-0.5">
++        <DetailRow
++          label={t('settings.remoteAccess.access.credentials.accountId')}
++          testId="remote-access-access-account-id"
++        >
++          <span className="font-mono">{status.access.accountId ?? '—'}</span>
++        </DetailRow>
++        <DetailRow
++          label={t('settings.remoteAccess.access.credentials.teamDomain')}
++          testId="remote-access-access-team-domain"
++        >
++          <span className="font-mono">{status.access.teamDomain ?? '—'}</span>
++        </DetailRow>
++      </div>
++      <Button
++        type="button"
++        size="xs"
++        variant="outline"
++        disabled={actions.busy}
++        onClick={() => actions.run({ action: 'clear_access_credentials' })}
++        data-testid="remote-access-access-clear-credentials"
++      >
++        {actions.pending === 'clear_access_credentials' ? (
++          <Loader2 className="animate-spin" />
++        ) : (
++          <X />
++        )}
++        {t('settings.remoteAccess.access.credentials.clear')}
++      </Button>
++    </div>
++  );
++}
++
++function RulesEditor({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  const [drafts, setDrafts] = useState<AccessRuleDraft[]>(() =>
++    status.access.rules.length > 0
++      ? ruleDraftsFrom(status.access.rules)
++      : [{ key: 'rule-0', kind: 'email', value: '' }]
++  );
++  const nextKey = useRef(1);
++  const job = status.job;
++  const running = job?.kind === 'access' && job.state === 'running';
++  const hostname = accessTargetHostname(status);
++  const applicable = canApplyAccess(status, drafts);
++
++  const patch = (key: string, next: Partial<AccessRuleDraft>) =>
++    setDrafts((current) =>
++      current.map((draft) => (draft.key === key ? { ...draft, ...next } : draft))
++    );
++
++  return (
++    <div className="space-y-3" data-testid="remote-access-access-rules">
++      <SectionTitle text={t('settings.remoteAccess.access.rules.title')} />
++      <p className="text-xs text-muted-foreground">
++        {t('settings.remoteAccess.access.rules.description')}
++      </p>
++
++      <div className="space-y-2">
++        {drafts.map((draft, index) => (
++          <RuleRow
++            key={draft.key}
++            draft={draft}
++            index={index}
++            disabled={actions.busy}
++            removable={drafts.length > 1}
++            onKind={(kind) => patch(draft.key, { kind })}
++            onValue={(value) => patch(draft.key, { value })}
++            onRemove={() =>
++              setDrafts((current) => current.filter((item) => item.key !== draft.key))
++            }
++          />
++        ))}
++      </div>
++
++      <Button
++        type="button"
++        size="xs"
++        variant="outline"
++        disabled={actions.busy}
++        onClick={() => {
++          const key = `rule-${nextKey.current++}`;
++          setDrafts((current) => [...current, { key, kind: 'email', value: '' }]);
++        }}
++        data-testid="remote-access-access-add-rule"
++      >
++        <Plus />
++        {t('settings.remoteAccess.access.rules.add')}
++      </Button>
++
++      {hostname === null && (
++        <SetupNotice tone="info" testId="remote-access-access-no-hostname">
++          {t('settings.remoteAccess.access.rules.needHostname')}
++        </SetupNotice>
++      )}
++
++      {shouldOfferAccessSync(status) && (
++        <SetupNotice tone="info" testId="remote-access-access-sync-hint">
++          {t('settings.remoteAccess.access.sync.hint', { hostname })}
++        </SetupNotice>
++      )}
++
++      {running && <JobProgress step={job.step} testId="remote-access-access-progress" />}
++
++      <div className="flex flex-wrap justify-end gap-2">
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          disabled={actions.busy || !canSyncAccess(status)}
++          onClick={() => actions.run({ action: 'sync_access' })}
++          data-testid="remote-access-access-sync"
++        >
++          {actions.pending === 'sync_access' ? <Loader2 className="animate-spin" /> : <RefreshCw />}
++          {t('settings.remoteAccess.access.sync.action')}
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy || !applicable}
++          onClick={() => actions.run({ action: 'configure_access', rules: toAccessRules(drafts) })}
++          data-testid="remote-access-access-apply"
++        >
++          {actions.pending === 'configure_access' ? (
++            <Loader2 className="animate-spin" />
++          ) : (
++            <Upload />
++          )}
++          {t('settings.remoteAccess.access.rules.apply')}
++        </Button>
++      </div>
++    </div>
++  );
++}
++
++const RULE_KINDS: AccessRuleKind[] = ['email', 'email_domain'];
++
++function RuleRow({
++  draft,
++  index,
++  disabled,
++  removable,
++  onKind,
++  onValue,
++  onRemove,
++}: {
++  draft: AccessRuleDraft;
++  index: number;
++  disabled: boolean;
++  removable: boolean;
++  onKind: (kind: AccessRuleKind) => void;
++  onValue: (value: string) => void;
++  onRemove: () => void;
++}) {
++  const { t } = useTranslation();
++  const error = ruleDraftError(draft);
++
++  return (
++    <div className="space-y-1" data-testid={`remote-access-access-rule-${index}`}>
++      <div className="flex flex-wrap items-center gap-2">
++        <div className="flex shrink-0 rounded-lg bg-muted p-0.5">
++          {RULE_KINDS.map((kind) => (
++            <button
++              key={kind}
++              type="button"
++              disabled={disabled}
++              aria-pressed={draft.kind === kind}
++              className={`rounded-[calc(var(--radius-lg)-2px)] px-2 py-1 text-xs transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none ${
++                draft.kind === kind
++                  ? 'bg-background font-medium shadow-xs'
++                  : 'text-muted-foreground'
++              } ${disabled ? 'pointer-events-none opacity-60' : ''}`}
++              onClick={() => onKind(kind)}
++              data-testid={`remote-access-access-rule-${index}-kind-${kind}`}
++            >
++              {t(`settings.remoteAccess.access.rules.kind.${kind}`)}
++            </button>
++          ))}
++        </div>
++        <Input
++          className="min-w-40 flex-1"
++          value={draft.value}
++          disabled={disabled}
++          aria-label={t(`settings.remoteAccess.access.rules.kind.${draft.kind}`)}
++          placeholder={t(`settings.remoteAccess.access.rules.placeholder.${draft.kind}`)}
++          onChange={(event) => onValue(event.target.value)}
++          data-testid={`remote-access-access-rule-${index}-value`}
++        />
++        {removable && (
++          <Button
++            type="button"
++            size="xs"
++            variant="ghost"
++            disabled={disabled}
++            aria-label={t('settings.remoteAccess.access.rules.remove')}
++            onClick={onRemove}
++            data-testid={`remote-access-access-rule-${index}-remove`}
++          >
++            <X />
++          </Button>
++        )}
++      </div>
++      {error === 'invalid' && (
++        <p
++          className="text-xs text-destructive"
++          data-testid={`remote-access-access-rule-${index}-error`}
++        >
++          {t(`settings.remoteAccess.access.rules.invalid.${draft.kind}`)}
++        </p>
++      )}
++    </div>
++  );
++}
++
++function AccessAppStatus({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  const access = status.access;
++  const [confirmRemove, setConfirmRemove] = useState(false);
++
++  return (
++    <div className="space-y-3" data-testid="remote-access-access-app">
++      <SectionTitle text={t('settings.remoteAccess.access.app.title')} />
++      <div className="space-y-0.5">
++        <DetailRow
++          label={t('settings.remoteAccess.access.app.appId')}
++          testId="remote-access-access-app-id"
++        >
++          <span className="font-mono">{access.appId ?? '—'}</span>
++        </DetailRow>
++        <DetailRow
++          label={t('settings.remoteAccess.access.app.aud')}
++          testId="remote-access-access-aud"
++        >
++          <span className="font-mono">{access.aud ?? '—'}</span>
++        </DetailRow>
++        <DetailRow
++          label={t('settings.remoteAccess.access.app.hostname')}
++          testId="remote-access-access-app-hostname"
++        >
++          <span className="font-mono">{access.hostname ?? '—'}</span>
++        </DetailRow>
++        <DetailRow
++          label={t('settings.remoteAccess.access.app.rules')}
++          testId="remote-access-access-app-rules"
++        >
++          {access.rules.length === 0
++            ? t('settings.remoteAccess.access.app.noRules')
++            : access.rules
++                .map(
++                  (rule) =>
++                    `${t(`settings.remoteAccess.access.rules.kind.${rule.kind}`)}: ${rule.value}`
++                )
++                .join('; ')}
++        </DetailRow>
++      </div>
++
++      <SwitchRow
++        id="remote-access-access-enforce"
++        label={t('settings.remoteAccess.access.app.enforce')}
++        hint={t('settings.remoteAccess.access.app.enforceHint')}
++        checked={access.enforceJwt}
++        disabled={actions.busy}
++        onCheckedChange={(checked) =>
++          actions.run({ action: 'set_access_enforce', enforceJwt: checked })
++        }
++      />
++      {!access.enforceJwt && (
++        <SetupNotice tone="warning" testId="remote-access-access-enforce-off">
++          {t('settings.remoteAccess.access.app.enforceOff')}
++        </SetupNotice>
++      )}
++
++      <Button
++        type="button"
++        size="xs"
++        variant="destructive"
++        disabled={actions.busy}
++        onClick={() => setConfirmRemove(true)}
++        data-testid="remote-access-access-remove"
++      >
++        {actions.pending === 'remove_access' ? <Loader2 className="animate-spin" /> : <Trash2 />}
++        {t('settings.remoteAccess.access.app.remove')}
++      </Button>
++
++      {confirmRemove && (
++        <AlertDialog
++          open
++          onOpenChange={(next) => {
++            if (!next) setConfirmRemove(false);
++          }}
++        >
++          <AlertDialogContent data-testid="remote-access-access-confirm-remove">
++            <AlertDialogHeader>
++              <AlertDialogTitle>
++                {t('settings.remoteAccess.access.confirmRemove.title')}
++              </AlertDialogTitle>
++              <AlertDialogDescription>
++                {t('settings.remoteAccess.access.confirmRemove.description')}
++              </AlertDialogDescription>
++            </AlertDialogHeader>
++            <AlertDialogFooter>
++              <AlertDialogCancel onClick={() => setConfirmRemove(false)}>
++                {t('settings.remoteAccess.access.confirmRemove.cancel')}
++              </AlertDialogCancel>
++              <AlertDialogAction
++                variant="destructive"
++                onClick={() => {
++                  setConfirmRemove(false);
++                  actions.run({ action: 'remove_access' });
++                }}
++                data-testid="remote-access-access-confirm-remove-confirm"
++              >
++                {t('settings.remoteAccess.access.confirmRemove.confirm')}
++              </AlertDialogAction>
++            </AlertDialogFooter>
++          </AlertDialogContent>
++        </AlertDialog>
++      )}
++    </div>
++  );
++}
++
++function SectionTitle({ text }: { text: string }) {
++  return <h4 className="text-xs font-medium tracking-wide text-muted-foreground">{text}</h4>;
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/exposure.tsx b/apps/fe/src/pages/settings/remote-access/exposure.tsx
+new file mode 100644
+index 00000000..b59d1347
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/exposure.tsx
+@@ -0,0 +1,64 @@
++// 未受保护时的公网暴露警示：一条 destructive 提示 + 一个显式确认勾选。
++//
++// 确认状态放在标签层，警示会在方式步骤上方与每个启动 / 创建动作旁重复出现，勾一次全部生效；
++// 只有勾上之后动作才会带 `acknowledgeExposure`，否则后端回 409 `exposure_ack_required`。
++
++import { useTranslation } from 'react-i18next';
++import { Link } from 'react-router';
++import { SetupNotice } from '../nodes/setup/form-parts';
++
++export interface ExposureState {
++  /** 既没有启用登录，也没有生效的 Cloudflare Access。 */
++  unprotected: boolean;
++  acknowledged: boolean;
++  setAcknowledged: (next: boolean) => void;
++  /** 后端已经回过 `exposure_ack_required`。 */
++  ackRequired: boolean;
++}
++
++export function ExposureWarning({
++  exposure,
++  id,
++  testId,
++  variant = 'full',
++}: {
++  exposure: ExposureState;
++  /** 勾选框的 id，同一页面里多处渲染必须各不相同。 */
++  id: string;
++  testId: string;
++  variant?: 'full' | 'compact';
++}) {
++  const { t } = useTranslation();
++  if (!exposure.unprotected && !exposure.ackRequired) return null;
++
++  return (
++    <SetupNotice tone="error" testId={testId}>
++      <p>
++        {t(
++          variant === 'full'
++            ? 'settings.remoteAccess.exposure.warning'
++            : 'settings.remoteAccess.exposure.warningShort'
++        )}
++      </p>
++      {exposure.ackRequired && !exposure.acknowledged && (
++        <p data-testid={`${testId}-required`}>{t('settings.remoteAccess.exposure.ackRequired')}</p>
++      )}
++      <label className="flex items-center gap-1.5 font-medium" htmlFor={id}>
++        <input
++          id={id}
++          type="checkbox"
++          className="size-3.5 shrink-0 accent-current"
++          checked={exposure.acknowledged}
++          onChange={(event) => exposure.setAcknowledged(event.target.checked)}
++          data-testid={`${testId}-ack`}
++        />
++        {t('settings.remoteAccess.exposure.acknowledge')}
++      </label>
++      {variant === 'full' && (
++        <Link className="underline underline-offset-4" to="?tab=nodes">
++          {t('settings.remoteAccess.exposure.enableLogin')}
++        </Link>
++      )}
++    </SetupNotice>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/external-card.tsx b/apps/fe/src/pages/settings/remote-access/external-card.tsx
+new file mode 100644
+index 00000000..4cb5377d
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/external-card.tsx
+@@ -0,0 +1,141 @@
++// 系统里已有的 cloudflared：探测到就先问用户是接管它，还是让 tmex 另建一条。
++//
++// 接管（`adopt_external`）只把 mode / hostname 记进 tmex，不去碰那个由 launchd/systemd
++// 管着的进程——两边同时拉起同一条隧道只会互相顶掉。
++
++import type { TunnelStatusResponse } from '@tmex/shared';
++import { Button } from '@tmex/ui/button';
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@tmex/ui/select';
++import { Loader2, PlugZap } from 'lucide-react';
++import { useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { SetupNotice } from '../nodes/setup/form-parts';
++import { DetailRow } from './step-shell';
++import type { TunnelActions } from './tunnel-actions';
++
++const KNOWN_SOURCES = new Set(['launchd', 'systemd', 'process', 'config']);
++
++export function ExternalTunnelCard({
++  status,
++  actions,
++  onDismiss,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  onDismiss: () => void;
++}) {
++  const { t } = useTranslation();
++  const external = status.external;
++  const [hostname, setHostname] = useState(external.hostnames[0] ?? '');
++  const target = external.hostnames.includes(hostname) ? hostname : (external.hostnames[0] ?? '');
++  const source = external.source;
++
++  return (
++    <section
++      className="space-y-3 rounded-xl bg-primary/5 p-3 ring-1 ring-primary"
++      data-testid="remote-access-external"
++    >
++      <div className="space-y-0.5">
++        <h3 className="text-sm font-medium">{t('settings.remoteAccess.external.title')}</h3>
++        <p className="text-xs text-muted-foreground">
++          {t('settings.remoteAccess.external.description')}
++        </p>
++      </div>
++
++      <div className="space-y-0.5">
++        {source && (
++          <DetailRow
++            label={t('settings.remoteAccess.external.source')}
++            testId="remote-access-external-source"
++          >
++            {KNOWN_SOURCES.has(source)
++              ? t(`settings.remoteAccess.external.sourceValue.${source}`)
++              : source}
++          </DetailRow>
++        )}
++        {external.tunnelName && (
++          <DetailRow label={t('settings.remoteAccess.steps.named.tunnelName')}>
++            <span className="font-mono">{external.tunnelName}</span>
++          </DetailRow>
++        )}
++        {external.tunnelId && (
++          <DetailRow label={t('settings.remoteAccess.steps.named.tunnelId')}>
++            <span className="font-mono">{external.tunnelId}</span>
++          </DetailRow>
++        )}
++        {external.configPath && (
++          <DetailRow label={t('settings.remoteAccess.external.configPath')}>
++            <span className="font-mono">{external.configPath}</span>
++          </DetailRow>
++        )}
++        <DetailRow
++          label={t('settings.remoteAccess.external.running')}
++          testId="remote-access-external-running"
++        >
++          {t(`settings.remoteAccess.external.runningValue.${external.running ? 'on' : 'off'}`)}
++        </DetailRow>
++      </div>
++
++      {external.hostnames.length === 0 ? (
++        <SetupNotice tone="warning" testId="remote-access-external-no-hostname">
++          {t('settings.remoteAccess.external.noHostname')}
++        </SetupNotice>
++      ) : external.hostnames.length === 1 ? (
++        <DetailRow
++          label={t('settings.remoteAccess.steps.named.hostname')}
++          testId="remote-access-external-hostname"
++        >
++          <span className="font-mono">{target}</span>
++        </DetailRow>
++      ) : (
++        <div className="space-y-2">
++          <label className="block text-sm font-medium" htmlFor="remote-access-external-hostname">
++            {t('settings.remoteAccess.external.chooseHostname')}
++          </label>
++          <Select value={target} onValueChange={(next) => next && setHostname(next)}>
++            <SelectTrigger
++              id="remote-access-external-hostname"
++              data-testid="remote-access-external-hostname"
++              className="w-full"
++            >
++              <SelectValue>{target}</SelectValue>
++            </SelectTrigger>
++            <SelectContent>
++              {external.hostnames.map((item) => (
++                <SelectItem key={item} value={item}>
++                  {item}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++        </div>
++      )}
++
++      <div className="flex flex-wrap gap-2">
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy || target.length === 0}
++          onClick={() => actions.run({ action: 'adopt_external', hostname: target })}
++          data-testid="remote-access-external-adopt"
++        >
++          {actions.pending === 'adopt_external' ? (
++            <Loader2 className="animate-spin" />
++          ) : (
++            <PlugZap />
++          )}
++          {t('settings.remoteAccess.external.adopt')}
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          onClick={onDismiss}
++          data-testid="remote-access-external-dismiss"
++        >
++          {t('settings.remoteAccess.external.dismiss')}
++        </Button>
++      </div>
++    </section>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/named-step.tsx b/apps/fe/src/pages/settings/remote-access/named-step.tsx
+index bd780e26..9c5b99c4 100644
+--- a/apps/fe/src/pages/settings/remote-access/named-step.tsx
++++ b/apps/fe/src/pages/settings/remote-access/named-step.tsx
+@@ -1,219 +1,222 @@
+-// 命名隧道：登录 Cloudflare → 填主机名 → 创建并启动。
++// 命名隧道的三步：登录 Cloudflare → 主机名 → 创建并启动。
+ //
+ // 登录是后台 job：`login` 受理后 `auth.loginUrl` 才会出现，用户在别的标签页完成授权，
+ // 这边靠轮询看到 `auth.loggedIn` 翻真。授权页有有效期，超时由后端报 `login_timeout`。
++//
++// 主机名没有单独的保存动作（契约里只有 `create` 带 hostname），所以「确认」只是向导内部的
++// 一步：确认之后才展开创建，Access 那一步也才有可展示的目标主机名。
+ 
+ import type { TunnelStatusResponse } from '@tmex/shared';
+ import { Button, buttonVariants } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+-import { ExternalLink, Loader2, LogIn, Rocket } from 'lucide-react';
+-import { useState } from 'react';
++import { ArrowRight, ExternalLink, Loader2, LogIn, Pencil, Rocket } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ import { CopyButton } from '../nodes/copy-feedback';
+ import { FormField, SetupNotice } from '../nodes/setup/form-parts';
++import { type ExposureState, ExposureWarning } from './exposure';
+ import { DetailRow, JobProgress, ProgressRow } from './step-shell';
+ import type { TunnelActions } from './tunnel-actions';
+ import { describeTunnelError, isValidHostname, isValidTunnelName } from './tunnel-model';
+ 
+-export function NamedTunnelStep({
++/** 主机名 / 隧道名称的草稿，由向导持有：创建那一步要用同一份。 */
++export interface NamedDraft {
++  hostname: string;
++  tunnelName: string;
++  confirmed: boolean;
++  setHostname: (value: string) => void;
++  setTunnelName: (value: string) => void;
++  setConfirmed: (value: boolean) => void;
++}
++
++export function LoginStep({
+   status,
+   actions,
+-  isHub,
+ }: {
+   status: TunnelStatusResponse;
+   actions: TunnelActions;
+-  isHub: boolean;
+ }) {
+   const { t } = useTranslation();
+   const job = status.job;
+   const loginRunning = job?.kind === 'login' && job.state === 'running';
+   const loginFailed = job?.kind === 'login' && job.state === 'error' && job.error !== null;
+ 
+-  // 隧道已经建好：再点一次「创建并启动」会在 Cloudflare 上多出一条孤儿隧道并覆盖本地配置，
+-  // 所以这一步只留只读摘要，换隧道必须先在状态卡里移除。
+-  if (status.config.mode === 'named') return <NamedTunnelSummary status={status} isHub={isHub} />;
++  if (status.config.externallyManaged) {
++    return (
++      <SetupNotice tone="info" testId="remote-access-login-skipped">
++        {t('settings.remoteAccess.steps.login.skipped')}
++      </SetupNotice>
++    );
++  }
+ 
+-  if (!status.auth.loggedIn) {
++  if (status.auth.loggedIn) {
+     return (
+-      <div className="space-y-2" data-testid="remote-access-login">
+-        <p className="text-xs text-muted-foreground">
+-          {t('settings.remoteAccess.steps.named.login.description')}
+-        </p>
++      <SetupNotice tone="success" testId="remote-access-logged-in">
++        {t('settings.remoteAccess.steps.named.login.done')}
++      </SetupNotice>
++    );
++  }
+ 
+-        {loginFailed && job.error && (
+-          <SetupNotice tone="error" testId="remote-access-login-error">
+-            {describeTunnelError(t, job.error)}
+-          </SetupNotice>
+-        )}
++  return (
++    <div className="space-y-2" data-testid="remote-access-login">
++      <p className="text-xs text-muted-foreground">
++        {t('settings.remoteAccess.steps.named.login.description')}
++      </p>
++
++      {loginFailed && job.error && (
++        <SetupNotice tone="error" testId="remote-access-login-error">
++          {describeTunnelError(t, job.error)}
++        </SetupNotice>
++      )}
+ 
+-        {loginRunning ? (
+-          <div className="space-y-2">
+-            <ProgressRow
+-              label={t('settings.remoteAccess.steps.named.login.waiting')}
+-              testId="remote-access-login-waiting"
+-            />
+-            {status.auth.loginUrl && (
+-              <div className="flex flex-wrap items-center gap-1.5">
+-                <a
+-                  className={buttonVariants({ size: 'sm' })}
+-                  href={status.auth.loginUrl}
+-                  target="_blank"
+-                  rel="noreferrer"
+-                  data-testid="remote-access-login-url"
+-                >
+-                  <ExternalLink />
+-                  {t('settings.remoteAccess.actions.openLoginUrl')}
+-                </a>
+-                <CopyButton value={status.auth.loginUrl} testId="remote-access-login-url" />
+-              </div>
+-            )}
+-            <Button
+-              type="button"
+-              size="sm"
+-              variant="outline"
+-              disabled={actions.pending !== null}
+-              onClick={() => actions.run({ action: 'cancel_login' })}
+-              data-testid="remote-access-login-cancel"
+-            >
+-              {actions.pending === 'cancel_login' ? <Loader2 className="animate-spin" /> : null}
+-              {t('settings.remoteAccess.actions.cancelLogin')}
+-            </Button>
+-          </div>
+-        ) : (
++      {loginRunning ? (
++        <div className="space-y-2">
++          <ProgressRow
++            label={t('settings.remoteAccess.steps.named.login.waiting')}
++            testId="remote-access-login-waiting"
++          />
++          {status.auth.loginUrl && (
++            <div className="flex flex-wrap items-center gap-1.5">
++              <a
++                className={buttonVariants({ size: 'sm' })}
++                href={status.auth.loginUrl}
++                target="_blank"
++                rel="noreferrer"
++                data-testid="remote-access-login-url"
++              >
++                <ExternalLink />
++                {t('settings.remoteAccess.actions.openLoginUrl')}
++              </a>
++              <CopyButton value={status.auth.loginUrl} testId="remote-access-login-url" />
++            </div>
++          )}
+           <Button
+             type="button"
+             size="sm"
+-            disabled={actions.busy}
+-            onClick={() => actions.run({ action: 'login' })}
+-            data-testid="remote-access-login-start"
++            variant="outline"
++            disabled={actions.pending !== null}
++            onClick={() => actions.run({ action: 'cancel_login' })}
++            data-testid="remote-access-login-cancel"
+           >
+-            {actions.pending === 'login' ? <Loader2 className="animate-spin" /> : <LogIn />}
+-            {t('settings.remoteAccess.actions.login')}
++            {actions.pending === 'cancel_login' ? <Loader2 className="animate-spin" /> : null}
++            {t('settings.remoteAccess.actions.cancelLogin')}
+           </Button>
+-        )}
+-      </div>
+-    );
+-  }
+-
+-  return <CreateTunnelForm status={status} actions={actions} isHub={isHub} />;
+-}
+-
+-function NamedTunnelSummary({
+-  status,
+-  isHub,
+-}: {
+-  status: TunnelStatusResponse;
+-  isHub: boolean;
+-}) {
+-  const { t } = useTranslation();
+-  return (
+-    <div className="space-y-2" data-testid="remote-access-named-summary">
+-      <SetupNotice tone="success" testId="remote-access-named-configured">
+-        {t('settings.remoteAccess.steps.named.configured')}
+-      </SetupNotice>
+-      <div className="space-y-0.5">
+-        <DetailRow
+-          label={t('settings.remoteAccess.steps.named.hostname')}
+-          testId="remote-access-named-hostname"
+-        >
+-          <span className="font-mono">{status.config.hostname ?? '—'}</span>
+-        </DetailRow>
+-        <DetailRow
+-          label={t('settings.remoteAccess.steps.named.tunnelName')}
+-          testId="remote-access-named-name"
+-        >
+-          <span className="font-mono">{status.config.tunnelName ?? '—'}</span>
+-        </DetailRow>
+-        <DetailRow
+-          label={t('settings.remoteAccess.steps.named.tunnelId')}
+-          testId="remote-access-named-id"
++        </div>
++      ) : (
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy}
++          onClick={() => actions.run({ action: 'login' })}
++          data-testid="remote-access-login-start"
+         >
+-          <span className="font-mono">{status.config.tunnelId ?? '—'}</span>
+-        </DetailRow>
+-      </div>
+-      <HubHint isHub={isHub} />
+-      <p className="text-xs text-muted-foreground">
+-        {t('settings.remoteAccess.steps.named.changeHint')}
+-      </p>
++          {actions.pending === 'login' ? <Loader2 className="animate-spin" /> : <LogIn />}
++          {t('settings.remoteAccess.actions.login')}
++        </Button>
++      )}
+     </div>
+   );
+ }
+ 
+-/** 本机即 Hub 时，创建出来的主机名同样要写进 Hub 公开地址，否则 join 串仍指向内网。 */
+-function HubHint({ isHub }: { isHub: boolean }) {
+-  const { t } = useTranslation();
+-  if (!isHub) return null;
+-  return (
+-    <p className="text-xs text-muted-foreground" data-testid="remote-access-hub-hint">
+-      {t('settings.remoteAccess.steps.named.hubHint')}{' '}
+-      <Link className="text-primary underline-offset-4 hover:underline" to="?tab=nodes">
+-        {t('settings.remoteAccess.steps.named.hubHintLink')}
+-      </Link>
+-    </p>
+-  );
+-}
+-
+-function CreateTunnelForm({
++export function HostnameStep({
+   status,
+   actions,
++  draft,
+   isHub,
+ }: {
+   status: TunnelStatusResponse;
+   actions: TunnelActions;
++  draft: NamedDraft;
+   isHub: boolean;
+ }) {
+   const { t } = useTranslation();
+-  const [hostname, setHostname] = useState(status.config.hostname ?? '');
+-  const [tunnelName, setTunnelName] = useState(status.config.tunnelName ?? '');
+-  const [touched, setTouched] = useState(false);
+-  const job = status.job;
+-  const creating = job?.kind === 'create' && job.state === 'running';
+-  const createFailed = job?.kind === 'create' && job.state === 'error' && job.error !== null;
+-  const trimmed = hostname.trim();
+-  const invalid = !isValidHostname(trimmed);
+-  const name = tunnelName.trim();
++
++  // 隧道已经建好：换主机名必须先移除，这里只留只读摘要。
++  if (status.config.mode === 'named') {
++    return (
++      <div className="space-y-2" data-testid="remote-access-named-summary">
++        <div className="space-y-0.5">
++          <DetailRow
++            label={t('settings.remoteAccess.steps.named.hostname')}
++            testId="remote-access-named-hostname"
++          >
++            <span className="font-mono">{status.config.hostname ?? '—'}</span>
++          </DetailRow>
++          <DetailRow
++            label={t('settings.remoteAccess.steps.named.tunnelName')}
++            testId="remote-access-named-name"
++          >
++            <span className="font-mono">{status.config.tunnelName ?? '—'}</span>
++          </DetailRow>
++        </div>
++        <HubHint isHub={isHub} />
++        <p className="text-xs text-muted-foreground">
++          {t('settings.remoteAccess.steps.named.changeHint')}
++        </p>
++      </div>
++    );
++  }
++
++  if (!status.auth.loggedIn) {
++    return (
++      <p className="text-xs text-muted-foreground" data-testid="remote-access-hostname-pending">
++        {t('settings.remoteAccess.steps.hostname.pending')}
++      </p>
++    );
++  }
++
++  const trimmed = draft.hostname.trim();
++  const hostnameInvalid = trimmed.length > 0 && !isValidHostname(trimmed);
++  const name = draft.tunnelName.trim();
+   // 名称留空时由后端生成；填了就必须过与后端一致的字符集校验（凭证文件名直接由它拼出来）。
+   const nameInvalid = name.length > 0 && !isValidTunnelName(name);
+ 
+-  const submit = () => {
+-    setTouched(true);
+-    if (invalid || nameInvalid || actions.busy) return;
+-    actions.run(
+-      name
+-        ? { action: 'create', hostname: trimmed, tunnelName: name }
+-        : { action: 'create', hostname: trimmed }
++  if (draft.confirmed) {
++    return (
++      <div className="space-y-2" data-testid="remote-access-hostname-confirmed">
++        <div className="space-y-0.5">
++          <DetailRow label={t('settings.remoteAccess.steps.named.hostname')}>
++            <span className="font-mono">{trimmed}</span>
++          </DetailRow>
++          {name && (
++            <DetailRow label={t('settings.remoteAccess.steps.named.tunnelName')}>
++              <span className="font-mono">{name}</span>
++            </DetailRow>
++          )}
++        </div>
++        <HubHint isHub={isHub} />
++        <Button
++          type="button"
++          size="xs"
++          variant="outline"
++          disabled={actions.busy}
++          onClick={() => draft.setConfirmed(false)}
++          data-testid="remote-access-hostname-edit"
++        >
++          <Pencil />
++          {t('settings.remoteAccess.steps.hostname.edit')}
++        </Button>
++      </div>
+     );
+-  };
++  }
+ 
+   return (
+-    <div className="space-y-3" data-testid="remote-access-create">
+-      <SetupNotice tone="success" testId="remote-access-logged-in">
+-        {t('settings.remoteAccess.steps.named.login.done')}
+-      </SetupNotice>
+-
+-      {createFailed && job.error && (
+-        <SetupNotice tone="error" testId="remote-access-create-error">
+-          {describeTunnelError(t, job.error)}
+-        </SetupNotice>
+-      )}
+-
++    <div className="space-y-3" data-testid="remote-access-hostname-form">
+       <FormField
+         id="remote-access-hostname"
+         label={t('settings.remoteAccess.steps.named.hostname')}
+         hint={t('settings.remoteAccess.steps.named.hostnameHint')}
+-        {...(touched && invalid
++        {...(hostnameInvalid
+           ? { error: t('settings.remoteAccess.steps.named.hostnameInvalid') }
+           : {})}
+       >
+         <Input
+           id="remote-access-hostname"
+           data-testid="remote-access-hostname"
+-          value={hostname}
++          value={draft.hostname}
+           disabled={actions.busy}
+           placeholder={t('settings.remoteAccess.steps.named.hostnamePlaceholder')}
+-          onChange={(event) => setHostname(event.target.value)}
+-          onBlur={() => setTouched(true)}
++          onChange={(event) => draft.setHostname(event.target.value)}
+         />
+       </FormField>
+ 
+@@ -230,21 +233,108 @@ function CreateTunnelForm({
+         <Input
+           id="remote-access-tunnel-name"
+           data-testid="remote-access-tunnel-name"
+-          value={tunnelName}
++          value={draft.tunnelName}
+           disabled={actions.busy}
+           placeholder={t('settings.remoteAccess.steps.named.tunnelNamePlaceholder')}
+-          onChange={(event) => setTunnelName(event.target.value)}
++          onChange={(event) => draft.setTunnelName(event.target.value)}
+         />
+       </FormField>
+ 
++      <div className="flex justify-end">
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy || !isValidHostname(trimmed) || nameInvalid}
++          onClick={() => draft.setConfirmed(true)}
++          data-testid="remote-access-hostname-confirm"
++        >
++          <ArrowRight />
++          {t('settings.remoteAccess.steps.hostname.confirm')}
++        </Button>
++      </div>
++    </div>
++  );
++}
++
++export function CreateStep({
++  status,
++  actions,
++  draft,
++  isHub,
++  exposure,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  draft: NamedDraft;
++  isHub: boolean;
++  exposure: ExposureState;
++}) {
++  const { t } = useTranslation();
++  const job = status.job;
++
++  if (status.config.mode === 'named') {
++    return (
++      <div className="space-y-2" data-testid="remote-access-named-created">
++        <SetupNotice tone="success" testId="remote-access-named-configured">
++          {t(
++            status.config.externallyManaged
++              ? 'settings.remoteAccess.steps.create.adopted'
++              : 'settings.remoteAccess.steps.named.configured'
++          )}
++        </SetupNotice>
++        <DetailRow
++          label={t('settings.remoteAccess.steps.named.tunnelId')}
++          testId="remote-access-named-id"
++        >
++          <span className="font-mono">{status.config.tunnelId ?? '—'}</span>
++        </DetailRow>
++        <HubHint isHub={isHub} />
++      </div>
++    );
++  }
++
++  if (!draft.confirmed) {
++    return (
++      <p className="text-xs text-muted-foreground" data-testid="remote-access-create-pending">
++        {t('settings.remoteAccess.steps.create.pending')}
++      </p>
++    );
++  }
++
++  const creating = job?.kind === 'create' && job.state === 'running';
++  const createFailed = job?.kind === 'create' && job.state === 'error' && job.error !== null;
++  const hostname = draft.hostname.trim();
++  const name = draft.tunnelName.trim();
++
++  return (
++    <div className="space-y-3" data-testid="remote-access-create">
++      {createFailed && job.error && job.error.code !== 'exposure_ack_required' && (
++        <SetupNotice tone="error" testId="remote-access-create-error">
++          {describeTunnelError(t, job.error)}
++        </SetupNotice>
++      )}
++
++      <ExposureWarning
++        exposure={exposure}
++        id="remote-access-create-ack"
++        testId="remote-access-create-exposure"
++        variant="compact"
++      />
++
+       {creating && <JobProgress step={job.step} testId="remote-access-create-progress" />}
+ 
+       <div className="flex justify-end">
+         <Button
+           type="button"
+           size="sm"
+-          disabled={actions.busy || nameInvalid}
+-          onClick={submit}
++          disabled={actions.busy}
++          onClick={() =>
++            actions.run(
++              name
++                ? { action: 'create', hostname, tunnelName: name }
++                : { action: 'create', hostname }
++            )
++          }
+           data-testid="remote-access-create-submit"
+         >
+           {actions.pending === 'create' ? <Loader2 className="animate-spin" /> : <Rocket />}
+@@ -254,3 +344,17 @@ function CreateTunnelForm({
+     </div>
+   );
+ }
++
++/** 本机即 Hub 时，创建出来的主机名同样要写进 Hub 公开地址，否则 join 串仍指向内网。 */
++function HubHint({ isHub }: { isHub: boolean }) {
++  const { t } = useTranslation();
++  if (!isHub) return null;
++  return (
++    <p className="text-xs text-muted-foreground" data-testid="remote-access-hub-hint">
++      {t('settings.remoteAccess.steps.named.hubHint')}{' '}
++      <Link className="text-primary underline-offset-4 hover:underline" to="?tab=nodes">
++        {t('settings.remoteAccess.steps.named.hubHintLink')}
++      </Link>
++    </p>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx b/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
+index 214762d0..097e82c0 100644
+--- a/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
++++ b/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
+@@ -1,5 +1,5 @@
+-// 「远程访问」标签的静态渲染：远端路由拦截、加载 / 未登录 / 失败分支、状态徽标矩阵、
+-// 向导步进（临时隧道与命名隧道两条路径）、登录授权地址与取消、错误码映射与忙锁。
++// 「远程访问」标签的静态渲染：远端路由拦截、加载 / 未登录 / 失败分支、状态与 Access 徽标矩阵、
++// 向导步进（临时隧道与命名隧道两条路径）、暴露警示与确认、Cloudflare Access 区块、系统隧道接管。
+ // 无 DOM 测试环境，用 react-dom/server 静态渲染（与 HttpsSection / SettingsPage 测试同一套做法）。
+ 
+ import { beforeEach, describe, expect, mock, test } from 'bun:test';
+@@ -11,6 +11,8 @@ import type {
+   TunnelStatusResponse,
+ } from '@tmex/shared';
+ import { installWindowStorage } from '@tmex/stores/test-utils';
++import type { ExposureState } from './exposure';
++import type { NamedDraft } from './named-step';
+ import type { TunnelActions } from './tunnel-actions';
+ 
+ installWindowStorage();
+@@ -72,6 +74,7 @@ function tunnel(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResp
+       tunnelName: null,
+       tunnelId: null,
+       autoStart: false,
++      externallyManaged: false,
+       originPort: 9883,
+     },
+     process: {
+@@ -82,6 +85,30 @@ function tunnel(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResp
+       lastError: null,
+       restarts: 0,
+     },
++    access: {
++      hasCredentials: false,
++      accountId: null,
++      teamDomain: null,
++      configured: false,
++      appId: null,
++      aud: null,
++      hostname: null,
++      rules: [],
++      enforceJwt: true,
++      lastError: null,
++    },
++    external: {
++      detected: false,
++      source: null,
++      configPath: null,
++      tunnelId: null,
++      tunnelName: null,
++      hostnames: [],
++      hasOriginCert: false,
++      running: false,
++    },
++    loginEnforced: true,
++    exposureProtected: true,
+     job: null,
+     trustProxy: false,
+     configuredTrustProxy: false,
+@@ -145,6 +172,11 @@ function stepStateOf(html: string, testId: string): string | null {
+   return /data-step-state="([a-z]+)"/.exec(tag[0])?.[1] ?? null;
+ }
+ 
++/** 向导里步骤卡出现的先后顺序。 */
++function stepOrder(html: string): string[] {
++  return [...html.matchAll(/data-testid="remote-access-step-([a-z]+)"/g)].map((m) => m[1] ?? '');
++}
++
+ beforeEach(() => {
+   status = tunnel();
+   loading = false;
+@@ -285,6 +317,154 @@ describe('状态徽标与操作按钮', () => {
+   });
+ });
+ 
++describe('Access 徽标', () => {
++  test('未配置 / 已配置但未强制 / 已保护三态', () => {
++    expect(render()).toContain('settings.remoteAccess.accessState.notConfigured');
++
++    status = tunnel({
++      access: { ...tunnel().access, configured: true, enforceJwt: false },
++    });
++    expect(render()).toContain('settings.remoteAccess.accessState.notEnforced');
++
++    status = tunnel({ access: { ...tunnel().access, configured: true, enforceJwt: true } });
++    expect(render()).toContain('settings.remoteAccess.accessState.protected');
++  });
++});
++
++describe('系统隧道接管', () => {
++  const detected = (overrides: Partial<TunnelStatusResponse['external']> = {}) => ({
++    ...tunnel().external,
++    detected: true,
++    source: 'launchd',
++    configPath: '/Users/me/.cloudflared/config.yml',
++    tunnelId: 'd8e1f0aa-0000-4000-8000-000000000000',
++    tunnelName: 'home',
++    hostnames: ['tmex.example.com'],
++    hasOriginCert: true,
++    running: true,
++    ...overrides,
++  });
++
++  test('探测到系统隧道且本机未配置时，在向导顶部给接管卡', () => {
++    status = tunnel({ external: detected() });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-external"');
++    expect(html).toContain('settings.remoteAccess.external.sourceValue.launchd');
++    expect(html).toContain('home');
++    expect(html).toContain('tmex.example.com');
++    expect(html).toContain('settings.remoteAccess.external.runningValue.on');
++    expect(html).toContain('data-testid="remote-access-external-adopt"');
++    expect(html).toContain('data-testid="remote-access-external-dismiss"');
++    // 接管卡排在第 1 步之前。
++    expect(html.indexOf('data-testid="remote-access-external"')).toBeLessThan(
++      html.indexOf('data-testid="remote-access-step-install"')
++    );
++  });
++
++  test('多个主机名时给下拉选择，没有主机名时不让接管', () => {
++    status = tunnel({ external: detected({ hostnames: ['a.example.com', 'b.example.com'] }) });
++    expect(render()).toContain('settings.remoteAccess.external.chooseHostname');
++
++    status = tunnel({ external: detected({ hostnames: [] }) });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-external-no-hostname"');
++    expect(isDisabled(html, 'remote-access-external-adopt')).toBe(true);
++  });
++
++  test('已经配置过隧道时不再打扰', () => {
++    status = configured('named', 'running', { external: detected() });
++    expect(render()).not.toContain('data-testid="remote-access-external"');
++  });
++
++  test('接管之后：状态卡打「由系统服务托管」，只留检查与取消接管', () => {
++    status = configured('named', 'stopped', { external: detected() });
++    status.config.externallyManaged = true;
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-managed"');
++    expect(html).toContain('data-testid="remote-access-managed-notice"');
++    expect(html).toContain('data-testid="remote-access-check"');
++    expect(html).toContain('data-testid="remote-access-release"');
++    expect(html).not.toContain('data-testid="remote-access-start"');
++    expect(html).not.toContain('data-testid="remote-access-stop"');
++    expect(html).not.toContain('data-testid="remote-access-remove"');
++    // 运行态以探测结果为准，tmex 侧没有进程。
++    expect(html).toContain('settings.remoteAccess.state.running');
++  });
++
++  test('接管之后安装与登录两步显示为跳过', () => {
++    status = configured('named', 'stopped', {
++      binary: { installed: false, version: null, path: null, source: null },
++      external: detected(),
++    });
++    status.config.externallyManaged = true;
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-install-skipped"');
++    expect(html).toContain('data-testid="remote-access-login-skipped"');
++    expect(stepStateOf(html, 'remote-access-step-install')).toBe('done');
++    expect(stepStateOf(html, 'remote-access-step-login')).toBe('done');
++    expect(html).toContain('settings.remoteAccess.steps.create.adopted');
++  });
++});
++
++describe('暴露警示与确认', () => {
++  test('未受保护时方式步骤上方给出警示与确认勾选，并链到多节点设置', () => {
++    status = tunnel({ loginEnforced: false, exposureProtected: false });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-exposure"');
++    expect(html).toContain('settings.remoteAccess.exposure.warning');
++    expect(html).toContain('data-testid="remote-access-exposure-ack"');
++    expect(html).toContain('?tab=nodes');
++    expect(html.indexOf('data-testid="remote-access-exposure"')).toBeLessThan(
++      html.indexOf('data-testid="remote-access-mode-chooser"')
++    );
++  });
++
++  test('未受保护不禁用临时隧道选项，也不禁用启动按钮', () => {
++    status = tunnel({ loginEnforced: false, exposureProtected: false });
++    const html = render();
++    expect(isDisabled(html, 'remote-access-mode-quick-input')).toBe(false);
++
++    status = configured('quick', 'stopped', { loginEnforced: false, exposureProtected: false });
++    const started = render();
++    expect(isDisabled(started, 'remote-access-start')).toBe(false);
++    expect(started).toContain('data-testid="remote-access-start-exposure"');
++  });
++
++  test('临时隧道与创建按钮旁各有一条精简警示', () => {
++    status = tunnel({ loginEnforced: false, exposureProtected: false });
++    expect(renderWizard('quick')).toContain('data-testid="remote-access-quick-exposure"');
++
++    status = tunnel({
++      auth: { loggedIn: true, loginUrl: null },
++      loginEnforced: false,
++      exposureProtected: false,
++    });
++    const html = renderWizard('named', { draft: namedDraft({ confirmed: true }) });
++    expect(html).toContain('data-testid="remote-access-create-exposure"');
++    expect(html).toContain('settings.remoteAccess.exposure.warningShort');
++  });
++
++  test('已受保护时一条警示都不出现', () => {
++    status = configured('quick', 'stopped');
++    const html = render();
++    expect(html).not.toContain('data-testid="remote-access-exposure"');
++    expect(html).not.toContain('data-testid="remote-access-start-exposure"');
++  });
++
++  test('后端回 exposure_ack_required 时给确认框而不是通用错误', () => {
++    status = configured('quick', 'stopped');
++    actionState = {
++      ...IDLE_ACTIONS,
++      error: { code: 'exposure_ack_required', message: 'ack required' },
++    };
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-status-exposure"');
++    expect(html).toContain('data-testid="remote-access-status-exposure-required"');
++    expect(html).toContain('data-testid="remote-access-status-exposure-ack"');
++    expect(html).not.toContain('data-testid="remote-access-error"');
++  });
++});
++
+ describe('错误码映射', () => {
+   test('已知错误码走本地化文案', () => {
+     actionState = {
+@@ -296,6 +476,14 @@ describe('错误码映射', () => {
+     expect(html).toContain('settings.remoteAccess.errors.busy');
+   });
+ 
++  test('Access API 失败带上服务端 message', () => {
++    actionState = {
++      ...IDLE_ACTIONS,
++      error: { code: 'access_api_failed', message: 'token lacks permission' },
++    };
++    expect(render()).toContain('settings.remoteAccess.errors.access_api_failed');
++  });
++
+   test('未知错误码退回带原始 message 的兜底文案', () => {
+     actionState = { ...IDLE_ACTIONS, error: { code: 'unknown', message: 'network down' } };
+     expect(render()).toContain('settings.remoteAccess.errors.unknown');
+@@ -303,6 +491,31 @@ describe('错误码映射', () => {
+ });
+ 
+ describe('向导步进', () => {
++  test('命名隧道的步骤顺序：安装 → 方式 → 登录 → 主机名 → 访问控制 → 创建 → 反向代理', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
++    expect(stepOrder(renderWizard('named'))).toEqual([
++      'install',
++      'mode',
++      'login',
++      'hostname',
++      'access',
++      'create',
++      'proxy',
++    ]);
++  });
++
++  test('临时隧道没有登录 / 主机名 / 访问控制三步', () => {
++    expect(stepOrder(renderWizard('quick'))).toEqual(['install', 'mode', 'quick', 'proxy']);
++  });
++
++  test('访问控制步带「推荐」（未启用登录）或「可选」（已启用登录）标签', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null }, loginEnforced: false });
++    expect(renderWizard('named')).toContain('settings.remoteAccess.access.tag.recommended');
++
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null }, loginEnforced: true });
++    expect(renderWizard('named')).toContain('settings.remoteAccess.access.tag.optional');
++  });
++
+   test('未安装 cloudflared 时停在第 1 步并给安装按钮', () => {
+     status = tunnel({ binary: { installed: false, version: null, path: null, source: null } });
+     const html = render();
+@@ -354,10 +567,10 @@ describe('向导步进', () => {
+     expect(html).toContain('data-testid="remote-access-binary"');
+   });
+ 
+-  test('已建好隧道时方式卡锁定，向导停在第 4 步', () => {
++  test('已建好隧道时方式卡锁定，向导停在反向代理步', () => {
+     status = configured('named', 'running');
+     const html = render();
+-    expect(stepStateOf(html, 'remote-access-step-tunnel')).toBe('done');
++    expect(stepStateOf(html, 'remote-access-step-create')).toBe('done');
+     expect(stepStateOf(html, 'remote-access-step-proxy')).toBe('current');
+     expect(isDisabled(html, 'remote-access-mode-named-input')).toBe(true);
+     expect(isDisabled(html, 'remote-access-mode-quick-input')).toBe(true);
+@@ -381,6 +594,12 @@ describe('向导步进', () => {
+     expect(html).toContain('data-testid="remote-access-restart-now"');
+   });
+ 
++  test('接管来的隧道不给「随 tmex 启动」开关', () => {
++    status = configured('named', 'stopped');
++    status.config.externallyManaged = true;
++    expect(render()).not.toContain('data-testid="remote-access-auto-start"');
++  });
++
+   test('信任开关绑已保存值，生效值单独展示', () => {
+     // 刚保存完：已保存 true，进程仍按 false 跑。
+     status = configured('quick', 'running', {
+@@ -441,13 +660,47 @@ describe('命名隧道', () => {
+     expect(renderWizard('named')).toContain('settings.remoteAccess.errors.login_timeout');
+   });
+ 
+-  test('登录后展示主机名与隧道名称表单', () => {
++  test('登录后主机名步给出表单，创建步先等主机名确认', () => {
+     status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
+     const html = renderWizard('named');
+     expect(html).toContain('data-testid="remote-access-logged-in"');
+     expect(html).toContain('data-testid="remote-access-hostname"');
+     expect(html).toContain('data-testid="remote-access-tunnel-name"');
++    expect(html).toContain('data-testid="remote-access-hostname-confirm"');
++    expect(html).toContain('data-testid="remote-access-create-pending"');
++    expect(html).not.toContain('data-testid="remote-access-create-submit"');
++  });
++
++  test('主机名非法时不让进入下一步', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
++    const invalid = renderWizard('named', { draft: namedDraft({ hostname: 'example' }) });
++    expect(isDisabled(invalid, 'remote-access-hostname-confirm')).toBe(true);
++    expect(invalid).toContain('settings.remoteAccess.steps.named.hostnameInvalid');
++
++    const valid = renderWizard('named', {
++      draft: namedDraft({ hostname: 'tmex.example.com' }),
++    });
++    expect(isDisabled(valid, 'remote-access-hostname-confirm')).toBe(false);
++  });
++
++  test('隧道名称非法时同样挡住下一步', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
++    const html = renderWizard('named', {
++      draft: namedDraft({ hostname: 'tmex.example.com', tunnelName: '../../pkg' }),
++    });
++    expect(html).toContain('settings.remoteAccess.steps.named.tunnelNameInvalid');
++    expect(isDisabled(html, 'remote-access-hostname-confirm')).toBe(true);
++  });
++
++  test('确认主机名后创建步才出现「创建并启动」', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
++    const html = renderWizard('named', {
++      draft: namedDraft({ hostname: 'tmex.example.com', confirmed: true }),
++    });
++    expect(html).toContain('data-testid="remote-access-hostname-confirmed"');
++    expect(html).toContain('data-testid="remote-access-hostname-edit"');
+     expect(html).toContain('data-testid="remote-access-create-submit"');
++    expect(html).not.toContain('data-testid="remote-access-create-pending"');
+   });
+ 
+   test('创建 job 在跑时展示 DNS 配置进度', () => {
+@@ -455,7 +708,9 @@ describe('命名隧道', () => {
+       auth: { loggedIn: true, loginUrl: null },
+       job: job({ kind: 'create', state: 'running', step: 'route_dns' }),
+     });
+-    const html = renderWizard('named');
++    const html = renderWizard('named', {
++      draft: namedDraft({ hostname: 'tmex.example.com', confirmed: true }),
++    });
+     expect(html).toContain('data-testid="remote-access-create-progress"');
+     expect(html).toContain('settings.remoteAccess.jobStep.route_dns');
+   });
+@@ -469,10 +724,13 @@ describe('命名隧道', () => {
+         error: { code: 'dns_route_failed', message: 'no zone' },
+       }),
+     });
+-    expect(renderWizard('named')).toContain('settings.remoteAccess.errors.dns_route_failed');
++    const html = renderWizard('named', {
++      draft: namedDraft({ hostname: 'tmex.example.com', confirmed: true }),
++    });
++    expect(html).toContain('settings.remoteAccess.errors.dns_route_failed');
+   });
+ 
+-  test('已配置命名隧道时第 3 步只给只读摘要，没有创建表单', () => {
++  test('已配置命名隧道时主机名步只读，没有创建表单', () => {
+     status = configured('named', 'running', {
+       auth: { loggedIn: true, loginUrl: null },
+     });
+@@ -499,18 +757,168 @@ describe('命名隧道', () => {
+   });
+ });
+ 
+-describe('未启用登录时的提醒', () => {
+-  test('/api/auth/mode 报 none 时在第 2 步之前给出提示并链到多节点设置', () => {
+-    const html = renderWizard('named', false, true);
+-    expect(html).toContain('data-testid="remote-access-auth-required"');
+-    expect(html).toContain('settings.remoteAccess.authRequired.notice');
+-    expect(html).toContain('?tab=nodes');
+-    expect(html.indexOf('data-testid="remote-access-auth-required"')).toBeLessThan(
+-      html.indexOf('data-testid="remote-access-step-mode"')
+-    );
++describe('Cloudflare Access 区块', () => {
++  const loggedIn = (overrides: Partial<TunnelStatusResponse> = {}) =>
++    configured('named', 'running', { auth: { loggedIn: true, loginUrl: null }, ...overrides });
++
++  test('未保存凭证时给令牌与账户 ID 表单，且没有规则编辑器', () => {
++    status = loggedIn();
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-credentials"');
++    expect(html).toContain('data-testid="remote-access-access-token"');
++    expect(html).toContain('data-testid="remote-access-access-account"');
++    expect(html).toContain('settings.remoteAccess.access.credentials.apiTokenHint');
++    // 令牌不能明文回显。
++    expect(html).toContain('type="password"');
++    expect(html).not.toContain('data-testid="remote-access-access-rules"');
++    // 两个字段都空时保存按钮不可点。
++    expect(isDisabled(html, 'remote-access-access-save-credentials')).toBe(true);
++  });
++
++  test('已保存凭证时只展示账户 ID、团队域与清除按钮', () => {
++    status = loggedIn({
++      access: {
++        ...tunnel().access,
++        hasCredentials: true,
++        accountId: 'acc-123',
++        teamDomain: 'tmex.cloudflareaccess.com',
++      },
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-credentials-saved"');
++    expect(html).toContain('acc-123');
++    expect(html).toContain('tmex.cloudflareaccess.com');
++    expect(html).toContain('data-testid="remote-access-access-clear-credentials"');
++    expect(html).not.toContain('data-testid="remote-access-access-token"');
++  });
++
++  test('凭证已保存但没有应用时提示先同步，并给出同步与应用两个按钮', () => {
++    status = loggedIn({ access: { ...tunnel().access, hasCredentials: true } });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-rules"');
++    expect(html).toContain('data-testid="remote-access-access-sync-hint"');
++    expect(html).toContain('data-testid="remote-access-access-sync"');
++    expect(html).toContain('data-testid="remote-access-access-apply"');
++    // 默认一条空规则：不合法，应用按钮禁用；也不给删除按钮（至少留一条）。
++    expect(html).toContain('data-testid="remote-access-access-rule-0-value"');
++    expect(isDisabled(html, 'remote-access-access-apply')).toBe(true);
++    expect(html).not.toContain('data-testid="remote-access-access-rule-0-remove"');
++  });
++
++  test('服务端已有规则时回填草稿，应用按钮可用，且能删除多余规则', () => {
++    status = loggedIn({
++      access: {
++        ...tunnel().access,
++        hasCredentials: true,
++        rules: [
++          { kind: 'email', value: 'you@example.com' },
++          { kind: 'email_domain', value: 'example.com' },
++        ],
++      },
++    });
++    const html = render();
++    expect(html).toContain('you@example.com');
++    expect(html).toContain('example.com');
++    expect(isDisabled(html, 'remote-access-access-apply')).toBe(false);
++    expect(html).toContain('data-testid="remote-access-access-rule-0-remove"');
++    expect(html).toContain('data-testid="remote-access-access-rule-1-remove"');
++  });
++
++  test('非法规则值就地报错', () => {
++    status = loggedIn({
++      access: {
++        ...tunnel().access,
++        hasCredentials: true,
++        rules: [{ kind: 'email', value: 'not-an-email' }],
++      },
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-rule-0-error"');
++    expect(html).toContain('settings.remoteAccess.access.rules.invalid.email');
++    expect(isDisabled(html, 'remote-access-access-apply')).toBe(true);
+   });
+ 
+-  test('后端回 auth_required 时同样常驻提示', () => {
++  test('还没有主机名时同步与应用都不可用，并说明原因', () => {
++    status = tunnel({
++      auth: { loggedIn: true, loginUrl: null },
++      access: { ...tunnel().access, hasCredentials: true },
++    });
++    const html = renderWizard('named');
++    expect(html).toContain('data-testid="remote-access-access-no-hostname"');
++    expect(isDisabled(html, 'remote-access-access-sync')).toBe(true);
++    expect(isDisabled(html, 'remote-access-access-apply')).toBe(true);
++    expect(html).not.toContain('data-testid="remote-access-access-sync-hint"');
++  });
++
++  test('access job 在跑时展示创建应用与配置策略的进度', () => {
++    status = loggedIn({
++      access: { ...tunnel().access, hasCredentials: true },
++      job: job({ kind: 'access', state: 'running', step: 'create_app' }),
++    });
++    expect(render()).toContain('settings.remoteAccess.jobStep.create_app');
++
++    status = loggedIn({
++      access: { ...tunnel().access, hasCredentials: true },
++      job: job({ kind: 'access', state: 'running', step: 'policy' }),
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-progress"');
++    expect(html).toContain('settings.remoteAccess.jobStep.policy');
++  });
++
++  test('应用已建好时展示应用 ID / AUD / 覆盖主机名 / 规则与强制开关', () => {
++    status = loggedIn({
++      access: {
++        ...tunnel().access,
++        hasCredentials: true,
++        configured: true,
++        appId: 'app-1',
++        aud: 'aud-hash',
++        hostname: 'tmex.example.com',
++        rules: [{ kind: 'email', value: 'you@example.com' }],
++      },
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-app"');
++    expect(html).toContain('app-1');
++    expect(html).toContain('aud-hash');
++    expect(html).toContain('data-testid="remote-access-access-app-hostname"');
++    expect(html).toContain('data-testid="remote-access-access-app-rules"');
++    expect(isChecked(html, 'remote-access-access-enforce')).toBe(true);
++    expect(html).not.toContain('data-testid="remote-access-access-enforce-off"');
++    expect(html).toContain('data-testid="remote-access-access-remove"');
++    // 静态渲染点不了按钮，删除应用的确认框默认不在 DOM 里。
++    expect(html).not.toContain('data-testid="remote-access-access-confirm-remove"');
++  });
++
++  test('关闭令牌校验时给出明确警告', () => {
++    status = loggedIn({
++      access: {
++        ...tunnel().access,
++        hasCredentials: true,
++        configured: true,
++        enforceJwt: false,
++        rules: [{ kind: 'email', value: 'you@example.com' }],
++      },
++    });
++    const html = render();
++    expect(isChecked(html, 'remote-access-access-enforce')).toBe(false);
++    expect(html).toContain('data-testid="remote-access-access-enforce-off"');
++    expect(html).toContain('settings.remoteAccess.access.app.enforceOff');
++  });
++
++  test('Access 最近一次错误就地展示', () => {
++    status = loggedIn({
++      access: { ...tunnel().access, hasCredentials: true, lastError: 'token expired' },
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-access-last-error"');
++    expect(html).toContain('settings.remoteAccess.access.lastError');
++  });
++});
++
++describe('未启用登录时的兼容提醒', () => {
++  test('后端仍回 auth_required 时给出旧提示并链到多节点设置', () => {
+     status = tunnel({
+       auth: { loggedIn: true, loginUrl: null },
+       job: job({
+@@ -519,12 +927,16 @@ describe('未启用登录时的提醒', () => {
+         error: { code: 'auth_required', message: 'sign-in disabled' },
+       }),
+     });
+-    const html = renderWizard('named');
++    const html = renderWizard('named', {
++      actions: { ...IDLE_ACTIONS, error: { code: 'auth_required', message: 'sign-in disabled' } },
++    });
+     expect(html).toContain('data-testid="remote-access-auth-required"');
+-    expect(html).toContain('settings.remoteAccess.errors.auth_required');
++    expect(html).toContain('settings.remoteAccess.authRequired.notice');
++    expect(html).toContain('?tab=nodes');
+   });
+ 
+-  test('登录已启用且没有相关错误时不打扰', () => {
++  test('没有相关错误时不打扰', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
+     expect(renderWizard('named')).not.toContain('data-testid="remote-access-auth-required"');
+   });
+ });
+@@ -549,22 +961,55 @@ describe('日志', () => {
+   });
+ });
+ 
++function namedDraft(overrides: Partial<NamedDraft> = {}): NamedDraft {
++  return {
++    hostname: '',
++    tunnelName: '',
++    confirmed: false,
++    setHostname: () => undefined,
++    setTunnelName: () => undefined,
++    setConfirmed: () => undefined,
++    ...overrides,
++  };
++}
++
++function exposureState(overrides: Partial<ExposureState> = {}): ExposureState {
++  const current = status;
++  return {
++    unprotected: current ? !current.exposureProtected : false,
++    acknowledged: false,
++    setAcknowledged: () => undefined,
++    ackRequired: false,
++    ...overrides,
++  };
++}
++
+ /**
+- * 第 3 步走哪条路径由本地选择驱动，静态渲染点不了方式卡——命名隧道的子步骤直接渲染
+- * `TunnelWizard` 并把选择传进去；`RemoteAccessTab` 只负责把 `useState` 接上这个入参。
++ * 方式与主机名草稿都由标签层的 `useState` 驱动，静态渲染点不了控件——命名隧道的子步骤
++ * 直接渲染 `TunnelWizard` 并把它们传进去；`RemoteAccessTab` 只负责把 state 接上这些入参。
+  */
+-function renderWizard(mode: TunnelMode, isHub = false, authDisabled = false): string {
++function renderWizard(
++  mode: TunnelMode,
++  options: {
++    isHub?: boolean;
++    draft?: NamedDraft;
++    actions?: ActionSnapshot;
++    exposure?: Partial<ExposureState>;
++  } = {}
++): string {
+   const current = status;
+   if (!current) throw new Error('status fixture is required');
++  const snapshot = options.actions ?? actionState;
+   return renderToStaticMarkup(
+     <MemoryRouter initialEntries={['/settings']}>
+       <TunnelWizard
+         status={current}
+-        actions={{ ...actionState, run: () => undefined, clearError: () => undefined }}
++        actions={{ ...snapshot, run: () => undefined, clearError: () => undefined }}
+         chosenMode={mode}
+         onChooseMode={() => undefined}
+-        isHub={isHub}
+-        authDisabled={authDisabled}
++        draft={options.draft ?? namedDraft()}
++        isHub={options.isHub ?? false}
++        exposure={exposureState(options.exposure)}
+         onRestarted={() => undefined}
+       />
+     </MemoryRouter>
+diff --git a/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx b/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
+index 474217c7..ba083579 100644
+--- a/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
++++ b/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
+@@ -13,8 +13,11 @@ import { Loader2 } from 'lucide-react';
+ import { useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { SetupNotice } from '../nodes/setup/form-parts';
++import type { ExposureState } from './exposure';
++import type { NamedDraft } from './named-step';
+ import { TunnelStatusCard } from './status-card';
+-import { useTunnelActions } from './tunnel-actions';
++import { type TunnelActions, useTunnelActions } from './tunnel-actions';
++import { isExposureAckError, withExposureAck } from './tunnel-model';
+ import { useTunnelStatus } from './use-tunnel-status';
+ import { TunnelWizard } from './wizard';
+ 
+@@ -43,11 +46,15 @@ function RemoteNodeNotice() {
+ function SelfRemoteAccess() {
+   const { t } = useTranslation();
+   const tunnel = useTunnelStatus();
+-  const { mode, loaded: modeLoaded } = useSharedAuthMode();
++  const { mode } = useSharedAuthMode();
+   const [chosenMode, setChosenMode] = useState<TunnelMode | null>(null);
++  const [acknowledged, setAcknowledged] = useState(false);
++  const [hostname, setHostnameValue] = useState('');
++  const [tunnelName, setTunnelNameValue] = useState('');
++  const [confirmed, setConfirmed] = useState(false);
+ 
+   const { setStatus, refresh } = tunnel;
+-  const actions = useTunnelActions(tunnel.status, { onStatus: setStatus, onRefresh: refresh });
++  const rawActions = useTunnelActions(tunnel.status, { onStatus: setStatus, onRefresh: refresh });
+ 
+   if (tunnel.loginRequired) {
+     return (
+@@ -90,16 +97,45 @@ function SelfRemoteAccess() {
+     );
+   }
+ 
++  const status = tunnel.status;
++  const draft: NamedDraft = {
++    hostname,
++    tunnelName,
++    confirmed,
++    // 改主机名等于推翻上一次确认：创建那一步必须重新走一遍。
++    setHostname: (value) => {
++      setHostnameValue(value);
++      setConfirmed(false);
++    },
++    setTunnelName: (value) => {
++      setTunnelNameValue(value);
++      setConfirmed(false);
++    },
++    setConfirmed,
++  };
++  const exposure: ExposureState = {
++    unprotected: !status.exposureProtected,
++    acknowledged,
++    setAcknowledged,
++    ackRequired: isExposureAckError(status, rawActions.error),
++  };
++  // 开放性动作只有在用户勾了确认之后才带上 `acknowledgeExposure`，否则由后端 409 挡下。
++  const actions: TunnelActions = {
++    ...rawActions,
++    run: (req) => rawActions.run(withExposureAck(req, acknowledged)),
++  };
++
+   return (
+     <div className="flex w-full flex-col gap-4" data-testid="settings-remote-access-tab">
+-      <TunnelStatusCard status={tunnel.status} actions={actions} />
++      <TunnelStatusCard status={status} actions={actions} exposure={exposure} />
+       <TunnelWizard
+-        status={tunnel.status}
++        status={status}
+         actions={actions}
+         chosenMode={chosenMode}
+         onChooseMode={setChosenMode}
++        draft={draft}
+         isHub={isSelfHub(mode)}
+-        authDisabled={modeLoaded && mode?.mode === 'none'}
++        exposure={exposure}
+         onRestarted={refresh}
+       />
+     </div>
+diff --git a/apps/fe/src/pages/settings/remote-access/status-card.tsx b/apps/fe/src/pages/settings/remote-access/status-card.tsx
+index 0c102011..4440f85e 100644
+--- a/apps/fe/src/pages/settings/remote-access/status-card.tsx
++++ b/apps/fe/src/pages/settings/remote-access/status-card.tsx
+@@ -1,4 +1,4 @@
+-// 远程访问状态卡：状态徽标、公网地址、启停 / 移除 / 连通性检查，以及可折叠的 cloudflared 日志。
++// 远程访问状态卡：状态与 Access 徽标、公网地址、启停 / 移除 / 连通性检查，以及可折叠的 cloudflared 日志。
+ 
+ import type { TunnelStatusResponse } from '@tmex/shared';
+ import {
+@@ -14,14 +14,21 @@ import {
+ import { Badge } from '@tmex/ui/badge';
+ import { Button, buttonVariants } from '@tmex/ui/button';
+ import { Card, CardContent, CardHeader, CardTitle } from '@tmex/ui/card';
+-import { ExternalLink, Loader2, Play, Radar, Square, Trash2 } from 'lucide-react';
++import { ExternalLink, Loader2, Play, Radar, Square, Trash2, Unplug } from 'lucide-react';
+ import { useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { CopyButton } from '../nodes/copy-feedback';
+ import { SetupNotice } from '../nodes/setup/form-parts';
++import { type ExposureState, ExposureWarning } from './exposure';
+ import { DetailRow } from './step-shell';
+ import type { TunnelActions } from './tunnel-actions';
+-import { describeTunnelError, logTail, tunnelPill } from './tunnel-model';
++import {
++  accessPill,
++  describeTunnelError,
++  isExposureAckError,
++  logTail,
++  tunnelPill,
++} from './tunnel-model';
+ 
+ const PILL_VARIANT = {
+   notConfigured: 'outline',
+@@ -31,21 +38,32 @@ const PILL_VARIANT = {
+   error: 'destructive',
+ } as const;
+ 
++const ACCESS_PILL_VARIANT = {
++  notConfigured: 'outline',
++  notEnforced: 'secondary',
++  protected: 'default',
++} as const;
++
+ export function TunnelStatusCard({
+   status,
+   actions,
++  exposure,
+ }: {
+   status: TunnelStatusResponse;
+   actions: TunnelActions;
++  exposure: ExposureState;
+ }) {
+   const { t } = useTranslation();
+   const pill = tunnelPill(status);
++  const access = accessPill(status);
+   const configured = status.config.mode !== 'off';
++  const adopted = status.config.externallyManaged;
+   const stoppable = status.process.state === 'running' || status.process.state === 'starting';
+   const { busy, pending } = actions;
+   // 命名隧道的移除会连 Cloudflare 上的隧道一起删掉，不可撤销，必须二次确认。
+   const [confirmRemove, setConfirmRemove] = useState(false);
+   const remove = () => actions.run({ action: 'remove' });
++  const ackError = isExposureAckError(status, actions.error);
+ 
+   return (
+     <Card data-testid="remote-access-status">
+@@ -55,15 +73,31 @@ export function TunnelStatusCard({
+           <Badge variant={PILL_VARIANT[pill]} data-testid="remote-access-state">
+             {t(`settings.remoteAccess.state.${pill}`)}
+           </Badge>
++          <Badge variant={ACCESS_PILL_VARIANT[access]} data-testid="remote-access-access-state">
++            {t(`settings.remoteAccess.accessState.${access}`)}
++          </Badge>
++          {adopted && (
++            <Badge variant="secondary" data-testid="remote-access-managed">
++              {t('settings.remoteAccess.externallyManaged')}
++            </Badge>
++          )}
+         </CardTitle>
+       </CardHeader>
+       <CardContent className="space-y-3">
+-        {actions.error && (
++        {actions.error && !ackError && (
+           <SetupNotice tone="error" testId="remote-access-error">
+             {describeTunnelError(t, actions.error)}
+           </SetupNotice>
+         )}
+ 
++        {ackError && (
++          <ExposureWarning
++            exposure={{ ...exposure, ackRequired: true }}
++            id="remote-access-status-ack"
++            testId="remote-access-status-exposure"
++          />
++        )}
++
+         {status.process.state === 'error' && status.process.lastError && (
+           <SetupNotice tone="error" testId="remote-access-process-error">
+             {status.process.lastError}
+@@ -109,9 +143,25 @@ export function TunnelStatusCard({
+           </div>
+         )}
+ 
++        {adopted && (
++          <SetupNotice tone="info" testId="remote-access-managed-notice">
++            {t('settings.remoteAccess.externallyManagedNotice')}
++          </SetupNotice>
++        )}
++
++        {/* 接管来的隧道由系统服务拉起，tmex 这边的启停 / 移除会被后端 409 挡回来。 */}
++        {configured && !adopted && !stoppable && (
++          <ExposureWarning
++            exposure={exposure}
++            id="remote-access-start-ack"
++            testId="remote-access-start-exposure"
++            variant="compact"
++          />
++        )}
++
+         {configured && (
+           <div className="flex flex-wrap gap-2">
+-            {!stoppable && (
++            {!adopted && !stoppable && (
+               <Button
+                 type="button"
+                 size="sm"
+@@ -123,7 +173,7 @@ export function TunnelStatusCard({
+                 {t('settings.remoteAccess.actions.start')}
+               </Button>
+             )}
+-            {stoppable && (
++            {!adopted && stoppable && (
+               <Button
+                 type="button"
+                 size="sm"
+@@ -136,7 +186,7 @@ export function TunnelStatusCard({
+                 {t('settings.remoteAccess.actions.stop')}
+               </Button>
+             )}
+-            {status.process.state === 'running' && (
++            {(adopted || status.process.state === 'running') && (
+               <Button
+                 type="button"
+                 size="sm"
+@@ -149,17 +199,31 @@ export function TunnelStatusCard({
+                 {t('settings.remoteAccess.actions.check')}
+               </Button>
+             )}
+-            <Button
+-              type="button"
+-              size="sm"
+-              variant="destructive"
+-              disabled={busy}
+-              onClick={() => (status.config.mode === 'named' ? setConfirmRemove(true) : remove())}
+-              data-testid="remote-access-remove"
+-            >
+-              {pending === 'remove' ? <Loader2 className="animate-spin" /> : <Trash2 />}
+-              {t('settings.remoteAccess.actions.remove')}
+-            </Button>
++            {adopted ? (
++              <Button
++                type="button"
++                size="sm"
++                variant="outline"
++                disabled={busy}
++                onClick={remove}
++                data-testid="remote-access-release"
++              >
++                {pending === 'remove' ? <Loader2 className="animate-spin" /> : <Unplug />}
++                {t('settings.remoteAccess.actions.release')}
++              </Button>
++            ) : (
++              <Button
++                type="button"
++                size="sm"
++                variant="destructive"
++                disabled={busy}
++                onClick={() => (status.config.mode === 'named' ? setConfirmRemove(true) : remove())}
++                data-testid="remote-access-remove"
++              >
++                {pending === 'remove' ? <Loader2 className="animate-spin" /> : <Trash2 />}
++                {t('settings.remoteAccess.actions.remove')}
++              </Button>
++            )}
+           </div>
+         )}
+ 
+diff --git a/apps/fe/src/pages/settings/remote-access/step-shell.tsx b/apps/fe/src/pages/settings/remote-access/step-shell.tsx
+index 0b08867a..09206a55 100644
+--- a/apps/fe/src/pages/settings/remote-access/step-shell.tsx
++++ b/apps/fe/src/pages/settings/remote-access/step-shell.tsx
+@@ -1,5 +1,6 @@
+ // 远程访问向导的步骤外壳与几个小展示件。
+ 
++import { Badge } from '@tmex/ui/badge';
+ import { Check, Loader2 } from 'lucide-react';
+ import type { ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+@@ -12,6 +13,7 @@ export function WizardStepCard({
+   description,
+   state,
+   testId,
++  tag,
+   children,
+ }: {
+   index: number;
+@@ -19,6 +21,8 @@ export function WizardStepCard({
+   description?: string;
+   state: StepState;
+   testId: string;
++  /** 可选步骤的标签（推荐 / 可选）。 */
++  tag?: string;
+   children?: ReactNode;
+ }) {
+   return (
+@@ -33,7 +37,14 @@ export function WizardStepCard({
+         <StepMarker index={index} state={state} testId={`${testId}-marker`} />
+         <div className="min-w-0 flex-1 space-y-2">
+           <div className="space-y-0.5">
+-            <h3 className="text-sm font-medium">{title}</h3>
++            <h3 className="flex flex-wrap items-center gap-1.5 text-sm font-medium">
++              {title}
++              {tag && (
++                <Badge variant="secondary" data-testid={`${testId}-tag`}>
++                  {tag}
++                </Badge>
++              )}
++            </h3>
+             {description && <p className="text-xs text-muted-foreground">{description}</p>}
+           </div>
+           {children}
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts b/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts
+index 69cf8184..6f40752c 100644
+--- a/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts
+@@ -29,6 +29,7 @@ function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResp
+       tunnelName: null,
+       tunnelId: null,
+       autoStart: false,
++      externallyManaged: false,
+       originPort: 9883,
+     },
+     process: {
+@@ -39,6 +40,30 @@ function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResp
+       lastError: null,
+       restarts: 0,
+     },
++    access: {
++      hasCredentials: false,
++      accountId: null,
++      teamDomain: null,
++      configured: false,
++      appId: null,
++      aud: null,
++      hostname: null,
++      rules: [],
++      enforceJwt: true,
++      lastError: null,
++    },
++    external: {
++      detected: false,
++      source: null,
++      configPath: null,
++      tunnelId: null,
++      tunnelName: null,
++      hostnames: [],
++      hasOriginCert: false,
++      running: false,
++    },
++    loginEnforced: true,
++    exposureProtected: true,
+     job: null,
+     trustProxy: false,
+     configuredTrustProxy: false,
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts b/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
+index 835249bc..0a7634fd 100644
+--- a/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
+@@ -6,20 +6,24 @@ import type { TunnelStatusResponse } from '@tmex/shared';
+ import {
+   TUNNEL_ACTIVE_POLL_MS,
+   TUNNEL_IDLE_POLL_MS,
+-  currentWizardStep,
++  accessPill,
+   describeTunnelError,
+   effectiveMode,
+   isAuthRequiredError,
++  isExposingAction,
++  isExposureAckError,
+   isValidHostname,
+   isValidTunnelName,
+   jobStepKey,
+   logTail,
+-  stepState,
+   toTunnelError,
+   trustProxyRestartRequired,
+   tunnelErrorKey,
+   tunnelPill,
+   tunnelPollInterval,
++  withExposureAck,
++  wizardStepState,
++  wizardSteps,
+ } from './tunnel-model';
+ 
+ function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResponse {
+@@ -34,6 +38,7 @@ function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResp
+       tunnelName: null,
+       tunnelId: null,
+       autoStart: false,
++      externallyManaged: false,
+       originPort: 9883,
+     },
+     process: {
+@@ -44,6 +49,30 @@ function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResp
+       lastError: null,
+       restarts: 0,
+     },
++    access: {
++      hasCredentials: false,
++      accountId: null,
++      teamDomain: null,
++      configured: false,
++      appId: null,
++      aud: null,
++      hostname: null,
++      rules: [],
++      enforceJwt: true,
++      lastError: null,
++    },
++    external: {
++      detected: false,
++      source: null,
++      configPath: null,
++      tunnelId: null,
++      tunnelName: null,
++      hostnames: [],
++      hasOriginCert: false,
++      running: false,
++    },
++    loginEnforced: true,
++    exposureProtected: true,
+     job: null,
+     trustProxy: false,
+     configuredTrustProxy: false,
+@@ -69,6 +98,13 @@ describe('tunnelPill', () => {
+     );
+   });
+ 
++  test('接管来的隧道按探测到的运行态显示，不看 tmex 自己的进程', () => {
++    const config = { ...status().config, mode: 'named' as const, externallyManaged: true };
++    const external = { ...status().external, detected: true, running: true };
++    expect(tunnelPill(status({ config, external }))).toBe('running');
++    expect(tunnelPill(status({ config }))).toBe('stopped');
++  });
++
+   test('进程报错优先于「未配置」：移除失败后不能显示成一片干净', () => {
+     expect(
+       tunnelPill(
+@@ -78,21 +114,34 @@ describe('tunnelPill', () => {
+   });
+ });
+ 
+-describe('currentWizardStep / effectiveMode', () => {
+-  test('没装 cloudflared 一律停在第 1 步', () => {
+-    const s = status({ binary: { installed: false, version: null, path: null, source: null } });
+-    expect(currentWizardStep(s, 'named')).toBe(1);
++describe('wizardSteps / effectiveMode', () => {
++  test('命名隧道七步：访问控制排在主机名之后、创建之前', () => {
++    expect(
++      wizardSteps({ status: status(), chosenMode: 'named', hostnameConfirmed: false })
++    ).toEqual(['install', 'mode', 'login', 'hostname', 'access', 'create', 'proxy']);
++  });
++
++  test('临时隧道没有登录 / 主机名 / 访问控制', () => {
++    expect(
++      wizardSteps({ status: status(), chosenMode: 'quick', hostnameConfirmed: false })
++    ).toEqual(['install', 'mode', 'quick', 'proxy']);
+   });
+ 
+-  test('装好但没选方式停在第 2 步，选了方式进第 3 步', () => {
+-    expect(currentWizardStep(status(), null)).toBe(2);
+-    expect(currentWizardStep(status(), 'quick')).toBe(3);
++  test('还没选方式时第 3 步只是占位', () => {
++    expect(wizardSteps({ status: status(), chosenMode: null, hostnameConfirmed: false })).toEqual([
++      'install',
++      'mode',
++      'tunnel',
++      'proxy',
++    ]);
+   });
+ 
+-  test('已经建好隧道直接进第 4 步，方式以服务端为准', () => {
++  test('已经建好隧道后方式以服务端为准', () => {
+     const s = status({ config: { ...status().config, mode: 'named', hostname: 'a.example.com' } });
+-    expect(currentWizardStep(s, 'quick')).toBe(4);
+     expect(effectiveMode(s, 'quick')).toBe('named');
++    expect(wizardSteps({ status: s, chosenMode: 'quick', hostnameConfirmed: false })).toContain(
++      'access'
++    );
+   });
+ 
+   test('未配置时方式取本地选择', () => {
+@@ -101,11 +150,129 @@ describe('currentWizardStep / effectiveMode', () => {
+   });
+ });
+ 
+-describe('stepState', () => {
+-  test('当前步高亮、之前的步骤打勾、之后的步骤待办', () => {
+-    expect(stepState(1, 3)).toBe('done');
+-    expect(stepState(3, 3)).toBe('current');
+-    expect(stepState(4, 3)).toBe('todo');
++describe('wizardStepState', () => {
++  const ctx = (
++    s: TunnelStatusResponse,
++    chosenMode: 'named' | 'quick' | null,
++    hostnameConfirmed = false
++  ) => ({ status: s, chosenMode, hostnameConfirmed });
++
++  test('没装 cloudflared 时停在安装步', () => {
++    const s = status({ binary: { installed: false, version: null, path: null, source: null } });
++    expect(wizardStepState('install', ctx(s, 'named'))).toBe('current');
++    expect(wizardStepState('mode', ctx(s, 'named'))).toBe('todo');
++  });
++
++  test('装好但没选方式时停在方式步', () => {
++    expect(wizardStepState('install', ctx(status(), null))).toBe('done');
++    expect(wizardStepState('mode', ctx(status(), null))).toBe('current');
++  });
++
++  test('命名隧道：登录 → 主机名 → 创建依次推进', () => {
++    const notLoggedIn = status();
++    expect(wizardStepState('login', ctx(notLoggedIn, 'named'))).toBe('current');
++    expect(wizardStepState('hostname', ctx(notLoggedIn, 'named'))).toBe('todo');
++    expect(wizardStepState('create', ctx(notLoggedIn, 'named'))).toBe('todo');
++
++    const loggedIn = status({ auth: { loggedIn: true, loginUrl: null } });
++    expect(wizardStepState('login', ctx(loggedIn, 'named'))).toBe('done');
++    expect(wizardStepState('hostname', ctx(loggedIn, 'named'))).toBe('current');
++    expect(wizardStepState('create', ctx(loggedIn, 'named'))).toBe('todo');
++
++    expect(wizardStepState('hostname', ctx(loggedIn, 'named', true))).toBe('done');
++    expect(wizardStepState('create', ctx(loggedIn, 'named', true))).toBe('current');
++  });
++
++  test('访问控制是可选步：没配就一直是待办，配了才打勾，绝不抢当前步', () => {
++    const loggedIn = status({ auth: { loggedIn: true, loginUrl: null } });
++    expect(wizardStepState('access', ctx(loggedIn, 'named', true))).toBe('todo');
++    const configured = status({
++      auth: { loggedIn: true, loginUrl: null },
++      access: { ...status().access, configured: true },
++    });
++    expect(wizardStepState('access', ctx(configured, 'named', true))).toBe('done');
++  });
++
++  test('隧道建好后创建步打勾、反向代理步成为当前步', () => {
++    const s = status({ config: { ...status().config, mode: 'named', hostname: 'a.example.com' } });
++    expect(wizardStepState('create', ctx(s, 'named'))).toBe('done');
++    expect(wizardStepState('hostname', ctx(s, 'named'))).toBe('done');
++    expect(wizardStepState('proxy', ctx(s, 'named'))).toBe('current');
++  });
++
++  test('接管系统隧道时安装与登录直接算完成', () => {
++    const s = status({
++      binary: { installed: false, version: null, path: null, source: null },
++      config: { ...status().config, mode: 'named', externallyManaged: true },
++    });
++    expect(wizardStepState('install', ctx(s, 'named'))).toBe('done');
++    expect(wizardStepState('login', ctx(s, 'named'))).toBe('done');
++  });
++
++  test('临时隧道启动前是当前步，启动后打勾', () => {
++    expect(wizardStepState('quick', ctx(status(), 'quick'))).toBe('current');
++    const started = status({ config: { ...status().config, mode: 'quick' } });
++    expect(wizardStepState('quick', ctx(started, 'quick'))).toBe('done');
++  });
++});
++
++describe('accessPill', () => {
++  test('未配置 / 已配置未强制 / 已保护', () => {
++    expect(accessPill(status())).toBe('notConfigured');
++    expect(
++      accessPill(status({ access: { ...status().access, configured: true, enforceJwt: false } }))
++    ).toBe('notEnforced');
++    expect(
++      accessPill(status({ access: { ...status().access, configured: true, enforceJwt: true } }))
++    ).toBe('protected');
++  });
++});
++
++describe('暴露确认', () => {
++  test('只有会把 tmex 开放出去的动作才需要确认', () => {
++    expect(isExposingAction({ action: 'quick_start' })).toBe(true);
++    expect(isExposingAction({ action: 'start' })).toBe(true);
++    expect(isExposingAction({ action: 'create', hostname: 'a.example.com' })).toBe(true);
++    expect(isExposingAction({ action: 'set_auto_start', autoStart: true })).toBe(true);
++    // 关掉自启动是收敛，不需要确认。
++    expect(isExposingAction({ action: 'set_auto_start', autoStart: false })).toBe(false);
++    expect(isExposingAction({ action: 'stop' })).toBe(false);
++    expect(isExposingAction({ action: 'install' })).toBe(false);
++  });
++
++  test('没勾确认时请求不带 acknowledgeExposure', () => {
++    expect(withExposureAck({ action: 'quick_start' }, false)).toEqual({ action: 'quick_start' });
++    expect(withExposureAck({ action: 'quick_start' }, true)).toEqual({
++      action: 'quick_start',
++      acknowledgeExposure: true,
++    });
++  });
++
++  test('非开放性动作即使勾了也不加这个字段', () => {
++    expect(withExposureAck({ action: 'stop' }, true)).toEqual({ action: 'stop' });
++  });
++
++  test('动作错误或 job 错误任一为 exposure_ack_required 都要弹确认', () => {
++    expect(isExposureAckError(status(), null)).toBe(false);
++    expect(isExposureAckError(status(), { code: 'exposure_ack_required', message: 'ack' })).toBe(
++      true
++    );
++    expect(
++      isExposureAckError(
++        status({
++          job: {
++            id: 'j1',
++            kind: 'start',
++            state: 'error',
++            step: null,
++            error: { code: 'exposure_ack_required', message: 'ack' },
++            startedAt: '2026-08-30T00:00:00.000Z',
++            finishedAt: '2026-08-30T00:00:01.000Z',
++          },
++        }),
++        null
++      )
++    ).toBe(true);
+   });
+ });
+ 
+@@ -162,6 +329,10 @@ describe('jobStepKey', () => {
+       'start',
+       'check',
+       'ok',
++      'create_app',
++      'policy',
++      'delete_app',
++      'sync',
+     ]) {
+       expect(jobStepKey(step)).toBe(`settings.remoteAccess.jobStep.${step}`);
+     }
+@@ -223,6 +394,18 @@ describe('错误映射', () => {
+     );
+   });
+ 
++  test('Access API 失败带上服务端的原始描述', () => {
++    expect(describeTunnelError(t, { code: 'access_api_failed', message: 'token invalid' })).toBe(
++      'settings.remoteAccess.errors.access_api_failed:{"message":"token invalid"}'
++    );
++  });
++
++  test('exposure_ack_required 有自己的文案', () => {
++    expect(tunnelErrorKey('exposure_ack_required')).toBe(
++      'settings.remoteAccess.errors.exposure_ack_required'
++    );
++  });
++
+   test('未知码退化成带原始 message 的兜底文案', () => {
+     expect(tunnelErrorKey('nope')).toBeNull();
+     expect(describeTunnelError(t, { code: 'unknown', message: 'boom' })).toBe(
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-model.ts b/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
+index 7ae02ffe..315430c5 100644
+--- a/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
+@@ -2,7 +2,12 @@
+ // 全部与 React 无关，便于脱离 DOM 直接测。
+ 
+ import { TunnelApiError } from '@tmex/api-client/local/tunnel-api';
+-import type { TunnelErrorCode, TunnelMode, TunnelStatusResponse } from '@tmex/shared';
++import type {
++  TunnelActionRequest,
++  TunnelErrorCode,
++  TunnelMode,
++  TunnelStatusResponse,
++} from '@tmex/shared';
+ 
+ export type TunnelPill = 'notConfigured' | 'stopped' | 'starting' | 'running' | 'error';
+ 
+@@ -13,24 +18,58 @@ export type TunnelPill = 'notConfigured' | 'stopped' | 'starting' | 'running' |
+ export function tunnelPill(status: TunnelStatusResponse): TunnelPill {
+   if (status.process.state === 'error') return 'error';
+   if (status.config.mode === 'off') return 'notConfigured';
++  // 接管来的隧道由系统服务跑，tmex 侧没有进程，运行态以探测结果为准。
++  if (status.config.externallyManaged) return status.external.running ? 'running' : 'stopped';
+   if (status.process.state === 'running') return 'running';
+   if (status.process.state === 'starting') return 'starting';
+   return 'stopped';
+ }
+ 
+-export type WizardStep = 1 | 2 | 3 | 4;
++/** Access 徽标：未配置 / 已配置但网关不校验令牌 / 已配置且强制校验。 */
++export type AccessPill = 'notConfigured' | 'notEnforced' | 'protected';
+ 
+-/**
+- * 当前所处步骤。`chosenMode` 是本地选择（尚未落库），只在还没配置出隧道时参与判断：
+- * 一旦 `config.mode` 有值，方式就以服务端为准。
+- */
+-export function currentWizardStep(
+-  status: TunnelStatusResponse,
+-  chosenMode: TunnelMode | null
+-): WizardStep {
+-  if (!status.binary.installed) return 1;
+-  if (status.config.mode !== 'off') return 4;
+-  return chosenMode === 'quick' || chosenMode === 'named' ? 3 : 2;
++export function accessPill(status: TunnelStatusResponse): AccessPill {
++  if (!status.access.configured) return 'notConfigured';
++  return status.access.enforceJwt ? 'protected' : 'notEnforced';
++}
++
++export type WizardStepId =
++  | 'install'
++  | 'mode'
++  | 'login'
++  | 'hostname'
++  | 'access'
++  | 'create'
++  | 'quick'
++  | 'tunnel'
++  | 'proxy';
++
++export interface WizardContext {
++  status: TunnelStatusResponse;
++  /** 本地选择的方式（尚未落库） */
++  chosenMode: TunnelMode | null;
++  /** 主机名步骤已在本地确认——契约里没有单独保存主机名的动作，只能由向导自己记。 */
++  hostnameConfirmed: boolean;
++}
++
++const NAMED_STEPS: WizardStepId[] = [
++  'install',
++  'mode',
++  'login',
++  'hostname',
++  'access',
++  'create',
++  'proxy',
++];
++const QUICK_STEPS: WizardStepId[] = ['install', 'mode', 'quick', 'proxy'];
++const UNDECIDED_STEPS: WizardStepId[] = ['install', 'mode', 'tunnel', 'proxy'];
++
++/** 步骤序列随方式变化：临时隧道没有登录 / 主机名 / 访问控制。 */
++export function wizardSteps(ctx: WizardContext): WizardStepId[] {
++  const mode = effectiveMode(ctx.status, ctx.chosenMode);
++  if (mode === 'named') return NAMED_STEPS;
++  if (mode === 'quick') return QUICK_STEPS;
++  return UNDECIDED_STEPS;
+ }
+ 
+ /** 步骤 3 展示哪条路径：已配置时以服务端为准，否则用本地选择。 */
+@@ -44,9 +83,45 @@ export function effectiveMode(
+ 
+ export type StepState = 'todo' | 'current' | 'done';
+ 
+-export function stepState(step: WizardStep, current: WizardStep): StepState {
+-  if (step === current) return 'current';
+-  return step < current ? 'done' : 'todo';
++function tunnelReady(status: TunnelStatusResponse): boolean {
++  return status.binary.installed || status.config.externallyManaged;
++}
++
++/**
++ * 每一步单独判定，不按下标推：访问控制是可选步骤，永远不会成为「当前」，
++ * 也不应该因为排在创建之前就被算成已完成。
++ */
++export function wizardStepState(step: WizardStepId, ctx: WizardContext): StepState {
++  const { status, hostnameConfirmed } = ctx;
++  const mode = effectiveMode(status, ctx.chosenMode);
++  const ready = tunnelReady(status);
++  const created = status.config.mode === 'named';
++
++  switch (step) {
++    case 'install':
++      return ready ? 'done' : 'current';
++    case 'mode':
++      if (!ready) return 'todo';
++      return mode === 'off' ? 'current' : 'done';
++    case 'tunnel':
++      return 'todo';
++    case 'quick':
++      if (!ready || mode !== 'quick') return 'todo';
++      return status.config.mode === 'quick' ? 'done' : 'current';
++    case 'login':
++      if (!ready || mode !== 'named') return 'todo';
++      return status.auth.loggedIn || created ? 'done' : 'current';
++    case 'hostname':
++      if (wizardStepState('login', ctx) !== 'done') return 'todo';
++      return created || hostnameConfirmed ? 'done' : 'current';
++    case 'access':
++      return status.access.configured ? 'done' : 'todo';
++    case 'create':
++      if (created) return 'done';
++      return wizardStepState('hostname', ctx) === 'done' ? 'current' : 'todo';
++    case 'proxy':
++      return status.config.mode === 'off' ? 'todo' : 'current';
++  }
+ }
+ 
+ const HOSTNAME_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+@@ -59,7 +134,6 @@ export function isValidHostname(value: string): boolean {
+   return labels.every((label) => label.length <= 63 && HOSTNAME_LABEL.test(label));
+ }
+ 
+-/** 与后端 `manager.ts` 里 `step(...)` 实际发出的标识一一对应。 */
+ /**
+  * 隧道名称：与后端一致的 `^[a-z0-9](?:[a-z0-9_-]{0,62})$`。名称会直接拼成凭证文件名，
+  * 斜杠与 `..` 必须挡在外面；这里只做即时反馈，真正的把关在后端。
+@@ -70,6 +144,7 @@ export function isValidTunnelName(value: string): boolean {
+   return TUNNEL_NAME.test(value);
+ }
+ 
++/** 与后端 `manager.ts` 里 `step(...)` 实际发出的标识一一对应。 */
+ const JOB_STEPS = new Set([
+   'download',
+   'extract',
+@@ -83,6 +158,10 @@ const JOB_STEPS = new Set([
+   'start',
+   'check',
+   'ok',
++  'create_app',
++  'policy',
++  'delete_app',
++  'sync',
+ ]);
+ 
+ /** 已知进度标识返回文案键；未知返回 null（由调用方原样展示服务端给的标识）。 */
+@@ -101,6 +180,8 @@ const ERROR_CODES = new Set<TunnelErrorCode>([
+   'invalid_hostname',
+   'tunnel_exists',
+   'dns_route_failed',
++  'access_api_failed',
++  'exposure_ack_required',
+   'process_failed',
+   'busy',
+   'not_configured',
+@@ -108,6 +189,9 @@ const ERROR_CODES = new Set<TunnelErrorCode>([
+   'auth_required',
+ ]);
+ 
++/** 带 `{{message}}` 插值的错误文案：服务端的原始描述比通用句子更有用。 */
++const ERROR_CODES_WITH_MESSAGE = new Set<TunnelErrorCode>(['access_api_failed']);
++
+ export function tunnelErrorKey(code: string): string | null {
+   return ERROR_CODES.has(code as TunnelErrorCode) ? `${ERROR_PREFIX}${code}` : null;
+ }
+@@ -129,8 +213,9 @@ type Translate = (key: string, options?: Record<string, unknown>) => string;
+ /** 已知错误码走本地化文案；未知码退化成「操作失败 + 服务端 message」。 */
+ export function describeTunnelError(t: Translate, error: TunnelError): string {
+   const key = tunnelErrorKey(error.code);
+-  if (key) return t(key);
+-  return t(`${ERROR_PREFIX}unknown`, { message: error.message });
++  if (!key) return t(`${ERROR_PREFIX}unknown`, { message: error.message });
++  if (ERROR_CODES_WITH_MESSAGE.has(error.code)) return t(key, { message: error.message });
++  return t(key);
+ }
+ 
+ /**
+@@ -141,7 +226,7 @@ export function trustProxyRestartRequired(status: TunnelStatusResponse): boolean
+   return status.restartRequired || status.configuredTrustProxy !== status.trustProxy;
+ }
+ 
+-/** 本机没开登录时后端会拒绝创建隧道（`auth_required`）：动作错误与 job 错误都要认。 */
++/** 旧后端在本机未启用登录时会直接拒绝创建隧道（`auth_required`）：动作错误与 job 错误都要认。 */
+ export function isAuthRequiredError(
+   status: TunnelStatusResponse,
+   error: TunnelError | null
+@@ -149,6 +234,32 @@ export function isAuthRequiredError(
+   return error?.code === 'auth_required' || status.job?.error?.code === 'auth_required';
+ }
+ 
++type ExposingAction = Extract<TunnelActionRequest, { acknowledgeExposure?: boolean }>;
++
++/** 会把 tmex 开放到公网的动作：未受保护时必须带上用户的显式确认。 */
++export function isExposingAction(req: TunnelActionRequest): req is ExposingAction {
++  if (req.action === 'set_auto_start') return req.autoStart;
++  return req.action === 'create' || req.action === 'quick_start' || req.action === 'start';
++}
++
++/** 只有用户勾了「我了解风险」才带上 `acknowledgeExposure`，否则由后端 409 挡下。 */
++export function withExposureAck(
++  req: TunnelActionRequest,
++  acknowledged: boolean
++): TunnelActionRequest {
++  if (!acknowledged || !isExposingAction(req)) return req;
++  return { ...req, acknowledgeExposure: true };
++}
++
++export function isExposureAckError(
++  status: TunnelStatusResponse,
++  error: TunnelError | null
++): boolean {
++  return (
++    error?.code === 'exposure_ack_required' || status.job?.error?.code === 'exposure_ack_required'
++  );
++}
++
+ export const TUNNEL_ACTIVE_POLL_MS = 2000;
+ export const TUNNEL_IDLE_POLL_MS = 10_000;
+ 
+diff --git a/apps/fe/src/pages/settings/remote-access/wizard.tsx b/apps/fe/src/pages/settings/remote-access/wizard.tsx
+index 4be24d9c..7443271d 100644
+--- a/apps/fe/src/pages/settings/remote-access/wizard.tsx
++++ b/apps/fe/src/pages/settings/remote-access/wizard.tsx
+@@ -1,24 +1,31 @@
+-// 远程访问向导：安装 cloudflared → 选择方式 → 建立隧道 → 反向代理信任。
++// 远程访问向导。步骤序列随方式变化：
++//   命名隧道 安装 → 方式 → 登录 → 主机名 → 访问控制 → 创建并启动 → 反向代理信任
++//   临时隧道 安装 → 方式 → 启动 → 反向代理信任
+ 
+ import type { TunnelMode, TunnelStatusResponse } from '@tmex/shared';
+ import { Button } from '@tmex/ui/button';
+ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@tmex/ui/card';
+ import { Cloud, Download, Loader2, Rocket, RotateCcw, Zap } from 'lucide-react';
+-import type { ReactNode } from 'react';
++import { type ReactNode, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ import { useRestartGateway } from '../nodes/restart/use-restart-now';
+ import { SetupNotice, SwitchRow } from '../nodes/setup/form-parts';
+-import { NamedTunnelStep } from './named-step';
++import { accessStepTag } from './access-model';
++import { AccessStep } from './access-step';
++import { type ExposureState, ExposureWarning } from './exposure';
++import { ExternalTunnelCard } from './external-card';
++import { CreateStep, HostnameStep, LoginStep, type NamedDraft } from './named-step';
+ import { DetailRow, JobProgress, WizardStepCard } from './step-shell';
+ import type { TunnelActions } from './tunnel-actions';
+ import {
+-  currentWizardStep,
++  type WizardStepId,
+   describeTunnelError,
+   effectiveMode,
+   isAuthRequiredError,
+-  stepState,
+   trustProxyRestartRequired,
++  wizardStepState,
++  wizardSteps,
+ } from './tunnel-model';
+ 
+ export interface TunnelWizardProps {
+@@ -26,9 +33,9 @@ export interface TunnelWizardProps {
+   actions: TunnelActions;
+   chosenMode: TunnelMode | null;
+   onChooseMode: (mode: TunnelMode) => void;
++  draft: NamedDraft;
+   isHub: boolean;
+-  /** 本机登录已关闭（`/api/auth/mode` 报 `none`）：暴露到公网前必须先开。 */
+-  authDisabled: boolean;
++  exposure: ExposureState;
+   onRestarted: () => void;
+ }
+ 
+@@ -37,14 +44,19 @@ export function TunnelWizard({
+   actions,
+   chosenMode,
+   onChooseMode,
++  draft,
+   isHub,
+-  authDisabled,
++  exposure,
+   onRestarted,
+ }: TunnelWizardProps) {
+   const { t } = useTranslation();
+-  const current = currentWizardStep(status, chosenMode);
+-  const mode = effectiveMode(status, chosenMode);
+-  const authRequired = authDisabled || isAuthRequiredError(status, actions.error);
++  const [externalDismissed, setExternalDismissed] = useState(false);
++
++  const ctx = { status, chosenMode, hostnameConfirmed: draft.confirmed };
++  const steps = wizardSteps(ctx);
++  const authRequired = isAuthRequiredError(status, actions.error);
++  const showExternal =
++    status.external.detected && status.config.mode === 'off' && !externalDismissed;
+ 
+   return (
+     <Card data-testid="remote-access-wizard">
+@@ -53,77 +65,157 @@ export function TunnelWizard({
+         <CardDescription>{t('settings.remoteAccess.description')}</CardDescription>
+       </CardHeader>
+       <CardContent className="space-y-3">
+-        <WizardStepCard
+-          index={1}
+-          testId="remote-access-step-install"
+-          state={stepState(1, current)}
+-          title={t('settings.remoteAccess.steps.install.title')}
+-          description={t('settings.remoteAccess.steps.install.description')}
+-        >
+-          <InstallStep status={status} actions={actions} />
+-        </WizardStepCard>
+-
+-        {authRequired && (
+-          <SetupNotice tone="warning" testId="remote-access-auth-required">
+-            <p>{t('settings.remoteAccess.authRequired.notice')}</p>
+-            <Link className="text-primary underline-offset-4 hover:underline" to="?tab=nodes">
+-              {t('settings.remoteAccess.authRequired.link')}
+-            </Link>
+-          </SetupNotice>
+-        )}
+-
+-        <WizardStepCard
+-          index={2}
+-          testId="remote-access-step-mode"
+-          state={stepState(2, current)}
+-          title={t('settings.remoteAccess.steps.mode.title')}
+-          description={t('settings.remoteAccess.steps.mode.description')}
+-        >
+-          <ModeChooser
+-            selected={mode}
+-            locked={status.config.mode !== 'off'}
+-            disabled={actions.busy || !status.binary.installed}
+-            onSelect={onChooseMode}
++        {showExternal && (
++          <ExternalTunnelCard
++            status={status}
++            actions={actions}
++            onDismiss={() => setExternalDismissed(true)}
+           />
+-        </WizardStepCard>
+-
+-        <WizardStepCard
+-          index={3}
+-          testId="remote-access-step-tunnel"
+-          state={stepState(3, current)}
+-          title={t(`settings.remoteAccess.steps.${mode === 'off' ? 'tunnel' : mode}.title`)}
+-          description={t(
+-            `settings.remoteAccess.steps.${mode === 'off' ? 'tunnel' : mode}.description`
+-          )}
+-        >
+-          {mode === 'off' ? (
+-            <p
+-              className="text-xs text-muted-foreground"
+-              data-testid="remote-access-step-tunnel-idle"
+-            >
+-              {t('settings.remoteAccess.steps.mode.pending')}
+-            </p>
+-          ) : mode === 'named' ? (
+-            <NamedTunnelStep status={status} actions={actions} isHub={isHub} />
+-          ) : (
+-            <QuickTunnelStep status={status} actions={actions} />
+-          )}
+-        </WizardStepCard>
++        )}
+ 
+-        <WizardStepCard
+-          index={4}
+-          testId="remote-access-step-proxy"
+-          state={stepState(4, current)}
+-          title={t('settings.remoteAccess.steps.proxy.title')}
+-          description={t('settings.remoteAccess.steps.proxy.description')}
+-        >
+-          <ProxyStep status={status} actions={actions} onRestarted={onRestarted} />
+-        </WizardStepCard>
++        {steps.map((step, index) => (
++          <StepSlot
++            key={step}
++            step={step}
++            index={index + 1}
++            state={wizardStepState(step, ctx)}
++            status={status}
++          >
++            {step === 'mode' && authRequired && (
++              <SetupNotice tone="warning" testId="remote-access-auth-required">
++                <p>{t('settings.remoteAccess.authRequired.notice')}</p>
++                <Link className="text-primary underline-offset-4 hover:underline" to="?tab=nodes">
++                  {t('settings.remoteAccess.authRequired.link')}
++                </Link>
++              </SetupNotice>
++            )}
++            {step === 'mode' && (
++              <ExposureWarning
++                exposure={exposure}
++                id="remote-access-mode-ack"
++                testId="remote-access-exposure"
++              />
++            )}
++            <StepContent
++              step={step}
++              status={status}
++              actions={actions}
++              draft={draft}
++              isHub={isHub}
++              exposure={exposure}
++              chosenMode={chosenMode}
++              onChooseMode={onChooseMode}
++              onRestarted={onRestarted}
++            />
++          </StepSlot>
++        ))}
+       </CardContent>
+     </Card>
+   );
+ }
+ 
++function StepSlot({
++  step,
++  index,
++  state,
++  status,
++  children,
++}: {
++  step: WizardStepId;
++  index: number;
++  state: 'todo' | 'current' | 'done';
++  status: TunnelStatusResponse;
++  children: ReactNode;
++}) {
++  const { t } = useTranslation();
++  return (
++    <WizardStepCard
++      index={index}
++      testId={`remote-access-step-${step}`}
++      state={state}
++      title={t(`settings.remoteAccess.steps.${step}.title`)}
++      description={t(`settings.remoteAccess.steps.${step}.description`)}
++      tag={
++        step === 'access'
++          ? t(`settings.remoteAccess.access.tag.${accessStepTag(status)}`)
++          : undefined
++      }
++    >
++      {children}
++    </WizardStepCard>
++  );
++}
++
++function StepContent({
++  step,
++  status,
++  actions,
++  draft,
++  isHub,
++  exposure,
++  chosenMode,
++  onChooseMode,
++  onRestarted,
++}: {
++  step: WizardStepId;
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  draft: NamedDraft;
++  isHub: boolean;
++  exposure: ExposureState;
++  chosenMode: TunnelMode | null;
++  onChooseMode: (mode: TunnelMode) => void;
++  onRestarted: () => void;
++}) {
++  const { t } = useTranslation();
++  switch (step) {
++    case 'install':
++      return <InstallStep status={status} actions={actions} />;
++    case 'mode':
++      return (
++        <ModeChooser
++          selected={effectiveMode(status, chosenMode)}
++          locked={status.config.mode !== 'off'}
++          disabled={actions.busy || !status.binary.installed}
++          onSelect={onChooseMode}
++        />
++      );
++    case 'tunnel':
++      return (
++        <p className="text-xs text-muted-foreground" data-testid="remote-access-step-tunnel-idle">
++          {t('settings.remoteAccess.steps.mode.pending')}
++        </p>
++      );
++    case 'quick':
++      return <QuickTunnelStep status={status} actions={actions} exposure={exposure} />;
++    case 'login':
++      return <LoginStep status={status} actions={actions} />;
++    case 'hostname':
++      return <HostnameStep status={status} actions={actions} draft={draft} isHub={isHub} />;
++    case 'access':
++      return <AccessStep status={status} actions={actions} />;
++    case 'create':
++      return (
++        <CreateStep
++          status={status}
++          actions={actions}
++          draft={draft}
++          isHub={isHub}
++          exposure={exposure}
++        />
++      );
++    case 'proxy':
++      return (
++        <ProxyStep
++          status={status}
++          actions={actions}
++          exposure={exposure}
++          onRestarted={onRestarted}
++        />
++      );
++  }
++}
++
+ function InstallStep({
+   status,
+   actions,
+@@ -136,7 +228,7 @@ function InstallStep({
+   const installing = job?.kind === 'install' && job.state === 'running';
+   const installFailed = job?.kind === 'install' && job.state === 'error' && job.error !== null;
+ 
+-  if (!status.supported) {
++  if (!status.supported && !status.config.externallyManaged) {
+     return (
+       <SetupNotice tone="warning" testId="remote-access-unsupported">
+         {t('settings.remoteAccess.unsupported', { platform: status.platform })}
+@@ -164,6 +256,14 @@ function InstallStep({
+     );
+   }
+ 
++  if (status.config.externallyManaged) {
++    return (
++      <SetupNotice tone="info" testId="remote-access-install-skipped">
++        {t('settings.remoteAccess.steps.install.skipped')}
++      </SetupNotice>
++    );
++  }
++
+   return (
+     <div className="space-y-2">
+       {installFailed && job.error && (
+@@ -272,9 +372,11 @@ function ModeCard({
+ function QuickTunnelStep({
+   status,
+   actions,
++  exposure,
+ }: {
+   status: TunnelStatusResponse;
+   actions: TunnelActions;
++  exposure: ExposureState;
+ }) {
+   const { t } = useTranslation();
+   const job = status.job;
+@@ -293,16 +395,24 @@ function QuickTunnelStep({
+       ) : starting ? (
+         <JobProgress step={job.step} testId="remote-access-quick-progress" />
+       ) : (
+-        <Button
+-          type="button"
+-          size="sm"
+-          disabled={actions.busy || !status.binary.installed}
+-          onClick={() => actions.run({ action: 'quick_start' })}
+-          data-testid="remote-access-quick-start"
+-        >
+-          {actions.pending === 'quick_start' ? <Loader2 className="animate-spin" /> : <Rocket />}
+-          {t('settings.remoteAccess.actions.quickStart')}
+-        </Button>
++        <>
++          <ExposureWarning
++            exposure={exposure}
++            id="remote-access-quick-ack"
++            testId="remote-access-quick-exposure"
++            variant="compact"
++          />
++          <Button
++            type="button"
++            size="sm"
++            disabled={actions.busy || !status.binary.installed}
++            onClick={() => actions.run({ action: 'quick_start' })}
++            data-testid="remote-access-quick-start"
++          >
++            {actions.pending === 'quick_start' ? <Loader2 className="animate-spin" /> : <Rocket />}
++            {t('settings.remoteAccess.actions.quickStart')}
++          </Button>
++        </>
+       )}
+     </div>
+   );
+@@ -311,10 +421,12 @@ function QuickTunnelStep({
+ function ProxyStep({
+   status,
+   actions,
++  exposure,
+   onRestarted,
+ }: {
+   status: TunnelStatusResponse;
+   actions: TunnelActions;
++  exposure: ExposureState;
+   onRestarted: () => void;
+ }) {
+   const { t } = useTranslation();
+@@ -343,14 +455,29 @@ function ProxyStep({
+       >
+         {t(`settings.remoteAccess.steps.proxy.trustProxyState.${status.trustProxy ? 'on' : 'off'}`)}
+       </DetailRow>
+-      <SwitchRow
+-        id="remote-access-auto-start"
+-        label={t('settings.remoteAccess.steps.proxy.autoStart')}
+-        hint={t('settings.remoteAccess.steps.proxy.autoStartHint')}
+-        checked={status.config.autoStart}
+-        disabled={actions.busy}
+-        onCheckedChange={(checked) => actions.run({ action: 'set_auto_start', autoStart: checked })}
+-      />
++
++      {!status.config.externallyManaged && (
++        <>
++          <SwitchRow
++            id="remote-access-auto-start"
++            label={t('settings.remoteAccess.steps.proxy.autoStart')}
++            hint={t('settings.remoteAccess.steps.proxy.autoStartHint')}
++            checked={status.config.autoStart}
++            disabled={actions.busy}
++            onCheckedChange={(checked) =>
++              actions.run({ action: 'set_auto_start', autoStart: checked })
++            }
++          />
++          {!status.config.autoStart && (
++            <ExposureWarning
++              exposure={exposure}
++              id="remote-access-auto-start-ack"
++              testId="remote-access-auto-start-exposure"
++              variant="compact"
++            />
++          )}
++        </>
++      )}
+ 
+       {restartRequired && (
+         <div
+diff --git a/apps/fe/tests/mesh-login.spec.ts b/apps/fe/tests/mesh-login.spec.ts
+index 8af94b97..68735bb2 100644
+--- a/apps/fe/tests/mesh-login.spec.ts
++++ b/apps/fe/tests/mesh-login.spec.ts
+@@ -1,4 +1,5 @@
+ import { expect, test } from '@playwright/test';
++import { sidebarDeviceVisibilityKey } from '@tmex/stores';
+ import {
+   type MeshState,
+   createDeviceOnNode,
+@@ -18,7 +19,9 @@ test.beforeAll(() => {
+   state = readMeshState();
+ });
+ 
+-test('mesh: password login lists the hub self node and the joined node', async ({ page }) => {
++test('mesh: sidebar shows the hub self node; other nodes only once a device is enabled', async ({
++  page,
++}) => {
+   await loginWithPassword(page, state);
+ 
+   const nodeList = page.getByTestId('sidebar-node-list');
+@@ -26,13 +29,8 @@ test('mesh: password login lists the hub self node and the joined node', async (
+ 
+   // entry（hub）在侧边栏用 `self` 作为 runtime node id，远端 node 用真实 node id。
+   await expect(page.getByTestId('sidebar-node-header-self')).toBeVisible();
+-  await expect(page.getByTestId(`sidebar-node-header-${state.remoteNodeId}`)).toBeVisible();
+-  // 徽标 title 是 `<展示名> · <nodeId>`。以 hub 为 entry 时 /api/mesh/nodes 的 name 取自
+-  // peers 表，刚 join 完那一段时间里会退化成 nodeId，所以断言只锚定 nodeId。
+-  await expect(page.getByTestId(`node-badge-${state.remoteNodeId}`).first()).toHaveAttribute(
+-    'title',
+-    new RegExp(`${state.remoteNodeId}$`)
+-  );
++  // 远端 node 的设备缺省不在侧边栏显示，整节（含登录入口）都不出现——登录别的节点走「管理设备」。
++  await expect(page.getByTestId(`sidebar-node-header-${state.remoteNodeId}`)).toHaveCount(0);
+ 
+   // 侧边栏渲染的成员集就是 entry 的 /api/mesh/nodes：两台、远端在线且已完成 fan-out 登录。
+   const nodes = await page.evaluate(() =>
+@@ -44,6 +42,46 @@ test('mesh: password login lists the hub self node and the joined node', async (
+   const remote = nodes.find((node) => node.id === state.remoteNodeId);
+   expect(remote?.online).toBe(true);
+   expect(remote?.loggedIn).toBe(true);
++
++  // 打开远端 node 一台设备的侧边栏显示（等价于「管理设备」里的终端开关）后，那一节才出现。
++  const deviceName = `tmex-mesh-sidebar-${Date.now()}`;
++  const deviceId = await createDeviceOnNode(page, state, state.remoteNodeId, {
++    name: deviceName,
++    session: deviceName,
++  });
++  try {
++    await page.evaluate(
++      (key) => {
++        const raw = window.localStorage.getItem('tmex-ui');
++        const parsed = (raw ? JSON.parse(raw) : { state: {}, version: 0 }) as {
++          state?: { sidebarDeviceVisibility?: Record<string, boolean> };
++        };
++        const persistedState = parsed.state ?? {};
++        persistedState.sidebarDeviceVisibility = {
++          ...(persistedState.sidebarDeviceVisibility ?? {}),
++          [key]: true,
++        };
++        window.localStorage.setItem(
++          'tmex-ui',
++          JSON.stringify({ ...parsed, state: persistedState, version: 0 })
++        );
++      },
++      sidebarDeviceVisibilityKey(state.remoteNodeId, deviceId)
++    );
++    await page.reload();
++
++    await expect(page.getByTestId(`sidebar-node-header-${state.remoteNodeId}`)).toBeVisible({
++      timeout: 30_000,
++    });
++    // 徽标 title 是 `<展示名> · <nodeId>`。以 hub 为 entry 时 /api/mesh/nodes 的 name 取自
++    // peers 表，刚 join 完那一段时间里会退化成 nodeId，所以断言只锚定 nodeId。
++    await expect(page.getByTestId(`node-badge-${state.remoteNodeId}`).first()).toHaveAttribute(
++      'title',
++      new RegExp(`${state.remoteNodeId}$`)
++    );
++  } finally {
++    await deleteDeviceOnNode(page, state, state.remoteNodeId, deviceId);
++  }
+ });
+ 
+ test('mesh: terminal on the joined node echoes through the entry', async ({ page }) => {
+diff --git a/apps/fe/tests/split-close-pane.spec.ts b/apps/fe/tests/split-close-pane.spec.ts
+new file mode 100644
+index 00000000..fe288487
+--- /dev/null
++++ b/apps/fe/tests/split-close-pane.spec.ts
+@@ -0,0 +1,121 @@
++import { type APIRequestContext, type Page, expect, test } from '@playwright/test';
++import {
++  createFourPaneSession,
++  createTwoPaneSession,
++  ensureCleanSession,
++  tmux,
++} from './helpers/tmux';
++
++// 分屏里关闭当前焦点 pane：URL 必须先落到幸存 pane 再发 close-pane，
++// 否则 kill 到新快照回来的这段时间 URL 指向已删除的 pane，中心会出现「连接设备中」遮罩。
++
++test.use({ viewport: { width: 1280, height: 800 } });
++
++async function createDevice(
++  request: APIRequestContext,
++  sessionName: string,
++  name: string
++): Promise<string> {
++  const createRes = await request.post('/api/devices', {
++    data: { name, type: 'local', session: sessionName, authMode: 'auto' },
++  });
++  expect(createRes.ok()).toBeTruthy();
++  const created = (await createRes.json()) as { device: { id: string } };
++  return created.device.id;
++}
++
++function routedPaneId(page: Page): string {
++  const match = decodeURIComponent(new URL(page.url()).pathname).match(/\/panes\/(.+)$/);
++  return match?.[1] ?? '';
++}
++
++function livePaneIds(sessionName: string): string[] {
++  return tmux(`list-panes -s -t ${sessionName} -F '#{pane_id}'`)
++    .split(/\r?\n/)
++    .map((line) => line.trim())
++    .filter(Boolean);
++}
++
++async function waitForSplitPanes(page: Page, expectedPanes: number): Promise<void> {
++  await expect(page.getByTestId('device-page')).toBeVisible();
++  await expect(page.getByTestId('split-terminal-area')).toBeVisible({ timeout: 20_000 });
++  await expect(page.getByTestId('split-pane')).toHaveCount(expectedPanes, { timeout: 20_000 });
++  await expect(page.locator('[data-terminal-engine] canvas').first()).toBeAttached({
++    timeout: 20_000,
++  });
++}
++
++/** 关闭后的一段时间里遮罩一次都不应出现（出现即说明 URL 仍指向已删除的 pane） */
++async function expectNoResolvingOverlay(page: Page, durationMs: number): Promise<void> {
++  const deadline = Date.now() + durationMs;
++  while (Date.now() < deadline) {
++    expect(await page.getByTestId('terminal-status-overlay').count()).toBe(0);
++    await page.waitForTimeout(100);
++  }
++}
++
++test('desktop: closing the focused pane from the split view moves the route to a survivor', async ({
++  page,
++  request,
++}) => {
++  const sessionName = `tmex-e2e-split-close-${Date.now()}`;
++  createFourPaneSession(sessionName);
++  const deviceId = await createDevice(request, sessionName, `e2e-split-close-${Date.now()}`);
++
++  try {
++    await page.goto(`/devices/${deviceId}`);
++    await waitForSplitPanes(page, 4);
++
++    const closingPaneId = routedPaneId(page);
++    expect(closingPaneId).not.toBe('');
++
++    await page.getByTestId(`split-pane-close-${closingPaneId}`).click();
++
++    // 路由立刻改写到幸存 pane，全程不出现「连接设备中」遮罩
++    await expect.poll(() => routedPaneId(page), { timeout: 5_000 }).not.toBe(closingPaneId);
++    await expectNoResolvingOverlay(page, 3_000);
++
++    await expect.poll(() => livePaneIds(sessionName).length, { timeout: 15_000 }).toBe(3);
++    await expect(page.getByTestId('split-pane')).toHaveCount(3, { timeout: 15_000 });
++    expect(livePaneIds(sessionName)).toContain(routedPaneId(page));
++    await expect(
++      page.locator(`[data-testid="split-pane"][data-focused][data-pane-id="${routedPaneId(page)}"]`)
++    ).toBeVisible({ timeout: 10_000 });
++  } finally {
++    await request.delete(`/api/devices/${deviceId}`);
++    ensureCleanSession(sessionName);
++  }
++});
++
++test('desktop: closing one of two panes leaves the survivor mounted without a connecting overlay', async ({
++  page,
++  request,
++}) => {
++  const sessionName = `tmex-e2e-split-close-last-${Date.now()}`;
++  const { paneIds } = createTwoPaneSession(sessionName);
++  const deviceId = await createDevice(request, sessionName, `e2e-split-close-last-${Date.now()}`);
++
++  try {
++    await page.goto(`/devices/${deviceId}`);
++    await waitForSplitPanes(page, 2);
++
++    const closingPaneId = routedPaneId(page);
++    const survivor = paneIds.find((id) => id !== closingPaneId);
++    expect(survivor).toBeDefined();
++
++    await page.getByTestId(`split-pane-close-${closingPaneId}`).click();
++
++    await expect.poll(() => routedPaneId(page), { timeout: 5_000 }).toBe(survivor);
++    await expectNoResolvingOverlay(page, 3_000);
++
++    // 剩一个 pane 时退出分屏，幸存 pane 以单终端挂载
++    await expect(page.getByTestId('split-terminal-area')).toHaveCount(0, { timeout: 15_000 });
++    await expect(page.locator('[data-terminal-engine] canvas').first()).toBeAttached({
++      timeout: 20_000,
++    });
++    expect(livePaneIds(sessionName)).toEqual([survivor as string]);
++  } finally {
++    await request.delete(`/api/devices/${deviceId}`);
++    ensureCleanSession(sessionName);
++  }
++});
+diff --git a/packages/panels/src/device-console/close-pane-fallback.ts b/packages/panels/src/device-console/close-pane-fallback.ts
+new file mode 100644
+index 00000000..a6d3fd66
+--- /dev/null
++++ b/packages/panels/src/device-console/close-pane-fallback.ts
+@@ -0,0 +1,53 @@
++// 关闭 pane 前的路由回落判定。
++// 关闭 URL 点名的 pane 必须先把路由挪到幸存目标再发 close-pane：否则 kill 到新快照回来的
++// 这段时间里 URL 指向的是一个已不存在的 pane，界面只能显示「连接设备中」遮罩。
++
++import { type SelectionWindowLike, pickActiveSelectionPane } from './selection-recovery';
++
++export type ClosePaneFallback =
++  | { kind: 'none' }
++  | { kind: 'pane'; windowId: string; paneId: string }
++  | { kind: 'device-list' };
++
++/**
++ * 关闭的不是路由 pane 时返回 none（只发 close-pane）；是路由 pane 时按
++ * 同窗剩余 pane（active 优先）→ 其他窗口的 active pane → 设备列表 依次回落。
++ */
++export function resolveCloseFallback({
++  windows,
++  routeWindowId,
++  routePaneId,
++  closingWindowId,
++  closingPaneId,
++}: {
++  windows: readonly SelectionWindowLike[] | undefined;
++  routeWindowId?: string;
++  routePaneId?: string;
++  closingWindowId: string;
++  closingPaneId: string;
++}): ClosePaneFallback {
++  if (!routePaneId || routePaneId !== closingPaneId || routeWindowId !== closingWindowId) {
++    return { kind: 'none' };
++  }
++
++  const allWindows = windows ?? [];
++  const routeWindow = allWindows.find((window) => window.id === routeWindowId);
++  if (routeWindow) {
++    const remaining = routeWindow.panes.filter((pane) => pane.id !== closingPaneId);
++    const sameWindowTarget = remaining.find((pane) => pane.active) ?? remaining[0];
++    if (sameWindowTarget) {
++      return { kind: 'pane', windowId: routeWindow.id, paneId: sameWindowTarget.id };
++    }
++  }
++
++  const otherWindows = allWindows.filter(
++    (window) => window.id !== routeWindowId && window.panes.length > 0
++  );
++  const nextWindow = otherWindows.find((window) => window.active) ?? otherWindows[0];
++  const nextPane = nextWindow ? pickActiveSelectionPane(nextWindow) : undefined;
++  if (nextWindow && nextPane) {
++    return { kind: 'pane', windowId: nextWindow.id, paneId: nextPane.id };
++  }
++
++  return { kind: 'device-list' };
++}
+diff --git a/packages/panels/src/device-console/pane-selection-rules.ts b/packages/panels/src/device-console/pane-selection-rules.ts
+index 544eab09..6c951794 100644
+--- a/packages/panels/src/device-console/pane-selection-rules.ts
++++ b/packages/panels/src/device-console/pane-selection-rules.ts
+@@ -25,6 +25,19 @@ export interface MissingSelectionState {
+   missingSelectionKey: string | null;
+ }
+ 
++/** URL 目标的身份：settle 计时与「曾见过该 pane」记账共用同一个 key */
++export function paneRouteKey({
++  deviceId,
++  windowId,
++  resolvedPaneId,
++}: {
++  deviceId?: string;
++  windowId?: string;
++  resolvedPaneId?: string;
++}): string {
++  return `${deviceId}:${windowId}:${resolvedPaneId ?? ''}`;
++}
++
+ export function resolveMissingSelection({
+   deviceId,
+   windowId,
+@@ -51,10 +64,31 @@ export function resolveMissingSelection({
+     isWindowMissing,
+     isPaneMissing,
+     missingSelectionKey:
+-      isWindowMissing || isPaneMissing ? `${deviceId}:${windowId}:${resolvedPaneId ?? ''}` : null,
++      isWindowMissing || isPaneMissing
++        ? paneRouteKey({ deviceId, windowId, resolvedPaneId })
++        : null,
+   };
+ }
+ 
++/**
++ * URL 点名的 pane 是否已被快照确认关闭：它曾出现在快照里、随后从快照消失。
++ * 「还没出现在快照里」（深链、刚 split 出来的 pane）不算，仍走 settle 宽限期。
++ */
++export function resolveConfirmedPaneClosure({
++  routeKey,
++  seenRouteKey,
++  isPaneMissing,
++  hasSelectedPane,
++}: {
++  routeKey: string;
++  seenRouteKey: string | null;
++  isPaneMissing: boolean;
++  hasSelectedPane: boolean;
++}): boolean {
++  if (hasSelectedPane || !isPaneMissing) return false;
++  return seenRouteKey === routeKey;
++}
++
+ /** PC 分屏：非移动端 + 当前 window 多 pane + layout 可用 + 选择未失效 */
+ export function resolveSplitView({
+   isMobile,
+diff --git a/packages/panels/src/device-console/terminal-stage.tsx b/packages/panels/src/device-console/terminal-stage.tsx
+index 91d15b72..9bfcb8b3 100644
+--- a/packages/panels/src/device-console/terminal-stage.tsx
++++ b/packages/panels/src/device-console/terminal-stage.tsx
+@@ -141,7 +141,7 @@ function StageContent(props: TerminalStageProps) {
+     prepareResources,
+     onActivateShortcut,
+   } = props;
+-  const { isSelectionInvalid, isSplitView, canInteractWithPane } = selection;
++  const { isSelectionInvalid, isPaneConfirmedClosed, isSplitView, canInteractWithPane } = selection;
+ 
+   const shortcutsSlot = (
+     <TerminalShortcutsSlot
+@@ -188,6 +188,7 @@ function StageContent(props: TerminalStageProps) {
+             deviceConnected={deviceConnected}
+             focusedTerminalRef={bindFocusedTerminalRef}
+             onUserSelectPane={selection.handleUserSelectPane}
++            onClosePane={selection.handleClosePane}
+             onWindowResize={selection.handleResize}
+             onWindowResizeSettled={selection.handleResizeSettled}
+             prepareResources={prepareResources}
+@@ -198,6 +199,12 @@ function StageContent(props: TerminalStageProps) {
+     );
+   }
+ 
++  // 快照已确认这个 pane 被关闭：不挂 Terminal（挂上只会对死 pane 订阅/select），
++  // 也不显示「连接中」——路由对账会立刻回落到幸存 pane
++  if (isPaneConfirmedClosed) {
++    return null;
++  }
++
+   return (
+     <div
+       ref={terminalContainerRef}
+@@ -231,6 +238,7 @@ export function TerminalStage(props: TerminalStageProps) {
+     props.deviceConnected &&
+     Boolean(props.resolvedPaneId) &&
+     !props.selection.isSelectionInvalid &&
++    !props.selection.isPaneConfirmedClosed &&
+     !props.selectedPane;
+ 
+   return (
+diff --git a/packages/panels/src/device-console/use-pane-selection-dispatch.ts b/packages/panels/src/device-console/use-pane-selection-dispatch.ts
+index 19e01bea..70e483d1 100644
+--- a/packages/panels/src/device-console/use-pane-selection-dispatch.ts
++++ b/packages/panels/src/device-console/use-pane-selection-dispatch.ts
+@@ -8,6 +8,7 @@ import { useRuntime, useTmuxStore } from '@tmex/stores/react';
+ import type { PaneSelection, TerminalRef, TerminalSizeSnapshot } from '@tmex/terminal-ui';
+ import { type RefObject, useCallback } from 'react';
+ import { useNavigate } from 'react-router';
++import { resolveCloseFallback } from './close-pane-fallback';
+ import {
+   appendRecentSelectRequest,
+   resolveSnapshotSelectSize,
+@@ -29,6 +30,8 @@ export interface PaneSelectionDispatch {
+     options?: { forceFullSelect?: boolean }
+   ) => void;
+   handleUserSelectPane: (windowId: string, paneId: string) => void;
++  /** 关闭 pane：若关的是 URL 点名的 pane，先把路由挪到幸存目标再发 close-pane */
++  handleClosePane: (windowId: string, paneId: string) => void;
+ }
+ 
+ function paneRoutePath(
+@@ -46,6 +49,7 @@ function paneRoutePath(
+ export function usePaneSelectionDispatch({
+   deviceId,
+   windowId,
++  resolvedPaneId,
+   windows,
+   terminalRef,
+   terminalContainerRef,
+@@ -53,6 +57,7 @@ export function usePaneSelectionDispatch({
+ }: {
+   deviceId?: string;
+   windowId?: string;
++  resolvedPaneId?: string;
+   windows?: readonly TmuxWindow[];
+   terminalRef: RefObject<TerminalRef | null>;
+   terminalContainerRef: RefObject<HTMLDivElement | null>;
+@@ -61,6 +66,7 @@ export function usePaneSelectionDispatch({
+   const runtime = useRuntime();
+   const navigate = useNavigate();
+   const selectPane = useTmuxStore((state) => state.selectPane);
++  const closePane = useTmuxStore((state) => state.closePane);
+ 
+   const { isMobileRef, isSplitViewRef, recentSelectRequestsRef, userInitiatedSelectionRef } = refs;
+ 
+@@ -149,6 +155,42 @@ export function usePaneSelectionDispatch({
+     [deviceId, navigateToPane, userInitiatedSelectionRef]
+   );
+ 
++  // 关闭 pane：路由指向它时先落到幸存目标（本窗剩余 pane → 其他窗口 → 设备列表），
++  // 再发 close-pane，避免 URL 短暂指向已删除的 pane
++  const handleClosePane = useCallback(
++    (targetWindowId: string, targetPaneId: string) => {
++      if (!deviceId) return;
++      const fallback = resolveCloseFallback({
++        windows,
++        routeWindowId: windowId,
++        routePaneId: resolvedPaneId,
++        closingWindowId: targetWindowId,
++        closingPaneId: targetPaneId,
++      });
++      if (fallback.kind === 'pane') {
++        userInitiatedSelectionRef.current = {
++          windowId: fallback.windowId,
++          paneId: fallback.paneId,
++          at: Date.now(),
++        };
++        navigateToPane(deviceId, fallback.windowId, fallback.paneId);
++      } else if (fallback.kind === 'device-list') {
++        navigateToDeviceList();
++      }
++      closePane(deviceId, targetPaneId);
++    },
++    [
++      closePane,
++      deviceId,
++      navigateToDeviceList,
++      navigateToPane,
++      resolvedPaneId,
++      userInitiatedSelectionRef,
++      windowId,
++      windows,
++    ]
++  );
++
+   return {
+     navigateToPane,
+     navigateToDeviceList,
+@@ -156,5 +198,6 @@ export function usePaneSelectionDispatch({
+     recordSelectRequest,
+     followSelection,
+     handleUserSelectPane,
++    handleClosePane,
+   };
+ }
+diff --git a/packages/panels/src/device-console/use-pane-selection-state.ts b/packages/panels/src/device-console/use-pane-selection-state.ts
+index 699d484f..a1fab77f 100644
+--- a/packages/panels/src/device-console/use-pane-selection-state.ts
++++ b/packages/panels/src/device-console/use-pane-selection-state.ts
+@@ -6,6 +6,8 @@ import type { TmuxPane, TmuxWindow } from '@tmex/shared';
+ import type { PaneSelection, TimedPaneSelection } from '@tmex/terminal-ui';
+ import { type RefObject, useEffect, useMemo, useRef, useState } from 'react';
+ import {
++  paneRouteKey,
++  resolveConfirmedPaneClosure,
+   resolveMissingSelection,
+   resolveSplitView,
+   resolveStackedLayoutTarget,
+@@ -38,6 +40,8 @@ export interface PaneSelectionState {
+   isLoading: boolean;
+   isWindowMissing: boolean;
+   isPaneMissing: boolean;
++  /** 路由 pane 曾在快照里、现已消失：不等宽限期就可以判定它被关闭了 */
++  isPaneConfirmedClosed: boolean;
+   isSelectionSettledMissing: boolean;
+   isSelectionInvalid: boolean;
+   canInteractWithPane: boolean;
+@@ -103,10 +107,27 @@ export function usePaneSelectionState({
+     return () => window.clearTimeout(timer);
+   }, [missingSelectionKey]);
+ 
+-  const isSelectionSettledMissing =
++  // 曾在快照里见过 URL 点名的 pane：它之后从快照消失就是「被关闭」，无需等宽限期
++  const routeKey = paneRouteKey({ deviceId, windowId, resolvedPaneId });
++  const seenPaneRouteKeyRef = useRef<string | null>(null);
++  useEffect(() => {
++    if (selectedPane) seenPaneRouteKeyRef.current = routeKey;
++  }, [routeKey, selectedPane]);
++
++  const isPaneConfirmedClosed = resolveConfirmedPaneClosure({
++    routeKey,
++    seenRouteKey: seenPaneRouteKeyRef.current,
++    isPaneMissing,
++    hasSelectedPane: Boolean(selectedPane),
++  });
++
++  // 宽限期只用于「快照还没追上」的深链；已确认关闭的 pane 直接让路由对账回落
++  const isSelectionInvalid =
+     missingSelectionKey !== null && settledMissingKey === missingSelectionKey;
+-  const isSelectionInvalid = isSelectionSettledMissing;
+-  const canInteractWithPane = Boolean(deviceConnected && resolvedPaneId && !isSelectionInvalid);
++  const isSelectionSettledMissing = isSelectionInvalid || isPaneConfirmedClosed;
++  const canInteractWithPane = Boolean(
++    deviceConnected && resolvedPaneId && !isSelectionInvalid && !isPaneConfirmedClosed
++  );
+ 
+   const isSplitView = resolveSplitView({ isMobile, selectedWindow, isSelectionInvalid });
+   const isSplitViewRef = useRef(isSplitView);
+@@ -161,6 +182,7 @@ export function usePaneSelectionState({
+     isLoading,
+     isWindowMissing,
+     isPaneMissing,
++    isPaneConfirmedClosed,
+     isSelectionSettledMissing,
+     isSelectionInvalid,
+     canInteractWithPane,
+diff --git a/packages/panels/src/device-management/device-dialog.tsx b/packages/panels/src/device-management/device-dialog.tsx
+index 7b962913..7fe622b0 100644
+--- a/packages/panels/src/device-management/device-dialog.tsx
++++ b/packages/panels/src/device-management/device-dialog.tsx
+@@ -74,7 +74,7 @@ export function DeviceDialog({
+       <DialogContent
+         data-testid="device-dialog"
+         data-device-kind={kind}
+-        className="w-full max-w-2xl"
++        className="flex max-h-[calc(100dvh-2rem)] w-full flex-col sm:max-w-2xl"
+       >
+         <DialogHeader>
+           <DialogTitle className="flex flex-wrap items-center gap-2">
+@@ -91,8 +91,8 @@ export function DeviceDialog({
+           <DialogDescription>{description}</DialogDescription>
+         </DialogHeader>
+ 
+-        <form onSubmit={handleSubmit} className="space-y-4">
+-          <div className="-mr-2 max-h-[min(70dvh,720px)] space-y-5 overflow-y-auto pr-2">
++        <form onSubmit={handleSubmit} className="flex min-h-0 min-w-0 flex-1 flex-col gap-4">
++          <div className="-mr-2 min-h-0 min-w-0 flex-1 space-y-5 overflow-y-auto pr-2">
+             {isEditMode && isRemote && device && (
+               <DeviceRemoteInfoFields device={device} nodeContext={nodeContext} />
+             )}
+diff --git a/packages/panels/src/settings/device-files-modal.tsx b/packages/panels/src/settings/device-files-modal.tsx
+index 4b79debd..c641d286 100644
+--- a/packages/panels/src/settings/device-files-modal.tsx
++++ b/packages/panels/src/settings/device-files-modal.tsx
+@@ -22,7 +22,7 @@ export function DeviceFilesModal({ device, nodeId, open, onOpenChange }: DeviceF
+   return (
+     <Dialog open={open} onOpenChange={onOpenChange}>
+       <DialogContent
+-        className="sm:max-w-2xl"
++        className="flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-2xl"
+         data-testid={`device-files-modal-${device.id}`}
+         data-node-id={nodeId}
+       >
+@@ -30,7 +30,9 @@ export function DeviceFilesModal({ device, nodeId, open, onOpenChange }: DeviceF
+           <DialogTitle>{t('settings.files.deviceModalTitle', { name: device.name })}</DialogTitle>
+         </DialogHeader>
+ 
+-        <FilesSettingsTab lockedDeviceId={device.id} title={t('settings.files.roots')} />
++        <div className="-mr-2 min-h-0 flex-1 overflow-y-auto pr-2">
++          <FilesSettingsTab lockedDeviceId={device.id} title={t('settings.files.roots')} />
++        </div>
+       </DialogContent>
+     </Dialog>
+   );
+diff --git a/packages/stores/src/tmux-event-router.ts b/packages/stores/src/tmux-event-router.ts
+index 4eefd4ad..5ae65787 100644
+--- a/packages/stores/src/tmux-event-router.ts
++++ b/packages/stores/src/tmux-event-router.ts
+@@ -79,22 +79,24 @@ const handlers: TmuxEventHandlers = {
+   },
+ 
+   'metadata-snapshot': (event, ctx) => {
++    const { deviceId } = event.snapshot;
++    const previous = ctx.getState().snapshots[deviceId];
+     ctx.setState((prev) => ({
+-      snapshots: { ...prev.snapshots, [event.snapshot.deviceId]: event.snapshot },
++      snapshots: { ...prev.snapshots, [deviceId]: event.snapshot },
+     }));
++    ctx.selection.handleSnapshotPaneRemoval(deviceId, previous);
+   },
+ 
+   'metadata-patch': (event, ctx) => {
+-    ctx.setState((prev) => {
+-      const current = prev.snapshots[event.deviceId];
+-      if (!current) return {};
+-      return {
+-        snapshots: {
+-          ...prev.snapshots,
+-          [event.deviceId]: wsBorsh.applyLegacyStateSnapshotDiff(current, event.patch),
+-        },
+-      };
+-    });
++    const previous = ctx.getState().snapshots[event.deviceId];
++    if (!previous) return;
++    ctx.setState((prev) => ({
++      snapshots: {
++        ...prev.snapshots,
++        [event.deviceId]: wsBorsh.applyLegacyStateSnapshotDiff(previous, event.patch),
++      },
++    }));
++    ctx.selection.handleSnapshotPaneRemoval(event.deviceId, previous);
+   },
+ 
+   'tmux-event': (event, ctx) => {
+diff --git a/packages/stores/src/tmux-selection-actions.ts b/packages/stores/src/tmux-selection-actions.ts
+index 1510f586..aab71626 100644
+--- a/packages/stores/src/tmux-selection-actions.ts
++++ b/packages/stores/src/tmux-selection-actions.ts
+@@ -1,11 +1,21 @@
+ // 选择面：当前设备的选中 window/pane、待重试的选择事务与最近上报的终端尺寸。
+ 
++import type { StateSnapshotPayload } from '@tmex/shared';
+ import { type SelectFailureReason, generateSelectToken } from '@tmex/ws-client';
+ import type { RuntimeCore } from './runtime';
+ import type { TmuxStoreAccess } from './tmux-state';
+ 
+ const RESELECT_RETRY_DELAY_MS = 250;
+ 
++export function snapshotHasPane(
++  snapshot: StateSnapshotPayload | undefined,
++  paneId: string
++): boolean {
++  return Boolean(
++    snapshot?.session?.windows.some((window) => window.panes.some((pane) => pane.id === paneId))
++  );
++}
++
+ export function normalizeTerminalSize(
+   cols: number | undefined,
+   rows: number | undefined
+@@ -33,6 +43,14 @@ export interface TmuxSelectionActions {
+   /** select 状态机上报失败：非 rejected 时排队一次重试 */
+   handleSelectFailed(deviceId: string, reason: SelectFailureReason): void;
+   cancelReselect(deviceId: string): void;
++  /**
++   * 新快照删除了当前选中的 pane：取消它的 select 事务与待重试，并清空选中记录，
++   * 避免 ACK/progress 超时与 250ms 重选对着已死 pane 空转（回落交给路由对账）。
++   */
++  handleSnapshotPaneRemoval(
++    deviceId: string,
++    previousSnapshot: StateSnapshotPayload | undefined
++  ): void;
+   /** 记录最近一次上报的终端尺寸，供后续 select-pane 复用 */
+   recordTerminalSize(deviceId: string, cols: number, rows: number): void;
+   dispose(): void;
+@@ -133,6 +151,24 @@ export function createTmuxSelectionActions(
+ 
+     cancelReselect,
+ 
++    handleSnapshotPaneRemoval(deviceId, previousSnapshot) {
++      const current = access.getState().selectedPanes[deviceId];
++      if (!current) return;
++      // 旧快照里也没有它 ≠ 已关闭：可能是刚建好/深链的 pane，快照还没追上
++      if (!snapshotHasPane(previousSnapshot, current.paneId)) return;
++      if (snapshotHasPane(access.getState().snapshots[deviceId], current.paneId)) return;
++
++      cancelReselect(deviceId);
++      core.selectMachine().abandonPane(deviceId, current.paneId);
++      access.setState((prev) => {
++        const selected = prev.selectedPanes[deviceId];
++        if (!selected || selected.paneId !== current.paneId) return {};
++        const nextSelected = { ...prev.selectedPanes };
++        delete nextSelected[deviceId];
++        return { selectedPanes: nextSelected };
++      });
++    },
++
+     recordTerminalSize(deviceId, cols, rows) {
+       const normalizedSize = normalizeTerminalSize(cols, rows);
+       if (!normalizedSize) return;
+diff --git a/packages/ws-client/src/state-machine.ts b/packages/ws-client/src/state-machine.ts
+index fd8509fd..137841ea 100644
+--- a/packages/ws-client/src/state-machine.ts
++++ b/packages/ws-client/src/state-machine.ts
+@@ -727,6 +727,17 @@ export class SelectStateMachine {
+ 
+   // ========== 清理 ==========
+ 
++  /**
++   * 目标 pane 已从快照中消失（被 kill / 关闭）：丢弃针对它的事务与门控缓冲。
++   * 不走 failTransaction——失败回调会触发调用方的重选重试，对着死 pane 空转。
++   */
++  abandonPane(deviceId: string, paneId: string): boolean {
++    const transaction = this.transactions.get(deviceId);
++    if (!transaction || transaction.paneId !== paneId) return false;
++    this.cancelTransaction(deviceId);
++    return true;
++  }
++
+   cleanup(deviceId: string): void {
+     this.cancelTransaction(deviceId);
+     this.outputGates.delete(deviceId);

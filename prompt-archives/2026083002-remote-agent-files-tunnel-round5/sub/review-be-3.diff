@@ -1,0 +1,3777 @@
+diff --git a/apps/gateway/drizzle/0029_tunnel_access.sql b/apps/gateway/drizzle/0029_tunnel_access.sql
+new file mode 100644
+index 00000000..1ccecc11
+--- /dev/null
++++ b/apps/gateway/drizzle/0029_tunnel_access.sql
+@@ -0,0 +1,16 @@
++ALTER TABLE `tunnel_config` ADD `externally_managed` integer DEFAULT false NOT NULL;--> statement-breakpoint
++ALTER TABLE `tunnel_config` ADD `exposure_acknowledged_at` text;--> statement-breakpoint
++CREATE TABLE `tunnel_access` (
++	`id` text PRIMARY KEY NOT NULL,
++	`account_id` text,
++	`api_token_enc` text,
++	`team_domain` text,
++	`app_id` text,
++	`aud` text,
++	`hostname` text,
++	`rules_json` text DEFAULT '[]' NOT NULL,
++	`enforce_jwt` integer DEFAULT false NOT NULL,
++	`last_error` text,
++	`updated_at` text NOT NULL,
++	CONSTRAINT "tunnel_access_singleton_check" CHECK("tunnel_access"."id" = 'default')
++);
+diff --git a/apps/gateway/src/api/tunnel-routes.ts b/apps/gateway/src/api/tunnel-routes.ts
+index f278c390..1b70d09c 100644
+--- a/apps/gateway/src/api/tunnel-routes.ts
++++ b/apps/gateway/src/api/tunnel-routes.ts
+@@ -1,6 +1,7 @@
+ import type { TunnelActionRequest } from '@tmex/shared';
+ import { MESH_VIA_SELF, getMeshRequestContext, requestDispatchContext } from '../mesh/mesh-deps';
+ import { isPeerInboundRequest } from '../mesh/peer-request-marker';
++import { parseAccessRules } from '../tunnel/access-rules';
+ import { TunnelError, tunnelErrorFrom, tunnelHttpStatus } from '../tunnel/errors';
+ import { normalizeTunnelHostname, normalizeTunnelName } from '../tunnel/hostname';
+ import { type TunnelManager, tunnelManager } from '../tunnel/manager';
+@@ -24,18 +25,32 @@ function rejectIfForwarded(req: Request, ctx: ApiRouteContext): Response | null
+   return new Response(null, { status: 404 });
+ }
+ 
++function optionalAck(body: Record<string, unknown>): boolean | undefined {
++  if (body.acknowledgeExposure === undefined) return undefined;
++  if (typeof body.acknowledgeExposure !== 'boolean') {
++    throw new TunnelError('invalid_request', 'acknowledgeExposure must be a boolean');
++  }
++  return body.acknowledgeExposure;
++}
++
+ function parseAction(body: Record<string, unknown>): TunnelActionRequest {
+   const action = body.action;
+   switch (action) {
+     case 'install':
+     case 'login':
+     case 'cancel_login':
+-    case 'quick_start':
+-    case 'start':
+     case 'stop':
+     case 'remove':
+     case 'check':
++    case 'clear_access_credentials':
++    case 'remove_access':
++    case 'sync_access':
+       return { action };
++    case 'quick_start':
++    case 'start': {
++      const acknowledgeExposure = optionalAck(body);
++      return acknowledgeExposure === undefined ? { action } : { action, acknowledgeExposure };
++    }
+     case 'create': {
+       if (typeof body.hostname !== 'string') {
+         throw new TunnelError('invalid_request', 'hostname is required');
+@@ -44,25 +59,72 @@ function parseAction(body: Record<string, unknown>): TunnelActionRequest {
+       if (!hostname) {
+         throw new TunnelError('invalid_hostname', 'hostname is not a valid RFC 1123 name');
+       }
++      const acknowledgeExposure = optionalAck(body);
+       if (typeof body.tunnelName === 'string' && body.tunnelName.trim()) {
+         const tunnelName = normalizeTunnelName(body.tunnelName);
+         if (!tunnelName) {
+           throw new TunnelError('invalid_request', 'tunnel name is not a valid identifier');
+         }
+-        return { action: 'create', hostname, tunnelName };
++        return {
++          action: 'create',
++          hostname,
++          tunnelName,
++          ...(acknowledgeExposure === undefined ? {} : { acknowledgeExposure }),
++        };
+       }
+-      return { action: 'create', hostname };
++      return {
++        action: 'create',
++        hostname,
++        ...(acknowledgeExposure === undefined ? {} : { acknowledgeExposure }),
++      };
+     }
+-    case 'set_auto_start':
++    case 'set_auto_start': {
+       if (typeof body.autoStart !== 'boolean') {
+         throw new TunnelError('invalid_request', 'autoStart must be a boolean');
+       }
+-      return { action: 'set_auto_start', autoStart: body.autoStart };
++      const acknowledgeExposure = optionalAck(body);
++      return {
++        action: 'set_auto_start',
++        autoStart: body.autoStart,
++        ...(acknowledgeExposure === undefined ? {} : { acknowledgeExposure }),
++      };
++    }
+     case 'set_trust_proxy':
+       if (typeof body.trustProxy !== 'boolean') {
+         throw new TunnelError('invalid_request', 'trustProxy must be a boolean');
+       }
+       return { action: 'set_trust_proxy', trustProxy: body.trustProxy };
++    case 'set_access_credentials': {
++      if (typeof body.apiToken !== 'string' || typeof body.accountId !== 'string') {
++        throw new TunnelError('invalid_request', 'apiToken and accountId are required');
++      }
++      return {
++        action: 'set_access_credentials',
++        apiToken: body.apiToken,
++        accountId: body.accountId,
++      };
++    }
++    case 'configure_access': {
++      if (!Array.isArray(body.rules)) {
++        throw new TunnelError('invalid_request', 'rules must be an array');
++      }
++      return { action: 'configure_access', rules: parseAccessRules(body.rules) };
++    }
++    case 'set_access_enforce':
++      if (typeof body.enforceJwt !== 'boolean') {
++        throw new TunnelError('invalid_request', 'enforceJwt must be a boolean');
++      }
++      return { action: 'set_access_enforce', enforceJwt: body.enforceJwt };
++    case 'adopt_external': {
++      if (typeof body.hostname !== 'string') {
++        throw new TunnelError('invalid_request', 'hostname is required');
++      }
++      const hostname = normalizeTunnelHostname(body.hostname);
++      if (!hostname) {
++        throw new TunnelError('invalid_hostname', 'hostname is not a valid RFC 1123 name');
++      }
++      return { action: 'adopt_external', hostname };
++    }
+     default:
+       throw new TunnelError('invalid_request', 'unknown action');
+   }
+@@ -73,9 +135,10 @@ export function createTunnelRoutes(manager: TunnelManager = tunnelManager): ApiR
+     route({
+       method: 'GET',
+       path: '/api/tunnel/status',
+-      handler: (req, _params, ctx) => {
++      handler: async (req, _params, ctx) => {
+         const blocked = rejectIfForwarded(req, ctx);
+         if (blocked) return blocked;
++        await manager.refreshExternal();
+         return json(manager.status());
+       },
+     }),
+diff --git a/apps/gateway/src/db/schema.ts b/apps/gateway/src/db/schema.ts
+index a5c014aa..e209a5e9 100644
+--- a/apps/gateway/src/db/schema.ts
++++ b/apps/gateway/src/db/schema.ts
+@@ -724,6 +724,8 @@ export const tunnelConfig = sqliteTable(
+     tunnelName: text('tunnel_name'),
+     tunnelId: text('tunnel_id'),
+     autoStart: integer('auto_start', { mode: 'boolean' }).notNull().default(false),
++    externallyManaged: integer('externally_managed', { mode: 'boolean' }).notNull().default(false),
++    exposureAcknowledgedAt: text('exposure_acknowledged_at'),
+     updatedAt: text('updated_at').notNull(),
+   },
+   (table) => [
+@@ -732,6 +734,24 @@ export const tunnelConfig = sqliteTable(
+   ]
+ );
+ 
++export const tunnelAccess = sqliteTable(
++  'tunnel_access',
++  {
++    id: text('id').primaryKey(),
++    accountId: text('account_id'),
++    apiTokenEnc: text('api_token_enc'),
++    teamDomain: text('team_domain'),
++    appId: text('app_id'),
++    aud: text('aud'),
++    hostname: text('hostname'),
++    rulesJson: text('rules_json').notNull().default('[]'),
++    enforceJwt: integer('enforce_jwt', { mode: 'boolean' }).notNull().default(false),
++    lastError: text('last_error'),
++    updatedAt: text('updated_at').notNull(),
++  },
++  (table) => [check('tunnel_access_singleton_check', sql`${table.id} = 'default'`)]
++);
++
+ export type UserRow = typeof users.$inferSelect;
+ export type UserKeyRow = typeof userKeys.$inferSelect;
+ export type UserKeyLogRow = typeof userKeyLog.$inferSelect;
+@@ -744,3 +764,4 @@ export type PeerCacheRow = typeof peerCache.$inferSelect;
+ export type TlsConfigRow = typeof tlsConfig.$inferSelect;
+ export type HubTrustRow = typeof hubTrust.$inferSelect;
+ export type TunnelConfigRow = typeof tunnelConfig.$inferSelect;
++export type TunnelAccessRow = typeof tunnelAccess.$inferSelect;
+diff --git a/apps/gateway/src/mesh/mesh-http.ts b/apps/gateway/src/mesh/mesh-http.ts
+index 7d4ff9d1..80289f94 100644
+--- a/apps/gateway/src/mesh/mesh-http.ts
++++ b/apps/gateway/src/mesh/mesh-http.ts
+@@ -3,6 +3,7 @@ import type { ChallengeStore } from '../auth/challenge-store';
+ import type { NodeSessionStore } from '../auth/node-session-store';
+ import type { UserKeyService } from '../auth/user-key-service';
+ import type { UserStore } from '../auth/user-store';
++import { guardTunnelAccess } from '../tunnel/access-guard';
+ import { type AuthKeyLogPublisher, AuthRoutes } from './auth-routes';
+ import { Forwarder, rewriteSelf, takePendingForwardStream } from './forwarder';
+ import {
+@@ -148,6 +149,8 @@ export class MeshHttpRuntime {
+   }
+ 
+   async handleRequest(req: Request, server: MeshUpgradeServer): Promise<MeshHandleResult> {
++    const denied = await guardTunnelAccess(req);
++    if (denied) return denied;
+     const safeReq = isPeerInboundRequest(req) ? req : stripMeshPeerMarkerFromRequest(req);
+     const path = new URL(safeReq.url).pathname;
+     if (isMeshInternalPath(path)) {
+diff --git a/apps/gateway/src/tunnel/access-client.test.ts b/apps/gateway/src/tunnel/access-client.test.ts
+new file mode 100644
+index 00000000..545df9bb
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-client.test.ts
+@@ -0,0 +1,172 @@
++import { describe, expect, test } from 'bun:test';
++import { CloudflareAccessClient, sanitizeAccessMessage } from './access-client';
++import { parseAccessRules, toCloudflareInclude } from './access-rules';
++
++function jsonRes(body: unknown, status = 200): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { 'Content-Type': 'application/json' },
++  });
++}
++
++describe('CloudflareAccessClient', () => {
++  test('looks up organization auth_domain', async () => {
++    const urls: string[] = [];
++    const client = new CloudflareAccessClient(async (input) => {
++      urls.push(String(input));
++      return jsonRes({ success: true, result: { auth_domain: 'team.cloudflareaccess.com' } });
++    });
++    const org = await client.getOrganization('acc1', 'tok');
++    expect(org.teamDomain).toBe('team.cloudflareaccess.com');
++    expect(urls[0]).toContain('/accounts/acc1/access/organizations');
++    expect(urls[0]).toContain('https://api.cloudflare.com/client/v4');
++  });
++
++  test('creates a self_hosted app with domain/name/session_duration and reads id/aud', async () => {
++    let body: unknown;
++    const client = new CloudflareAccessClient(async (input, init) => {
++      body = JSON.parse(String(init?.body));
++      expect(String(input)).toContain('/accounts/acc1/access/apps');
++      expect(init?.method).toBe('POST');
++      return jsonRes({
++        success: true,
++        result: { id: 'app-1', aud: 'aud-1', name: 'tmex', domain: 'tmex.example.com' },
++      });
++    });
++    const app = await client.createApp('acc1', 'tok', 'tmex.example.com');
++    expect(app).toMatchObject({ id: 'app-1', aud: 'aud-1' });
++    expect(body).toMatchObject({
++      type: 'self_hosted',
++      domain: 'tmex.example.com',
++      session_duration: '24h',
++    });
++  });
++
++  test('replaces a single allow policy and deletes extras', async () => {
++    const calls: Array<{ method?: string; url: string; body?: unknown }> = [];
++    const client = new CloudflareAccessClient(async (input, init) => {
++      const url = String(input);
++      const method = init?.method;
++      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
++      calls.push({ method, url, body });
++      if (url.endsWith('/policies') && method === 'GET') {
++        return jsonRes({
++          success: true,
++          result: [
++            { id: 'pol-1', include: [] },
++            { id: 'pol-2', include: [] },
++          ],
++        });
++      }
++      if (url.endsWith('/policies/pol-1') && method === 'PUT') {
++        return jsonRes({ success: true, result: { id: 'pol-1', include: body?.include } });
++      }
++      if (url.endsWith('/policies/pol-2') && method === 'DELETE') {
++        return jsonRes({ success: true, result: null });
++      }
++      return jsonRes({ success: false, errors: [{ message: `unexpected ${method} ${url}` }] }, 400);
++    });
++    const rules = [{ kind: 'email' as const, value: 'a@example.com' }];
++    await client.replaceAllowPolicy('acc1', 'tok', 'app-1', rules);
++    expect(calls.some((c) => c.method === 'PUT' && c.url.endsWith('/policies/pol-1'))).toBe(true);
++    expect(calls.some((c) => c.method === 'DELETE' && c.url.endsWith('/policies/pol-2'))).toBe(
++      true
++    );
++    const put = calls.find((c) => c.method === 'PUT');
++    expect(put?.body).toMatchObject({
++      decision: 'allow',
++      include: [{ email: { email: 'a@example.com' } }],
++    });
++  });
++
++  test('maps Cloudflare error envelopes without leaking tokens', async () => {
++    const client = new CloudflareAccessClient(async () =>
++      jsonRes({ success: false, errors: [{ code: 10000, message: 'Invalid API Token' }] }, 401)
++    );
++    try {
++      await client.getOrganization('acc1', 'super-secret-token-value-xxxxxxxx');
++      throw new Error('expected failure');
++    } catch (error) {
++      expect((error as Error).message).toBe('Invalid API Token');
++      expect((error as Error).message).not.toContain('super-secret');
++    }
++  });
++
++  test('paginates Access apps and matches hostname', async () => {
++    const pages: string[] = [];
++    const client = new CloudflareAccessClient(async (input) => {
++      const url = String(input);
++      pages.push(url);
++      if (/[?&]page=1(?:&|$)/.test(url)) {
++        return jsonRes({
++          success: true,
++          result: [{ id: 'app-a', aud: 'aud-a', domain: 'other.example.com', name: 'x' }],
++          result_info: { page: 1, per_page: 100, total_count: 2, total_pages: 2 },
++        });
++      }
++      if (/[?&]page=2(?:&|$)/.test(url)) {
++        return jsonRes({
++          success: true,
++          result: [{ id: 'app-b', aud: 'aud-b', domain: 'tmex.example.com', name: 'tmex' }],
++          result_info: { page: 2, per_page: 100, total_count: 2, total_pages: 2 },
++        });
++      }
++      return jsonRes({ success: false, errors: [{ message: url }] }, 400);
++    });
++    const apps = await client.listApps('acc1', 'tok');
++    expect(apps.map((a) => a.id)).toEqual(['app-a', 'app-b']);
++    expect(client.findAppForHostname(apps, 'tmex.example.com')?.id).toBe('app-b');
++    expect(pages.some((u) => u.includes('page=2'))).toBe(true);
++  });
++
++  test('reads remotely-managed tunnel ingress and name', async () => {
++    const client = new CloudflareAccessClient(async (input) => {
++      const url = String(input);
++      if (url.endsWith('/cfd_tunnel/tid/configurations')) {
++        return jsonRes({
++          success: true,
++          result: {
++            config: {
++              ingress: [
++                { hostname: 'tmex.example.com', service: 'http://127.0.0.1:19883' },
++                { service: 'http_status:404' },
++              ],
++            },
++          },
++        });
++      }
++      if (url.endsWith('/cfd_tunnel/tid')) {
++        return jsonRes({ success: true, result: { id: 'tid', name: 'tmex-ext' } });
++      }
++      return jsonRes({ success: false, errors: [{ message: url }] }, 400);
++    });
++    const ingress = await client.getTunnelIngress('acc1', 'tok', 'tid');
++    expect(ingress).toEqual([
++      { hostname: 'tmex.example.com', service: 'http://127.0.0.1:19883' },
++      { hostname: null, service: 'http_status:404' },
++    ]);
++    expect(await client.getTunnel('acc1', 'tok', 'tid')).toEqual({
++      id: 'tid',
++      name: 'tmex-ext',
++    });
++  });
++});
++
++describe('access rule helpers', () => {
++  test('parses and rejects invalid emails/domains', () => {
++    expect(parseAccessRules([{ kind: 'email', value: '  A@Ex.com ' }])).toEqual([
++      { kind: 'email', value: 'a@ex.com' },
++    ]);
++    expect(() => parseAccessRules([])).toThrow();
++    expect(() => parseAccessRules([{ kind: 'email', value: 'not-an-email' }])).toThrow();
++    expect(toCloudflareInclude([{ kind: 'email_domain', value: 'example.com' }])).toEqual([
++      { email_domain: { domain: 'example.com' } },
++    ]);
++  });
++
++  test('sanitizeAccessMessage redacts long secrets', () => {
++    expect(sanitizeAccessMessage('token=abcdefghijklmnopqrstuvwxyz0123456789ABCD')).not.toContain(
++      'abcdefghijklmnopqrstuvwxyz0123456789ABCD'
++    );
++  });
++});
+diff --git a/apps/gateway/src/tunnel/access-client.ts b/apps/gateway/src/tunnel/access-client.ts
+new file mode 100644
+index 00000000..124a3071
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-client.ts
+@@ -0,0 +1,342 @@
++import type { TunnelAccessPolicyRule } from '@tmex/shared';
++import { fromCloudflareInclude, toCloudflareInclude } from './access-rules';
++import { TunnelError } from './errors';
++import { redactSecrets } from './redact';
++
++const CF_API = 'https://api.cloudflare.com/client/v4';
++const APP_NAME = 'tmex';
++const POLICY_NAME = 'tmex-allow';
++const SESSION_DURATION = '24h';
++
++export type CloudflareApp = {
++  id: string;
++  aud: string;
++  name: string;
++  domain: string;
++};
++
++export type CloudflarePolicy = {
++  id: string;
++  name: string;
++  decision: string;
++  include: unknown;
++};
++
++type CfEnvelope<T> = {
++  success?: boolean;
++  result?: T;
++  errors?: Array<{ code?: number; message?: string }>;
++  result_info?: {
++    page?: number;
++    per_page?: number;
++    count?: number;
++    total_count?: number;
++    total_pages?: number;
++  };
++};
++
++export type TunnelFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
++
++export function sanitizeAccessMessage(message: string): string {
++  return redactSecrets(message.replace(/\s+/g, ' ').trim()).slice(0, 400);
++}
++
++function asRecord(value: unknown): Record<string, unknown> | null {
++  return typeof value === 'object' && value !== null && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : null;
++}
++
++function readString(rec: Record<string, unknown> | null, key: string): string | null {
++  const value = rec?.[key];
++  return typeof value === 'string' && value.trim() ? value.trim() : null;
++}
++
++export class CloudflareAccessClient {
++  constructor(private readonly fetchImpl: TunnelFetch = fetch) {}
++
++  async getOrganization(accountId: string, apiToken: string): Promise<{ teamDomain: string }> {
++    const result = await this.request<Record<string, unknown>>(
++      'GET',
++      `/accounts/${encodeURIComponent(accountId)}/access/organizations`,
++      apiToken
++    );
++    const authDomain = readString(result, 'auth_domain');
++    if (!authDomain) {
++      throw new TunnelError(
++        'access_api_failed',
++        'Cloudflare Access organization has no team domain'
++      );
++    }
++    return { teamDomain: authDomain.replace(/^https?:\/\//, '').replace(/\/$/, '') };
++  }
++
++  async createApp(accountId: string, apiToken: string, hostname: string): Promise<CloudflareApp> {
++    const result = await this.request<Record<string, unknown>>(
++      'POST',
++      `/accounts/${encodeURIComponent(accountId)}/access/apps`,
++      apiToken,
++      {
++        type: 'self_hosted',
++        name: APP_NAME,
++        domain: hostname,
++        session_duration: SESSION_DURATION,
++      }
++    );
++    return this.parseApp(result);
++  }
++
++  async updateApp(
++    accountId: string,
++    apiToken: string,
++    appId: string,
++    hostname: string
++  ): Promise<CloudflareApp> {
++    const result = await this.request<Record<string, unknown>>(
++      'PUT',
++      `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}`,
++      apiToken,
++      {
++        type: 'self_hosted',
++        name: APP_NAME,
++        domain: hostname,
++        session_duration: SESSION_DURATION,
++      }
++    );
++    return this.parseApp(result);
++  }
++
++  async getApp(accountId: string, apiToken: string, appId: string): Promise<CloudflareApp> {
++    const result = await this.request<Record<string, unknown>>(
++      'GET',
++      `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}`,
++      apiToken
++    );
++    return this.parseApp(result);
++  }
++
++  async deleteApp(accountId: string, apiToken: string, appId: string): Promise<void> {
++    await this.request(
++      'DELETE',
++      `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}`,
++      apiToken
++    );
++  }
++
++  async listApps(accountId: string, apiToken: string): Promise<CloudflareApp[]> {
++    const apps: CloudflareApp[] = [];
++    let page = 1;
++    for (;;) {
++      const { result, result_info } = await this.requestEnvelope<unknown[]>(
++        'GET',
++        `/accounts/${encodeURIComponent(accountId)}/access/apps?page=${page}&per_page=100`,
++        apiToken
++      );
++      const batch = Array.isArray(result) ? result : [];
++      for (const item of batch) {
++        try {
++          apps.push(this.parseApp(asRecord(item) ?? {}));
++        } catch {
++          // skip malformed
++        }
++      }
++      const total = result_info?.total_count;
++      const totalPages = result_info?.total_pages;
++      if (typeof totalPages === 'number') {
++        if (page >= totalPages) break;
++      } else if (typeof total === 'number') {
++        if (apps.length >= total) break;
++      } else if (batch.length < 100) {
++        break;
++      }
++      page += 1;
++      if (page > 50) break;
++    }
++    return apps;
++  }
++
++  async listPolicies(
++    accountId: string,
++    apiToken: string,
++    appId: string
++  ): Promise<CloudflarePolicy[]> {
++    const result = await this.request<unknown[]>(
++      'GET',
++      `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}/policies`,
++      apiToken
++    );
++    if (!Array.isArray(result)) return [];
++    const policies: CloudflarePolicy[] = [];
++    for (const item of result) {
++      const rec = asRecord(item);
++      const id = readString(rec, 'id');
++      if (!id) continue;
++      policies.push({
++        id,
++        name: readString(rec, 'name') ?? '',
++        decision: readString(rec, 'decision') ?? '',
++        include: rec?.include,
++      });
++    }
++    return policies;
++  }
++
++  async replaceAllowPolicy(
++    accountId: string,
++    apiToken: string,
++    appId: string,
++    rules: TunnelAccessPolicyRule[]
++  ): Promise<void> {
++    const include = toCloudflareInclude(rules);
++    const body = {
++      name: POLICY_NAME,
++      decision: 'allow',
++      include,
++    };
++    const existing = await this.listPolicies(accountId, apiToken, appId);
++    const keep = existing[0];
++    if (!keep) {
++      await this.request(
++        'POST',
++        `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}/policies`,
++        apiToken,
++        body
++      );
++      return;
++    }
++    await this.request(
++      'PUT',
++      `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}/policies/${encodeURIComponent(keep.id)}`,
++      apiToken,
++      body
++    );
++    for (const extra of existing.slice(1)) {
++      await this.request(
++        'DELETE',
++        `/accounts/${encodeURIComponent(accountId)}/access/apps/${encodeURIComponent(appId)}/policies/${encodeURIComponent(extra.id)}`,
++        apiToken
++      ).catch(() => {});
++    }
++  }
++
++  async readAppRules(
++    accountId: string,
++    apiToken: string,
++    appId: string
++  ): Promise<TunnelAccessPolicyRule[]> {
++    const policies = await this.listPolicies(accountId, apiToken, appId);
++    const allow = policies.find((p) => p.decision === 'allow') ?? policies[0];
++    return fromCloudflareInclude(allow?.include);
++  }
++
++  findAppForHostname(apps: CloudflareApp[], hostname: string): CloudflareApp | null {
++    const host = hostname.toLowerCase();
++    for (const app of apps) {
++      const domain = app.domain.toLowerCase();
++      if (domain === host || domain.startsWith(`${host}/`)) return app;
++    }
++    return null;
++  }
++
++  async getTunnel(
++    accountId: string,
++    apiToken: string,
++    tunnelId: string
++  ): Promise<{ id: string; name: string | null }> {
++    const result = await this.request<Record<string, unknown>>(
++      'GET',
++      `/accounts/${encodeURIComponent(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`,
++      apiToken
++    );
++    return {
++      id: readString(result, 'id') ?? tunnelId,
++      name: readString(result, 'name'),
++    };
++  }
++
++  async getTunnelIngress(
++    accountId: string,
++    apiToken: string,
++    tunnelId: string
++  ): Promise<Array<{ hostname: string | null; service: string }>> {
++    const result = await this.request<Record<string, unknown>>(
++      'GET',
++      `/accounts/${encodeURIComponent(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/configurations`,
++      apiToken
++    );
++    const config = asRecord(result?.config);
++    const ingress = config?.ingress;
++    if (!Array.isArray(ingress)) return [];
++    const rows: Array<{ hostname: string | null; service: string }> = [];
++    for (const item of ingress) {
++      const rec = asRecord(item);
++      const service = readString(rec, 'service');
++      if (!service) continue;
++      rows.push({ hostname: readString(rec, 'hostname'), service });
++    }
++    return rows;
++  }
++
++  private parseApp(result: Record<string, unknown>): CloudflareApp {
++    const id = readString(result, 'id');
++    const aud = readString(result, 'aud');
++    if (!id || !aud) {
++      throw new TunnelError(
++        'access_api_failed',
++        'Cloudflare Access application response is missing id or aud'
++      );
++    }
++    return {
++      id,
++      aud,
++      name: readString(result, 'name') ?? APP_NAME,
++      domain: readString(result, 'domain') ?? '',
++    };
++  }
++
++  private async request<T>(
++    method: string,
++    path: string,
++    apiToken: string,
++    body?: unknown
++  ): Promise<T> {
++    const { result } = await this.requestEnvelope<T>(method, path, apiToken, body);
++    return result as T;
++  }
++
++  private async requestEnvelope<T>(
++    method: string,
++    path: string,
++    apiToken: string,
++    body?: unknown
++  ): Promise<CfEnvelope<T>> {
++    let res: Response;
++    try {
++      res = await this.fetchImpl(`${CF_API}${path}`, {
++        method,
++        headers: {
++          Authorization: `Bearer ${apiToken}`,
++          'Content-Type': 'application/json',
++        },
++        body: body === undefined ? undefined : JSON.stringify(body),
++      });
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      throw new TunnelError('access_api_failed', sanitizeAccessMessage(message));
++    }
++    let envelope: CfEnvelope<T> = {};
++    try {
++      envelope = (await res.json()) as CfEnvelope<T>;
++    } catch {
++      throw new TunnelError(
++        'access_api_failed',
++        sanitizeAccessMessage(`Cloudflare API HTTP ${res.status}`)
++      );
++    }
++    if (!res.ok || envelope.success === false) {
++      const cfMessage = envelope.errors?.[0]?.message ?? `Cloudflare API HTTP ${res.status}`;
++      throw new TunnelError('access_api_failed', sanitizeAccessMessage(cfMessage));
++    }
++    return envelope;
++  }
++}
+diff --git a/apps/gateway/src/tunnel/access-guard.test.ts b/apps/gateway/src/tunnel/access-guard.test.ts
+new file mode 100644
+index 00000000..1a54fa71
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-guard.test.ts
+@@ -0,0 +1,121 @@
++import { describe, expect, test } from 'bun:test';
++import { enforceAccessJwt } from './access-guard';
++import { JwksCache } from './access-jwt';
++
++async function generateRsa() {
++  return crypto.subtle.generateKey(
++    {
++      name: 'RSASSA-PKCS1-v1_5',
++      modulusLength: 2048,
++      publicExponent: new Uint8Array([1, 0, 1]),
++      hash: 'SHA-256',
++    },
++    true,
++    ['sign', 'verify']
++  );
++}
++
++async function signJwt(
++  privateKey: CryptoKey,
++  header: Record<string, unknown>,
++  payload: Record<string, unknown>
++): Promise<string> {
++  const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString('base64url');
++  const data = `${enc(header)}.${enc(payload)}`;
++  const sig = await crypto.subtle.sign(
++    'RSASSA-PKCS1-v1_5',
++    privateKey,
++    new TextEncoder().encode(data)
++  );
++  return `${data}.${Buffer.from(sig).toString('base64url')}`;
++}
++
++const TEAM = 'team.cloudflareaccess.com';
++const AUD = 'aud-1';
++const SNAP = {
++  enforceJwt: true,
++  configured: true,
++  teamDomain: TEAM,
++  aud: AUD,
++};
++
++describe('enforceAccessJwt', () => {
++  test('passes when cf-connecting-ip is absent', async () => {
++    const res = await enforceAccessJwt(new Request('http://127.0.0.1/api/devices'), {
++      snapshot: () => SNAP,
++      jwks: new JwksCache(),
++    });
++    expect(res).toBeNull();
++  });
++
++  test('returns 403 when the request came through cloudflared without a JWT', async () => {
++    const res = await enforceAccessJwt(
++      new Request('http://127.0.0.1/api/devices', { headers: { 'cf-connecting-ip': '1.2.3.4' } }),
++      { snapshot: () => SNAP, jwks: new JwksCache() }
++    );
++    expect(res?.status).toBe(403);
++    expect(await res?.json()).toEqual({ error: { code: 'access_denied' } });
++  });
++
++  test('passes a valid JWT on a cloudflared request', async () => {
++    const { publicKey, privateKey } = await generateRsa();
++    const kid = 'k1';
++    const jwks = new JwksCache({
++      fetchImpl: async () => {
++        const jwk = await crypto.subtle.exportKey('jwk', publicKey);
++        return Response.json({ keys: [{ ...jwk, kid, alg: 'RS256', use: 'sig' }] });
++      },
++    });
++    const now = Date.now();
++    const token = await signJwt(
++      privateKey,
++      { alg: 'RS256', kid, typ: 'JWT' },
++      {
++        aud: [AUD],
++        iss: `https://${TEAM}`,
++        exp: Math.floor(now / 1000) + 120,
++      }
++    );
++    const res = await enforceAccessJwt(
++      new Request('http://127.0.0.1/api/devices', {
++        headers: {
++          'cf-connecting-ip': '1.2.3.4',
++          'Cf-Access-Jwt-Assertion': token,
++        },
++      }),
++      { snapshot: () => SNAP, jwks }
++    );
++    expect(res).toBeNull();
++  });
++
++  test('accepts CF_Authorization cookie on a cloudflared request', async () => {
++    const { publicKey, privateKey } = await generateRsa();
++    const kid = 'k-cookie';
++    const jwks = new JwksCache({
++      fetchImpl: async () => {
++        const jwk = await crypto.subtle.exportKey('jwk', publicKey);
++        return Response.json({ keys: [{ ...jwk, kid, alg: 'RS256', use: 'sig' }] });
++      },
++    });
++    const now = Date.now();
++    const token = await signJwt(
++      privateKey,
++      { alg: 'RS256', kid, typ: 'JWT' },
++      {
++        aud: [AUD],
++        iss: `https://${TEAM}`,
++        exp: Math.floor(now / 1000) + 120,
++      }
++    );
++    const res = await enforceAccessJwt(
++      new Request('http://127.0.0.1/api/devices', {
++        headers: {
++          'cf-connecting-ip': '1.2.3.4',
++          Cookie: `CF_Authorization=${token}`,
++        },
++      }),
++      { snapshot: () => SNAP, jwks }
++    );
++    expect(res).toBeNull();
++  });
++});
+diff --git a/apps/gateway/src/tunnel/access-guard.ts b/apps/gateway/src/tunnel/access-guard.ts
+new file mode 100644
+index 00000000..05e2f621
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-guard.ts
+@@ -0,0 +1,116 @@
++import { json } from '../api/http';
++import { parseCookies } from '../auth/cookies';
++import type { TunnelFetch } from './access-client';
++import { JwksCache, verifyAccessJwt } from './access-jwt';
++
++export type AccessEnforcement = {
++  enforceJwt: boolean;
++  configured: boolean;
++  aud: string | null;
++  teamDomain: string | null;
++};
++
++export type AccessGuardOptions = {
++  snapshot?: () => AccessEnforcement;
++  fetchImpl?: TunnelFetch;
++  now?: () => number;
++  jwks?: JwksCache;
++};
++
++const DENIED = { error: { code: 'access_denied' as const } };
++
++const defaultSnapshot = (): AccessEnforcement => ({
++  enforceJwt: false,
++  configured: false,
++  aud: null,
++  teamDomain: null,
++});
++
++let snapshotFn: () => AccessEnforcement = defaultSnapshot;
++let fetchImpl: TunnelFetch = fetch;
++let nowFn: () => number = Date.now;
++let defaultJwks = new JwksCache();
++
++export function setAccessGuardSnapshot(fn: (() => AccessEnforcement) | null): void {
++  snapshotFn = fn ?? defaultSnapshot;
++}
++
++export const setAccessGuardSource = setAccessGuardSnapshot;
++
++export function setAccessJwtVerifier(jwks: JwksCache): void {
++  defaultJwks = jwks;
++}
++
++export const guardTunnelAccess = enforceTunnelAccessJwt;
++
++export function setAccessGuardFetch(fn: TunnelFetch): void {
++  fetchImpl = fn;
++  defaultJwks.setFetchImpl(fn);
++}
++
++export function setAccessGuardNow(fn: () => number): void {
++  nowFn = fn;
++}
++
++export function resetAccessGuardForTests(): void {
++  snapshotFn = defaultSnapshot;
++  fetchImpl = fetch;
++  nowFn = Date.now;
++  defaultJwks.invalidate();
++  defaultJwks.setFetchImpl(fetch);
++}
++
++export function createAccessGuard(opts: AccessGuardOptions = {}) {
++  const jwks = opts.jwks ?? new JwksCache({ fetchImpl: opts.fetchImpl, now: opts.now });
++  if (opts.fetchImpl) jwks.setFetchImpl(opts.fetchImpl);
++  return (req: Request) =>
++    enforceAccessJwt(req, {
++      snapshot: opts.snapshot ?? snapshotFn,
++      fetchImpl: opts.fetchImpl ?? fetchImpl,
++      now: opts.now ?? nowFn,
++      jwks,
++    });
++}
++
++export async function enforceTunnelAccessJwt(req: Request): Promise<Response | null> {
++  return enforceAccessJwt(req, {
++    snapshot: snapshotFn,
++    fetchImpl,
++    now: nowFn,
++    jwks: defaultJwks,
++  });
++}
++
++export async function enforceAccessJwt(
++  req: Request,
++  opts: {
++    snapshot: () => AccessEnforcement;
++    fetchImpl?: TunnelFetch;
++    now?: () => number;
++    jwks: JwksCache;
++  }
++): Promise<Response | null> {
++  if (!req.headers.get('cf-connecting-ip')) return null;
++  const snap = opts.snapshot();
++  if (!snap.enforceJwt || !snap.configured || !snap.aud || !snap.teamDomain) return null;
++  const token = readAccessJwt(req);
++  if (!token) return json(DENIED, 403);
++  const ok = await verifyAccessJwt({
++    token,
++    teamDomain: snap.teamDomain,
++    aud: snap.aud,
++    now: (opts.now ?? Date.now)(),
++    jwks: opts.jwks,
++  });
++  if (!ok) return json(DENIED, 403);
++  return null;
++}
++
++export function readAccessJwt(req: Request): string | null {
++  const header = req.headers.get('Cf-Access-Jwt-Assertion')?.trim();
++  if (header) return header;
++  const cookies = parseCookies(req.headers.get('Cookie'));
++  const fromCookie = cookies.get('CF_Authorization')?.trim();
++  if (!fromCookie) return null;
++  return fromCookie.replace(/^"|"$/g, '');
++}
+diff --git a/apps/gateway/src/tunnel/access-jwt.test.ts b/apps/gateway/src/tunnel/access-jwt.test.ts
+new file mode 100644
+index 00000000..6eca2162
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-jwt.test.ts
+@@ -0,0 +1,128 @@
++import { describe, expect, test } from 'bun:test';
++import { JwksCache, verifyAccessJwt } from './access-jwt';
++
++async function generateRsa() {
++  return crypto.subtle.generateKey(
++    {
++      name: 'RSASSA-PKCS1-v1_5',
++      modulusLength: 2048,
++      publicExponent: new Uint8Array([1, 0, 1]),
++      hash: 'SHA-256',
++    },
++    true,
++    ['sign', 'verify']
++  );
++}
++
++async function signJwt(
++  privateKey: CryptoKey,
++  header: Record<string, unknown>,
++  payload: Record<string, unknown>
++): Promise<string> {
++  const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString('base64url');
++  const data = `${enc(header)}.${enc(payload)}`;
++  const sig = await crypto.subtle.sign(
++    'RSASSA-PKCS1-v1_5',
++    privateKey,
++    new TextEncoder().encode(data)
++  );
++  return `${data}.${Buffer.from(sig).toString('base64url')}`;
++}
++
++async function jwkFor(publicKey: CryptoKey, kid: string) {
++  const jwk = await crypto.subtle.exportKey('jwk', publicKey);
++  return { ...jwk, kid, alg: 'RS256', use: 'sig' };
++}
++
++const TEAM = 'team.cloudflareaccess.com';
++const AUD = 'app-aud-1';
++const NOW = 1_700_000_000_000;
++
++describe('verifyAccessJwt', () => {
++  test('accepts a valid RS256 token and rejects expired/wrong-aud/wrong-iss', async () => {
++    const { publicKey, privateKey } = await generateRsa();
++    const kid = 'kid-1';
++    let fetches = 0;
++    const jwks = new JwksCache({
++      now: () => NOW,
++      fetchImpl: async () => {
++        fetches += 1;
++        return Response.json({ keys: [await jwkFor(publicKey, kid)] });
++      },
++    });
++    const valid = await signJwt(
++      privateKey,
++      { alg: 'RS256', kid, typ: 'JWT' },
++      {
++        aud: [AUD],
++        iss: `https://${TEAM}`,
++        exp: Math.floor(NOW / 1000) + 60,
++        nbf: Math.floor(NOW / 1000) - 10,
++      }
++    );
++    expect(
++      await verifyAccessJwt({ token: valid, teamDomain: TEAM, aud: AUD, now: NOW, jwks })
++    ).toBe(true);
++
++    const expired = await signJwt(
++      privateKey,
++      { alg: 'RS256', kid, typ: 'JWT' },
++      { aud: [AUD], iss: `https://${TEAM}`, exp: Math.floor(NOW / 1000) - 1 }
++    );
++    expect(
++      await verifyAccessJwt({ token: expired, teamDomain: TEAM, aud: AUD, now: NOW, jwks })
++    ).toBe(false);
++
++    const wrongAud = await signJwt(
++      privateKey,
++      { alg: 'RS256', kid, typ: 'JWT' },
++      { aud: ['other'], iss: `https://${TEAM}`, exp: Math.floor(NOW / 1000) + 60 }
++    );
++    expect(
++      await verifyAccessJwt({ token: wrongAud, teamDomain: TEAM, aud: AUD, now: NOW, jwks })
++    ).toBe(false);
++
++    const wrongIss = await signJwt(
++      privateKey,
++      { alg: 'RS256', kid, typ: 'JWT' },
++      { aud: [AUD], iss: 'https://evil.example', exp: Math.floor(NOW / 1000) + 60 }
++    );
++    expect(
++      await verifyAccessJwt({ token: wrongIss, teamDomain: TEAM, aud: AUD, now: NOW, jwks })
++    ).toBe(false);
++    expect(fetches).toBe(1);
++  });
++
++  test('refreshes JWKS when kid is unknown', async () => {
++    const first = await generateRsa();
++    const second = await generateRsa();
++    const kids = ['old', 'new'];
++    let fetches = 0;
++    const jwks = new JwksCache({
++      now: () => NOW,
++      fetchImpl: async () => {
++        fetches += 1;
++        const pair = fetches === 1 ? first : second;
++        const kid = kids[fetches - 1];
++        return Response.json({ keys: [await jwkFor(pair.publicKey, kid)] });
++      },
++    });
++    const firstTok = await signJwt(
++      first.privateKey,
++      { alg: 'RS256', kid: 'old', typ: 'JWT' },
++      { aud: [AUD], iss: `https://${TEAM}`, exp: Math.floor(NOW / 1000) + 60 }
++    );
++    expect(
++      await verifyAccessJwt({ token: firstTok, teamDomain: TEAM, aud: AUD, now: NOW, jwks })
++    ).toBe(true);
++    const secondTok = await signJwt(
++      second.privateKey,
++      { alg: 'RS256', kid: 'new', typ: 'JWT' },
++      { aud: [AUD], iss: `https://${TEAM}`, exp: Math.floor(NOW / 1000) + 60 }
++    );
++    expect(
++      await verifyAccessJwt({ token: secondTok, teamDomain: TEAM, aud: AUD, now: NOW, jwks })
++    ).toBe(true);
++    expect(fetches).toBe(2);
++  });
++});
+diff --git a/apps/gateway/src/tunnel/access-jwt.ts b/apps/gateway/src/tunnel/access-jwt.ts
+new file mode 100644
+index 00000000..e754f6d7
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-jwt.ts
+@@ -0,0 +1,219 @@
++import type { TunnelFetch } from './access-client';
++import { jwksUrlForTeam, teamIssuer } from './access-sanitize';
++
++export type JwkRsa = {
++  kty?: string;
++  kid?: string;
++  alg?: string;
++  n?: string;
++  e?: string;
++  use?: string;
++};
++
++export type Jwks = { keys?: JwkRsa[] };
++
++const JWKS_TTL_MS = 10 * 60 * 1000;
++
++export type JwksCacheOptions = {
++  fetchImpl?: TunnelFetch;
++  now?: () => number;
++  ttlMs?: number;
++  cacheTtlMs?: number;
++};
++
++export class JwksCache {
++  private keys: JwkRsa[] = [];
++  private fetchedAt = 0;
++  private readonly ttlMs: number;
++  private fetchImpl: TunnelFetch;
++  protected readonly now: () => number;
++
++  constructor(opts: JwksCacheOptions = {}) {
++    this.fetchImpl = opts.fetchImpl ?? fetch;
++    this.now = opts.now ?? Date.now;
++    this.ttlMs = opts.ttlMs ?? opts.cacheTtlMs ?? JWKS_TTL_MS;
++  }
++
++  setFetchImpl(fn: TunnelFetch): void {
++    this.fetchImpl = fn;
++  }
++
++  invalidate(): void {
++    this.keys = [];
++    this.fetchedAt = 0;
++  }
++
++  async getKey(teamDomain: string, kid: string, forceRefresh = false): Promise<JwkRsa | null> {
++    const stale = this.now() - this.fetchedAt > this.ttlMs;
++    if (forceRefresh || stale || this.keys.length === 0) {
++      await this.refresh(teamDomain);
++    }
++    let found = this.keys.find((k) => k.kid === kid) ?? null;
++    if (!found && !forceRefresh) {
++      await this.refresh(teamDomain);
++      found = this.keys.find((k) => k.kid === kid) ?? null;
++    }
++    return found;
++  }
++
++  private async refresh(teamDomain: string): Promise<void> {
++    const url = jwksUrlForTeam(teamDomain);
++    const res = await this.fetchImpl(url);
++    if (!res.ok) {
++      throw new Error(`JWKS HTTP ${res.status}`);
++    }
++    const body = (await res.json()) as Jwks;
++    this.keys = Array.isArray(body.keys) ? body.keys : [];
++    this.fetchedAt = this.now();
++  }
++}
++
++export type VerifyAccessJwtInput = {
++  token: string;
++  teamDomain: string;
++  aud: string;
++  now?: number;
++  jwks: JwksCache;
++};
++
++export async function verifyAccessJwt(input: VerifyAccessJwtInput): Promise<boolean> {
++  const parsed = splitJwt(input.token);
++  if (!parsed) return false;
++  const { header, payload, signingInput, signature } = parsed;
++  if (header.alg !== 'RS256') return false;
++  const kid = typeof header.kid === 'string' ? header.kid : '';
++  if (!kid) return false;
++  let key: JwkRsa | null;
++  try {
++    key = await input.jwks.getKey(input.teamDomain, kid);
++  } catch {
++    return false;
++  }
++  if (!key?.n || !key.e) return false;
++  const ok = await verifyRs256(signingInput, signature, key);
++  if (!ok) return false;
++  const nowSec = Math.floor((input.now ?? Date.now()) / 1000);
++  if (typeof payload.exp === 'number' && nowSec >= payload.exp) return false;
++  if (typeof payload.nbf === 'number' && nowSec < payload.nbf) return false;
++  const iss = teamIssuer(input.teamDomain);
++  if (payload.iss !== iss) return false;
++  const auds = Array.isArray(payload.aud)
++    ? payload.aud.filter((v): v is string => typeof v === 'string')
++    : typeof payload.aud === 'string'
++      ? [payload.aud]
++      : [];
++  return auds.includes(input.aud);
++}
++
++type JwtHeader = { alg?: string; kid?: string; typ?: string };
++type JwtPayload = { aud?: unknown; iss?: unknown; exp?: number; nbf?: number; iat?: number };
++
++function splitJwt(token: string): {
++  header: JwtHeader;
++  payload: JwtPayload;
++  signingInput: string;
++  signature: Uint8Array;
++} | null {
++  const parts = token.split('.');
++  if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) return null;
++  try {
++    const header = JSON.parse(utf8FromB64url(parts[0])) as JwtHeader;
++    const payload = JSON.parse(utf8FromB64url(parts[1])) as JwtPayload;
++    return {
++      header,
++      payload,
++      signingInput: `${parts[0]}.${parts[1]}`,
++      signature: b64urlToBytes(parts[2]),
++    };
++  } catch {
++    return null;
++  }
++}
++
++async function verifyRs256(
++  signingInput: string,
++  signature: Uint8Array,
++  jwk: JwkRsa
++): Promise<boolean> {
++  try {
++    const key = await crypto.subtle.importKey(
++      'jwk',
++      { kty: 'RSA', n: jwk.n, e: jwk.e, alg: 'RS256', ext: true },
++      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
++      false,
++      ['verify']
++    );
++    const data = new TextEncoder().encode(signingInput);
++    const sig = signature.buffer.slice(
++      signature.byteOffset,
++      signature.byteOffset + signature.byteLength
++    ) as ArrayBuffer;
++    return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig, data);
++  } catch {
++    return false;
++  }
++}
++
++function utf8FromB64url(value: string): string {
++  return new TextDecoder().decode(b64urlToBytes(value));
++}
++
++function b64urlToBytes(value: string): Uint8Array {
++  const padded = value
++    .replace(/-/g, '+')
++    .replace(/_/g, '/')
++    .padEnd(Math.ceil(value.length / 4) * 4, '=');
++  return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
++}
++
++export function bytesToB64url(bytes: Uint8Array): string {
++  let bin = '';
++  for (const b of bytes) bin += String.fromCharCode(b);
++  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
++}
++
++export class AccessJwtVerifier extends JwksCache {
++  async verify(token: string, claims: { aud: string; teamDomain: string }): Promise<boolean> {
++    return verifyAccessJwt({
++      token,
++      teamDomain: claims.teamDomain,
++      aud: claims.aud,
++      now: this.now(),
++      jwks: this,
++    });
++  }
++}
++
++export async function generateAccessTestKey(kid: string): Promise<{
++  privateKey: CryptoKey;
++  jwk: JwkRsa;
++}> {
++  const pair = await crypto.subtle.generateKey(
++    {
++      name: 'RSASSA-PKCS1-v1_5',
++      modulusLength: 2048,
++      publicExponent: new Uint8Array([1, 0, 1]),
++      hash: 'SHA-256',
++    },
++    true,
++    ['sign', 'verify']
++  );
++  const jwk = (await crypto.subtle.exportKey('jwk', pair.publicKey)) as JwkRsa;
++  return {
++    privateKey: pair.privateKey,
++    jwk: { ...jwk, kid, alg: 'RS256', use: 'sig' },
++  };
++}
++
++export async function signAccessJwt(
++  privateKey: CryptoKey,
++  header: Record<string, unknown>,
++  payload: Record<string, unknown>
++): Promise<string> {
++  const encoder = new TextEncoder();
++  const signingInput = `${bytesToB64url(encoder.encode(JSON.stringify(header)))}.${bytesToB64url(encoder.encode(JSON.stringify(payload)))}`;
++  const signature = new Uint8Array(
++    await crypto.subtle.sign('RSASSA-PKCS1-v1_5', privateKey, encoder.encode(signingInput))
++  );
++  return `${signingInput}.${bytesToB64url(signature)}`;
++}
+diff --git a/apps/gateway/src/tunnel/access-rules.test.ts b/apps/gateway/src/tunnel/access-rules.test.ts
+new file mode 100644
+index 00000000..1ac89c7a
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-rules.test.ts
+@@ -0,0 +1,17 @@
++import { describe, expect, test } from 'bun:test';
++import { parseAccessRules } from './access-rules';
++
++describe('parseAccessRules', () => {
++  test('requires at least one valid email or domain rule', () => {
++    expect(() => parseAccessRules([])).toThrow();
++    expect(parseAccessRules([{ kind: 'email', value: 'A@Example.COM' }])).toEqual([
++      { kind: 'email', value: 'a@example.com' },
++    ]);
++    expect(parseAccessRules([{ kind: 'email_domain', value: 'Example.com' }])).toEqual([
++      { kind: 'email_domain', value: 'example.com' },
++    ]);
++    expect(() => parseAccessRules([{ kind: 'email', value: 'not-an-email' }])).toThrow();
++    expect(() => parseAccessRules([{ kind: 'email_domain', value: 'not a domain' }])).toThrow();
++    expect(() => parseAccessRules([{ kind: 'email_domain', value: '@x.com' }])).toThrow();
++  });
++});
+diff --git a/apps/gateway/src/tunnel/access-rules.ts b/apps/gateway/src/tunnel/access-rules.ts
+new file mode 100644
+index 00000000..b795a17f
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-rules.ts
+@@ -0,0 +1,86 @@
++import type { TunnelAccessPolicyRule } from '@tmex/shared';
++import { TunnelError } from './errors';
++import { normalizeTunnelHostname } from './hostname';
++
++const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
++export function parseAccessRules(raw: unknown): TunnelAccessPolicyRule[] {
++  if (!Array.isArray(raw)) {
++    throw new TunnelError('invalid_request', 'rules must be an array');
++  }
++  return validateAccessRules(raw as TunnelAccessPolicyRule[]);
++}
++
++export function validateAccessRules(rules: TunnelAccessPolicyRule[]): TunnelAccessPolicyRule[] {
++  if (!Array.isArray(rules) || rules.length === 0) {
++    throw new TunnelError('invalid_request', 'at least one Access policy rule is required');
++  }
++  return rules.map((rule, index) => {
++    if (!rule || (rule.kind !== 'email' && rule.kind !== 'email_domain')) {
++      throw new TunnelError('invalid_request', `rules[${index}] has an invalid kind`);
++    }
++    const value = rule.value.trim().toLowerCase();
++    if (rule.kind === 'email') {
++      if (!EMAIL_RE.test(value)) {
++        throw new TunnelError('invalid_request', `rules[${index}] is not a valid email`);
++      }
++      return { kind: 'email', value };
++    }
++    if (value.startsWith('@') || !normalizeTunnelHostname(value)) {
++      throw new TunnelError('invalid_request', `rules[${index}] is not a valid email domain`);
++    }
++    return { kind: 'email_domain', value };
++  });
++}
++
++export function parseAccessRulesJson(raw: string | null | undefined): TunnelAccessPolicyRule[] {
++  if (!raw) return [];
++  try {
++    const parsed = JSON.parse(raw) as unknown;
++    if (!Array.isArray(parsed)) return [];
++    return parsed.flatMap((item) => {
++      if (!item || typeof item !== 'object') return [];
++      const rec = item as { kind?: unknown; value?: unknown };
++      if ((rec.kind === 'email' || rec.kind === 'email_domain') && typeof rec.value === 'string') {
++        return [{ kind: rec.kind, value: rec.value }];
++      }
++      return [];
++    });
++  } catch {
++    return [];
++  }
++}
++
++export function rulesToCfInclude(
++  rules: TunnelAccessPolicyRule[]
++): Array<{ email: { email: string } } | { email_domain: { domain: string } }> {
++  return rules.map((rule) =>
++    rule.kind === 'email'
++      ? { email: { email: rule.value } }
++      : { email_domain: { domain: rule.value } }
++  );
++}
++
++export function rulesFromCfInclude(include: unknown): TunnelAccessPolicyRule[] {
++  if (!Array.isArray(include)) return [];
++  const out: TunnelAccessPolicyRule[] = [];
++  for (const item of include) {
++    if (!item || typeof item !== 'object') continue;
++    const rec = item as Record<string, unknown>;
++    if (rec.email && typeof rec.email === 'object' && rec.email) {
++      const email = (rec.email as { email?: unknown }).email;
++      if (typeof email === 'string' && email.trim()) {
++        out.push({ kind: 'email', value: email.trim().toLowerCase() });
++      }
++    } else if (rec.email_domain && typeof rec.email_domain === 'object' && rec.email_domain) {
++      const domain = (rec.email_domain as { domain?: unknown }).domain;
++      if (typeof domain === 'string' && domain.trim()) {
++        out.push({ kind: 'email_domain', value: domain.trim().toLowerCase() });
++      }
++    }
++  }
++  return out;
++}
++
++export const toCloudflareInclude = rulesToCfInclude;
++export const fromCloudflareInclude = rulesFromCfInclude;
+diff --git a/apps/gateway/src/tunnel/access-sanitize.ts b/apps/gateway/src/tunnel/access-sanitize.ts
+new file mode 100644
+index 00000000..7986a9af
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-sanitize.ts
+@@ -0,0 +1,29 @@
++import { redactSecrets } from './redact';
++
++const BEARER = /bearer\s+[A-Za-z0-9._\-]+/gi;
++const CF_TOKEN = /\b[A-Za-z0-9_\-]{40,}\b/g;
++
++export function sanitizeAccessError(message: string): string {
++  let out = message.replace(BEARER, 'Bearer ***');
++  out = redactSecrets(out);
++  out = out.replace(CF_TOKEN, '***');
++  out = out.replace(/\s+/g, ' ').trim();
++  if (out.length > 300) out = `${out.slice(0, 297)}...`;
++  return out || 'Cloudflare API request failed';
++}
++
++export function teamDomainFromAuthDomain(raw: string | null | undefined): string | null {
++  if (!raw) return null;
++  let value = raw.trim().toLowerCase();
++  value = value.replace(/^https?:\/\//, '').replace(/\/+$/, '');
++  if (!value) return null;
++  return value;
++}
++
++export function teamIssuer(teamDomain: string): string {
++  return `https://${teamDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`;
++}
++
++export function jwksUrlForTeam(teamDomain: string): string {
++  return `${teamIssuer(teamDomain)}/cdn-cgi/access/certs`;
++}
+diff --git a/apps/gateway/src/tunnel/access-store.ts b/apps/gateway/src/tunnel/access-store.ts
+new file mode 100644
+index 00000000..4094131e
+--- /dev/null
++++ b/apps/gateway/src/tunnel/access-store.ts
+@@ -0,0 +1,191 @@
++import type { TunnelAccessPolicyRule, TunnelAccessStatus } from '@tmex/shared';
++import { eq } from 'drizzle-orm';
++import type { AuthDb } from '../auth/types';
++import { decryptWithContext, encrypt } from '../crypto';
++import { tunnelAccess } from '../db/schema';
++import { parseAccessRulesJson } from './access-rules';
++import { sanitizeAccessError } from './access-sanitize';
++
++export const TUNNEL_ACCESS_ID = 'default';
++const ACCESS_SCOPE = 'tunnel_access';
++
++export type TunnelAccessPersisted = {
++  accountId: string | null;
++  apiTokenEnc: string | null;
++  teamDomain: string | null;
++  appId: string | null;
++  aud: string | null;
++  hostname: string | null;
++  rules: TunnelAccessPolicyRule[];
++  enforceJwt: boolean;
++  lastError: string | null;
++  updatedAt: string;
++};
++
++export const DEFAULT_TUNNEL_ACCESS: TunnelAccessPersisted = {
++  accountId: null,
++  apiTokenEnc: null,
++  teamDomain: null,
++  appId: null,
++  aud: null,
++  hostname: null,
++  rules: [],
++  enforceJwt: false,
++  lastError: null,
++  updatedAt: '',
++};
++
++export type TunnelAccessPatch = Partial<Omit<TunnelAccessPersisted, 'updatedAt'>> & {
++  apiToken?: string | null;
++};
++
++export interface TunnelAccessStoreLike {
++  get(): TunnelAccessPersisted;
++  save(patch: TunnelAccessPatch): Promise<TunnelAccessPersisted>;
++  getApiToken(): Promise<string | null>;
++}
++
++export function accessStatusFrom(row: TunnelAccessPersisted): TunnelAccessStatus {
++  return {
++    hasCredentials: Boolean(row.apiTokenEnc && row.accountId),
++    accountId: row.accountId,
++    teamDomain: row.teamDomain,
++    configured: Boolean(row.appId && row.aud && row.hostname),
++    appId: row.appId,
++    aud: row.aud,
++    hostname: row.hostname,
++    rules: [...row.rules],
++    enforceJwt: row.enforceJwt,
++    lastError: row.lastError,
++  };
++}
++
++export class MemoryTunnelAccessStore implements TunnelAccessStoreLike {
++  private row: TunnelAccessPersisted = { ...DEFAULT_TUNNEL_ACCESS, rules: [] };
++  private apiToken: string | null = null;
++
++  get(): TunnelAccessPersisted {
++    return { ...this.row, rules: [...this.row.rules] };
++  }
++
++  async save(patch: TunnelAccessPatch): Promise<TunnelAccessPersisted> {
++    let next = patch;
++    if ('apiToken' in patch) {
++      this.apiToken = patch.apiToken ?? null;
++      next = { ...patch, apiTokenEnc: patch.apiToken ? 'enc' : null };
++    }
++    this.row = applyAccessPatch(this.row, next);
++    return this.get();
++  }
++
++  async getApiToken(): Promise<string | null> {
++    return this.apiToken;
++  }
++}
++
++export class TunnelAccessStore implements TunnelAccessStoreLike {
++  constructor(private readonly db: AuthDb) {}
++
++  get(): TunnelAccessPersisted {
++    try {
++      const row = this.db
++        .select()
++        .from(tunnelAccess)
++        .where(eq(tunnelAccess.id, TUNNEL_ACCESS_ID))
++        .get();
++      if (!row) return { ...DEFAULT_TUNNEL_ACCESS, rules: [] };
++      return {
++        accountId: row.accountId ?? null,
++        apiTokenEnc: row.apiTokenEnc ?? null,
++        teamDomain: row.teamDomain ?? null,
++        appId: row.appId ?? null,
++        aud: row.aud ?? null,
++        hostname: row.hostname ?? null,
++        rules: parseAccessRulesJson(row.rulesJson),
++        enforceJwt: Boolean(row.enforceJwt),
++        lastError: row.lastError ?? null,
++        updatedAt: row.updatedAt,
++      };
++    } catch {
++      return { ...DEFAULT_TUNNEL_ACCESS, rules: [] };
++    }
++  }
++
++  async save(patch: TunnelAccessPatch): Promise<TunnelAccessPersisted> {
++    const current = this.get();
++    let apiTokenEnc = current.apiTokenEnc;
++    if ('apiToken' in patch) {
++      apiTokenEnc = patch.apiToken ? await encrypt(patch.apiToken) : null;
++    } else if (patch.apiTokenEnc !== undefined) {
++      apiTokenEnc = patch.apiTokenEnc;
++    }
++    const next = applyAccessPatch({ ...current, apiTokenEnc }, patch);
++    const values = {
++      id: TUNNEL_ACCESS_ID,
++      accountId: next.accountId,
++      apiTokenEnc: next.apiTokenEnc,
++      teamDomain: next.teamDomain,
++      appId: next.appId,
++      aud: next.aud,
++      hostname: next.hostname,
++      rulesJson: JSON.stringify(next.rules),
++      enforceJwt: next.enforceJwt,
++      lastError: next.lastError,
++      updatedAt: next.updatedAt,
++    };
++    this.db
++      .insert(tunnelAccess)
++      .values(values)
++      .onConflictDoUpdate({
++        target: tunnelAccess.id,
++        set: {
++          accountId: values.accountId,
++          apiTokenEnc: values.apiTokenEnc,
++          teamDomain: values.teamDomain,
++          appId: values.appId,
++          aud: values.aud,
++          hostname: values.hostname,
++          rulesJson: values.rulesJson,
++          enforceJwt: values.enforceJwt,
++          lastError: values.lastError,
++          updatedAt: values.updatedAt,
++        },
++      })
++      .run();
++    return next;
++  }
++
++  async getApiToken(): Promise<string | null> {
++    const row = this.get();
++    if (!row.apiTokenEnc) return null;
++    return decryptWithContext(row.apiTokenEnc, {
++      scope: ACCESS_SCOPE,
++      entityId: TUNNEL_ACCESS_ID,
++      field: 'api_token',
++    });
++  }
++}
++
++function applyAccessPatch(
++  current: TunnelAccessPersisted,
++  patch: TunnelAccessPatch
++): TunnelAccessPersisted {
++  const lastError =
++    patch.lastError === undefined
++      ? current.lastError
++      : patch.lastError
++        ? sanitizeAccessError(patch.lastError)
++        : null;
++  return {
++    accountId: patch.accountId !== undefined ? patch.accountId : current.accountId,
++    apiTokenEnc: patch.apiTokenEnc !== undefined ? patch.apiTokenEnc : current.apiTokenEnc,
++    teamDomain: patch.teamDomain !== undefined ? patch.teamDomain : current.teamDomain,
++    appId: patch.appId !== undefined ? patch.appId : current.appId,
++    aud: patch.aud !== undefined ? patch.aud : current.aud,
++    hostname: patch.hostname !== undefined ? patch.hostname : current.hostname,
++    rules: patch.rules !== undefined ? patch.rules : current.rules,
++    enforceJwt: patch.enforceJwt ?? current.enforceJwt,
++    lastError,
++    updatedAt: new Date().toISOString(),
++  };
++}
+diff --git a/apps/gateway/src/tunnel/config-store.test.ts b/apps/gateway/src/tunnel/config-store.test.ts
+index fd9147b1..9abe4c33 100644
+--- a/apps/gateway/src/tunnel/config-store.test.ts
++++ b/apps/gateway/src/tunnel/config-store.test.ts
+@@ -1,15 +1,23 @@
+ import { describe, expect, test } from 'bun:test';
+ import { createMigratedAuthDb } from '../auth/test-db';
++import { TunnelAccessStore } from './access-store';
+ import { TunnelConfigStore } from './config-store';
+ 
+ describe('tunnel_config migration', () => {
+-  test('applies tunnel_config and round-trips a row', () => {
++  test('applies tunnel_config / tunnel_access and round-trips a row', async () => {
+     const { sqlite, db, close } = createMigratedAuthDb();
+     try {
+       const tables = sqlite
+-        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tunnel_config'")
+-        .all();
+-      expect(tables.length).toBe(1);
++        .query(
++          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tunnel_config', 'tunnel_access')"
++        )
++        .all() as Array<{ name: string }>;
++      expect(tables.map((t) => t.name).sort()).toEqual(['tunnel_access', 'tunnel_config']);
++      const cols = sqlite.query('PRAGMA table_info(tunnel_config)').all() as Array<{
++        name: string;
++      }>;
++      expect(cols.map((c) => c.name)).toContain('exposure_acknowledged_at');
++      expect(cols.map((c) => c.name)).toContain('externally_managed');
+       const store = new TunnelConfigStore(db);
+       expect(store.get().mode).toBe('off');
+       const saved = store.save({
+@@ -18,6 +26,8 @@ describe('tunnel_config migration', () => {
+         tunnelName: 'tmex-tmex',
+         tunnelId: '550e8400-e29b-41d4-a716-446655440000',
+         autoStart: true,
++        externallyManaged: true,
++        exposureAcknowledgedAt: '2026-08-30T00:00:00.000Z',
+       });
+       expect(saved.mode).toBe('named');
+       expect(store.get()).toMatchObject({
+@@ -25,7 +35,22 @@ describe('tunnel_config migration', () => {
+         hostname: 'tmex.example.com',
+         tunnelName: 'tmex-tmex',
+         autoStart: true,
++        externallyManaged: true,
++        exposureAcknowledgedAt: '2026-08-30T00:00:00.000Z',
+       });
++      const access = new TunnelAccessStore(db);
++      await access.save({
++        apiToken: 'cf-token-secret',
++        accountId: 'acc-1',
++        teamDomain: 'team.cloudflareaccess.com',
++        rules: [{ kind: 'email_domain', value: 'example.com' }],
++        enforceJwt: true,
++      });
++      const row = access.get();
++      expect(row.apiTokenEnc).toBeTruthy();
++      expect(row.apiTokenEnc).not.toContain('cf-token-secret');
++      expect(row.accountId).toBe('acc-1');
++      expect(await access.getApiToken()).toBe('cf-token-secret');
+     } finally {
+       close();
+     }
+diff --git a/apps/gateway/src/tunnel/config-store.ts b/apps/gateway/src/tunnel/config-store.ts
+index dc9f2170..cda7b68a 100644
+--- a/apps/gateway/src/tunnel/config-store.ts
++++ b/apps/gateway/src/tunnel/config-store.ts
+@@ -11,6 +11,8 @@ export type TunnelPersisted = {
+   tunnelName: string | null;
+   tunnelId: string | null;
+   autoStart: boolean;
++  externallyManaged: boolean;
++  exposureAcknowledgedAt: string | null;
+   updatedAt: string;
+ };
+ 
+@@ -20,6 +22,8 @@ export const DEFAULT_TUNNEL_CONFIG: TunnelPersisted = {
+   tunnelName: null,
+   tunnelId: null,
+   autoStart: false,
++  externallyManaged: false,
++  exposureAcknowledgedAt: null,
+   updatedAt: '',
+ };
+ 
+@@ -67,6 +71,8 @@ export class TunnelConfigStore implements TunnelConfigStoreLike {
+         tunnelName: row.tunnelName ?? null,
+         tunnelId: row.tunnelId ?? null,
+         autoStart: Boolean(row.autoStart),
++        externallyManaged: Boolean(row.externallyManaged),
++        exposureAcknowledgedAt: row.exposureAcknowledgedAt ?? null,
+         updatedAt: row.updatedAt,
+       };
+     } catch {
+@@ -82,6 +88,12 @@ export class TunnelConfigStore implements TunnelConfigStoreLike {
+       tunnelName: patch.tunnelName !== undefined ? patch.tunnelName : current.tunnelName,
+       tunnelId: patch.tunnelId !== undefined ? patch.tunnelId : current.tunnelId,
+       autoStart: patch.autoStart ?? current.autoStart,
++      externallyManaged:
++        patch.externallyManaged !== undefined ? patch.externallyManaged : current.externallyManaged,
++      exposureAcknowledgedAt:
++        patch.exposureAcknowledgedAt !== undefined
++          ? patch.exposureAcknowledgedAt
++          : current.exposureAcknowledgedAt,
+       updatedAt: new Date().toISOString(),
+     };
+     const values = {
+@@ -91,6 +103,8 @@ export class TunnelConfigStore implements TunnelConfigStoreLike {
+       tunnelName: next.tunnelName,
+       tunnelId: next.tunnelId,
+       autoStart: next.autoStart,
++      externallyManaged: next.externallyManaged,
++      exposureAcknowledgedAt: next.exposureAcknowledgedAt,
+       updatedAt: next.updatedAt,
+     };
+     this.db
+@@ -104,6 +118,8 @@ export class TunnelConfigStore implements TunnelConfigStoreLike {
+           tunnelName: values.tunnelName,
+           tunnelId: values.tunnelId,
+           autoStart: values.autoStart,
++          externallyManaged: values.externallyManaged,
++          exposureAcknowledgedAt: values.exposureAcknowledgedAt,
+           updatedAt: values.updatedAt,
+         },
+       })
+diff --git a/apps/gateway/src/tunnel/errors.ts b/apps/gateway/src/tunnel/errors.ts
+index 53e0401f..ce02ca65 100644
+--- a/apps/gateway/src/tunnel/errors.ts
++++ b/apps/gateway/src/tunnel/errors.ts
+@@ -3,7 +3,8 @@ import type { TunnelErrorCode } from '@tmex/shared';
+ export class TunnelError extends Error {
+   constructor(
+     readonly code: TunnelErrorCode,
+-    message: string
++    message: string,
++    readonly httpStatusOverride?: number
+   ) {
+     super(message);
+     this.name = 'TunnelError';
+@@ -20,11 +21,13 @@ export function tunnelErrorFrom(error: unknown): { code: TunnelErrorCode; messag
+   };
+ }
+ 
+-export function tunnelHttpStatus(code: TunnelErrorCode): number {
++export function tunnelHttpStatus(code: TunnelErrorCode, override?: number): number {
++  if (override) return override;
+   switch (code) {
+     case 'busy':
+     case 'tunnel_exists':
+     case 'auth_required':
++    case 'exposure_ack_required':
+       return 409;
+     case 'invalid_request':
+     case 'invalid_hostname':
+@@ -32,6 +35,7 @@ export function tunnelHttpStatus(code: TunnelErrorCode): number {
+     case 'unsupported_platform':
+     case 'binary_missing':
+     case 'not_logged_in':
++    case 'access_api_failed':
+       return 400;
+     default:
+       return 500;
+diff --git a/apps/gateway/src/tunnel/external-detect.test.ts b/apps/gateway/src/tunnel/external-detect.test.ts
+new file mode 100644
+index 00000000..ee129096
+--- /dev/null
++++ b/apps/gateway/src/tunnel/external-detect.test.ts
+@@ -0,0 +1,171 @@
++import { describe, expect, test } from 'bun:test';
++import {
++  ExternalTunnelDetector,
++  hostnamesFromLog,
++  parseArgv,
++  parseCloudflaredConfigYml,
++  parsePlistProgramArguments,
++  parseProcessList,
++  parseTunnelToken,
++  serviceHitsOrigin,
++} from './external-detect';
++
++describe('external tunnel parsing', () => {
++  test('parses token-file / logfile flags and token payload without exposing the secret', () => {
++    const parsed = parseProcessList(
++      '42 /opt/homebrew/bin/cloudflared tunnel --logfile /tmp/cf.log run --token-file /tmp/token\n'
++    );
++    expect(parsed[0]).toMatchObject({
++      pid: '42',
++      tokenFile: '/tmp/token',
++    });
++    const payload = parseTunnelToken(
++      Buffer.from(JSON.stringify({ a: 'acct', t: 'tun-id', s: 'super-secret' })).toString('base64')
++    );
++    expect(payload).toEqual({ accountId: 'acct', tunnelId: 'tun-id' });
++    expect(JSON.stringify(payload)).not.toContain('super-secret');
++  });
++
++  test('parses config.yml ingress and keeps hostnames whose service hits originPort', () => {
++    const yml = parseCloudflaredConfigYml(`
++tunnel: 550e8400-e29b-41d4-a716-446655440000
++credentials-file: /tmp/cred.json
++ingress:
++  - hostname: tmex.example.com
++    service: http://127.0.0.1:19883
++  - hostname: other.example.com
++    service: http://127.0.0.1:80
++  - service: http_status:404
++`);
++    expect(yml.tunnel).toBe('550e8400-e29b-41d4-a716-446655440000');
++    expect(yml.credentialsFile).toBe('/tmp/cred.json');
++    expect(
++      yml.ingress.filter((row) => serviceHitsOrigin(row.service, 19883)).map((r) => r.hostname)
++    ).toEqual(['tmex.example.com']);
++  });
++
++  test('parses launchd ProgramArguments and logfile ingress JSON', () => {
++    const args = parsePlistProgramArguments(`<?xml version="1.0"?>
++<plist><dict>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/opt/homebrew/bin/cloudflared</string>
++    <string>tunnel</string>
++    <string>--logfile</string>
++    <string>/tmp/cf.log</string>
++    <string>run</string>
++    <string>--token-file</string>
++    <string>/tmp/token</string>
++  </array>
++</dict></plist>`);
++    expect(args[0]).toContain('cloudflared');
++    expect(args).toContain('--token-file');
++    const hosts = hostnamesFromLog(
++      'noise\n{"ingress":[{"hostname":"old.example","service":"http://127.0.0.1:1"}]}\nfinal {"ingress":[{"hostname":"tmex.example.com","service":"http://127.0.0.1:19883"}]}\n',
++      19883
++    );
++    expect(hosts).toEqual(['tmex.example.com']);
++  });
++
++  test('keeps launchd token-file paths that contain spaces', () => {
++    const args = parsePlistProgramArguments(`<?xml version="1.0"?>
++<plist><dict>
++  <key>ProgramArguments</key>
++  <array>
++    <string>/opt/homebrew/bin/cloudflared</string>
++    <string>tunnel</string>
++    <string>--logfile</string>
++    <string>/Users/me/Library/Application Support/tmex-cloudflared/cloudflared.log</string>
++    <string>run</string>
++    <string>--token-file</string>
++    <string>/Users/me/Library/Application Support/tmex-cloudflared/token</string>
++  </array>
++</dict></plist>`);
++    expect(parseArgv(args).tokenFile).toBe(
++      '/Users/me/Library/Application Support/tmex-cloudflared/token'
++    );
++  });
++
++  test('detector prefers launchd + sibling hostname file and caches for 30s', async () => {
++    const files = new Map<string, string>([
++      [
++        '/Users/me/Library/LaunchAgents/com.tmex.cloudflared.plist',
++        `<plist><dict><key>ProgramArguments</key><array>
++          <string>/opt/homebrew/bin/cloudflared</string><string>tunnel</string>
++          <string>--logfile</string><string>/tmp/cf.log</string>
++          <string>run</string><string>--token-file</string><string>/tmp/tmex-cf/token</string>
++        </array></dict></plist>`,
++      ],
++      [
++        '/tmp/tmex-cf/token',
++        Buffer.from(JSON.stringify({ a: 'acct', t: 'tid', s: 'secret' })).toString('base64'),
++      ],
++      ['/tmp/tmex-cf/hostname', 'tmex.konata.tv\n'],
++      ['/tmp/tmex-cf/tunnel-id', 'tid\n'],
++    ]);
++    const dirs = new Map<string, string[]>([
++      ['/Users/me/Library/LaunchAgents', ['com.tmex.cloudflared.plist']],
++      ['/Library/LaunchDaemons', []],
++    ]);
++    let now = 1_000;
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => now,
++      homedir: () => '/Users/me',
++      platform: 'darwin',
++      listProcesses: async () =>
++        '9 /opt/homebrew/bin/cloudflared tunnel --logfile /tmp/cf.log run --token-file /tmp/tmex-cf/token\n',
++      readFile: async (path) => files.get(path) ?? null,
++      listDir: async (path) => dirs.get(path) ?? [],
++    });
++    const first = await d.detect();
++    expect(first).toMatchObject({
++      detected: true,
++      source: 'launchd',
++      running: true,
++      tunnelId: 'tid',
++      hostnames: ['tmex.konata.tv'],
++    });
++    now += 10_000;
++    files.delete('/tmp/tmex-cf/hostname');
++    const cached = await d.detect();
++    expect(cached.hostnames).toEqual(['tmex.konata.tv']);
++  });
++
++  test('uses Cloudflare tunnel API for hostname and name when no sibling file', async () => {
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => 1,
++      homedir: () => '/no-home',
++      platform: 'linux',
++      listProcesses: async () => '7 /usr/bin/cloudflared tunnel run --token-file /tmp/token\n',
++      readFile: async (path) => {
++        if (path === '/tmp/token') {
++          return Buffer.from(JSON.stringify({ a: 'acct', t: 'tid', s: 'super-secret' })).toString(
++            'base64'
++          );
++        }
++        return null;
++      },
++      listDir: async () => [],
++      getCredentials: async () => ({ accountId: 'acct', apiToken: 'tok' }),
++      accessClient: {
++        getTunnelIngress: async () => [
++          { hostname: 'api.example.com', service: 'http://127.0.0.1:19883' },
++          { hostname: 'other.example.com', service: 'http://127.0.0.1:80' },
++        ],
++        getTunnel: async () => ({ id: 'tid', name: 'tmex-ext' }),
++      },
++    });
++    const found = await d.detect();
++    expect(found).toMatchObject({
++      detected: true,
++      source: 'process',
++      tunnelId: 'tid',
++      tunnelName: 'tmex-ext',
++      hostnames: ['api.example.com'],
++      tokenAccountId: 'acct',
++    });
++    expect(JSON.stringify(found)).not.toContain('super-secret');
++  });
++});
+diff --git a/apps/gateway/src/tunnel/external-detect.ts b/apps/gateway/src/tunnel/external-detect.ts
+new file mode 100644
+index 00000000..36e73bcd
+--- /dev/null
++++ b/apps/gateway/src/tunnel/external-detect.ts
+@@ -0,0 +1,665 @@
++import { readFileSync, readdirSync } from 'node:fs';
++import { homedir } from 'node:os';
++import { join } from 'node:path';
++import type { TunnelExternalStatus } from '@tmex/shared';
++
++export type ExternalProcess = { pid: number; command: string };
++
++export type DetectedTunnel = TunnelExternalStatus & {
++  pid: number | null;
++  tokenFile: string | null;
++  logFile: string | null;
++  accountId: string | null;
++};
++
++export const EMPTY_EXTERNAL: DetectedTunnel = {
++  detected: false,
++  source: null,
++  configPath: null,
++  tunnelId: null,
++  tunnelName: null,
++  hostnames: [],
++  hasOriginCert: false,
++  running: false,
++  pid: null,
++  tokenFile: null,
++  logFile: null,
++  accountId: null,
++};
++
++export type ExternalAccessApi = {
++  getTunnelIngress: (
++    accountId: string,
++    apiToken: string,
++    tunnelId: string
++  ) => Promise<Array<{ hostname: string | null; service: string | null }>>;
++  getTunnel?: (
++    accountId: string,
++    apiToken: string,
++    tunnelId: string
++  ) => Promise<{ id: string; name: string | null }>;
++};
++
++export type ExternalDetectDeps = {
++  now?: () => number;
++  originPort: number;
++  homeDir?: string;
++  homedir?: () => string;
++  platform?: NodeJS.Platform;
++  listProcesses?: () => ExternalProcess[] | string | Promise<ExternalProcess[] | string>;
++  readFile?: (path: string) => string | null | Promise<string | null>;
++  listDir?: (path: string) => string[] | Promise<string[]>;
++  accessApi?: ExternalAccessApi | null;
++  accessClient?: ExternalAccessApi | null;
++  getApiCredentials?: () => Promise<{ accountId: string; apiToken: string } | null>;
++  getCredentials?: () => Promise<{ accountId: string; apiToken: string } | null>;
++};
++
++const CACHE_MS = 30_000;
++
++type CacheEntry = { at: number; value: DetectedTunnel };
++
++let cache: CacheEntry | null = null;
++
++export function resetExternalDetectCache(): void {
++  cache = null;
++}
++
++export function defaultListProcesses(): ExternalProcess[] {
++  try {
++    const proc = Bun.spawnSync(['ps', '-axo', 'pid=,command='], { stdout: 'pipe', stderr: 'pipe' });
++    const text = new TextDecoder().decode(proc.stdout);
++    return parsePsOutput(text);
++  } catch {
++    return [];
++  }
++}
++
++export function parsePsOutput(text: string): ExternalProcess[] {
++  const out: ExternalProcess[] = [];
++  for (const line of text.split('\n')) {
++    const trimmed = line.trim();
++    if (!trimmed) continue;
++    const match = trimmed.match(/^(\d+)\s+(.*)$/);
++    if (!match) continue;
++    out.push({ pid: Number(match[1]), command: match[2] ?? '' });
++  }
++  return out;
++}
++
++export async function detectExternalCloudflared(deps: ExternalDetectDeps): Promise<DetectedTunnel> {
++  const now = deps.now ?? Date.now;
++  if (cache && now() - cache.at < CACHE_MS) return cache.value;
++  const value = await detectUncached(deps);
++  cache = { at: now(), value };
++  return value;
++}
++
++async function detectUncached(deps: ExternalDetectDeps): Promise<DetectedTunnel> {
++  const home = deps.homeDir ?? deps.homedir?.() ?? homedir();
++  const readFile = async (path: string): Promise<string | null> =>
++    (await (deps.readFile ?? defaultReadFile)(path)) ?? null;
++  const listDir = async (path: string): Promise<string[]> =>
++    (await (deps.listDir ?? defaultListDir)(path)) ?? [];
++  const rawProcesses = await (deps.listProcesses ?? defaultListProcesses)();
++  const processes = normalizeProcesses(rawProcesses);
++
++  const cloudflaredHome = join(home, '.cloudflared');
++  const hasOriginCert = Boolean(await readFile(join(cloudflaredHome, 'cert.pem')));
++  const configPath = join(cloudflaredHome, 'config.yml');
++  const ymlText = await readFile(configPath);
++  const parsedYml = ymlText ? parseCloudflaredYml(ymlText) : null;
++
++  const procHits = processes.filter((p) => isCloudflaredTunnelCommand(p.command));
++  const running = procHits.length > 0;
++  const fromProc = procHits[0] ? parseCommandLine(procHits[0].command) : null;
++
++  const launchd = await findLaunchdUnit(home, listDir, readFile);
++  const systemd = await findSystemdUnit(home, listDir, readFile);
++
++  let source: string | null = null;
++  let parsed = fromProc;
++  if (launchd) {
++    source = 'launchd';
++    parsed = mergeParsed(launchd, parsed);
++  } else if (systemd) {
++    source = 'systemd';
++    parsed = mergeParsed(systemd, parsed);
++  } else if (fromProc) {
++    source = 'process';
++  } else if (parsedYml) {
++    source = 'config';
++    parsed = {
++      tokenFile: null,
++      logFile: null,
++      configPath,
++      tunnelId: parsedYml.tunnelId,
++      tunnelName: parsedYml.tunnelName,
++    };
++  }
++
++  const detected = Boolean(source);
++  const tokenFile = parsed?.tokenFile ?? null;
++  const logFile = parsed?.logFile ?? null;
++  const resolvedConfig = parsed?.configPath ?? (ymlText ? configPath : null);
++
++  let tunnelId = parsed?.tunnelId ?? parsedYml?.tunnelId ?? null;
++  let tunnelName = parsed?.tunnelName ?? parsedYml?.tunnelName ?? null;
++  let accountId: string | null = null;
++
++  if (tokenFile) {
++    const tokenMeta = parseTokenFileMeta(await readFile(tokenFile));
++    if (tokenMeta) {
++      tunnelId = tunnelId ?? tokenMeta.tunnelId;
++      accountId = tokenMeta.accountId;
++    }
++    if (!tunnelId) {
++      const idSibling = (await readFile(join(dirnameOf(tokenFile), 'tunnel-id')))?.trim();
++      if (idSibling && looksLikeId(idSibling)) tunnelId = idSibling;
++    }
++  }
++
++  if (!tunnelName && tunnelId) {
++    const fromApi = await lookupTunnelName({
++      tunnelId,
++      accountId,
++      accessApi: deps.accessApi ?? deps.accessClient ?? null,
++      getApiCredentials: deps.getApiCredentials ?? deps.getCredentials,
++    });
++    if (fromApi) tunnelName = fromApi;
++  }
++
++  const hostnames = await resolveHostnames({
++    originPort: deps.originPort,
++    yml: parsedYml,
++    tokenFile,
++    logFile,
++    tunnelId,
++    accountId,
++    readFile,
++    accessApi: deps.accessApi ?? deps.accessClient ?? null,
++    getApiCredentials: deps.getApiCredentials ?? deps.getCredentials,
++  });
++
++  if (parsedYml && !tunnelName && parsedYml.tunnelName && looksLikeName(parsedYml.tunnelName)) {
++    tunnelName = parsedYml.tunnelName;
++  }
++  if (parsedYml && !tunnelId && parsedYml.tunnelId && looksLikeId(parsedYml.tunnelId)) {
++    tunnelId = parsedYml.tunnelId;
++  }
++
++  return {
++    detected,
++    source,
++    configPath: resolvedConfig,
++    tunnelId,
++    tunnelName,
++    hostnames: uniqueHostnames(hostnames),
++    hasOriginCert,
++    running,
++    pid: procHits[0]?.pid ?? null,
++    tokenFile,
++    logFile,
++    accountId,
++  };
++}
++
++export function isCloudflaredTunnelCommand(command: string): boolean {
++  return /\bcloudflared\b/.test(command) && /\btunnel\b/.test(command);
++}
++
++export type ParsedArgs = {
++  tokenFile: string | null;
++  logFile: string | null;
++  configPath: string | null;
++  tunnelId: string | null;
++  tunnelName: string | null;
++};
++
++const FLAGS_WITH_VALUE = new Set([
++  '--token-file',
++  '--token',
++  '--logfile',
++  '--log-file',
++  '--config',
++  '--origincert',
++  '--credentials-file',
++]);
++
++export function parseArgv(tokens: string[]): ParsedArgs {
++  const tokenFile = flagValue(tokens, '--token-file');
++  const logFile = flagValue(tokens, '--logfile') ?? flagValue(tokens, '--log-file');
++  const configPath = flagValue(tokens, '--config');
++  let tunnelId: string | null = null;
++  let tunnelName: string | null = null;
++  const runIdx = tokens.findIndex((t) => t === 'run');
++  if (runIdx >= 0) {
++    const rest = tokens.slice(runIdx + 1);
++    for (let i = 0; i < rest.length; i++) {
++      const token = rest[i];
++      if (!token) continue;
++      if (FLAGS_WITH_VALUE.has(token)) {
++        i += 1;
++        continue;
++      }
++      if (token.startsWith('-')) continue;
++      if (looksLikeId(token)) tunnelId = token;
++      else if (!token.includes('/') && !token.includes('\\')) tunnelName = token;
++      break;
++    }
++  }
++  return { tokenFile, logFile, configPath, tunnelId, tunnelName };
++}
++
++export function parseCommandLine(command: string): ParsedArgs {
++  return parseArgv(tokenize(command));
++}
++
++export function parseCloudflaredYml(text: string): {
++  tunnelId: string | null;
++  tunnelName: string | null;
++  credentialsFile: string | null;
++  ingress: Array<{ hostname: string | null; service: string | null }>;
++} | null {
++  if (!text.trim()) return null;
++  let tunnelRaw: string | null = null;
++  let credentialsFile: string | null = null;
++  const ingress: Array<{ hostname: string | null; service: string | null }> = [];
++  let inIngress = false;
++  let current: { hostname: string | null; service: string | null } | null = null;
++  for (const rawLine of text.split('\n')) {
++    const line = rawLine.replace(/\t/g, '  ');
++    const trimmed = line.trim();
++    if (!trimmed || trimmed.startsWith('#')) continue;
++    if (!line.startsWith(' ') && !line.startsWith('-')) inIngress = false;
++    const tunnelMatch = trimmed.match(/^tunnel:\s*(.+)$/);
++    if (tunnelMatch && !inIngress) {
++      tunnelRaw = unquote(tunnelMatch[1] ?? '');
++      continue;
++    }
++    const credMatch = trimmed.match(/^credentials-file:\s*(.+)$/);
++    if (credMatch) {
++      credentialsFile = unquote(credMatch[1] ?? '');
++      continue;
++    }
++    if (/^ingress:\s*$/.test(trimmed)) {
++      inIngress = true;
++      continue;
++    }
++    if (inIngress) {
++      if (/^-\s*/.test(trimmed)) {
++        if (current) ingress.push(current);
++        current = { hostname: null, service: null };
++        const rest = trimmed.replace(/^-\s*/, '');
++        applyIngressField(current, rest);
++      } else if (current) {
++        applyIngressField(current, trimmed);
++      }
++    }
++  }
++  if (current) ingress.push(current);
++  const tunnelId = tunnelRaw && looksLikeId(tunnelRaw) ? tunnelRaw : null;
++  const tunnelName = tunnelRaw && !looksLikeId(tunnelRaw) ? tunnelRaw : null;
++  return { tunnelId, tunnelName, credentialsFile, ingress };
++}
++
++export function serviceHitsOrigin(service: string | null | undefined, originPort: number): boolean {
++  if (!service) return false;
++  return new RegExp(`:${originPort}(?:[/\\s?#]|$)`).test(service);
++}
++
++export function parseTokenFileMeta(
++  raw: string | null | undefined
++): { accountId: string; tunnelId: string } | null {
++  if (!raw) return null;
++  const text = raw.trim();
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(text);
++  } catch {
++    try {
++      parsed = JSON.parse(Buffer.from(text, 'base64').toString('utf8'));
++    } catch {
++      return null;
++    }
++  }
++  if (!parsed || typeof parsed !== 'object') return null;
++  const rec = parsed as { a?: unknown; t?: unknown };
++  if (typeof rec.a !== 'string' || typeof rec.t !== 'string') return null;
++  return { accountId: rec.a, tunnelId: rec.t };
++}
++
++export function parseIngressFromLog(text: string, originPort: number): string[] {
++  const hostnames: string[] = [];
++  const lines = text.split('\n');
++  for (let i = lines.length - 1; i >= 0; i--) {
++    const line = lines[i] ?? '';
++    const match = line.match(/"ingress"\s*:\s*(\[[^\]]*\])/);
++    if (!match?.[1]) continue;
++    try {
++      const ingress = JSON.parse(match[1]) as unknown;
++      if (!Array.isArray(ingress)) continue;
++      for (const item of ingress) {
++        if (!item || typeof item !== 'object') continue;
++        const rec = item as { hostname?: unknown; service?: unknown };
++        if (
++          typeof rec.hostname === 'string' &&
++          serviceHitsOrigin(String(rec.service ?? ''), originPort)
++        ) {
++          hostnames.push(rec.hostname.toLowerCase());
++        }
++      }
++      if (hostnames.length) return uniqueHostnames(hostnames);
++    } catch {}
++  }
++  return hostnames;
++}
++
++async function resolveHostnames(opts: {
++  originPort: number;
++  yml: ReturnType<typeof parseCloudflaredYml>;
++  tokenFile: string | null;
++  logFile: string | null;
++  tunnelId: string | null;
++  accountId: string | null;
++  readFile: (path: string) => Promise<string | null>;
++  accessApi: ExternalAccessApi | null;
++  getApiCredentials?: () => Promise<{ accountId: string; apiToken: string } | null>;
++}): Promise<string[]> {
++  if (opts.yml) {
++    const fromYml = opts.yml.ingress
++      .filter((r) => r.hostname && serviceHitsOrigin(r.service, opts.originPort))
++      .map((r) => r.hostname as string);
++    if (fromYml.length) return fromYml;
++  }
++  if (opts.tokenFile) {
++    const sibling = join(dirnameOf(opts.tokenFile), 'hostname');
++    const host = (await opts.readFile(sibling))?.trim().toLowerCase();
++    if (host) return [host];
++  }
++  const creds = opts.getApiCredentials ? await opts.getApiCredentials() : null;
++  if (creds && opts.accessApi && opts.tunnelId) {
++    const accountId = opts.accountId ?? creds.accountId;
++    try {
++      const ingress = await opts.accessApi.getTunnelIngress(
++        accountId,
++        creds.apiToken,
++        opts.tunnelId
++      );
++      const matched = ingress
++        .filter((r) => r.hostname && serviceHitsOrigin(r.service, opts.originPort))
++        .map((r) => r.hostname as string);
++      if (matched.length) return matched;
++    } catch {
++      // 探测失败时继续看日志
++    }
++  }
++  if (opts.logFile) {
++    const fromLog = parseIngressFromLog((await opts.readFile(opts.logFile)) ?? '', opts.originPort);
++    if (fromLog.length) return fromLog;
++  }
++  return [];
++}
++
++async function lookupTunnelName(opts: {
++  tunnelId: string;
++  accountId: string | null;
++  accessApi: ExternalAccessApi | null;
++  getApiCredentials?: () => Promise<{ accountId: string; apiToken: string } | null>;
++}): Promise<string | null> {
++  if (!opts.accessApi?.getTunnel) return null;
++  const creds = opts.getApiCredentials ? await opts.getApiCredentials() : null;
++  if (!creds) return null;
++  try {
++    const tunnel = await opts.accessApi.getTunnel(
++      opts.accountId ?? creds.accountId,
++      creds.apiToken,
++      opts.tunnelId
++    );
++    return tunnel.name;
++  } catch {
++    return null;
++  }
++}
++
++async function findLaunchdUnit(
++  home: string,
++  listDir: (path: string) => Promise<string[]>,
++  readFile: (path: string) => Promise<string | null>
++): Promise<ParsedArgs | null> {
++  const dirs = [join(home, 'Library/LaunchAgents'), '/Library/LaunchDaemons'];
++  for (const dir of dirs) {
++    for (const name of await listDir(dir)) {
++      if (!name.endsWith('.plist')) continue;
++      const body = await readFile(join(dir, name));
++      if (!body || !body.includes('cloudflared')) continue;
++      const args = parsePlistProgramArguments(body);
++      if (!args.some((a) => a.includes('cloudflared'))) continue;
++      return parseArgv(args);
++    }
++  }
++  return null;
++}
++
++async function findSystemdUnit(
++  home: string,
++  listDir: (path: string) => Promise<string[]>,
++  readFile: (path: string) => Promise<string | null>
++): Promise<ParsedArgs | null> {
++  const dirs = ['/etc/systemd/system', '/lib/systemd/system', join(home, '.config/systemd/user')];
++  for (const dir of dirs) {
++    for (const name of await listDir(dir)) {
++      if (!name.startsWith('cloudflared') || !name.endsWith('.service')) continue;
++      const body = await readFile(join(dir, name));
++      if (!body) continue;
++      const exec = body.match(/^ExecStart=(.+)$/m)?.[1];
++      if (!exec || !exec.includes('cloudflared')) continue;
++      return parseCommandLine(exec);
++    }
++  }
++  return null;
++}
++
++export function parsePlistProgramArguments(plist: string): string[] {
++  const block = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/i);
++  if (!block?.[1]) {
++    const prog = plist.match(/<key>Program<\/key>\s*<string>([^<]+)<\/string>/i);
++    return prog?.[1] ? [unescapeXml(prog[1])] : [];
++  }
++  const args: string[] = [];
++  for (const m of block[1].matchAll(/<string>([^<]*)<\/string>/gi)) {
++    args.push(unescapeXml(m[1] ?? ''));
++  }
++  return args;
++}
++
++function mergeParsed(primary: ParsedArgs, extra: ParsedArgs | null): ParsedArgs {
++  if (!extra) return primary;
++  return {
++    tokenFile: primary.tokenFile ?? extra.tokenFile,
++    logFile: primary.logFile ?? extra.logFile,
++    configPath: primary.configPath ?? extra.configPath,
++    tunnelId: primary.tunnelId ?? extra.tunnelId,
++    tunnelName: primary.tunnelName ?? extra.tunnelName,
++  };
++}
++
++function flagValue(tokens: string[], name: string): string | null {
++  for (let i = 0; i < tokens.length; i++) {
++    const t = tokens[i] ?? '';
++    if (t.startsWith(`${name}=`)) return stripQuotes(t.slice(name.length + 1));
++    if (t !== name) continue;
++    const parts: string[] = [];
++    for (let j = i + 1; j < tokens.length; j++) {
++      const next = tokens[j] ?? '';
++      if (!next || next.startsWith('-') || next === 'run') break;
++      parts.push(stripQuotes(next));
++    }
++    if (parts.length) return parts.join(' ');
++  }
++  return null;
++}
++
++function tokenize(command: string): string[] {
++  const out: string[] = [];
++  for (const m of command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) {
++    out.push(m[1] ?? m[2] ?? m[3] ?? '');
++  }
++  return out;
++}
++
++function applyIngressField(
++  current: { hostname: string | null; service: string | null },
++  rest: string
++): void {
++  const host = rest.match(/^hostname:\s*(.+)$/);
++  if (host) current.hostname = unquote(host[1] ?? '').toLowerCase();
++  const svc = rest.match(/^service:\s*(.+)$/);
++  if (svc) current.service = unquote(svc[1] ?? '');
++}
++
++function unquote(value: string): string {
++  return stripQuotes(value.trim());
++}
++
++function stripQuotes(value: string): string {
++  if (
++    (value.startsWith('"') && value.endsWith('"')) ||
++    (value.startsWith("'") && value.endsWith("'"))
++  ) {
++    return value.slice(1, -1);
++  }
++  return value;
++}
++
++function unescapeXml(value: string): string {
++  return value
++    .replace(/&amp;/g, '&')
++    .replace(/&lt;/g, '<')
++    .replace(/&gt;/g, '>')
++    .replace(/&quot;/g, '"')
++    .replace(/&apos;/g, "'");
++}
++
++function looksLikeId(value: string): boolean {
++  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
++}
++
++function looksLikeName(value: string | null): boolean {
++  return Boolean(value && !looksLikeId(value));
++}
++
++function uniqueHostnames(values: string[]): string[] {
++  const seen = new Set<string>();
++  const out: string[] = [];
++  for (const h of values) {
++    const n = h.trim().toLowerCase();
++    if (!n || seen.has(n)) continue;
++    seen.add(n);
++    out.push(n);
++  }
++  return out;
++}
++
++function dirnameOf(path: string): string {
++  const i = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
++  return i >= 0 ? path.slice(0, i) : '.';
++}
++
++function defaultReadFile(path: string): string | null {
++  try {
++    return readFileSync(path, 'utf8');
++  } catch {
++    return null;
++  }
++}
++
++function defaultListDir(path: string): string[] {
++  try {
++    return readdirSync(path);
++  } catch {
++    return [];
++  }
++}
++
++export function toExternalStatus(detected: DetectedTunnel): TunnelExternalStatus {
++  return {
++    detected: detected.detected,
++    source: detected.source,
++    configPath: detected.configPath,
++    tunnelId: detected.tunnelId,
++    tunnelName: detected.tunnelName,
++    hostnames: [...detected.hostnames],
++    hasOriginCert: detected.hasOriginCert,
++    running: detected.running,
++  };
++}
++
++function normalizeProcesses(raw: ExternalProcess[] | string): ExternalProcess[] {
++  return typeof raw === 'string' ? parsePsOutput(raw) : raw;
++}
++
++export type ExternalDetection = DetectedTunnel & { tokenAccountId: string | null };
++
++export class ExternalTunnelDetector {
++  private localCache: { at: number; value: ExternalDetection } | null = null;
++
++  constructor(private readonly deps: ExternalDetectDeps) {}
++
++  invalidate(): void {
++    this.localCache = null;
++    resetExternalDetectCache();
++  }
++
++  async detect(): Promise<ExternalDetection> {
++    const now = this.deps.now ?? Date.now;
++    if (this.localCache && now() - this.localCache.at < CACHE_MS) {
++      return this.localCache.value;
++    }
++    const detected = await detectUncached(this.deps);
++    const value: ExternalDetection = { ...detected, tokenAccountId: detected.accountId };
++    this.localCache = { at: now(), value };
++    return value;
++  }
++}
++
++export function parseProcessList(raw: string): Array<{
++  pid: string;
++  command: string;
++  tokenFile: string | null;
++  configPath: string | null;
++  runName: string | null;
++  running: boolean;
++}> {
++  return parsePsOutput(raw)
++    .filter((p) => isCloudflaredTunnelCommand(p.command))
++    .map((p) => {
++      const parsed = parseCommandLine(p.command);
++      return {
++        pid: String(p.pid),
++        command: p.command,
++        tokenFile: parsed.tokenFile,
++        configPath: parsed.configPath,
++        runName: parsed.tunnelName ?? parsed.tunnelId,
++        running: true,
++      };
++    });
++}
++
++export function parseCloudflaredConfigYml(text: string): {
++  tunnel: string | null;
++  credentialsFile: string | null;
++  ingress: Array<{ hostname: string | null; service: string }>;
++} {
++  const parsed = parseCloudflaredYml(text);
++  return {
++    tunnel: parsed?.tunnelId ?? parsed?.tunnelName ?? null,
++    credentialsFile: parsed?.credentialsFile ?? null,
++    ingress: (parsed?.ingress ?? [])
++      .filter((row) => row.service)
++      .map((row) => ({ hostname: row.hostname, service: row.service as string })),
++  };
++}
++
++export const parseTunnelToken = parseTokenFileMeta;
++export const hostnamesFromLog = parseIngressFromLog;
+diff --git a/apps/gateway/src/tunnel/index.ts b/apps/gateway/src/tunnel/index.ts
+index e00bd9fe..6d3d2f1c 100644
+--- a/apps/gateway/src/tunnel/index.ts
++++ b/apps/gateway/src/tunnel/index.ts
+@@ -1,6 +1,7 @@
+ export { TunnelManager, tunnelManager } from './manager';
+ export { TunnelConfigStore, MemoryTunnelConfigStore } from './config-store';
+ export { redactSecrets } from './redact';
++export { guardTunnelAccess } from './access-guard';
+ export {
+   parseVersion,
+   parseLoginUrl,
+diff --git a/apps/gateway/src/tunnel/manager.test.ts b/apps/gateway/src/tunnel/manager.test.ts
+index a429e5d2..6f7e9feb 100644
+--- a/apps/gateway/src/tunnel/manager.test.ts
++++ b/apps/gateway/src/tunnel/manager.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
+ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
++import { MemoryTunnelAccessStore } from './access-store';
+ import { MemoryTunnelConfigStore } from './config-store';
+ import { FakeSpawner, argsInclude } from './fake-spawn';
+ import { TunnelManager } from './manager';
+@@ -51,6 +52,14 @@ async function setup(overrides: ConstructorParameters<typeof TunnelManager>[0] =
+     trustProxy: false,
+     healthzStartedAt: 111,
+     loginEnforced: () => true,
++    registerAccessGuard: false,
++    externalDetectDeps: {
++      listProcesses: async () => '',
++      readFile: async () => null,
++      listDir: async () => [],
++      homedir: () => '/no-home',
++      platform: 'linux',
++    },
+     ...overrides,
+   });
+   return { dir, spawner, store, manager };
+@@ -279,13 +288,14 @@ describe('TunnelManager', () => {
+     }
+   });
+ 
+-  test('refuses public exposure when login is not enforced', async () => {
++  test('requires acknowledgeExposure when unprotected', async () => {
+     const ctx = await setup({ loginEnforced: () => false });
+     dirs.push(ctx.dir);
+     await writeFile(join(ctx.dir, 'cert.pem'), 'CERT', 'utf8');
+     const expected = {
+-      code: 'auth_required' as const,
+-      message: 'Sign-in must be enabled before exposing tmex publicly',
++      code: 'exposure_ack_required' as const,
++      message:
++        'This instance has no sign-in and no Cloudflare Access protection; confirm public exposure explicitly',
+     };
+     for (const body of [
+       { action: 'quick_start' as const },
+@@ -297,12 +307,19 @@ describe('TunnelManager', () => {
+       expect(result.httpStatus).toBe(409);
+       expect('error' in result.payload && result.payload.error).toEqual(expected);
+     }
++    const acked = await ctx.manager.handleAction({
++      action: 'set_auto_start',
++      autoStart: true,
++      acknowledgeExposure: true,
++    });
++    expect(acked.httpStatus).toBe(200);
++    expect(ctx.manager.status().config.autoStart).toBe(true);
++    expect(ctx.manager.status().exposureProtected).toBe(false);
+     const disable = await ctx.manager.handleAction({ action: 'set_auto_start', autoStart: false });
+     expect(disable.httpStatus).toBe(200);
+-    expect(ctx.manager.status().config.autoStart).toBe(false);
+   });
+ 
+-  test('skips auto-start at boot when login is not enforced', async () => {
++  test('skips auto-start at boot when unprotected and unacknowledged', async () => {
+     const warnings: string[] = [];
+     const ctx = await setup({
+       loginEnforced: () => false,
+@@ -317,7 +334,7 @@ describe('TunnelManager', () => {
+     await ctx.manager.start();
+     expect(ctx.manager.status().process.state).toBe('stopped');
+     expect(ctx.spawner.calls.some((c) => argsInclude(c, '--url'))).toBe(false);
+-    expect(warnings.some((w) => /sign-in must be enabled/i.test(w))).toBe(true);
++    expect(warnings.some((w) => /confirm public exposure/i.test(w))).toBe(true);
+   });
+ 
+   test('rejects path-traversal tunnel names before writing credentials', async () => {
+@@ -442,4 +459,248 @@ describe('TunnelManager', () => {
+       expect(ok.payload.status.restartRequired).toBe(false);
+     }
+   });
++
++  test('set_access_credentials validates via organizations and stores teamDomain', async () => {
++    const ctx = await setup({
++      fetchImpl: async (input) => {
++        expect(String(input)).toContain('/access/organizations');
++        return Response.json({
++          success: true,
++          result: { auth_domain: 'acme.cloudflareaccess.com' },
++        });
++      },
++    });
++    dirs.push(ctx.dir);
++    const result = await ctx.manager.handleAction({
++      action: 'set_access_credentials',
++      apiToken: 'cf-token',
++      accountId: 'account-1',
++    });
++    expect(result.httpStatus).toBe(200);
++    const status = ctx.manager.status();
++    expect(status.access.hasCredentials).toBe(true);
++    expect(status.access.accountId).toBe('account-1');
++    expect(status.access.teamDomain).toBe('acme.cloudflareaccess.com');
++    expect(status.loginEnforced).toBe(true);
++  });
++
++  test('configure_access creates app, replaces policy, and enables JWT', async () => {
++    const calls: string[] = [];
++    const ctx = await setup({
++      fetchImpl: async (input, init) => {
++        const url = String(input);
++        const method = init?.method ?? 'GET';
++        calls.push(`${method} ${url}`);
++        if (url.includes('/access/organizations')) {
++          return Response.json({
++            success: true,
++            result: { auth_domain: 'acme.cloudflareaccess.com' },
++          });
++        }
++        if (url.endsWith('/access/apps') && method === 'POST') {
++          return Response.json({
++            success: true,
++            result: { id: 'app-1', aud: 'aud-1', domain: 'remote.example.com', name: 'tmex' },
++          });
++        }
++        if (url.includes('/access/apps/app-1/policies') && method === 'GET') {
++          return Response.json({ success: true, result: [] });
++        }
++        if (url.includes('/access/apps/app-1/policies') && method === 'POST') {
++          return Response.json({ success: true, result: { id: 'pol-1' } });
++        }
++        if (url.endsWith('/access/apps/app-1') && method === 'GET') {
++          return Response.json({
++            success: true,
++            result: { id: 'app-1', aud: 'aud-1', domain: 'remote.example.com', name: 'tmex' },
++          });
++        }
++        return Response.json(
++          { success: false, errors: [{ message: `unexpected ${method} ${url}` }] },
++          { status: 400 }
++        );
++      },
++    });
++    dirs.push(ctx.dir);
++    await ctx.manager.handleAction({
++      action: 'set_access_credentials',
++      apiToken: 'tok',
++      accountId: 'acc',
++    });
++    ctx.store.save({ mode: 'named', hostname: 'remote.example.com' });
++    const queued = await ctx.manager.handleAction({
++      action: 'configure_access',
++      rules: [{ kind: 'email', value: 'owner@example.com' }],
++    });
++    expect(queued.httpStatus).toBe(202);
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    expect(job?.step).toBe('verify');
++    const access = ctx.manager.status().access;
++    expect(access.configured).toBe(true);
++    expect(access.appId).toBe('app-1');
++    expect(access.aud).toBe('aud-1');
++    expect(access.enforceJwt).toBe(true);
++    expect(access.hostname).toBe('remote.example.com');
++    expect(ctx.manager.status().exposureProtected).toBe(true);
++  });
++
++  test('named start is allowed without ack when Access JWT is enforced for the hostname', async () => {
++    const accessStore = new MemoryTunnelAccessStore();
++    await accessStore.save({
++      accountId: 'acc',
++      apiToken: 'tok',
++      teamDomain: 'team.cloudflareaccess.com',
++      appId: 'app',
++      aud: 'aud',
++      hostname: 'ok.example.com',
++      rules: [{ kind: 'email_domain', value: 'example.com' }],
++      enforceJwt: true,
++    });
++    const ctx = await setup({ loginEnforced: () => false, accessStore });
++    dirs.push(ctx.dir);
++    ctx.store.save({ mode: 'named', hostname: 'ok.example.com', tunnelId: 'tid', tunnelName: 'n' });
++    expect(ctx.manager.status().exposureProtected).toBe(true);
++    const result = await ctx.manager.handleAction({ action: 'start' });
++    expect(result.httpStatus).toBe(202);
++  });
++
++  test('adopt_external blocks start/stop while system-managed; remove releases the adoption', async () => {
++    const ctx = await setup({
++      loginEnforced: () => false,
++      externalDetectDeps: {
++        listProcesses: async () => '  1 cloudflared tunnel --token-file /tmp/tok run\n',
++        readFile: async (path) => {
++          if (path === '/tmp/tok') {
++            return Buffer.from(JSON.stringify({ a: 'a', t: 'tid', s: 's' })).toString('base64');
++          }
++          if (path === '/tmp/hostname') return 'ext.example.com';
++          return null;
++        },
++        listDir: async () => [],
++        homedir: () => '/no-home',
++        platform: 'linux',
++      },
++    });
++    dirs.push(ctx.dir);
++    const adopt = await ctx.manager.handleAction({
++      action: 'adopt_external',
++      hostname: 'ext.example.com',
++    });
++    expect(adopt.httpStatus).toBe(200);
++    const status = ctx.manager.status();
++    expect(status.config.externallyManaged).toBe(true);
++    expect(status.config.mode).toBe('named');
++    expect(status.config.hostname).toBe('ext.example.com');
++    const start = await ctx.manager.handleAction({ action: 'start', acknowledgeExposure: true });
++    expect(start.httpStatus).toBe(409);
++    expect('error' in start.payload && start.payload.error.message).toBe(
++      'managed by the system service'
++    );
++    const stop = await ctx.manager.handleAction({ action: 'stop' });
++    expect(stop.httpStatus).toBe(409);
++    const remove = await ctx.manager.handleAction({ action: 'remove' });
++    expect(remove.httpStatus).toBe(200);
++    const released = ctx.manager.status();
++    expect(released.config.externallyManaged).toBe(false);
++    expect(released.config.mode).toBe('off');
++    expect(released.config.hostname).toBeNull();
++    expect(released.external.detected).toBe(true);
++  });
++
++  test('set_access_credentials maps API failure and clear wipes token', async () => {
++    const ctx = await setup({
++      fetchImpl: async () =>
++        Response.json(
++          { success: false, errors: [{ message: 'Invalid API Token' }] },
++          { status: 401 }
++        ),
++    });
++    dirs.push(ctx.dir);
++    const failed = await ctx.manager.handleAction({
++      action: 'set_access_credentials',
++      apiToken: 'bad-token',
++      accountId: 'acc',
++    });
++    expect(failed.httpStatus).toBe(400);
++    expect('error' in failed.payload && failed.payload.error.code).toBe('access_api_failed');
++    expect(ctx.manager.status().access.hasCredentials).toBe(false);
++    expect(ctx.manager.status().access.lastError).toBe('Invalid API Token');
++
++    const okCtx = await setup({
++      fetchImpl: async (input) => {
++        if (String(input).includes('/access/organizations')) {
++          return Response.json({
++            success: true,
++            result: { auth_domain: 'acme.cloudflareaccess.com' },
++          });
++        }
++        return Response.json(
++          { success: false, errors: [{ message: String(input) }] },
++          { status: 400 }
++        );
++      },
++    });
++    dirs.push(okCtx.dir);
++    await okCtx.manager.handleAction({
++      action: 'set_access_credentials',
++      apiToken: 'tok',
++      accountId: 'acc',
++    });
++    expect(okCtx.manager.status().access.hasCredentials).toBe(true);
++    const cleared = await okCtx.manager.handleAction({ action: 'clear_access_credentials' });
++    expect(cleared.httpStatus).toBe(200);
++    expect(okCtx.manager.status().access.hasCredentials).toBe(false);
++    expect(okCtx.manager.status().access.accountId).toBeNull();
++  });
++
++  test('sync_access copies dashboard Access app rules for the hostname', async () => {
++    const ctx = await setup({
++      fetchImpl: async (input) => {
++        const url = String(input);
++        if (url.includes('/access/organizations')) {
++          return Response.json({
++            success: true,
++            result: { auth_domain: 'acme.cloudflareaccess.com' },
++          });
++        }
++        if (url.includes('/access/apps?')) {
++          return Response.json({
++            success: true,
++            result: [{ id: 'app-9', aud: 'aud-9', domain: 'remote.example.com', name: 'tmex' }],
++            result_info: { page: 1, per_page: 100, total_count: 1, total_pages: 1 },
++          });
++        }
++        if (url.includes('/access/apps/app-9/policies')) {
++          return Response.json({
++            success: true,
++            result: [
++              {
++                id: 'pol-1',
++                decision: 'allow',
++                include: [{ email: { email: 'owner@example.com' } }],
++              },
++            ],
++          });
++        }
++        return Response.json({ success: false, errors: [{ message: url }] }, { status: 400 });
++      },
++    });
++    dirs.push(ctx.dir);
++    await ctx.manager.handleAction({
++      action: 'set_access_credentials',
++      apiToken: 'tok',
++      accountId: 'acc',
++    });
++    ctx.store.save({ mode: 'named', hostname: 'remote.example.com' });
++    const queued = await ctx.manager.handleAction({ action: 'sync_access' });
++    expect(queued.httpStatus).toBe(202);
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    const access = ctx.manager.status().access;
++    expect(access.configured).toBe(true);
++    expect(access.appId).toBe('app-9');
++    expect(access.aud).toBe('aud-9');
++    expect(access.rules).toEqual([{ kind: 'email', value: 'owner@example.com' }]);
++  });
+ });
+diff --git a/apps/gateway/src/tunnel/manager.ts b/apps/gateway/src/tunnel/manager.ts
+index 8f1a995d..edd36eec 100644
+--- a/apps/gateway/src/tunnel/manager.ts
++++ b/apps/gateway/src/tunnel/manager.ts
+@@ -2,10 +2,12 @@ import { randomUUID } from 'node:crypto';
+ import { existsSync } from 'node:fs';
+ import { mkdir, rm, writeFile } from 'node:fs/promises';
+ import type {
++  TunnelAccessStatus,
+   TunnelActionRequest,
+   TunnelActionResponse,
+   TunnelBinaryStatus,
+   TunnelErrorResponse,
++  TunnelExternalStatus,
+   TunnelJobKind,
+   TunnelJobStatus,
+   TunnelMode,
+@@ -14,6 +16,15 @@ import type {
+ import { PROCESS_STARTED_AT } from '../api/system-routes';
+ import { config, originUrlFromBindHost } from '../config';
+ import { getDb as getOrmDb } from '../db/client';
++import { CloudflareAccessClient, type TunnelFetch, sanitizeAccessMessage } from './access-client';
++import { setAccessGuardSource, setAccessJwtVerifier } from './access-guard';
++import { AccessJwtVerifier } from './access-jwt';
++import { parseAccessRules } from './access-rules';
++import {
++  MemoryTunnelAccessStore,
++  TunnelAccessStore,
++  type TunnelAccessStoreLike,
++} from './access-store';
+ import {
+   DEFAULT_TUNNEL_CONFIG,
+   TunnelConfigStore,
+@@ -22,6 +33,11 @@ import {
+ } from './config-store';
+ import { type Downloader, defaultDownloader, installCloudflaredBinary } from './download';
+ import { TunnelError, tunnelErrorFrom, tunnelHttpStatus } from './errors';
++import {
++  type ExternalDetectDeps,
++  type ExternalDetection,
++  ExternalTunnelDetector,
++} from './external-detect';
+ import { defaultTunnelName, normalizeTunnelHostname, normalizeTunnelName } from './hostname';
+ import { LogRingBuffer } from './log-buffer';
+ import { isTunnelPlatformSupported, tunnelPlatformLabel } from './platform';
+@@ -49,7 +65,7 @@ export type TunnelManagerOptions = {
+   spawner?: Spawner;
+   which?: (cmd: string) => string | null;
+   downloader?: Downloader;
+-  fetchImpl?: typeof fetch;
++  fetchImpl?: TunnelFetch;
+   patchHostEnv?: PatchHostEnv | null;
+   readHostEnv?: ReadHostEnv | null;
+   now?: () => number;
+@@ -64,6 +80,11 @@ export type TunnelManagerOptions = {
+   runningWaitMs?: number;
+   loginEnforced?: () => boolean;
+   warn?: (message: string) => void;
++  accessStore?: TunnelAccessStoreLike;
++  accessClient?: CloudflareAccessClient;
++  externalDetect?: ExternalTunnelDetector;
++  externalDetectDeps?: Partial<ExternalDetectDeps>;
++  registerAccessGuard?: boolean;
+ };
+ 
+ type BinaryCache = {
+@@ -75,7 +96,25 @@ type BinaryCache = {
+ const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+ const LOGIN_POLL_MS = 500;
+ const HOST_ENV_MESSAGE = 'Host environment is not managed by tmex-cli';
+-const AUTH_REQUIRED_MESSAGE = 'Sign-in must be enabled before exposing tmex publicly';
++const EXPOSURE_ACK_MESSAGE =
++  'This instance has no sign-in and no Cloudflare Access protection; confirm public exposure explicitly';
++const EXTERNAL_MANAGED_MESSAGE = 'managed by the system service';
++
++const EMPTY_EXTERNAL: ExternalDetection = {
++  detected: false,
++  source: null,
++  configPath: null,
++  tunnelId: null,
++  tunnelName: null,
++  hostnames: [],
++  hasOriginCert: false,
++  running: false,
++  pid: null,
++  tokenFile: null,
++  logFile: null,
++  accountId: null,
++  tokenAccountId: null,
++};
+ 
+ function yamlQuote(value: string): string {
+   if (/[:#\n]|^\s|\s$/.test(value)) {
+@@ -112,7 +151,7 @@ export class TunnelManager {
+   private readonly store: TunnelConfigStoreLike;
+   private readonly which: (cmd: string) => string | null;
+   private readonly downloader: Downloader;
+-  private readonly fetchImpl: typeof fetch;
++  private readonly fetchImpl: TunnelFetch;
+   private readonly now: () => number;
+   private readonly sleep: (ms: number) => Promise<void>;
+   private readonly loginTimeoutMs: number;
+@@ -124,6 +163,11 @@ export class TunnelManager {
+   private readonly supervisor: TunnelSupervisor;
+   private readonly probeVersionOnStart: boolean;
+   private readonly warn: (message: string) => void;
++  private readonly accessStore: TunnelAccessStoreLike;
++  private readonly accessClient: CloudflareAccessClient;
++  private readonly jwtVerifier: AccessJwtVerifier;
++  private readonly externalDetector: ExternalTunnelDetector;
++  private lastExternal: ExternalDetection = { ...EMPTY_EXTERNAL };
+   private loginEnforcedFn: () => boolean;
+   private trustProxy: boolean;
+   private configuredTrustProxy: boolean;
+@@ -167,6 +211,30 @@ export class TunnelManager {
+     this.probeVersionOnStart = opts.probeVersionOnStart ?? false;
+     this.loginEnforcedFn = opts.loginEnforced ?? (() => config.roles.hub || config.roles.node);
+     this.warn = opts.warn ?? ((message) => console.warn(message));
++    this.accessStore =
++      opts.accessStore ??
++      (opts.store ? new MemoryTunnelAccessStore() : new TunnelAccessStore(getOrmDb()));
++    this.accessClient = opts.accessClient ?? new CloudflareAccessClient(this.fetchImpl);
++    this.jwtVerifier = new AccessJwtVerifier({ fetchImpl: this.fetchImpl, now: this.now });
++    this.externalDetector =
++      opts.externalDetect ??
++      new ExternalTunnelDetector({
++        originPort: this.originPort,
++        now: this.now,
++        platform: this.platform,
++        getCredentials: async () => {
++          const apiToken = await this.accessStore.getApiToken();
++          const accountId = this.accessStore.get().accountId;
++          if (!apiToken || !accountId) return null;
++          return { accountId, apiToken };
++        },
++        accessClient: this.accessClient,
++        ...opts.externalDetectDeps,
++      });
++    if (opts.registerAccessGuard !== false) {
++      setAccessGuardSource(() => this.accessGuardState());
++      setAccessJwtVerifier(this.jwtVerifier);
++    }
+     const spawner: Spawner = opts.spawner ?? bunSpawner;
+     this.provider = new CloudflaredProvider(spawner, this.tunnelDir);
+     this.supervisor = new TunnelSupervisor({
+@@ -201,9 +269,12 @@ export class TunnelManager {
+       await this.probeVersion();
+     }
+     const persisted = this.store.get();
++    await this.refreshExternal();
+     if (persisted.autoStart && persisted.mode !== 'off') {
+-      if (!this.loginEnforcedFn()) {
+-        this.warn(`[tunnel] auto-start skipped: ${AUTH_REQUIRED_MESSAGE}`);
++      if (persisted.externallyManaged) {
++        // 系统服务托管，不拉起子进程
++      } else if (!this.isExposureProtected() && !persisted.exposureAcknowledgedAt) {
++        this.warn(`[tunnel] auto-start skipped: ${EXPOSURE_ACK_MESSAGE}`);
+       } else {
+         try {
+           await this.startProcess(persisted.mode);
+@@ -225,9 +296,18 @@ export class TunnelManager {
+     this.refreshBinaryPresence();
+     const persisted = this.safePersisted();
+     const loggedIn = existsSync(originCertPath(this.tunnelDir));
+-    const running = this.supervisor.state === 'running';
+-    const publicUrl =
+-      persisted.mode === 'named' && running && persisted.hostname
++    const access = this.accessStatus();
++    const external = this.externalStatus();
++    const loginEnforced = this.loginEnforcedFn();
++    const exposureProtected = this.isExposureProtected(persisted, access, loginEnforced);
++    const running = persisted.externallyManaged
++      ? this.lastExternal.running
++      : this.supervisor.state === 'running';
++    const publicUrl = persisted.externallyManaged
++      ? persisted.hostname
++        ? `https://${persisted.hostname}`
++        : null
++      : persisted.mode === 'named' && running && persisted.hostname
+         ? `https://${persisted.hostname}`
+         : persisted.mode === 'quick' && running
+           ? this.supervisor.publicUrl
+@@ -251,16 +331,25 @@ export class TunnelManager {
+         tunnelName: persisted.tunnelName,
+         tunnelId: persisted.tunnelId,
+         autoStart: persisted.autoStart,
++        externallyManaged: persisted.externallyManaged,
+         originPort: this.originPort,
+       },
+       process: {
+-        state: this.supervisor.state,
+-        pid: this.supervisor.pid,
+-        startedAt: this.supervisor.startedAt,
++        state: persisted.externallyManaged
++          ? this.lastExternal.running
++            ? 'running'
++            : 'stopped'
++          : this.supervisor.state,
++        pid: persisted.externallyManaged ? null : this.supervisor.pid,
++        startedAt: persisted.externallyManaged ? null : this.supervisor.startedAt,
+         publicUrl,
+-        lastError: this.supervisor.lastError,
+-        restarts: this.supervisor.restarts,
++        lastError: persisted.externallyManaged ? null : this.supervisor.lastError,
++        restarts: persisted.externallyManaged ? 0 : this.supervisor.restarts,
+       },
++      access,
++      external,
++      loginEnforced,
++      exposureProtected,
+       job: this.job ? { ...this.job } : null,
+       trustProxy: this.trustProxy,
+       configuredTrustProxy: this.configuredTrustProxy,
+@@ -282,38 +371,70 @@ export class TunnelManager {
+           this.cancelLogin();
+           return this.ok(200);
+         case 'create':
+-          this.requireLoginEnforced();
++          this.requireNotExternallyManaged();
++          await this.requireExposureAck(body.acknowledgeExposure);
+           this.requireModeOff();
+           this.assertCreateName(body.hostname, body.tunnelName);
+           return await this.enqueueJob('create', (step) =>
+             this.jobCreate(body.hostname, body.tunnelName, step)
+           );
+         case 'quick_start':
+-          this.requireLoginEnforced();
++          this.requireNotExternallyManaged();
++          await this.requireExposureAck(body.acknowledgeExposure);
+           return await this.enqueueJob('start', (step) => this.jobQuickStart(step));
+         case 'start':
+-          this.requireLoginEnforced();
++          this.requireNotExternallyManaged();
++          await this.requireExposureAck(body.acknowledgeExposure);
+           return await this.enqueueJob('start', (step) => this.jobStart(step));
+         case 'stop':
++          this.requireNotExternallyManaged();
+           return await this.enqueueJob('stop', (step) => this.jobStop(step));
+         case 'remove':
++          if (this.store.get().externallyManaged) {
++            this.releaseExternal();
++            return this.ok(200);
++          }
+           return await this.enqueueJob('remove', (step) => this.jobRemove(step));
+         case 'check':
+           return await this.enqueueJob('check', (step) => this.jobCheck(step));
+         case 'set_auto_start':
+-          if (body.autoStart) this.requireLoginEnforced();
++          if (body.autoStart) {
++            this.requireNotExternallyManaged();
++            await this.requireExposureAck(body.acknowledgeExposure);
++          }
+           this.store.save({ autoStart: body.autoStart });
+           return this.ok(200);
+         case 'set_trust_proxy':
+           await this.setTrustProxy(body.trustProxy);
+           return this.ok(200);
++        case 'set_access_credentials':
++          await this.setAccessCredentials(body.apiToken, body.accountId);
++          return this.ok(200);
++        case 'clear_access_credentials':
++          await this.clearAccessCredentials();
++          return this.ok(200);
++        case 'configure_access':
++          return await this.enqueueJob('access', (step) =>
++            this.jobConfigureAccess(body.rules, step)
++          );
++        case 'remove_access':
++          return await this.enqueueJob('access', (step) => this.jobRemoveAccess(step));
++        case 'sync_access':
++          return await this.enqueueJob('access', (step) => this.jobSyncAccess(step));
++        case 'set_access_enforce':
++          await this.setAccessEnforce(body.enforceJwt);
++          return this.ok(200);
++        case 'adopt_external':
++          await this.adoptExternal(body.hostname);
++          return this.ok(200);
+         default:
+           throw new TunnelError('invalid_request', 'unknown action');
+       }
+     } catch (error) {
+       const parsed = tunnelErrorFrom(error);
++      const override = error instanceof TunnelError ? error.httpStatusOverride : undefined;
+       return {
+-        httpStatus: tunnelHttpStatus(parsed.code),
++        httpStatus: tunnelHttpStatus(parsed.code, override),
+         payload: { error: parsed },
+       };
+     }
+@@ -369,9 +490,97 @@ export class TunnelManager {
+     }
+   }
+ 
+-  private requireLoginEnforced(): void {
+-    if (!this.loginEnforcedFn()) {
+-      throw new TunnelError('auth_required', AUTH_REQUIRED_MESSAGE);
++  private requireNotExternallyManaged(): void {
++    if (this.store.get().externallyManaged) {
++      throw new TunnelError('invalid_request', EXTERNAL_MANAGED_MESSAGE, 409);
++    }
++  }
++
++  private async requireExposureAck(acknowledgeExposure: boolean | undefined): Promise<void> {
++    if (this.isExposureProtected()) return;
++    if (acknowledgeExposure === true) {
++      this.store.save({ exposureAcknowledgedAt: new Date(this.now()).toISOString() });
++      return;
++    }
++    throw new TunnelError('exposure_ack_required', EXPOSURE_ACK_MESSAGE);
++  }
++
++  private isExposureProtected(
++    persisted = this.safePersisted(),
++    access = this.accessStatus(),
++    loginEnforced = this.loginEnforcedFn()
++  ): boolean {
++    return (
++      loginEnforced ||
++      Boolean(
++        access.configured &&
++          access.enforceJwt &&
++          access.hostname &&
++          access.hostname === persisted.hostname
++      )
++    );
++  }
++
++  private accessGuardState() {
++    const access = this.accessStatus();
++    return {
++      configured: access.configured,
++      enforceJwt: access.enforceJwt,
++      aud: access.aud,
++      teamDomain: access.teamDomain,
++    };
++  }
++
++  private accessStatus(): TunnelAccessStatus {
++    try {
++      const row = this.accessStore.get();
++      return {
++        hasCredentials: Boolean(row.apiTokenEnc && row.accountId),
++        accountId: row.accountId,
++        teamDomain: row.teamDomain,
++        configured: Boolean(row.appId && row.aud && row.hostname),
++        appId: row.appId,
++        aud: row.aud,
++        hostname: row.hostname,
++        rules: [...row.rules],
++        enforceJwt: row.enforceJwt,
++        lastError: row.lastError,
++      };
++    } catch {
++      return {
++        hasCredentials: false,
++        accountId: null,
++        teamDomain: null,
++        configured: false,
++        appId: null,
++        aud: null,
++        hostname: null,
++        rules: [],
++        enforceJwt: false,
++        lastError: null,
++      };
++    }
++  }
++
++  private externalStatus(): TunnelExternalStatus {
++    const ext = this.lastExternal;
++    return {
++      detected: ext.detected,
++      source: ext.source,
++      configPath: ext.configPath,
++      tunnelId: ext.tunnelId,
++      tunnelName: ext.tunnelName,
++      hostnames: [...ext.hostnames],
++      hasOriginCert: ext.hasOriginCert,
++      running: ext.running,
++    };
++  }
++
++  async refreshExternal(): Promise<void> {
++    try {
++      this.lastExternal = await this.externalDetector.detect();
++    } catch {
++      this.lastExternal = { ...EMPTY_EXTERNAL };
+     }
+   }
+ 
+@@ -601,6 +810,20 @@ export class TunnelManager {
+     await this.supervisor.stop();
+   }
+ 
++  // 取消接管：只清本地配置，不停系统服务、不动 Cloudflare 上的隧道。
++  private releaseExternal(): void {
++    this.store.save({
++      mode: 'off',
++      hostname: null,
++      tunnelName: null,
++      tunnelId: null,
++      externallyManaged: false,
++      autoStart: false,
++    });
++    this.supervisor.publicUrl = null;
++    this.supervisor.lastError = null;
++  }
++
+   private async jobRemove(step: (name: string) => void): Promise<void> {
+     step('stop');
+     await this.supervisor.stop();
+@@ -673,6 +896,159 @@ export class TunnelManager {
+     this.restartRequired = this.configuredTrustProxy !== this.trustProxy;
+   }
+ 
++  private async setAccessCredentials(apiTokenRaw: string, accountIdRaw: string): Promise<void> {
++    const apiToken = apiTokenRaw.trim();
++    const accountId = accountIdRaw.trim();
++    if (!apiToken || !accountId) {
++      throw new TunnelError('invalid_request', 'apiToken and accountId are required');
++    }
++    try {
++      const { teamDomain } = await this.accessClient.getOrganization(accountId, apiToken);
++      await this.accessStore.save({
++        apiToken,
++        accountId,
++        teamDomain,
++        lastError: null,
++      });
++    } catch (error) {
++      const parsed = tunnelErrorFrom(error);
++      const message = sanitizeAccessMessage(parsed.message);
++      await this.accessStore.save({ lastError: message }).catch(() => {});
++      throw new TunnelError('access_api_failed', message);
++    }
++  }
++
++  private async clearAccessCredentials(): Promise<void> {
++    await this.accessStore.save({
++      apiToken: null,
++      accountId: null,
++      lastError: null,
++    });
++  }
++
++  private async setAccessEnforce(enforceJwt: boolean): Promise<void> {
++    const access = this.accessStore.get();
++    if (!access.appId || !access.aud) {
++      throw new TunnelError('not_configured', 'Cloudflare Access is not configured');
++    }
++    await this.accessStore.save({ enforceJwt, lastError: null });
++  }
++
++  private async jobConfigureAccess(rulesRaw: unknown, step: (name: string) => void): Promise<void> {
++    const rules = parseAccessRules(rulesRaw);
++    const persisted = this.store.get();
++    const hostname = persisted.hostname;
++    if (!hostname) {
++      throw new TunnelError('not_configured', 'named tunnel hostname is required');
++    }
++    const apiToken = await this.accessStore.getApiToken();
++    const accountId = this.accessStore.get().accountId;
++    if (!apiToken || !accountId) {
++      throw new TunnelError('not_configured', 'Cloudflare Access credentials are not saved');
++    }
++    try {
++      step('create_app');
++      const current = this.accessStore.get();
++      const app = current.appId
++        ? await this.accessClient.updateApp(accountId, apiToken, current.appId, hostname)
++        : await this.accessClient.createApp(accountId, apiToken, hostname);
++      step('policy');
++      await this.accessClient.replaceAllowPolicy(accountId, apiToken, app.id, rules);
++      step('verify');
++      const verified = await this.accessClient.getApp(accountId, apiToken, app.id);
++      await this.accessStore.save({
++        appId: verified.id,
++        aud: verified.aud,
++        hostname,
++        rules,
++        enforceJwt: true,
++        lastError: null,
++      });
++    } catch (error) {
++      const parsed = tunnelErrorFrom(error);
++      const message = sanitizeAccessMessage(parsed.message);
++      await this.accessStore.save({ lastError: message }).catch(() => {});
++      throw new TunnelError(
++        parsed.code === 'access_api_failed' ? 'access_api_failed' : parsed.code,
++        message
++      );
++    }
++  }
++
++  private async jobRemoveAccess(step: (name: string) => void): Promise<void> {
++    step('delete_app');
++    const row = this.accessStore.get();
++    const apiToken = await this.accessStore.getApiToken();
++    if (row.appId && apiToken && row.accountId) {
++      await this.accessClient.deleteApp(row.accountId, apiToken, row.appId).catch(() => {});
++    }
++    await this.accessStore.save({
++      appId: null,
++      aud: null,
++      hostname: null,
++      rules: [],
++      enforceJwt: false,
++      lastError: null,
++    });
++  }
++
++  private async jobSyncAccess(step: (name: string) => void): Promise<void> {
++    step('sync');
++    const apiToken = await this.accessStore.getApiToken();
++    const accountId = this.accessStore.get().accountId;
++    if (!apiToken || !accountId) {
++      throw new TunnelError('not_configured', 'Cloudflare Access credentials are not saved');
++    }
++    await this.refreshExternal();
++    const hostname = this.store.get().hostname ?? this.lastExternal.hostnames[0] ?? null;
++    if (!hostname) {
++      throw new TunnelError('not_configured', 'no hostname to match an Access application');
++    }
++    try {
++      const apps = await this.accessClient.listApps(accountId, apiToken);
++      const app = this.accessClient.findAppForHostname(apps, hostname);
++      if (!app) {
++        await this.accessStore.save({
++          lastError: sanitizeAccessMessage('No Access application matches this hostname'),
++        });
++        return;
++      }
++      const rules = await this.accessClient.readAppRules(accountId, apiToken, app.id);
++      await this.accessStore.save({
++        appId: app.id,
++        aud: app.aud,
++        hostname,
++        rules,
++        lastError: null,
++      });
++    } catch (error) {
++      const parsed = tunnelErrorFrom(error);
++      const message = sanitizeAccessMessage(parsed.message);
++      await this.accessStore.save({ lastError: message }).catch(() => {});
++      throw new TunnelError('access_api_failed', message);
++    }
++  }
++
++  private async adoptExternal(hostnameRaw: string): Promise<void> {
++    const hostname = normalizeTunnelHostname(hostnameRaw);
++    if (!hostname) {
++      throw new TunnelError('invalid_hostname', 'hostname is not a valid RFC 1123 name');
++    }
++    this.externalDetector.invalidate();
++    await this.refreshExternal();
++    if (!this.lastExternal.hostnames.includes(hostname)) {
++      throw new TunnelError('invalid_request', 'hostname is not in the detected external tunnel');
++    }
++    this.store.save({
++      mode: 'named',
++      hostname,
++      tunnelId: this.lastExternal.tunnelId,
++      tunnelName: this.lastExternal.tunnelName,
++      externallyManaged: true,
++      autoStart: false,
++    });
++  }
++
+   private async refreshConfiguredTrustProxy(): Promise<void> {
+     if (this.readHostEnv) {
+       const saved = await this.readHostEnv();
+diff --git a/packages/app/src/runtime/assemble.ts b/packages/app/src/runtime/assemble.ts
+index 457ce492..85dc3074 100644
+--- a/packages/app/src/runtime/assemble.ts
++++ b/packages/app/src/runtime/assemble.ts
+@@ -32,6 +32,7 @@ import {
+ import type { GatewayRuntime } from '../../../../apps/gateway/src/runtime';
+ import { resolveInstallDir as resolveGatewayInstallDir } from '../../../../apps/gateway/src/system/install-info';
+ import { TlsConfigStore } from '../../../../apps/gateway/src/tls/tls-config-store';
++import { guardTunnelAccess } from '../../../../apps/gateway/src/tunnel/access-guard';
+ import { tunnelManager } from '../../../../apps/gateway/src/tunnel/manager';
+ import type { GatewaySession } from '../../../../apps/gateway/src/ws/gateway-session';
+ import { readNodeEnv } from '../../../../packages/shared/src/env/load-env';
+@@ -155,6 +156,8 @@ async function meshHttp(
+   req: Request,
+   server: Bun.Server<unknown>
+ ): Promise<HttpResult> {
++  const denied = await guardTunnelAccess(req);
++  if (denied) return denied;
+   const path = new URL(req.url).pathname;
+   if (!mesh) {
+     return path === '/api/auth/mode' && req.method === 'GET'
+diff --git a/packages/shared/src/contracts/tunnel.ts b/packages/shared/src/contracts/tunnel.ts
+index 0aae366a..a5d2f11e 100644
+--- a/packages/shared/src/contracts/tunnel.ts
++++ b/packages/shared/src/contracts/tunnel.ts
+@@ -12,7 +12,8 @@ export type TunnelJobKind =
+   | 'start'
+   | 'stop'
+   | 'remove'
+-  | 'check';
++  | 'check'
++  | 'access';
+ 
+ export type TunnelJobState = 'running' | 'done' | 'error';
+ 
+@@ -25,6 +26,10 @@ export type TunnelErrorCode =
+   | 'invalid_hostname'
+   | 'tunnel_exists'
+   | 'dns_route_failed'
++  /** Cloudflare API 调用失败（token 权限不足 / account 不对 / 网络） */
++  | 'access_api_failed'
++  /** 本机既未启用登录也未受 Access 保护时，启动隧道必须显式带 acknowledgeExposure=true */
++  | 'exposure_ack_required'
+   | 'process_failed'
+   | 'busy'
+   | 'not_configured'
+@@ -56,10 +61,59 @@ export interface TunnelConfigStatus {
+   tunnelId: string | null;
+   /** 随 gateway 启动自动拉起 */
+   autoStart: boolean;
++  /** 隧道进程由系统服务托管（adopt_external），tmex 不拉起/停止它 */
++  externallyManaged: boolean;
+   /** 本机监听端口（cloudflared ingress 的 origin） */
+   originPort: number;
+ }
+ 
++export type TunnelAccessPolicyRule =
++  | { kind: 'email'; value: string }
++  | { kind: 'email_domain'; value: string };
++
++/**
++ * Cloudflare Access 应用状态（standalone 模式下公网隧道的鉴权层；mesh 登录实例可选）。
++ * API token / account id 只存服务端，状态里只透出是否已保存。
++ */
++export interface TunnelAccessStatus {
++  /** 已保存 Cloudflare API token + account id */
++  hasCredentials: boolean;
++  accountId: string | null;
++  /** Access 团队域（<team>.cloudflareaccess.com），从 API 读取 */
++  teamDomain: string | null;
++  /** 已为当前 hostname 创建 Access 应用 */
++  configured: boolean;
++  appId: string | null;
++  /** 应用 AUD 标签，网关校验 JWT 时使用 */
++  aud: string | null;
++  /** 应用覆盖的主机名 */
++  hostname: string | null;
++  /** allow 策略规则（邮箱 / 邮箱域） */
++  rules: TunnelAccessPolicyRule[];
++  /** 网关对带 cf-connecting-ip 的请求强制校验 Cf-Access-Jwt-Assertion */
++  enforceJwt: boolean;
++  /** 最近一次 Access API 错误（脱敏） */
++  lastError: string | null;
++}
++
++/**
++ * 系统里已存在、不由 tmex 托管的 cloudflared（brew/launchd/systemd 服务或手工进程）。
++ * 探测来源：进程列表、launchd/systemd 单元、~/.cloudflared/config.yml 与 cert.pem。
++ */
++export interface TunnelExternalStatus {
++  detected: boolean;
++  /** 'launchd' | 'systemd' | 'process' | 'config' */
++  source: string | null;
++  configPath: string | null;
++  tunnelId: string | null;
++  tunnelName: string | null;
++  /** config.yml ingress 里 service 指向本机 gateway 端口的主机名 */
++  hostnames: string[];
++  /** ~/.cloudflared/cert.pem 存在 */
++  hasOriginCert: boolean;
++  running: boolean;
++}
++
+ export interface TunnelProcessStatus {
+   state: TunnelProcessState;
+   pid: number | null;
+@@ -88,6 +142,12 @@ export interface TunnelStatusResponse {
+   auth: TunnelAuthStatus;
+   config: TunnelConfigStatus;
+   process: TunnelProcessStatus;
++  access: TunnelAccessStatus;
++  external: TunnelExternalStatus;
++  /** 本机是否启用了登录（mesh 角色下的用户名/密码/2FA） */
++  loginEnforced: boolean;
++  /** 隧道流量是否受保护：loginEnforced，或 Access 已配置且强制校验且主机名匹配 */
++  exposureProtected: boolean;
+   /** 进行中或最近一次结束的 job */
+   job: TunnelJobStatus | null;
+   /** 当前进程是否已按 TMEX_TRUST_PROXY=true 运行（生效值） */
+@@ -105,14 +165,30 @@ export type TunnelActionRequest =
+   | { action: 'install' }
+   | { action: 'login' }
+   | { action: 'cancel_login' }
+-  | { action: 'create'; hostname: string; tunnelName?: string }
+-  | { action: 'quick_start' }
+-  | { action: 'start' }
++  | { action: 'create'; hostname: string; tunnelName?: string; acknowledgeExposure?: boolean }
++  /** 未受保护（!exposureProtected）时必须 acknowledgeExposure=true，否则 409 exposure_ack_required */
++  | { action: 'quick_start'; acknowledgeExposure?: boolean }
++  | { action: 'start'; acknowledgeExposure?: boolean }
+   | { action: 'stop' }
+   | { action: 'remove' }
+   | { action: 'check' }
+-  | { action: 'set_auto_start'; autoStart: boolean }
+-  | { action: 'set_trust_proxy'; trustProxy: boolean };
++  | { action: 'set_auto_start'; autoStart: boolean; acknowledgeExposure?: boolean }
++  | { action: 'set_trust_proxy'; trustProxy: boolean }
++  /** 保存 Cloudflare API token（需 Access: Apps and Policies 编辑权限）与 account id；同步动作 */
++  | { action: 'set_access_credentials'; apiToken: string; accountId: string }
++  | { action: 'clear_access_credentials' }
++  /** 为当前 hostname 创建/更新 Access 应用与 allow 策略；异步 job kind = 'access' */
++  | { action: 'configure_access'; rules: TunnelAccessPolicyRule[] }
++  /** 删除 Access 应用；异步 job kind = 'access' */
++  | { action: 'remove_access' }
++  /** 用已保存凭证按主机名同步 Cloudflare 上已存在的 Access 应用/策略到本地状态；异步 job kind = 'access' */
++  | { action: 'sync_access' }
++  /**
++   * 接管系统里已存在的隧道：mode=named、hostname 取 external.hostnames[index]，
++   * 不由 tmex 拉起进程（external 已在跑），只做状态展示与连通性检查
++   */
++  | { action: 'adopt_external'; hostname: string }
++  | { action: 'set_access_enforce'; enforceJwt: boolean };
+ 
+ export interface TunnelActionResponse {
+   status: TunnelStatusResponse;

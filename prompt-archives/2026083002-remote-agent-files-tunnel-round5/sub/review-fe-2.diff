@@ -1,0 +1,4889 @@
+diff --git a/apps/fe/src/pages/SettingsPage.test.tsx b/apps/fe/src/pages/SettingsPage.test.tsx
+index ac331165..b1e2772d 100644
+--- a/apps/fe/src/pages/SettingsPage.test.tsx
++++ b/apps/fe/src/pages/SettingsPage.test.tsx
+@@ -29,7 +29,15 @@ const { renderToStaticMarkup } = await import('react-dom/server');
+ const { MemoryRouter } = await import('react-router');
+ const { default: SettingsPage, settingsTabFromParam } = await import('./SettingsPage');
+ 
+-const TAB_IDS = ['general', 'terminal', 'devicesAndFiles', 'nodes', 'notifications', 'ai'];
++const TAB_IDS = [
++  'general',
++  'terminal',
++  'remoteAccess',
++  'devicesAndFiles',
++  'nodes',
++  'notifications',
++  'ai',
++];
+ 
+ function render(entry = '/settings'): string {
+   return renderToStaticMarkup(
+@@ -40,7 +48,7 @@ function render(entry = '/settings'): string {
+ }
+ 
+ describe('SettingsPage 标签栏', () => {
+-  test('六个标签都在，「节点」排在设备与文件与通知之间', () => {
++  test('七个标签都在，「节点」排在设备与文件与通知之间', () => {
+     const html = render();
+     for (const tab of TAB_IDS) {
+       expect(html).toContain(`data-testid="settings-tab-${tab}"`);
+@@ -54,10 +62,22 @@ describe('SettingsPage 标签栏', () => {
+     expect(html).toContain('settings.tabGroup.nodes');
+   });
+ 
+-  test('面板互斥：默认标签下只挂通用面板，NodesTab 不渲染', () => {
++  test('「远程访问」紧挨在「终端」右侧', () => {
++    const html = render();
++    expect(html.indexOf('settings-tab-remoteAccess')).toBeGreaterThan(
++      html.indexOf('settings-tab-terminal')
++    );
++    expect(html.indexOf('settings-tab-remoteAccess')).toBeLessThan(
++      html.indexOf('settings-tab-devicesAndFiles')
++    );
++    expect(html).toContain('settings.tabGroup.remoteAccess');
++  });
++
++  test('面板互斥：默认标签下只挂通用面板，NodesTab / 远程访问都不渲染', () => {
+     const html = render();
+     expect(html).toContain('data-testid="general-settings-tab"');
+     expect(html).not.toContain('data-testid="settings-nodes-tab"');
++    expect(html).not.toContain('data-testid="settings-remote-access-tab"');
+   });
+ 
+   test('`?tab=` 选中对应标签的面板（用有替身的「通知」面板验证深链）', () => {
+diff --git a/apps/fe/src/pages/SettingsPage.tsx b/apps/fe/src/pages/SettingsPage.tsx
+index 7b9409ef..15b8fe4e 100644
+--- a/apps/fe/src/pages/SettingsPage.tsx
++++ b/apps/fe/src/pages/SettingsPage.tsx
+@@ -1,6 +1,7 @@
+ import { useMutation } from '@tanstack/react-query';
+ import {
+   Bell,
++  Globe,
+   Monitor,
+   Network,
+   RotateCcw,
+@@ -35,6 +36,7 @@ import { DevicesAndFilesTab } from './settings/devices-and-files-tab';
+ import { GeneralSettingsTab } from './settings/general-settings-tab';
+ import { NodesTab } from './settings/nodes/nodes-tab';
+ import { NotificationSettingsTab } from './settings/notification-settings-tab';
++import { RemoteAccessTab } from './settings/remote-access/remote-access-tab';
+ import { useSiteSettingsForm } from './settings/use-site-settings-form';
+ 
+ export type SettingsTab =
+@@ -43,7 +45,8 @@ export type SettingsTab =
+   | 'nodes'
+   | 'notifications'
+   | 'ai'
+-  | 'terminal';
++  | 'terminal'
++  | 'remoteAccess';
+ 
+ const SETTINGS_TABS: SettingsTab[] = [
+   'general',
+@@ -52,6 +55,7 @@ const SETTINGS_TABS: SettingsTab[] = [
+   'notifications',
+   'ai',
+   'terminal',
++  'remoteAccess',
+ ];
+ 
+ function isSettingsTab(value: string | null): value is SettingsTab {
+@@ -101,6 +105,12 @@ export default function SettingsPage() {
+       icon: Monitor,
+       testId: 'settings-tab-terminal',
+     },
++    {
++      value: 'remoteAccess',
++      label: t('settings.tabGroup.remoteAccess'),
++      icon: Globe,
++      testId: 'settings-tab-remoteAccess',
++    },
+     {
+       value: 'devicesAndFiles',
+       label: t('settings.tabGroup.devicesAndFiles'),
+@@ -166,6 +176,8 @@ export default function SettingsPage() {
+         {activeTab === 'ai' && <AISettingsTab />}
+ 
+         {activeTab === 'terminal' && <TerminalSettingsTab />}
++
++        {activeTab === 'remoteAccess' && <RemoteAccessTab />}
+       </Reveal>
+     </div>
+   );
+diff --git a/apps/fe/src/pages/settings/remote-access/named-step.tsx b/apps/fe/src/pages/settings/remote-access/named-step.tsx
+new file mode 100644
+index 00000000..dae40060
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/named-step.tsx
+@@ -0,0 +1,199 @@
++// 命名隧道：登录 Cloudflare → 填主机名 → 创建并启动。
++//
++// 登录是后台 job：`login` 受理后 `auth.loginUrl` 才会出现，用户在别的标签页完成授权，
++// 这边靠轮询看到 `auth.loggedIn` 翻真。授权页有有效期，超时由后端报 `login_timeout`。
++
++import type { TunnelStatusResponse } from '@tmex/shared';
++import { Button, buttonVariants } from '@tmex/ui/button';
++import { Input } from '@tmex/ui/input';
++import { ExternalLink, Loader2, LogIn, Rocket } from 'lucide-react';
++import { useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { Link } from 'react-router';
++import { CopyButton } from '../nodes/copy-feedback';
++import { FormField, SetupNotice } from '../nodes/setup/form-parts';
++import { JobProgress, ProgressRow } from './step-shell';
++import type { TunnelActions } from './tunnel-actions';
++import { describeTunnelError, isValidHostname } from './tunnel-model';
++
++export function NamedTunnelStep({
++  status,
++  actions,
++  isHub,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  isHub: boolean;
++}) {
++  const { t } = useTranslation();
++  const job = status.job;
++  const loginRunning = job?.kind === 'login' && job.state === 'running';
++  const loginFailed = job?.kind === 'login' && job.state === 'error' && job.error !== null;
++
++  if (!status.auth.loggedIn) {
++    return (
++      <div className="space-y-2" data-testid="remote-access-login">
++        <p className="text-xs text-muted-foreground">
++          {t('settings.remoteAccess.steps.named.login.description')}
++        </p>
++
++        {loginFailed && job.error && (
++          <SetupNotice tone="error" testId="remote-access-login-error">
++            {describeTunnelError(t, job.error)}
++          </SetupNotice>
++        )}
++
++        {loginRunning ? (
++          <div className="space-y-2">
++            <ProgressRow
++              label={t('settings.remoteAccess.steps.named.login.waiting')}
++              testId="remote-access-login-waiting"
++            />
++            {status.auth.loginUrl && (
++              <div className="flex flex-wrap items-center gap-1.5">
++                <a
++                  className={buttonVariants({ size: 'sm' })}
++                  href={status.auth.loginUrl}
++                  target="_blank"
++                  rel="noreferrer"
++                  data-testid="remote-access-login-url"
++                >
++                  <ExternalLink />
++                  {t('settings.remoteAccess.actions.openLoginUrl')}
++                </a>
++                <CopyButton value={status.auth.loginUrl} testId="remote-access-login-url" />
++              </div>
++            )}
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              disabled={actions.pending !== null}
++              onClick={() => actions.run({ action: 'cancel_login' })}
++              data-testid="remote-access-login-cancel"
++            >
++              {actions.pending === 'cancel_login' ? <Loader2 className="animate-spin" /> : null}
++              {t('settings.remoteAccess.actions.cancelLogin')}
++            </Button>
++          </div>
++        ) : (
++          <Button
++            type="button"
++            size="sm"
++            disabled={actions.busy}
++            onClick={() => actions.run({ action: 'login' })}
++            data-testid="remote-access-login-start"
++          >
++            {actions.pending === 'login' ? <Loader2 className="animate-spin" /> : <LogIn />}
++            {t('settings.remoteAccess.actions.login')}
++          </Button>
++        )}
++      </div>
++    );
++  }
++
++  return <CreateTunnelForm status={status} actions={actions} isHub={isHub} />;
++}
++
++function CreateTunnelForm({
++  status,
++  actions,
++  isHub,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  isHub: boolean;
++}) {
++  const { t } = useTranslation();
++  const [hostname, setHostname] = useState(status.config.hostname ?? '');
++  const [tunnelName, setTunnelName] = useState(status.config.tunnelName ?? '');
++  const [touched, setTouched] = useState(false);
++  const job = status.job;
++  const creating = job?.kind === 'create' && job.state === 'running';
++  const createFailed = job?.kind === 'create' && job.state === 'error' && job.error !== null;
++  const trimmed = hostname.trim();
++  const invalid = !isValidHostname(trimmed);
++
++  const submit = () => {
++    setTouched(true);
++    if (invalid || actions.busy) return;
++    const name = tunnelName.trim();
++    actions.run(
++      name
++        ? { action: 'create', hostname: trimmed, tunnelName: name }
++        : { action: 'create', hostname: trimmed }
++    );
++  };
++
++  return (
++    <div className="space-y-3" data-testid="remote-access-create">
++      <SetupNotice tone="success" testId="remote-access-logged-in">
++        {t('settings.remoteAccess.steps.named.login.done')}
++      </SetupNotice>
++
++      {createFailed && job.error && (
++        <SetupNotice tone="error" testId="remote-access-create-error">
++          {describeTunnelError(t, job.error)}
++        </SetupNotice>
++      )}
++
++      <FormField
++        id="remote-access-hostname"
++        label={t('settings.remoteAccess.steps.named.hostname')}
++        hint={t('settings.remoteAccess.steps.named.hostnameHint')}
++        {...(touched && invalid
++          ? { error: t('settings.remoteAccess.steps.named.hostnameInvalid') }
++          : {})}
++      >
++        <Input
++          id="remote-access-hostname"
++          data-testid="remote-access-hostname"
++          value={hostname}
++          disabled={actions.busy}
++          placeholder={t('settings.remoteAccess.steps.named.hostnamePlaceholder')}
++          onChange={(event) => setHostname(event.target.value)}
++          onBlur={() => setTouched(true)}
++        />
++      </FormField>
++
++      {isHub && (
++        <p className="text-xs text-muted-foreground" data-testid="remote-access-hub-hint">
++          {t('settings.remoteAccess.steps.named.hubHint')}{' '}
++          <Link className="text-primary underline-offset-4 hover:underline" to="?tab=nodes">
++            {t('settings.remoteAccess.steps.named.hubHintLink')}
++          </Link>
++        </p>
++      )}
++
++      <FormField
++        id="remote-access-tunnel-name"
++        label={t('settings.remoteAccess.steps.named.tunnelName')}
++        hint={t('settings.remoteAccess.steps.named.tunnelNameHint')}
++      >
++        <Input
++          id="remote-access-tunnel-name"
++          data-testid="remote-access-tunnel-name"
++          value={tunnelName}
++          disabled={actions.busy}
++          placeholder={t('settings.remoteAccess.steps.named.tunnelNamePlaceholder')}
++          onChange={(event) => setTunnelName(event.target.value)}
++        />
++      </FormField>
++
++      {creating && <JobProgress step={job.step} testId="remote-access-create-progress" />}
++
++      <div className="flex justify-end">
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy}
++          onClick={submit}
++          data-testid="remote-access-create-submit"
++        >
++          {actions.pending === 'create' ? <Loader2 className="animate-spin" /> : <Rocket />}
++          {t('settings.remoteAccess.actions.create')}
++        </Button>
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx b/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
+new file mode 100644
+index 00000000..a4a44a5d
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
+@@ -0,0 +1,495 @@
++// 「远程访问」标签的静态渲染：远端路由拦截、加载 / 未登录 / 失败分支、状态徽标矩阵、
++// 向导步进（临时隧道与命名隧道两条路径）、登录授权地址与取消、错误码映射与忙锁。
++// 无 DOM 测试环境，用 react-dom/server 静态渲染（与 HttpsSection / SettingsPage 测试同一套做法）。
++
++import { beforeEach, describe, expect, mock, test } from 'bun:test';
++import type { AuthModeResponse } from '@tmex/api-client/auth/index';
++import type {
++  TunnelJobStatus,
++  TunnelMode,
++  TunnelProcessState,
++  TunnelStatusResponse,
++} from '@tmex/shared';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++import type { TunnelActionState } from './tunnel-actions';
++
++installWindowStorage();
++
++let status: TunnelStatusResponse | null = null;
++let loading = false;
++let loginRequired = false;
++let loadError: string | null = null;
++let actionState: TunnelActionState & { busy: boolean } = {
++  pending: null,
++  error: null,
++  check: null,
++  busy: false,
++};
++
++mock.module('./use-tunnel-status', () => ({
++  TUNNEL_STATUS_QUERY_KEY: ['tunnel-status'],
++  useTunnelStatus: () => ({
++    status,
++    loading,
++    loginRequired,
++    error: loadError,
++    refresh: () => undefined,
++    setStatus: () => undefined,
++  }),
++}));
++
++// 锁与结果处理在 tunnel-actions.test.ts 里测；这里只驱动它的输出，验证忙态真的落到控件上。
++const actualActions = await import('./tunnel-actions');
++mock.module('./tunnel-actions', () => ({
++  ...actualActions,
++  useTunnelActions: () => ({ ...actionState, run: () => undefined, clearError: () => undefined }),
++}));
++
++const { renderToStaticMarkup } = await import('react-dom/server');
++const { MemoryRouter } = await import('react-router');
++const { resetMeshNodesStateForTest, setMeshNodesStateForTest } = await import('@/node/mesh-nodes');
++const { RemoteAccessTab } = await import('./remote-access-tab');
++const { TunnelWizard } = await import('./wizard');
++
++const SELF_ID = 'a'.repeat(32);
++const OTHER_ID = 'b'.repeat(32);
++
++function tunnel(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResponse {
++  return {
++    supported: true,
++    platform: 'darwin-arm64',
++    binary: { installed: true, version: '2026.1.0', path: '/data/cloudflared', source: 'managed' },
++    auth: { loggedIn: false, loginUrl: null },
++    config: {
++      mode: 'off',
++      hostname: null,
++      tunnelName: null,
++      tunnelId: null,
++      autoStart: false,
++      originPort: 9883,
++    },
++    process: {
++      state: 'stopped',
++      pid: null,
++      startedAt: null,
++      publicUrl: null,
++      lastError: null,
++      restarts: 0,
++    },
++    job: null,
++    trustProxy: false,
++    restartRequired: false,
++    log: [],
++    ...overrides,
++  };
++}
++
++function configured(
++  mode: Exclude<TunnelMode, 'off'>,
++  state: TunnelProcessState,
++  overrides: Partial<TunnelStatusResponse> = {}
++): TunnelStatusResponse {
++  const base = tunnel(overrides);
++  return {
++    ...base,
++    config: { ...base.config, mode, hostname: mode === 'named' ? 'tmex.example.com' : null },
++    process: { ...base.process, state },
++  };
++}
++
++function job(overrides: Partial<TunnelJobStatus> = {}): TunnelJobStatus {
++  return {
++    id: 'j1',
++    kind: 'install',
++    state: 'running',
++    step: null,
++    error: null,
++    startedAt: '2026-08-30T00:00:00.000Z',
++    finishedAt: null,
++    ...overrides,
++  };
++}
++
++function render(entry = '/settings'): string {
++  return renderToStaticMarkup(
++    <MemoryRouter initialEntries={[entry]}>
++      <RemoteAccessTab />
++    </MemoryRouter>
++  );
++}
++
++/** 只看标签自身的 `disabled=""`：class 里的 `disabled:` 变体前缀不算数。 */
++function isDisabled(html: string, testId: string): boolean {
++  const tag = new RegExp(`<[a-z]+[^>]*data-testid="${testId}"[^>]*>`).exec(html);
++  if (!tag) throw new Error(`missing element: ${testId}`);
++  return / disabled=""/.test(tag[0]);
++}
++
++function stepStateOf(html: string, testId: string): string | null {
++  const tag = new RegExp(`<[a-z]+[^>]*data-testid="${testId}"[^>]*>`).exec(html);
++  if (!tag) throw new Error(`missing element: ${testId}`);
++  return /data-step-state="([a-z]+)"/.exec(tag[0])?.[1] ?? null;
++}
++
++beforeEach(() => {
++  status = tunnel();
++  loading = false;
++  loginRequired = false;
++  loadError = null;
++  actionState = { pending: null, error: null, check: null, busy: false };
++  resetMeshNodesStateForTest();
++});
++
++describe('路由与加载分支', () => {
++  test('浏览远端 node 时只给提示，不渲染状态卡与向导', () => {
++    const html = render(`/n/${OTHER_ID}/settings`);
++    expect(html).toContain('data-testid="remote-access-remote-node"');
++    expect(html).toContain('settings.remoteAccess.remoteNodeNotice');
++    expect(html).not.toContain('data-testid="remote-access-status"');
++    expect(html).not.toContain('data-testid="remote-access-wizard"');
++  });
++
++  test('未登录时给登录提示', () => {
++    loginRequired = true;
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-login-required"');
++    expect(html).not.toContain('data-testid="remote-access-wizard"');
++  });
++
++  test('加载中只转圈', () => {
++    loading = true;
++    status = null;
++    const html = render();
++    expect(html).toContain('data-testid="settings-remote-access-tab"');
++    expect(html).not.toContain('data-testid="remote-access-status"');
++  });
++
++  test('加载失败展示错误而不是空白', () => {
++    status = null;
++    loadError = 'boom';
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-load-failed"');
++    expect(html).toContain('boom');
++  });
++});
++
++describe('状态徽标与操作按钮', () => {
++  test('未配置：徽标为未配置，且不出现启停 / 移除按钮', () => {
++    const html = render();
++    expect(html).toContain('settings.remoteAccess.state.notConfigured');
++    expect(html).not.toContain('data-testid="remote-access-start"');
++    expect(html).not.toContain('data-testid="remote-access-remove"');
++  });
++
++  test('已停止：可启动、可移除，没有停止与连通性检查', () => {
++    status = configured('quick', 'stopped');
++    const html = render();
++    expect(html).toContain('settings.remoteAccess.state.stopped');
++    expect(html).toContain('data-testid="remote-access-start"');
++    expect(html).toContain('data-testid="remote-access-remove"');
++    expect(html).not.toContain('data-testid="remote-access-stop"');
++    expect(html).not.toContain('data-testid="remote-access-check"');
++  });
++
++  test('启动中：只给停止，不给连通性检查', () => {
++    status = configured('quick', 'starting');
++    const html = render();
++    expect(html).toContain('settings.remoteAccess.state.starting');
++    expect(html).toContain('data-testid="remote-access-stop"');
++    expect(html).not.toContain('data-testid="remote-access-start"');
++    expect(html).not.toContain('data-testid="remote-access-check"');
++  });
++
++  test('运行中：公网地址、复制、新标签页打开、连通性检查与重启次数', () => {
++    status = configured('quick', 'running');
++    status.process.publicUrl = 'https://calm-fox.trycloudflare.com';
++    status.process.restarts = 2;
++    const html = render();
++    expect(html).toContain('settings.remoteAccess.state.running');
++    expect(html).toContain('https://calm-fox.trycloudflare.com');
++    expect(html).toContain('data-testid="remote-access-public-url-copy"');
++    expect(html).toContain('data-testid="remote-access-open"');
++    expect(html).toContain('data-testid="remote-access-check"');
++    expect(html).toContain('data-testid="remote-access-restarts"');
++    expect(html).toContain('settings.remoteAccess.mode.quick.title');
++  });
++
++  test('重启次数为 0 时不显示这一行', () => {
++    status = configured('named', 'running');
++    const html = render();
++    expect(html).not.toContain('data-testid="remote-access-restarts"');
++  });
++
++  test('错误态展示进程最后一次错误', () => {
++    status = configured('named', 'error');
++    status.process.lastError = 'exit status 1';
++    const html = render();
++    expect(html).toContain('settings.remoteAccess.state.error');
++    expect(html).toContain('data-testid="remote-access-process-error"');
++    expect(html).toContain('exit status 1');
++  });
++
++  test('忙锁：所有操作按钮同时禁用', () => {
++    status = configured('quick', 'running');
++    actionState = { pending: 'stop', error: null, check: null, busy: true };
++    const html = render();
++    expect(isDisabled(html, 'remote-access-stop')).toBe(true);
++    expect(isDisabled(html, 'remote-access-check')).toBe(true);
++    expect(isDisabled(html, 'remote-access-remove')).toBe(true);
++  });
++
++  test('连通性检查的结果就地展示', () => {
++    status = configured('quick', 'running');
++    actionState = { pending: null, error: null, check: { ok: true, message: null }, busy: false };
++    expect(render()).toContain('data-testid="remote-access-check-ok"');
++
++    actionState = {
++      pending: null,
++      error: null,
++      check: { ok: false, message: '502 bad gateway' },
++      busy: false,
++    };
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-check-failed"');
++    expect(html).toContain('502 bad gateway');
++  });
++});
++
++describe('错误码映射', () => {
++  test('已知错误码走本地化文案', () => {
++    actionState = {
++      pending: null,
++      error: { code: 'busy', message: 'another action is running' },
++      check: null,
++      busy: false,
++    };
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-error"');
++    expect(html).toContain('settings.remoteAccess.errors.busy');
++  });
++
++  test('未知错误码退回带原始 message 的兜底文案', () => {
++    actionState = {
++      pending: null,
++      error: { code: 'unknown', message: 'network down' },
++      check: null,
++      busy: false,
++    };
++    expect(render()).toContain('settings.remoteAccess.errors.unknown');
++  });
++});
++
++describe('向导步进', () => {
++  test('未安装 cloudflared 时停在第 1 步并给安装按钮', () => {
++    status = tunnel({ binary: { installed: false, version: null, path: null, source: null } });
++    const html = render();
++    expect(stepStateOf(html, 'remote-access-step-install')).toBe('current');
++    expect(stepStateOf(html, 'remote-access-step-mode')).toBe('todo');
++    expect(html).toContain('data-testid="remote-access-install"');
++  });
++
++  test('不支持的平台只给提示，不给安装按钮', () => {
++    status = tunnel({
++      supported: false,
++      platform: 'freebsd-x64',
++      binary: { installed: false, version: null, path: null, source: null },
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-unsupported"');
++    expect(html).not.toContain('data-testid="remote-access-install"');
++  });
++
++  test('安装 job 在跑时展示进度步骤', () => {
++    status = tunnel({
++      binary: { installed: false, version: null, path: null, source: null },
++      job: job({ kind: 'install', state: 'running', step: 'download' }),
++    });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-install-progress"');
++    expect(html).toContain('settings.remoteAccess.jobStep.download');
++  });
++
++  test('安装 job 失败时映射错误码', () => {
++    status = tunnel({
++      binary: { installed: false, version: null, path: null, source: null },
++      job: job({
++        kind: 'install',
++        state: 'error',
++        error: { code: 'download_failed', message: 'timeout' },
++      }),
++    });
++    expect(render()).toContain('settings.remoteAccess.errors.download_failed');
++  });
++
++  test('装好后停在第 2 步：两张方式卡都在，第 3 步等待选择', () => {
++    const html = render();
++    expect(stepStateOf(html, 'remote-access-step-install')).toBe('done');
++    expect(stepStateOf(html, 'remote-access-step-mode')).toBe('current');
++    expect(html).toContain('data-testid="remote-access-mode-quick"');
++    expect(html).toContain('data-testid="remote-access-mode-named"');
++    expect(html).toContain('data-testid="remote-access-step-tunnel-idle"');
++    expect(html).toContain('data-testid="remote-access-binary"');
++  });
++
++  test('已建好隧道时方式卡锁定，向导停在第 4 步', () => {
++    status = configured('named', 'running');
++    const html = render();
++    expect(stepStateOf(html, 'remote-access-step-tunnel')).toBe('done');
++    expect(stepStateOf(html, 'remote-access-step-proxy')).toBe('current');
++    expect(isDisabled(html, 'remote-access-mode-named-input')).toBe(true);
++    expect(isDisabled(html, 'remote-access-mode-quick-input')).toBe(true);
++  });
++
++  test('临时隧道启动后展示 trycloudflare 地址', () => {
++    status = configured('quick', 'running');
++    status.process.publicUrl = 'https://calm-fox.trycloudflare.com';
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-quick-started"');
++    expect(html).toContain('data-testid="remote-access-quick-url"');
++    expect(html).not.toContain('data-testid="remote-access-quick-start"');
++  });
++
++  test('反向代理信任与随 tmex 启动两个开关都在；需要重启时给立即重启', () => {
++    status = configured('quick', 'running', { restartRequired: true });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-trust-proxy"');
++    expect(html).toContain('data-testid="remote-access-auto-start"');
++    expect(html).toContain('data-testid="remote-access-restart-required"');
++    expect(html).toContain('data-testid="remote-access-restart-now"');
++  });
++
++  test('不需要重启时不显示重启提示', () => {
++    status = configured('quick', 'running');
++    expect(render()).not.toContain('data-testid="remote-access-restart-required"');
++  });
++});
++
++describe('命名隧道', () => {
++  test('未登录时先给登录按钮', () => {
++    status = tunnel();
++    const html = renderWizard('named');
++    expect(html).toContain('data-testid="remote-access-login-start"');
++    expect(html).not.toContain('data-testid="remote-access-hostname"');
++  });
++
++  test('登录 job 在跑时展示授权地址、复制与取消', () => {
++    status = tunnel({
++      auth: { loggedIn: false, loginUrl: 'https://dash.cloudflare.com/argotunnel?a=1' },
++      job: job({ kind: 'login', state: 'running' }),
++    });
++    const html = renderWizard('named');
++    expect(html).toContain('data-testid="remote-access-login-waiting"');
++    expect(html).toContain('https://dash.cloudflare.com/argotunnel?a=1');
++    expect(html).toContain('data-testid="remote-access-login-url-copy"');
++    expect(html).toContain('data-testid="remote-access-login-cancel"');
++    expect(html).not.toContain('data-testid="remote-access-login-start"');
++  });
++
++  test('登录超时映射成本地化文案', () => {
++    status = tunnel({
++      job: job({
++        kind: 'login',
++        state: 'error',
++        error: { code: 'login_timeout', message: 'timed out' },
++      }),
++    });
++    expect(renderWizard('named')).toContain('settings.remoteAccess.errors.login_timeout');
++  });
++
++  test('登录后展示主机名与隧道名称表单', () => {
++    status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
++    const html = renderWizard('named');
++    expect(html).toContain('data-testid="remote-access-logged-in"');
++    expect(html).toContain('data-testid="remote-access-hostname"');
++    expect(html).toContain('data-testid="remote-access-tunnel-name"');
++    expect(html).toContain('data-testid="remote-access-create-submit"');
++  });
++
++  test('创建 job 在跑时展示 DNS 配置进度', () => {
++    status = tunnel({
++      auth: { loggedIn: true, loginUrl: null },
++      job: job({ kind: 'create', state: 'running', step: 'route_dns' }),
++    });
++    const html = renderWizard('named');
++    expect(html).toContain('data-testid="remote-access-create-progress"');
++    expect(html).toContain('settings.remoteAccess.jobStep.route_dns');
++  });
++
++  test('创建失败时映射 DNS 错误码', () => {
++    status = tunnel({
++      auth: { loggedIn: true, loginUrl: null },
++      job: job({
++        kind: 'create',
++        state: 'error',
++        error: { code: 'dns_route_failed', message: 'no zone' },
++      }),
++    });
++    expect(renderWizard('named')).toContain('settings.remoteAccess.errors.dns_route_failed');
++  });
++
++  test('本机即 hub 时在主机名步骤给出 Hub 公开地址提示', () => {
++    status = configured('named', 'stopped', { auth: { loggedIn: true, loginUrl: null } });
++
++    setMeshNodesStateForTest({ modeLoaded: true, entryNodeId: SELF_ID, mode: authMode(OTHER_ID) });
++    expect(render()).not.toContain('data-testid="remote-access-hub-hint"');
++
++    setMeshNodesStateForTest({ modeLoaded: true, entryNodeId: SELF_ID, mode: authMode(SELF_ID) });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-hub-hint"');
++    expect(html).toContain('?tab=nodes');
++  });
++});
++
++describe('日志', () => {
++  test('有输出时渲染日志框，无输出时给空提示', () => {
++    status = tunnel({ log: ['2026-08-30 INF Registered tunnel connection'] });
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-log-box"');
++    expect(html).toContain('Registered tunnel connection');
++
++    status = tunnel();
++    expect(render()).toContain('data-testid="remote-access-log-empty"');
++  });
++
++  test('只渲染末尾 200 行', () => {
++    status = tunnel({ log: Array.from({ length: 260 }, (_, i) => `line ${i}`) });
++    const html = render();
++    expect(html).not.toContain('line 59');
++    expect(html).toContain('line 60');
++    expect(html).toContain('line 259');
++  });
++});
++
++/**
++ * 第 3 步走哪条路径由本地选择驱动，静态渲染点不了方式卡——命名隧道的子步骤直接渲染
++ * `TunnelWizard` 并把选择传进去；`RemoteAccessTab` 只负责把 `useState` 接上这个入参。
++ */
++function renderWizard(mode: TunnelMode, isHub = false): string {
++  const current = status;
++  if (!current) throw new Error('status fixture is required');
++  return renderToStaticMarkup(
++    <MemoryRouter initialEntries={['/settings']}>
++      <TunnelWizard
++        status={current}
++        actions={{ ...actionState, run: () => undefined, clearError: () => undefined }}
++        chosenMode={mode}
++        onChooseMode={() => undefined}
++        isHub={isHub}
++        onRestarted={() => undefined}
++      />
++    </MemoryRouter>
++  );
++}
++
++function authMode(hubNodeId: string): AuthModeResponse {
++  return {
++    mode: 'mesh',
++    nodeId: SELF_ID,
++    uid: null,
++    username: null,
++    kdfParams: null,
++    passkeysForThisOrigin: false,
++    passkeyAvailable: false,
++    hubNodeId,
++  };
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx b/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
+new file mode 100644
+index 00000000..8b5b650c
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
+@@ -0,0 +1,111 @@
++// 设置页「远程访问」标签：用 Cloudflare Tunnel 把本机的 tmex 暴露到公网。
++//
++// `/api/tunnel/*` 与 TLS / LocalApi 一样只作用于浏览器直连的那台机器：它要落盘二进制、写 env、
++// 起常驻进程，经 `/n/<id>` 转发过去只会改到入口机自己。因此浏览远端 node 时整块不渲染，只给提示。
++
++import { useSharedAuthMode } from '@/node/mesh-nodes';
++import { useRouteNodeId } from '@/node/node-runtime-boundary';
++import { isSelfNode } from '@tmex/api-client';
++import type { AuthModeResponse } from '@tmex/api-client/auth/index';
++import type { TunnelMode } from '@tmex/shared';
++import { Card, CardContent, CardHeader, CardTitle } from '@tmex/ui/card';
++import { Loader2 } from 'lucide-react';
++import { useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { SetupNotice } from '../nodes/setup/form-parts';
++import { TunnelStatusCard } from './status-card';
++import { useTunnelActions } from './tunnel-actions';
++import { useTunnelStatus } from './use-tunnel-status';
++import { TunnelWizard } from './wizard';
++
++export function RemoteAccessTab() {
++  const routeNodeId = useRouteNodeId();
++  if (!isSelfNode(routeNodeId)) return <RemoteNodeNotice />;
++  return <SelfRemoteAccess />;
++}
++
++function RemoteNodeNotice() {
++  const { t } = useTranslation();
++  return (
++    <Card data-testid="settings-remote-access-tab">
++      <CardHeader>
++        <CardTitle>{t('settings.remoteAccess.title')}</CardTitle>
++      </CardHeader>
++      <CardContent>
++        <SetupNotice tone="info" testId="remote-access-remote-node">
++          {t('settings.remoteAccess.remoteNodeNotice')}
++        </SetupNotice>
++      </CardContent>
++    </Card>
++  );
++}
++
++function SelfRemoteAccess() {
++  const { t } = useTranslation();
++  const tunnel = useTunnelStatus();
++  const { mode } = useSharedAuthMode();
++  const [chosenMode, setChosenMode] = useState<TunnelMode | null>(null);
++
++  const { setStatus, refresh } = tunnel;
++  const actions = useTunnelActions(tunnel.status, { onStatus: setStatus, onRefresh: refresh });
++
++  if (tunnel.loginRequired) {
++    return (
++      <Card data-testid="settings-remote-access-tab">
++        <CardHeader>
++          <CardTitle>{t('settings.remoteAccess.title')}</CardTitle>
++        </CardHeader>
++        <CardContent>
++          <p className="text-xs text-muted-foreground" data-testid="remote-access-login-required">
++            {t('settings.remoteAccess.loginRequired')}
++          </p>
++        </CardContent>
++      </Card>
++    );
++  }
++
++  if (tunnel.loading) {
++    return (
++      <div
++        className="flex h-9 items-center px-1 text-muted-foreground"
++        data-testid="settings-remote-access-tab"
++      >
++        <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
++      </div>
++    );
++  }
++
++  if (!tunnel.status) {
++    return (
++      <Card data-testid="settings-remote-access-tab">
++        <CardHeader>
++          <CardTitle>{t('settings.remoteAccess.title')}</CardTitle>
++        </CardHeader>
++        <CardContent>
++          <SetupNotice tone="error" testId="remote-access-load-failed">
++            {tunnel.error ?? t('settings.remoteAccess.loadFailed')}
++          </SetupNotice>
++        </CardContent>
++      </Card>
++    );
++  }
++
++  return (
++    <div className="flex w-full flex-col gap-4" data-testid="settings-remote-access-tab">
++      <TunnelStatusCard status={tunnel.status} actions={actions} />
++      <TunnelWizard
++        status={tunnel.status}
++        actions={actions}
++        chosenMode={chosenMode}
++        onChooseMode={setChosenMode}
++        isHub={isSelfHub(mode)}
++        onRestarted={refresh}
++      />
++    </div>
++  );
++}
++
++/** 本机即 hub：`/api/auth/mode` 下发的 `hubNodeId` 与自身 nodeId 相同。 */
++function isSelfHub(mode: AuthModeResponse | null): boolean {
++  return mode?.mode === 'mesh' && !!mode.hubNodeId && mode.hubNodeId === mode.nodeId;
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/status-card.tsx b/apps/fe/src/pages/settings/remote-access/status-card.tsx
+new file mode 100644
+index 00000000..42851f53
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/status-card.tsx
+@@ -0,0 +1,209 @@
++// 远程访问状态卡：状态徽标、公网地址、启停 / 移除 / 连通性检查，以及可折叠的 cloudflared 日志。
++
++import type { TunnelStatusResponse } from '@tmex/shared';
++import { Badge } from '@tmex/ui/badge';
++import { Button, buttonVariants } from '@tmex/ui/button';
++import { Card, CardContent, CardHeader, CardTitle } from '@tmex/ui/card';
++import { ExternalLink, Loader2, Play, Radar, Square, Trash2 } from 'lucide-react';
++import { useEffect, useRef } from 'react';
++import { useTranslation } from 'react-i18next';
++import { CopyButton } from '../nodes/copy-feedback';
++import { SetupNotice } from '../nodes/setup/form-parts';
++import { DetailRow } from './step-shell';
++import type { TunnelActions } from './tunnel-actions';
++import { describeTunnelError, logTail, tunnelPill } from './tunnel-model';
++
++const PILL_VARIANT = {
++  notConfigured: 'outline',
++  stopped: 'outline',
++  starting: 'secondary',
++  running: 'default',
++  error: 'destructive',
++} as const;
++
++export function TunnelStatusCard({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  const pill = tunnelPill(status);
++  const configured = status.config.mode !== 'off';
++  const stoppable = status.process.state === 'running' || status.process.state === 'starting';
++  const { busy, pending } = actions;
++
++  return (
++    <Card data-testid="remote-access-status">
++      <CardHeader>
++        <CardTitle className="flex flex-wrap items-center gap-2">
++          {t('settings.remoteAccess.title')}
++          <Badge variant={PILL_VARIANT[pill]} data-testid="remote-access-state">
++            {t(`settings.remoteAccess.state.${pill}`)}
++          </Badge>
++        </CardTitle>
++      </CardHeader>
++      <CardContent className="space-y-3">
++        {actions.error && (
++          <SetupNotice tone="error" testId="remote-access-error">
++            {describeTunnelError(t, actions.error)}
++          </SetupNotice>
++        )}
++
++        {status.process.state === 'error' && status.process.lastError && (
++          <SetupNotice tone="error" testId="remote-access-process-error">
++            {status.process.lastError}
++          </SetupNotice>
++        )}
++
++        {configured && (
++          <div className="space-y-0.5 rounded-lg bg-muted/40 p-3">
++            <DetailRow label={t('settings.remoteAccess.modeLabel')} testId="remote-access-mode">
++              {t(`settings.remoteAccess.mode.${status.config.mode}.title`)}
++            </DetailRow>
++            {status.process.publicUrl && (
++              <DetailRow label={t('settings.remoteAccess.publicUrl')}>
++                <span className="flex flex-wrap items-center gap-1">
++                  <code
++                    className="min-w-0 break-all rounded bg-background px-1.5 py-0.5 font-mono text-[11px]"
++                    data-testid="remote-access-public-url"
++                  >
++                    {status.process.publicUrl}
++                  </code>
++                  <CopyButton value={status.process.publicUrl} testId="remote-access-public-url" />
++                  <a
++                    className={buttonVariants({ size: 'xs', variant: 'ghost' })}
++                    href={status.process.publicUrl}
++                    target="_blank"
++                    rel="noreferrer"
++                    data-testid="remote-access-open"
++                  >
++                    <ExternalLink />
++                    {t('settings.remoteAccess.actions.open')}
++                  </a>
++                </span>
++              </DetailRow>
++            )}
++            {status.process.restarts > 0 && (
++              <DetailRow
++                label={t('settings.remoteAccess.restartsLabel')}
++                testId="remote-access-restarts"
++              >
++                {t('settings.remoteAccess.restarts', { times: status.process.restarts })}
++              </DetailRow>
++            )}
++          </div>
++        )}
++
++        {configured && (
++          <div className="flex flex-wrap gap-2">
++            {!stoppable && (
++              <Button
++                type="button"
++                size="sm"
++                disabled={busy}
++                onClick={() => actions.run({ action: 'start' })}
++                data-testid="remote-access-start"
++              >
++                {pending === 'start' ? <Loader2 className="animate-spin" /> : <Play />}
++                {t('settings.remoteAccess.actions.start')}
++              </Button>
++            )}
++            {stoppable && (
++              <Button
++                type="button"
++                size="sm"
++                variant="outline"
++                disabled={busy}
++                onClick={() => actions.run({ action: 'stop' })}
++                data-testid="remote-access-stop"
++              >
++                {pending === 'stop' ? <Loader2 className="animate-spin" /> : <Square />}
++                {t('settings.remoteAccess.actions.stop')}
++              </Button>
++            )}
++            {status.process.state === 'running' && (
++              <Button
++                type="button"
++                size="sm"
++                variant="outline"
++                disabled={busy}
++                onClick={() => actions.run({ action: 'check' })}
++                data-testid="remote-access-check"
++              >
++                {pending === 'check' ? <Loader2 className="animate-spin" /> : <Radar />}
++                {t('settings.remoteAccess.actions.check')}
++              </Button>
++            )}
++            <Button
++              type="button"
++              size="sm"
++              variant="destructive"
++              disabled={busy}
++              onClick={() => actions.run({ action: 'remove' })}
++              data-testid="remote-access-remove"
++            >
++              {pending === 'remove' ? <Loader2 className="animate-spin" /> : <Trash2 />}
++              {t('settings.remoteAccess.actions.remove')}
++            </Button>
++          </div>
++        )}
++
++        {actions.check && (
++          <SetupNotice
++            tone={actions.check.ok ? 'success' : 'error'}
++            testId={actions.check.ok ? 'remote-access-check-ok' : 'remote-access-check-failed'}
++          >
++            <p>
++              {actions.check.ok
++                ? t('settings.remoteAccess.check.reachable')
++                : t('settings.remoteAccess.check.unreachable')}
++            </p>
++            {actions.check.message && <p className="break-all">{actions.check.message}</p>}
++          </SetupNotice>
++        )}
++
++        <TunnelLog log={status.log} />
++      </CardContent>
++    </Card>
++  );
++}
++
++/**
++ * 日志用 `<details>` 而不是受控折叠：内容始终在 DOM 里，展开时不必重挂，
++ * 也让静态渲染的用例能直接断言到行内容。
++ */
++function TunnelLog({ log }: { log: string[] }) {
++  const { t } = useTranslation();
++  const lines = logTail(log);
++  const lineCount = lines.length;
++  const boxRef = useRef<HTMLPreElement | null>(null);
++
++  // 新行永远追加在末尾：日志一变就贴到底，否则展开后看到的一直是最早那几行。
++  useEffect(() => {
++    const box = boxRef.current;
++    if (box && lineCount > 0) box.scrollTop = box.scrollHeight;
++  }, [lineCount]);
++
++  return (
++    <details data-testid="remote-access-log">
++      <summary className="cursor-pointer text-xs text-muted-foreground">
++        {t('settings.remoteAccess.log.title')}
++      </summary>
++      {lineCount === 0 ? (
++        <p className="mt-2 text-xs text-muted-foreground" data-testid="remote-access-log-empty">
++          {t('settings.remoteAccess.log.empty')}
++        </p>
++      ) : (
++        <pre
++          ref={boxRef}
++          className="mt-2 max-h-64 overflow-auto rounded-lg bg-muted/60 p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap"
++          data-testid="remote-access-log-box"
++        >
++          {lines.join('\n')}
++        </pre>
++      )}
++    </details>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/step-shell.tsx b/apps/fe/src/pages/settings/remote-access/step-shell.tsx
+new file mode 100644
+index 00000000..0b08867a
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/step-shell.tsx
+@@ -0,0 +1,107 @@
++// 远程访问向导的步骤外壳与几个小展示件。
++
++import { Check, Loader2 } from 'lucide-react';
++import type { ReactNode } from 'react';
++import { useTranslation } from 'react-i18next';
++import type { StepState } from './tunnel-model';
++import { jobStepKey } from './tunnel-model';
++
++export function WizardStepCard({
++  index,
++  title,
++  description,
++  state,
++  testId,
++  children,
++}: {
++  index: number;
++  title: string;
++  description?: string;
++  state: StepState;
++  testId: string;
++  children?: ReactNode;
++}) {
++  return (
++    <section
++      data-testid={testId}
++      data-step-state={state}
++      className={`rounded-xl p-3 ring-1 transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none ${
++        state === 'current' ? 'bg-primary/5 ring-primary' : 'bg-card ring-foreground/10'
++      }`}
++    >
++      <div className="flex items-start gap-2.5">
++        <StepMarker index={index} state={state} testId={`${testId}-marker`} />
++        <div className="min-w-0 flex-1 space-y-2">
++          <div className="space-y-0.5">
++            <h3 className="text-sm font-medium">{title}</h3>
++            {description && <p className="text-xs text-muted-foreground">{description}</p>}
++          </div>
++          {children}
++        </div>
++      </div>
++    </section>
++  );
++}
++
++function StepMarker({
++  index,
++  state,
++  testId,
++}: {
++  index: number;
++  state: StepState;
++  testId: string;
++}) {
++  return (
++    <span
++      data-testid={testId}
++      className={`mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full text-[11px] font-medium ${
++        state === 'done'
++          ? 'bg-primary/15 text-primary'
++          : state === 'current'
++            ? 'bg-primary text-primary-foreground'
++            : 'bg-muted text-muted-foreground'
++      }`}
++    >
++      {state === 'done' ? <Check className="size-3" /> : index}
++    </span>
++  );
++}
++
++export function ProgressRow({ label, testId }: { label: string; testId: string }) {
++  return (
++    <div
++      className="flex items-center gap-1.5 rounded-lg bg-muted/60 p-2 text-xs text-muted-foreground"
++      data-testid={testId}
++    >
++      <Loader2 className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none" />
++      {label}
++    </div>
++  );
++}
++
++/** 后台 job 的进度行：已知步骤走本地化文案，未知步骤原样展示服务端标识。 */
++export function JobProgress({ step, testId }: { step: string | null; testId: string }) {
++  const { t } = useTranslation();
++  const key = jobStepKey(step);
++  return <ProgressRow label={key ? t(key) : (step ?? t('common.loading'))} testId={testId} />;
++}
++
++export function DetailRow({
++  label,
++  testId,
++  children,
++}: {
++  label: string;
++  testId?: string;
++  children: ReactNode;
++}) {
++  return (
++    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
++      <span className="w-24 shrink-0 text-xs text-muted-foreground">{label}</span>
++      <span className="min-w-0 break-all text-xs" data-testid={testId}>
++        {children}
++      </span>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts b/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts
+new file mode 100644
+index 00000000..05595827
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-actions.test.ts
+@@ -0,0 +1,207 @@
++// 动作串行化：一把锁挡住并发、job 在跑时只放行 cancel_login、check 结果与失败后的重拉。
++
++import { describe, expect, test } from 'bun:test';
++import { TunnelApiError } from '@tmex/api-client/local/tunnel-api';
++import type {
++  TunnelActionRequest,
++  TunnelActionResponse,
++  TunnelJobStatus,
++  TunnelStatusResponse,
++} from '@tmex/shared';
++import { TunnelActionController, checkResultOf, isTunnelBusy } from './tunnel-actions';
++
++function noop(): void {}
++
++function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResponse {
++  return {
++    supported: true,
++    platform: 'linux-x64',
++    binary: { installed: true, version: '2026.1.0', path: '/data/cloudflared', source: 'managed' },
++    auth: { loggedIn: false, loginUrl: null },
++    config: {
++      mode: 'off',
++      hostname: null,
++      tunnelName: null,
++      tunnelId: null,
++      autoStart: false,
++      originPort: 9883,
++    },
++    process: {
++      state: 'stopped',
++      pid: null,
++      startedAt: null,
++      publicUrl: null,
++      lastError: null,
++      restarts: 0,
++    },
++    job: null,
++    trustProxy: false,
++    restartRequired: false,
++    log: [],
++    ...overrides,
++  };
++}
++
++function job(overrides: Partial<TunnelJobStatus> = {}): TunnelJobStatus {
++  return {
++    id: 'j1',
++    kind: 'check',
++    state: 'done',
++    step: null,
++    error: null,
++    startedAt: '2026-08-30T00:00:00.000Z',
++    finishedAt: '2026-08-30T00:00:01.000Z',
++    ...overrides,
++  };
++}
++
++interface Harness {
++  controller: TunnelActionController;
++  calls: TunnelActionRequest[];
++  statuses: TunnelStatusResponse[];
++  refreshes: number;
++  setStatus: (next: TunnelStatusResponse) => void;
++}
++
++function harness(
++  run: (body: TunnelActionRequest) => Promise<TunnelActionResponse>,
++  initial: TunnelStatusResponse = status()
++): Harness {
++  let current = initial;
++  const h: Harness = {
++    calls: [],
++    statuses: [],
++    refreshes: 0,
++    setStatus: (next) => {
++      current = next;
++    },
++    controller: null as unknown as TunnelActionController,
++  };
++  h.controller = new TunnelActionController(
++    (body) => {
++      h.calls.push(body);
++      return run(body);
++    },
++    () => current,
++    () => ({
++      onStatus: (next) => {
++        h.statuses.push(next);
++        current = next;
++      },
++      onRefresh: () => {
++        h.refreshes += 1;
++      },
++    })
++  );
++  return h;
++}
++
++describe('isTunnelBusy', () => {
++  test('有挂起动作或后台 job 在跑都算忙', () => {
++    expect(isTunnelBusy(null, status())).toBe(false);
++    expect(isTunnelBusy('install', status())).toBe(true);
++    expect(isTunnelBusy(null, status({ job: job({ kind: 'install', state: 'running' }) }))).toBe(
++      true
++    );
++    expect(isTunnelBusy(null, status({ job: job({ kind: 'install', state: 'done' }) }))).toBe(
++      false
++    );
++  });
++});
++
++describe('TunnelActionController 锁', () => {
++  test('挂起期间第二次调用直接丢弃', async () => {
++    let release: () => void = noop;
++    const gate = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    const h = harness(async () => {
++      await gate;
++      return { status: status(), job: null };
++    });
++
++    const first = h.controller.run({ action: 'install' });
++    expect(h.controller.snapshot().pending).toBe('install');
++    await h.controller.run({ action: 'quick_start' });
++    expect(h.calls).toHaveLength(1);
++
++    release();
++    await first;
++    expect(h.controller.snapshot().pending).toBeNull();
++  });
++
++  test('后台 job 在跑时挡下普通动作，但放行 cancel_login', async () => {
++    const running = status({ job: job({ kind: 'login', state: 'running', step: null }) });
++    const h = harness(async () => ({ status: status(), job: null }), running);
++
++    await h.controller.run({ action: 'install' });
++    expect(h.calls).toHaveLength(0);
++
++    await h.controller.run({ action: 'cancel_login' });
++    expect(h.calls).toEqual([{ action: 'cancel_login' }]);
++  });
++});
++
++describe('TunnelActionController 结果处理', () => {
++  test('成功时把响应里的新快照写回', async () => {
++    const next = status({ config: { ...status().config, mode: 'quick' } });
++    const h = harness(async () => ({ status: next, job: null }));
++    await h.controller.run({ action: 'quick_start' });
++    expect(h.statuses).toEqual([next]);
++    expect(h.controller.snapshot().error).toBeNull();
++  });
++
++  test('check 成功记为可访问，job 带 error 记为不可达', async () => {
++    const ok = harness(async () => ({ status: status(), job: job() }));
++    await ok.controller.run({ action: 'check' });
++    expect(ok.controller.snapshot().check).toEqual({ ok: true, message: null });
++
++    const bad = harness(async () => ({
++      status: status(),
++      job: job({ state: 'error', error: { code: 'process_failed', message: '502 bad gateway' } }),
++    }));
++    await bad.controller.run({ action: 'check' });
++    expect(bad.controller.snapshot().check).toEqual({ ok: false, message: '502 bad gateway' });
++  });
++
++  test('失败时保留错误码并重拉状态', async () => {
++    const h = harness(async () => {
++      throw new TunnelApiError('busy', 'another action is running', 409);
++    });
++    await h.controller.run({ action: 'start' });
++    expect(h.controller.snapshot().error).toEqual({
++      code: 'busy',
++      message: 'another action is running',
++    });
++    expect(h.refreshes).toBe(1);
++    expect(h.controller.snapshot().pending).toBeNull();
++  });
++
++  test('新动作开始时清掉上一次的错误', async () => {
++    let fail = true;
++    const h = harness(async () => {
++      if (fail) throw new TunnelApiError('download_failed', 'timeout', 500);
++      return { status: status(), job: null };
++    });
++    await h.controller.run({ action: 'install' });
++    expect(h.controller.snapshot().error?.code).toBe('download_failed');
++    fail = false;
++    await h.controller.run({ action: 'install' });
++    expect(h.controller.snapshot().error).toBeNull();
++  });
++});
++
++describe('checkResultOf', () => {
++  test('没有 job 时按可访问处理', () => {
++    expect(checkResultOf({ status: status(), job: null })).toEqual({ ok: true, message: null });
++  });
++
++  test('job 报错但没有 message 时退回错误码', () => {
++    expect(
++      checkResultOf({
++        status: status(),
++        job: job({ state: 'error', error: { code: 'process_failed', message: '' } }),
++      })
++    ).toEqual({ ok: false, message: 'process_failed' });
++  });
++});
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-actions.ts b/apps/fe/src/pages/settings/remote-access/tunnel-actions.ts
+new file mode 100644
+index 00000000..306f9da3
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-actions.ts
+@@ -0,0 +1,152 @@
++// 远程访问动作的串行化：所有变更共用一把锁，后台 job 在跑时同样算「忙」。
++//
++// 后端对并发动作直接返回 409（`busy`），前端先自己挡一层：安装、登录、创建、启停都会改同一份
++// 主机状态，抢着发只会拿到一串 409，还会让按钮的挂起态和实际进度对不上。
++// 唯一的例外是 `cancel_login`——它存在的意义就是打断正在跑的 login job。
++//
++// 状态放在可订阅的控制器里而不是组件 state：锁与错误处理可以脱离 DOM 直接测。
++
++import { type ApiClient, defaultApiClient } from '@tmex/api-client';
++import { runTunnelAction } from '@tmex/api-client/local/tunnel-api';
++import type { TunnelActionRequest, TunnelActionResponse, TunnelStatusResponse } from '@tmex/shared';
++import { useMemo, useRef, useSyncExternalStore } from 'react';
++import { type TunnelError, toTunnelError } from './tunnel-model';
++
++export type TunnelActionName = TunnelActionRequest['action'];
++
++export interface TunnelCheckResult {
++  ok: boolean;
++  message: string | null;
++}
++
++export interface TunnelActionState {
++  pending: TunnelActionName | null;
++  error: TunnelError | null;
++  /** 最近一次「检查连通性」的结果。 */
++  check: TunnelCheckResult | null;
++}
++
++export interface TunnelActionCallbacks {
++  onStatus: (next: TunnelStatusResponse) => void;
++  onRefresh: () => void;
++}
++
++export type RunTunnelAction = (body: TunnelActionRequest) => Promise<TunnelActionResponse>;
++
++export function isTunnelBusy(
++  pending: TunnelActionName | null,
++  status: TunnelStatusResponse | null
++): boolean {
++  return pending !== null || status?.job?.state === 'running';
++}
++
++const INITIAL: TunnelActionState = { pending: null, error: null, check: null };
++
++export class TunnelActionController {
++  private state: TunnelActionState = INITIAL;
++  private readonly listeners = new Set<() => void>();
++
++  constructor(
++    private readonly runAction: RunTunnelAction,
++    private readonly readStatus: () => TunnelStatusResponse | null,
++    private readonly readCallbacks: () => TunnelActionCallbacks
++  ) {}
++
++  snapshot = (): TunnelActionState => this.state;
++
++  subscribe = (listener: () => void): (() => void) => {
++    this.listeners.add(listener);
++    return () => {
++      this.listeners.delete(listener);
++    };
++  };
++
++  get busy(): boolean {
++    return isTunnelBusy(this.state.pending, this.readStatus());
++  }
++
++  clearError = (): void => {
++    if (this.state.error) this.update({ error: null });
++  };
++
++  run = async (req: TunnelActionRequest): Promise<void> => {
++    if (this.state.pending !== null) return;
++    if (req.action !== 'cancel_login' && this.readStatus()?.job?.state === 'running') return;
++
++    this.update({
++      pending: req.action,
++      error: null,
++      check: req.action === 'check' ? null : this.state.check,
++    });
++    try {
++      const res = await this.runAction(req);
++      this.readCallbacks().onStatus(res.status);
++      if (req.action === 'check') this.update({ check: checkResultOf(res) });
++    } catch (error) {
++      this.update({ error: toTunnelError(error) });
++      // 失败时服务端状态很可能已经变了（进程退出、job 转 error），必须重拉才看得到。
++      this.readCallbacks().onRefresh();
++    } finally {
++      this.update({ pending: null });
++    }
++  };
++
++  private update(patch: Partial<TunnelActionState>): void {
++    this.state = { ...this.state, ...patch };
++    for (const listener of this.listeners) listener();
++  }
++}
++
++/** `check` 是同步动作：结果落在响应的 job 上，job 带 error 即不可达。 */
++export function checkResultOf(res: TunnelActionResponse): TunnelCheckResult {
++  const job = res.job;
++  if (job?.error) return { ok: false, message: job.error.message || job.error.code };
++  return { ok: job?.state !== 'error', message: null };
++}
++
++export interface TunnelActions extends TunnelActionState {
++  busy: boolean;
++  run: (req: TunnelActionRequest) => void;
++  clearError: () => void;
++}
++
++export interface UseTunnelActionsOptions {
++  client?: ApiClient;
++  /** 测试注入；默认打 `POST /api/tunnel/actions`。 */
++  runAction?: RunTunnelAction;
++}
++
++export function useTunnelActions(
++  status: TunnelStatusResponse | null,
++  callbacks: TunnelActionCallbacks,
++  options: UseTunnelActionsOptions = {}
++): TunnelActions {
++  const statusRef = useRef(status);
++  statusRef.current = status;
++  const callbacksRef = useRef(callbacks);
++  callbacksRef.current = callbacks;
++
++  const client = options.client ?? defaultApiClient;
++  const injected = options.runAction;
++  const controller = useMemo(
++    () =>
++      new TunnelActionController(
++        injected ?? ((body) => runTunnelAction(body, client)),
++        () => statusRef.current,
++        () => callbacksRef.current
++      ),
++    [client, injected]
++  );
++  const state = useSyncExternalStore(
++    controller.subscribe,
++    controller.snapshot,
++    controller.snapshot
++  );
++
++  return {
++    ...state,
++    busy: isTunnelBusy(state.pending, status),
++    run: (req) => void controller.run(req),
++    clearError: controller.clearError,
++  };
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts b/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
+new file mode 100644
+index 00000000..c43a737f
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
+@@ -0,0 +1,209 @@
++// 远程访问的纯推导：状态徽标、向导步进、主机名校验、轮询节奏与错误 / 进度文案键。
++
++import { describe, expect, test } from 'bun:test';
++import { TunnelApiError } from '@tmex/api-client/local/tunnel-api';
++import type { TunnelStatusResponse } from '@tmex/shared';
++import {
++  TUNNEL_ACTIVE_POLL_MS,
++  TUNNEL_IDLE_POLL_MS,
++  currentWizardStep,
++  describeTunnelError,
++  effectiveMode,
++  isValidHostname,
++  jobStepKey,
++  logTail,
++  stepState,
++  toTunnelError,
++  tunnelErrorKey,
++  tunnelPill,
++  tunnelPollInterval,
++} from './tunnel-model';
++
++function status(overrides: Partial<TunnelStatusResponse> = {}): TunnelStatusResponse {
++  return {
++    supported: true,
++    platform: 'darwin-arm64',
++    binary: { installed: true, version: '2026.1.0', path: '/data/cloudflared', source: 'managed' },
++    auth: { loggedIn: false, loginUrl: null },
++    config: {
++      mode: 'off',
++      hostname: null,
++      tunnelName: null,
++      tunnelId: null,
++      autoStart: false,
++      originPort: 9883,
++    },
++    process: {
++      state: 'stopped',
++      pid: null,
++      startedAt: null,
++      publicUrl: null,
++      lastError: null,
++      restarts: 0,
++    },
++    job: null,
++    trustProxy: false,
++    restartRequired: false,
++    log: [],
++    ...overrides,
++  };
++}
++
++describe('tunnelPill', () => {
++  test('未配置：mode 为 off 且进程没报错', () => {
++    expect(tunnelPill(status())).toBe('notConfigured');
++  });
++
++  test('已配置后按进程状态映射', () => {
++    const config = { ...status().config, mode: 'quick' as const };
++    expect(tunnelPill(status({ config }))).toBe('stopped');
++    expect(
++      tunnelPill(status({ config, process: { ...status().process, state: 'starting' } }))
++    ).toBe('starting');
++    expect(tunnelPill(status({ config, process: { ...status().process, state: 'running' } }))).toBe(
++      'running'
++    );
++  });
++
++  test('进程报错优先于「未配置」：移除失败后不能显示成一片干净', () => {
++    expect(
++      tunnelPill(
++        status({ process: { ...status().process, state: 'error', lastError: 'exit code 1' } })
++      )
++    ).toBe('error');
++  });
++});
++
++describe('currentWizardStep / effectiveMode', () => {
++  test('没装 cloudflared 一律停在第 1 步', () => {
++    const s = status({ binary: { installed: false, version: null, path: null, source: null } });
++    expect(currentWizardStep(s, 'named')).toBe(1);
++  });
++
++  test('装好但没选方式停在第 2 步，选了方式进第 3 步', () => {
++    expect(currentWizardStep(status(), null)).toBe(2);
++    expect(currentWizardStep(status(), 'quick')).toBe(3);
++  });
++
++  test('已经建好隧道直接进第 4 步，方式以服务端为准', () => {
++    const s = status({ config: { ...status().config, mode: 'named', hostname: 'a.example.com' } });
++    expect(currentWizardStep(s, 'quick')).toBe(4);
++    expect(effectiveMode(s, 'quick')).toBe('named');
++  });
++
++  test('未配置时方式取本地选择', () => {
++    expect(effectiveMode(status(), 'quick')).toBe('quick');
++    expect(effectiveMode(status(), null)).toBe('off');
++  });
++});
++
++describe('stepState', () => {
++  test('当前步高亮、之前的步骤打勾、之后的步骤待办', () => {
++    expect(stepState(1, 3)).toBe('done');
++    expect(stepState(3, 3)).toBe('current');
++    expect(stepState(4, 3)).toBe('todo');
++  });
++});
++
++describe('isValidHostname', () => {
++  test('接受小写多级主机名', () => {
++    expect(isValidHostname('tmex.example.com')).toBe(true);
++    expect(isValidHostname('a-b.c-d.example.co.uk')).toBe(true);
++  });
++
++  test('拒绝大写、单级、空标签、首尾连字符与超长标签', () => {
++    expect(isValidHostname('TMEX.example.com')).toBe(false);
++    expect(isValidHostname('example')).toBe(false);
++    expect(isValidHostname('')).toBe(false);
++    expect(isValidHostname('a..com')).toBe(false);
++    expect(isValidHostname('-a.example.com')).toBe(false);
++    expect(isValidHostname('a-.example.com')).toBe(false);
++    expect(isValidHostname(`${'a'.repeat(64)}.example.com`)).toBe(false);
++    expect(isValidHostname('tmex.example.com/path')).toBe(false);
++  });
++});
++
++describe('jobStepKey', () => {
++  test('已知步骤给文案键', () => {
++    expect(jobStepKey('download')).toBe('settings.remoteAccess.jobStep.download');
++    expect(jobStepKey('route_dns')).toBe('settings.remoteAccess.jobStep.route_dns');
++  });
++
++  test('未知或缺失步骤返回 null', () => {
++    expect(jobStepKey('mystery')).toBeNull();
++    expect(jobStepKey(null)).toBeNull();
++  });
++});
++
++describe('错误映射', () => {
++  const t = (key: string, options?: Record<string, unknown>) =>
++    options ? `${key}:${JSON.stringify(options)}` : key;
++
++  test('已知错误码走本地化键', () => {
++    expect(tunnelErrorKey('login_timeout')).toBe('settings.remoteAccess.errors.login_timeout');
++    expect(describeTunnelError(t, { code: 'busy', message: 'busy' })).toBe(
++      'settings.remoteAccess.errors.busy'
++    );
++  });
++
++  test('未知码退化成带原始 message 的兜底文案', () => {
++    expect(tunnelErrorKey('nope')).toBeNull();
++    expect(describeTunnelError(t, { code: 'unknown', message: 'boom' })).toBe(
++      'settings.remoteAccess.errors.unknown:{"message":"boom"}'
++    );
++  });
++
++  test('TunnelApiError 保留 code 与 message，其它异常落到 unknown', () => {
++    expect(toTunnelError(new TunnelApiError('dns_route_failed', 'no zone', 400))).toEqual({
++      code: 'dns_route_failed',
++      message: 'no zone',
++    });
++    expect(toTunnelError(new Error('network down'))).toEqual({
++      code: 'unknown',
++      message: 'network down',
++    });
++  });
++});
++
++describe('tunnelPollInterval', () => {
++  test('job 在跑或进程正在起来时 2 秒一拉', () => {
++    expect(
++      tunnelPollInterval(
++        status({
++          job: {
++            id: 'j1',
++            kind: 'install',
++            state: 'running',
++            step: 'download',
++            error: null,
++            startedAt: '2026-08-30T00:00:00.000Z',
++            finishedAt: null,
++          },
++        })
++      )
++    ).toBe(TUNNEL_ACTIVE_POLL_MS);
++    expect(
++      tunnelPollInterval(status({ process: { ...status().process, state: 'starting' } }))
++    ).toBe(TUNNEL_ACTIVE_POLL_MS);
++  });
++
++  test('空闲时 10 秒一拉，没有快照也不加速', () => {
++    expect(tunnelPollInterval(status())).toBe(TUNNEL_IDLE_POLL_MS);
++    expect(tunnelPollInterval(null)).toBe(TUNNEL_IDLE_POLL_MS);
++  });
++});
++
++describe('logTail', () => {
++  test('不超过上限时原样返回同一个数组', () => {
++    const log = ['a', 'b'];
++    expect(logTail(log)).toBe(log);
++  });
++
++  test('超出上限只留末尾 200 行', () => {
++    const log = Array.from({ length: 250 }, (_, i) => `line ${i}`);
++    const tail = logTail(log);
++    expect(tail).toHaveLength(200);
++    expect(tail[0]).toBe('line 50');
++    expect(tail[199]).toBe('line 249');
++  });
++});
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-model.ts b/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
+new file mode 100644
+index 00000000..7f9766cd
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
+@@ -0,0 +1,126 @@
++// 远程访问（Cloudflare Tunnel）的纯推导：状态徽标、向导步进、主机名校验、错误与进度文案键。
++// 全部与 React 无关，便于脱离 DOM 直接测。
++
++import { TunnelApiError } from '@tmex/api-client/local/tunnel-api';
++import type { TunnelErrorCode, TunnelMode, TunnelStatusResponse } from '@tmex/shared';
++
++export type TunnelPill = 'notConfigured' | 'stopped' | 'starting' | 'running' | 'error';
++
++/**
++ * 进程报错优先于「未配置」：`remove` 之后若上一次失败仍留在 `process.lastError` 上，
++ * 用户需要先看到错误而不是一个干净的「未配置」。
++ */
++export function tunnelPill(status: TunnelStatusResponse): TunnelPill {
++  if (status.process.state === 'error') return 'error';
++  if (status.config.mode === 'off') return 'notConfigured';
++  if (status.process.state === 'running') return 'running';
++  if (status.process.state === 'starting') return 'starting';
++  return 'stopped';
++}
++
++export type WizardStep = 1 | 2 | 3 | 4;
++
++/**
++ * 当前所处步骤。`chosenMode` 是本地选择（尚未落库），只在还没配置出隧道时参与判断：
++ * 一旦 `config.mode` 有值，方式就以服务端为准。
++ */
++export function currentWizardStep(
++  status: TunnelStatusResponse,
++  chosenMode: TunnelMode | null
++): WizardStep {
++  if (!status.binary.installed) return 1;
++  if (status.config.mode !== 'off') return 4;
++  return chosenMode === 'quick' || chosenMode === 'named' ? 3 : 2;
++}
++
++/** 步骤 3 展示哪条路径：已配置时以服务端为准，否则用本地选择。 */
++export function effectiveMode(
++  status: TunnelStatusResponse,
++  chosenMode: TunnelMode | null
++): TunnelMode {
++  if (status.config.mode !== 'off') return status.config.mode;
++  return chosenMode ?? 'off';
++}
++
++export type StepState = 'todo' | 'current' | 'done';
++
++export function stepState(step: WizardStep, current: WizardStep): StepState {
++  if (step === current) return 'current';
++  return step < current ? 'done' : 'todo';
++}
++
++const HOSTNAME_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
++
++/** RFC 1123 主机名（只接受小写），且至少两级——Cloudflare 只能给托管域名下的子域配 DNS。 */
++export function isValidHostname(value: string): boolean {
++  if (value.length === 0 || value.length > 253) return false;
++  const labels = value.split('.');
++  if (labels.length < 2) return false;
++  return labels.every((label) => label.length <= 63 && HOSTNAME_LABEL.test(label));
++}
++
++const JOB_STEPS = new Set(['download', 'extract', 'verify', 'create_tunnel', 'route_dns', 'start']);
++
++/** 已知进度标识返回文案键；未知返回 null（由调用方原样展示服务端给的标识）。 */
++export function jobStepKey(step: string | null): string | null {
++  return step && JOB_STEPS.has(step) ? `settings.remoteAccess.jobStep.${step}` : null;
++}
++
++const ERROR_PREFIX = 'settings.remoteAccess.errors.';
++
++const ERROR_CODES = new Set<TunnelErrorCode>([
++  'unsupported_platform',
++  'binary_missing',
++  'download_failed',
++  'not_logged_in',
++  'login_timeout',
++  'invalid_hostname',
++  'tunnel_exists',
++  'dns_route_failed',
++  'process_failed',
++  'busy',
++  'not_configured',
++  'invalid_request',
++]);
++
++export function tunnelErrorKey(code: string): string | null {
++  return ERROR_CODES.has(code as TunnelErrorCode) ? `${ERROR_PREFIX}${code}` : null;
++}
++
++export interface TunnelError {
++  code: TunnelErrorCode;
++  message: string;
++}
++
++export function toTunnelError(error: unknown): TunnelError {
++  if (error instanceof TunnelApiError) {
++    return { code: error.code, message: error.message || error.code };
++  }
++  return { code: 'unknown', message: error instanceof Error ? error.message : String(error) };
++}
++
++type Translate = (key: string, options?: Record<string, unknown>) => string;
++
++/** 已知错误码走本地化文案；未知码退化成「操作失败 + 服务端 message」。 */
++export function describeTunnelError(t: Translate, error: TunnelError): string {
++  const key = tunnelErrorKey(error.code);
++  if (key) return t(key);
++  return t(`${ERROR_PREFIX}unknown`, { message: error.message });
++}
++
++export const TUNNEL_ACTIVE_POLL_MS = 2000;
++export const TUNNEL_IDLE_POLL_MS = 10_000;
++
++/** job 在跑或进程正在起来时 2 秒一拉，其余 10 秒。 */
++export function tunnelPollInterval(status: TunnelStatusResponse | null | undefined): number {
++  if (!status) return TUNNEL_IDLE_POLL_MS;
++  const active = status.job?.state === 'running' || status.process.state === 'starting';
++  return active ? TUNNEL_ACTIVE_POLL_MS : TUNNEL_IDLE_POLL_MS;
++}
++
++/** 日志框只保留末尾若干行：cloudflared 的输出会一直增长，整段渲染会拖垮设置页。 */
++export const LOG_TAIL_LINES = 200;
++
++export function logTail(log: string[]): string[] {
++  return log.length > LOG_TAIL_LINES ? log.slice(-LOG_TAIL_LINES) : log;
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/use-tunnel-status.ts b/apps/fe/src/pages/settings/remote-access/use-tunnel-status.ts
+new file mode 100644
+index 00000000..b6b16700
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/use-tunnel-status.ts
+@@ -0,0 +1,74 @@
++// 远程访问状态查询。
++//
++// 安装 / 登录 / 创建都是后台 job：`POST /api/tunnel/actions` 只返回受理时的快照，成败要靠
++// 轮询 `GET /api/tunnel/status` 才看得到，因此 job 在跑或进程正在起来时 2 秒一拉，其余 10 秒。
++
++import { useQuery, useQueryClient } from '@tanstack/react-query';
++import { type ApiClient, defaultApiClient } from '@tmex/api-client';
++import { TunnelApiError, fetchTunnelStatus } from '@tmex/api-client/local/tunnel-api';
++import type { TunnelStatusResponse } from '@tmex/shared';
++import { useCallback } from 'react';
++import { tunnelPollInterval } from './tunnel-model';
++
++export const TUNNEL_STATUS_QUERY_KEY = ['tunnel-status'] as const;
++
++export interface TunnelStatusState {
++  status: TunnelStatusResponse | null;
++  loading: boolean;
++  /** mesh 下未登录：给登录提示，不报错。 */
++  loginRequired: boolean;
++  error: string | null;
++  refresh: () => void;
++  /** 动作接口的响应体里就带着新快照，直接写缓存省一次往返。 */
++  setStatus: (next: TunnelStatusResponse) => void;
++}
++
++function isUnauthorized(error: unknown): boolean {
++  return error instanceof TunnelApiError && error.status === 401;
++}
++
++export interface UseTunnelStatusOptions {
++  enabled?: boolean;
++  client?: ApiClient;
++}
++
++export function useTunnelStatus(options: UseTunnelStatusOptions = {}): TunnelStatusState {
++  const enabled = options.enabled ?? true;
++  const client = options.client ?? defaultApiClient;
++  const queryClient = useQueryClient();
++  const query = useQuery({
++    queryKey: TUNNEL_STATUS_QUERY_KEY,
++    queryFn: () => fetchTunnelStatus(client),
++    enabled,
++    // 401 不重试：重试只会多刷几次登录拦截器。
++    retry: (failureCount, error) => !isUnauthorized(error) && failureCount < 2,
++    refetchInterval: (q) => tunnelPollInterval(q.state.data),
++  });
++
++  const refresh = useCallback(() => {
++    void queryClient.invalidateQueries({ queryKey: TUNNEL_STATUS_QUERY_KEY });
++  }, [queryClient]);
++
++  const setStatus = useCallback(
++    (next: TunnelStatusResponse) => {
++      queryClient.setQueryData(TUNNEL_STATUS_QUERY_KEY, next);
++    },
++    [queryClient]
++  );
++
++  const loginRequired = isUnauthorized(query.error);
++  return {
++    status: query.data ?? null,
++    // 关掉查询时 react-query 也报 pending，但这时不该转圈。
++    loading: enabled && query.isPending,
++    loginRequired,
++    error:
++      !query.error || loginRequired
++        ? null
++        : query.error instanceof Error
++          ? query.error.message
++          : String(query.error),
++    refresh,
++    setStatus,
++  };
++}
+diff --git a/apps/fe/src/pages/settings/remote-access/wizard.tsx b/apps/fe/src/pages/settings/remote-access/wizard.tsx
+new file mode 100644
+index 00000000..44caef47
+--- /dev/null
++++ b/apps/fe/src/pages/settings/remote-access/wizard.tsx
+@@ -0,0 +1,350 @@
++// 远程访问向导：安装 cloudflared → 选择方式 → 建立隧道 → 反向代理信任。
++
++import type { TunnelMode, TunnelStatusResponse } from '@tmex/shared';
++import { Button } from '@tmex/ui/button';
++import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@tmex/ui/card';
++import { Cloud, Download, Loader2, Rocket, RotateCcw, Zap } from 'lucide-react';
++import type { ReactNode } from 'react';
++import { useTranslation } from 'react-i18next';
++import { useRestartGateway } from '../nodes/restart/use-restart-now';
++import { SetupNotice, SwitchRow } from '../nodes/setup/form-parts';
++import { NamedTunnelStep } from './named-step';
++import { DetailRow, JobProgress, WizardStepCard } from './step-shell';
++import type { TunnelActions } from './tunnel-actions';
++import { currentWizardStep, describeTunnelError, effectiveMode, stepState } from './tunnel-model';
++
++export interface TunnelWizardProps {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  chosenMode: TunnelMode | null;
++  onChooseMode: (mode: TunnelMode) => void;
++  isHub: boolean;
++  onRestarted: () => void;
++}
++
++export function TunnelWizard({
++  status,
++  actions,
++  chosenMode,
++  onChooseMode,
++  isHub,
++  onRestarted,
++}: TunnelWizardProps) {
++  const { t } = useTranslation();
++  const current = currentWizardStep(status, chosenMode);
++  const mode = effectiveMode(status, chosenMode);
++
++  return (
++    <Card data-testid="remote-access-wizard">
++      <CardHeader>
++        <CardTitle>{t('settings.remoteAccess.wizardTitle')}</CardTitle>
++        <CardDescription>{t('settings.remoteAccess.description')}</CardDescription>
++      </CardHeader>
++      <CardContent className="space-y-3">
++        <WizardStepCard
++          index={1}
++          testId="remote-access-step-install"
++          state={stepState(1, current)}
++          title={t('settings.remoteAccess.steps.install.title')}
++          description={t('settings.remoteAccess.steps.install.description')}
++        >
++          <InstallStep status={status} actions={actions} />
++        </WizardStepCard>
++
++        <WizardStepCard
++          index={2}
++          testId="remote-access-step-mode"
++          state={stepState(2, current)}
++          title={t('settings.remoteAccess.steps.mode.title')}
++          description={t('settings.remoteAccess.steps.mode.description')}
++        >
++          <ModeChooser
++            selected={mode}
++            locked={status.config.mode !== 'off'}
++            disabled={actions.busy || !status.binary.installed}
++            onSelect={onChooseMode}
++          />
++        </WizardStepCard>
++
++        <WizardStepCard
++          index={3}
++          testId="remote-access-step-tunnel"
++          state={stepState(3, current)}
++          title={t(`settings.remoteAccess.steps.${mode === 'off' ? 'tunnel' : mode}.title`)}
++          description={t(
++            `settings.remoteAccess.steps.${mode === 'off' ? 'tunnel' : mode}.description`
++          )}
++        >
++          {mode === 'off' ? (
++            <p
++              className="text-xs text-muted-foreground"
++              data-testid="remote-access-step-tunnel-idle"
++            >
++              {t('settings.remoteAccess.steps.mode.pending')}
++            </p>
++          ) : mode === 'named' ? (
++            <NamedTunnelStep status={status} actions={actions} isHub={isHub} />
++          ) : (
++            <QuickTunnelStep status={status} actions={actions} />
++          )}
++        </WizardStepCard>
++
++        <WizardStepCard
++          index={4}
++          testId="remote-access-step-proxy"
++          state={stepState(4, current)}
++          title={t('settings.remoteAccess.steps.proxy.title')}
++          description={t('settings.remoteAccess.steps.proxy.description')}
++        >
++          <ProxyStep status={status} actions={actions} onRestarted={onRestarted} />
++        </WizardStepCard>
++      </CardContent>
++    </Card>
++  );
++}
++
++function InstallStep({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  const job = status.job;
++  const installing = job?.kind === 'install' && job.state === 'running';
++  const installFailed = job?.kind === 'install' && job.state === 'error' && job.error !== null;
++
++  if (!status.supported) {
++    return (
++      <SetupNotice tone="warning" testId="remote-access-unsupported">
++        {t('settings.remoteAccess.unsupported', { platform: status.platform })}
++      </SetupNotice>
++    );
++  }
++
++  if (status.binary.installed) {
++    return (
++      <div className="space-y-0.5" data-testid="remote-access-binary">
++        <DetailRow label={t('settings.remoteAccess.steps.install.version')}>
++          <span className="font-mono">{status.binary.version ?? '—'}</span>
++        </DetailRow>
++        {status.binary.source && (
++          <DetailRow label={t('settings.remoteAccess.steps.install.source')}>
++            {t(`settings.remoteAccess.steps.install.sourceValue.${status.binary.source}`)}
++          </DetailRow>
++        )}
++        {status.binary.path && (
++          <DetailRow label={t('settings.remoteAccess.steps.install.path')}>
++            <span className="font-mono">{status.binary.path}</span>
++          </DetailRow>
++        )}
++      </div>
++    );
++  }
++
++  return (
++    <div className="space-y-2">
++      {installFailed && job.error && (
++        <SetupNotice tone="error" testId="remote-access-install-error">
++          {describeTunnelError(t, job.error)}
++        </SetupNotice>
++      )}
++      {installing ? (
++        <JobProgress step={job.step} testId="remote-access-install-progress" />
++      ) : (
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy}
++          onClick={() => actions.run({ action: 'install' })}
++          data-testid="remote-access-install"
++        >
++          {actions.pending === 'install' ? <Loader2 className="animate-spin" /> : <Download />}
++          {t('settings.remoteAccess.actions.install')}
++        </Button>
++      )}
++    </div>
++  );
++}
++
++function ModeChooser({
++  selected,
++  locked,
++  disabled,
++  onSelect,
++}: {
++  selected: TunnelMode;
++  /** 已经建过隧道：换方式必须先「移除」，这里只展示当前方式。 */
++  locked: boolean;
++  disabled: boolean;
++  onSelect: (mode: TunnelMode) => void;
++}) {
++  const { t } = useTranslation();
++  return (
++    <div
++      className="grid gap-3 sm:grid-cols-2"
++      role="radiogroup"
++      aria-label={t('settings.remoteAccess.steps.mode.title')}
++      data-testid="remote-access-mode-chooser"
++    >
++      <ModeCard
++        mode="quick"
++        icon={<Zap className="size-4" />}
++        selected={selected === 'quick'}
++        disabled={disabled || locked}
++        onSelect={onSelect}
++      />
++      <ModeCard
++        mode="named"
++        icon={<Cloud className="size-4" />}
++        selected={selected === 'named'}
++        disabled={disabled || locked}
++        onSelect={onSelect}
++      />
++    </div>
++  );
++}
++
++function ModeCard({
++  mode,
++  icon,
++  selected,
++  disabled,
++  onSelect,
++}: {
++  mode: Exclude<TunnelMode, 'off'>;
++  icon: ReactNode;
++  selected: boolean;
++  disabled: boolean;
++  onSelect: (mode: TunnelMode) => void;
++}) {
++  const { t } = useTranslation();
++  return (
++    <label
++      data-testid={`remote-access-mode-${mode}`}
++      data-selected={selected ? 'true' : 'false'}
++      className={`flex cursor-pointer flex-col gap-1.5 rounded-xl p-3 text-left ring-1 transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none ${
++        selected ? 'bg-primary/5 ring-primary' : 'bg-card ring-foreground/10 hover:bg-muted/50'
++      } ${disabled ? 'pointer-events-none opacity-60' : ''}`}
++    >
++      <input
++        type="radio"
++        name="remote-access-mode"
++        data-testid={`remote-access-mode-${mode}-input`}
++        className="sr-only"
++        checked={selected}
++        disabled={disabled}
++        onChange={() => onSelect(mode)}
++      />
++      <span className="flex items-center gap-2 text-sm font-medium">
++        {icon}
++        {t(`settings.remoteAccess.mode.${mode}.title`)}
++      </span>
++      <span className="text-xs text-muted-foreground">
++        {t(`settings.remoteAccess.mode.${mode}.description`)}
++      </span>
++    </label>
++  );
++}
++
++function QuickTunnelStep({
++  status,
++  actions,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++}) {
++  const { t } = useTranslation();
++  const job = status.job;
++  const starting = job?.kind === 'start' && job.state === 'running';
++  const started = status.config.mode === 'quick' && status.process.publicUrl !== null;
++
++  return (
++    <div className="space-y-2" data-testid="remote-access-quick">
++      {started ? (
++        <SetupNotice tone="success" testId="remote-access-quick-started">
++          <p>{t('settings.remoteAccess.steps.quick.started')}</p>
++          <p className="font-mono break-all" data-testid="remote-access-quick-url">
++            {status.process.publicUrl}
++          </p>
++        </SetupNotice>
++      ) : starting ? (
++        <JobProgress step={job.step} testId="remote-access-quick-progress" />
++      ) : (
++        <Button
++          type="button"
++          size="sm"
++          disabled={actions.busy || !status.binary.installed}
++          onClick={() => actions.run({ action: 'quick_start' })}
++          data-testid="remote-access-quick-start"
++        >
++          {actions.pending === 'quick_start' ? <Loader2 className="animate-spin" /> : <Rocket />}
++          {t('settings.remoteAccess.actions.quickStart')}
++        </Button>
++      )}
++    </div>
++  );
++}
++
++function ProxyStep({
++  status,
++  actions,
++  onRestarted,
++}: {
++  status: TunnelStatusResponse;
++  actions: TunnelActions;
++  onRestarted: () => void;
++}) {
++  const { t } = useTranslation();
++  const restart = useRestartGateway(undefined, onRestarted);
++
++  return (
++    <div className="space-y-3">
++      <SwitchRow
++        id="remote-access-trust-proxy"
++        label={t('settings.remoteAccess.steps.proxy.trustProxy')}
++        hint={t('settings.remoteAccess.steps.proxy.trustProxyHint')}
++        checked={status.trustProxy}
++        disabled={actions.busy}
++        onCheckedChange={(checked) =>
++          actions.run({ action: 'set_trust_proxy', trustProxy: checked })
++        }
++      />
++      <SwitchRow
++        id="remote-access-auto-start"
++        label={t('settings.remoteAccess.steps.proxy.autoStart')}
++        hint={t('settings.remoteAccess.steps.proxy.autoStartHint')}
++        checked={status.config.autoStart}
++        disabled={actions.busy}
++        onCheckedChange={(checked) => actions.run({ action: 'set_auto_start', autoStart: checked })}
++      />
++
++      {status.restartRequired && (
++        <div
++          className="flex flex-wrap items-center gap-2 rounded-lg bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400"
++          data-testid="remote-access-restart-required"
++        >
++          <span>
++            {restart.state === 'waiting'
++              ? t('settings.remoteAccess.steps.proxy.restarting')
++              : restart.state === 'timeout'
++                ? t('settings.remoteAccess.steps.proxy.restartTimeout')
++                : t('settings.remoteAccess.steps.proxy.restartRequired')}
++          </span>
++          <Button
++            type="button"
++            size="xs"
++            variant="outline"
++            disabled={restart.waiting}
++            onClick={() => void restart.run()}
++            data-testid="remote-access-restart-now"
++          >
++            {restart.waiting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
++            {t('settings.remoteAccess.steps.proxy.restartNow')}
++          </Button>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/packages/panels/src/device-management/device-card.test.tsx b/packages/panels/src/device-management/device-card.test.tsx
+index f75458eb..c5f86578 100644
+--- a/packages/panels/src/device-management/device-card.test.tsx
++++ b/packages/panels/src/device-management/device-card.test.tsx
+@@ -1,11 +1,11 @@
+ // 设备卡片：种类展示（本地 / SSH / 远端节点上的设备）、连接开关的三种状态、
+-// 「显示在侧栏」开关默认值。bun test 无 DOM，用 react-dom/server 静态渲染断言 HTML；
+-// 静态渲染下 zustand 走 `getInitialState`，所以侧栏开关只能覆盖默认值，
+-// 「存过的值优先」由 stores 的单测覆盖。
++// 「侧栏显示」开关组（终端 / 文件）的默认值与禁用态。bun test 无 DOM，
++// 用 react-dom/server 静态渲染断言 HTML；静态渲染下 zustand 走 `getInitialState`，
++// 所以侧栏开关只能覆盖默认值，「存过的值优先」由 stores 的单测覆盖。
+ 
+ import { describe, expect, test } from 'bun:test';
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+-import type { Device } from '@tmex/shared';
++import type { Device, FileRootDto } from '@tmex/shared';
+ import { I18N_RESOURCES } from '@tmex/shared';
+ import { createAppRuntime, sidebarDeviceVisibilityKey } from '@tmex/stores';
+ import { RuntimeProvider } from '@tmex/stores/react';
+@@ -49,6 +49,17 @@ const SSH_DEVICE: Device = {
+   username: 'root',
+ };
+ 
++const DEVICE_ROOT: FileRootDto = {
++  id: 'root-1',
++  deviceId: LOCAL_DEVICE.id,
++  deviceName: LOCAL_DEVICE.name,
++  deviceType: 'local',
++  path: '/srv/data',
++  name: 'data',
++  enabled: true,
++  sortOrder: 0,
++};
++
+ const SELF_CONTEXT: DeviceNodeContext = { runtimeNodeId: 'self', name: '', isSelf: true };
+ const REMOTE_CONTEXT: DeviceNodeContext = { runtimeNodeId: 'n1', name: '书房节点', isSelf: false };
+ 
+@@ -69,6 +80,7 @@ function renderCard(options: {
+   nodeContext?: DeviceNodeContext;
+   connection?: DeviceConnectionAdapter;
+   offline?: boolean;
++  roots?: FileRootDto[];
+ }): string {
+   const nodeContext = options.nodeContext ?? SELF_CONTEXT;
+   // 每次一个独立的 persist key：共享的内存 localStorage 不会把用例之间的偏好串起来。
+@@ -76,10 +88,14 @@ function renderCard(options: {
+     nodeId: nodeContext.runtimeNodeId,
+     storagePrefix: `device-card-test-${storageSeq++}:`,
+   });
++  const queryClient = new QueryClient();
++  if (options.roots) {
++    queryClient.setQueryData(['files', 'roots'], { roots: options.roots });
++  }
+   const html = renderToStaticMarkup(
+     <MemoryRouter>
+       <I18nextProvider i18n={i18n}>
+-        <QueryClientProvider client={new QueryClient()}>
++        <QueryClientProvider client={queryClient}>
+           <RuntimeProvider runtime={runtime}>
+             <DeviceCard
+               device={options.device ?? LOCAL_DEVICE}
+@@ -120,8 +136,8 @@ function tagOf(html: string, testId: string): string | null {
+  * 开关的选中态只看 `aria-checked`：class 里同时带 `data-checked:` / `data-unchecked:`
+  * 两个 tailwind 变体前缀，按 data-* 属性匹配会永远命中。
+  */
+-function switchState(html: string): string | null {
+-  const tag = tagOf(html, 'device-card-sidebar-dev-1');
++function switchState(html: string, testId = 'device-card-sidebar-dev-1'): string | null {
++  const tag = tagOf(html, testId);
+   if (!tag) return null;
+   return tag.includes('aria-checked="true"') ? 'checked' : 'unchecked';
+ }
+@@ -272,14 +288,61 @@ describe('DeviceCard 的离线态', () => {
+ });
+ 
+ describe('DeviceCard 的侧栏可见性开关', () => {
+-  test('self 的设备默认开', () => {
++  test('一个组标签带终端 / 文件两个开关', () => {
++    const html = renderCard({ roots: [DEVICE_ROOT] });
++    expect(html).toContain('data-testid="device-card-sidebar-group-dev-1"');
++    expect(html).toContain('侧栏显示');
++    expect(html).toContain('data-testid="device-card-sidebar-dev-1"');
++    expect(html).toContain('data-testid="device-card-sidebar-files-dev-1"');
++    expect(html).toContain('在侧栏的终端页显示该设备');
++    expect(html).toContain('在侧栏的文件页显示该设备的目录');
++  });
++
++  test('终端开关：self 的设备默认开', () => {
+     expect(switchState(renderCard({}))).toBe('checked');
+   });
+ 
+-  test('远端 node 的设备默认关', () => {
++  test('终端开关：远端 node 的设备默认关', () => {
+     expect(switchState(renderCard({ nodeContext: REMOTE_CONTEXT }))).toBe('unchecked');
+   });
+ 
++  test('文件开关：配过目录就默认开，本机与远端一致', () => {
++    expect(
++      switchState(renderCard({ roots: [DEVICE_ROOT] }), 'device-card-sidebar-files-dev-1')
++    ).toBe('checked');
++    expect(
++      switchState(
++        renderCard({ nodeContext: REMOTE_CONTEXT, roots: [DEVICE_ROOT] }),
++        'device-card-sidebar-files-dev-1'
++      )
++    ).toBe('checked');
++  });
++
++  test('文件开关：没配过目录时禁用并提示去配目录', () => {
++    const html = renderCard({ roots: [] });
++    const tag = tagOf(html, 'device-card-sidebar-files-dev-1');
++    expect(tag).toContain('aria-disabled="true"');
++    expect(switchState(html, 'device-card-sidebar-files-dev-1')).toBe('unchecked');
++    expect(html).toContain('尚未为该设备配置目录');
++    expect(html).not.toContain('在侧栏的文件页显示该设备的目录');
++  });
++
++  test('文件开关：只认本设备的目录', () => {
++    const html = renderCard({ roots: [{ ...DEVICE_ROOT, deviceId: 'other-device' }] });
++    expect(tagOf(html, 'device-card-sidebar-files-dev-1')).toContain('aria-disabled="true"');
++  });
++
++  // 离线只是不再去打远端要列表（`enabled`），缓存里的目录照样算数：
++  // 两个开关都是浏览器本地偏好，离线期间仍然可改。
++  test('节点离线时沿用缓存里的目录，开关不被禁用', () => {
++    const tag = tagOf(
++      renderCard({ nodeContext: REMOTE_CONTEXT, offline: true, roots: [DEVICE_ROOT] }),
++      'device-card-sidebar-files-dev-1'
++    );
++    expect(tag).not.toContain('aria-disabled="true"');
++    expect(tag).toContain('aria-checked="true"');
++  });
++
+   test('紧凑布局仍保留 e2e 依赖的选择器', () => {
+     const html = renderCard({});
+     expect(html).toContain('data-testid="device-card"');
+diff --git a/packages/panels/src/device-management/device-card.tsx b/packages/panels/src/device-management/device-card.tsx
+index 7a753ebb..679c03bb 100644
+--- a/packages/panels/src/device-management/device-card.tsx
++++ b/packages/panels/src/device-management/device-card.tsx
+@@ -1,14 +1,21 @@
+ // 设备卡片：紧凑两行布局。第一行（可选的拖拽把手）图标/名称/SSH 目标 + 连接开关、打开与更多菜单；
+-// 第二行「设备种类」pill（本地 / SSH / 远程…，种类只在这里出现一次）、会话、
+-// 状态徽标与「显示在侧栏」开关（浏览器本地偏好，按 `${runtimeNodeId}:${deviceId}` 记）。
++// 第二行「设备种类」pill（本地 / SSH / 远程…，种类只在这里出现一次）、会话、状态徽标与
++// 「侧栏显示」开关组——终端页与文件页各一个开关（浏览器本地偏好，两张表共用
++// `${runtimeNodeId}:${deviceId}` 复合键）。文件开关在该设备没有配过目录时禁用，目录本身
++// 由更多菜单里的「文件」入口配置。
+ //
+ // `offline`：所属节点离线，卡片来自最近一次快照——灰显、标「节点离线」、编辑/删除/测试等
+ // 要打远端 API 的动作禁用；连接开关仍可点（手动发起一次连接尝试）。
+ 
+-import { useMutation } from '@tanstack/react-query';
+-import { testDeviceConnection } from '@tmex/api-client';
++import { useMutation, useQuery } from '@tanstack/react-query';
++import { fetchFileRoots, testDeviceConnection } from '@tmex/api-client';
+ import type { Device } from '@tmex/shared';
+-import { hostAppPath, isSidebarDeviceVisible, sidebarDeviceVisibilityKey } from '@tmex/stores';
++import {
++  hostAppPath,
++  isSidebarDeviceVisible,
++  isSidebarFilesVisible,
++  sidebarDeviceVisibilityKey,
++} from '@tmex/stores';
+ import { useRuntime, useUIStore } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import { Badge } from '@tmex/ui/badge';
+@@ -25,6 +32,7 @@ import { Switch } from '@tmex/ui/switch';
+ import { Tooltip, TooltipContent, TooltipTrigger } from '@tmex/ui/tooltip';
+ import {
+   ArrowUpRight,
++  FolderCog,
+   Globe,
+   Monitor,
+   MoreHorizontal,
+@@ -34,12 +42,13 @@ import {
+   WifiOff,
+   Zap,
+ } from 'lucide-react';
+-import type { CSSProperties, ReactNode } from 'react';
++import { type CSSProperties, type ReactNode, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ import { toast } from 'sonner';
+ import type { DeviceConnectionAdapter } from '../device-connection';
+ import { DeviceStatusBadge } from '../device-status-badge';
++import { DeviceFilesModal } from '../settings/device-files-modal';
+ import { DeviceCardConnectToggle } from './device-card-connect-toggle';
+ import {
+   type DeviceNodeContext,
+@@ -116,8 +125,13 @@ function DeviceCardMenu({
+   device,
+   onEdit,
+   onDelete,
++  onOpenFiles,
+   offline,
+-}: Pick<DeviceCardProps, 'device' | 'onEdit' | 'onDelete'> & { offline: boolean }) {
++}: Pick<DeviceCardProps, 'device' | 'onEdit' | 'onDelete'> & {
++  /** 缺省表示该 runtime 关了文件 UI，不给「文件」入口 */
++  onOpenFiles?: () => void;
++  offline: boolean;
++}) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+ 
+@@ -166,6 +180,16 @@ function DeviceCardMenu({
+             {t('common.test')}
+           </DropdownMenuItem>
+         )}
++        {onOpenFiles && (
++          <DropdownMenuItem
++            data-testid={`device-card-files-${device.id}`}
++            onClick={onOpenFiles}
++            disabled={offline}
++          >
++            <FolderCog className="h-4 w-4" />
++            {t('files.title')}
++          </DropdownMenuItem>
++        )}
+         <DropdownMenuSeparator />
+         <DropdownMenuItem
+           data-testid={`device-card-delete-${device.id}`}
+@@ -181,6 +205,47 @@ function DeviceCardMenu({
+   );
+ }
+ 
++/**
++ * 侧栏显示开关组里的一项：标签与开关同属一个 tooltip 触发器（渲染成 div，不进 Tab 序，
++ * 开关本身仍可聚焦），`title` 一并保留给触屏与无障碍工具。
++ */
++function SidebarVisibilityToggle({
++  label,
++  hint,
++  checked,
++  disabled,
++  testId,
++  onCheckedChange,
++}: {
++  label: string;
++  hint: string;
++  checked: boolean;
++  disabled?: boolean;
++  testId: string;
++  onCheckedChange: (checked: boolean) => void;
++}) {
++  return (
++    <Tooltip>
++      <TooltipTrigger
++        className={cn('flex shrink-0 items-center gap-1', disabled && 'opacity-60')}
++        title={hint}
++        render={<div />}
++      >
++        <span>{label}</span>
++        <Switch
++          size="sm"
++          checked={checked}
++          disabled={disabled}
++          data-testid={testId}
++          aria-label={label}
++          onCheckedChange={(value) => onCheckedChange(Boolean(value))}
++        />
++      </TooltipTrigger>
++      <TooltipContent>{hint}</TooltipContent>
++    </Tooltip>
++  );
++}
++
+ export function DeviceCard({
+   device,
+   onEdit,
+@@ -195,101 +260,158 @@ export function DeviceCard({
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+   const nodeId = nodeContext.runtimeNodeId;
++  const filesUi = runtime.features.filesUi;
++  const [filesModalOpen, setFilesModalOpen] = useState(false);
++  // 开过一次就常驻挂载，关闭动画才播得完；没开过的卡片一个 modal 都不挂（一页几十张）。
++  const [filesModalMounted, setFilesModalMounted] = useState(false);
++
++  // 与文件侧栏同一个 query key：`file-roots` 设置事件失效 ['files'] 后，
++  // 在弹窗里配完目录，这里的「文件」开关立刻从禁用变可用。
++  const rootsQuery = useQuery({
++    queryKey: ['files', 'roots'],
++    queryFn: () => fetchFileRoots(runtime.apiClient),
++    enabled: filesUi && !offline,
++    throwOnError: false,
++  });
++  const hasRoots = (rootsQuery.data?.roots ?? []).some((root) => root.deviceId === device.id);
+ 
++  const visibilityKey = sidebarDeviceVisibilityKey(nodeId, device.id);
+   const sidebarVisible = useUIStore((state) =>
+     isSidebarDeviceVisible(state.sidebarDeviceVisibility, nodeId, device.id)
+   );
+   const setSidebarVisible = useUIStore((state) => state.setSidebarDeviceVisibility);
++  const filesVisible = useUIStore((state) =>
++    isSidebarFilesVisible(state.sidebarFilesVisibility, nodeId, device.id, hasRoots)
++  );
++  const setFilesVisible = useUIStore((state) => state.setSidebarFilesVisibility);
++
++  const openFilesModal = () => {
++    setFilesModalMounted(true);
++    setFilesModalOpen(true);
++  };
+ 
+   const kind = deviceDisplayKind(device.type, nodeContext);
+   const kindLabel = deviceKindLabel(t, kind);
+   const target = sshTarget(device);
+ 
+   return (
+-    <Card
+-      size="sm"
+-      data-testid="device-card"
+-      data-device-id={device.id}
+-      data-device-name={device.name}
+-      data-device-kind={kind}
+-      data-offline={offline ? 'true' : undefined}
+-      style={style}
+-      className={cn(
+-        'gap-2 overflow-hidden border-border/50 py-2.5 transition-[box-shadow,border-color,opacity] duration-(--tmex-motion-standard) ease-out hover:shadow-md hover:ring-foreground/20 motion-reduce:transition-none',
+-        offline && 'border-dashed bg-muted/20 opacity-75 hover:shadow-none',
+-        className
+-      )}
+-    >
+-      <CardContent className="flex items-center gap-1.5">
+-        {dragHandle}
+-        <DeviceCardIcon device={device} remote={isRemoteDeviceKind(kind)} />
+-        <div className="min-w-0 flex-1">
+-          <TruncatedLine text={device.name} className="text-sm font-medium leading-tight" />
+-          {target && (
+-            <TruncatedLine text={target} className="text-xs leading-tight text-muted-foreground" />
+-          )}
+-        </div>
+-        {connection && (
+-          <DeviceCardConnectToggle deviceId={device.id} connection={connection} offline={offline} />
++    <>
++      <Card
++        size="sm"
++        data-testid="device-card"
++        data-device-id={device.id}
++        data-device-name={device.name}
++        data-device-kind={kind}
++        data-offline={offline ? 'true' : undefined}
++        style={style}
++        className={cn(
++          'gap-2 overflow-hidden border-border/50 py-2.5 transition-[box-shadow,border-color,opacity] duration-(--tmex-motion-standard) ease-out hover:shadow-md hover:ring-foreground/20 motion-reduce:transition-none',
++          offline && 'border-dashed bg-muted/20 opacity-75 hover:shadow-none',
++          className
+         )}
+-        <Link
+-          to={hostAppPath(runtime.host, `/devices/${device.id}`)}
+-          data-testid={`device-card-open-${device.id}`}
+-          aria-label={t('device.open')}
+-          title={t('device.open')}
+-          className={buttonVariants({
+-            variant: connection ? 'ghost' : 'outline',
+-            size: connection ? 'icon-sm' : 'sm',
+-            className: 'shrink-0',
+-          })}
+-        >
+-          <ArrowUpRight className="h-4 w-4" />
+-          {connection ? null : t('device.open')}
+-        </Link>
+-        <DeviceCardMenu device={device} onEdit={onEdit} onDelete={onDelete} offline={offline} />
+-      </CardContent>
++      >
++        <CardContent className="flex items-center gap-1.5">
++          {dragHandle}
++          <DeviceCardIcon device={device} remote={isRemoteDeviceKind(kind)} />
++          <div className="min-w-0 flex-1">
++            <TruncatedLine text={device.name} className="text-sm font-medium leading-tight" />
++            {target && (
++              <TruncatedLine
++                text={target}
++                className="text-xs leading-tight text-muted-foreground"
++              />
++            )}
++          </div>
++          {connection && (
++            <DeviceCardConnectToggle
++              deviceId={device.id}
++              connection={connection}
++              offline={offline}
++            />
++          )}
++          <Link
++            to={hostAppPath(runtime.host, `/devices/${device.id}`)}
++            data-testid={`device-card-open-${device.id}`}
++            aria-label={t('device.open')}
++            title={t('device.open')}
++            className={buttonVariants({
++              variant: connection ? 'ghost' : 'outline',
++              size: connection ? 'icon-sm' : 'sm',
++              className: 'shrink-0',
++            })}
++          >
++            <ArrowUpRight className="h-4 w-4" />
++            {connection ? null : t('device.open')}
++          </Link>
++          <DeviceCardMenu
++            device={device}
++            onEdit={onEdit}
++            onDelete={onDelete}
++            onOpenFiles={filesUi ? openFilesModal : undefined}
++            offline={offline}
++          />
++        </CardContent>
+ 
+-      <CardContent className="flex flex-wrap items-center gap-x-2 gap-y-1">
+-        <Badge
+-          variant="outline"
+-          data-testid={`device-card-kind-${device.id}`}
+-          className="max-w-full truncate px-1.5 py-0 text-[10px] font-normal"
+-        >
+-          {kindLabel}
+-        </Badge>
+-        {device.session && (
+-          <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
+-            {device.session}
+-          </Badge>
+-        )}
+-        {offline ? (
++        <CardContent className="flex flex-wrap items-center gap-x-2 gap-y-1">
+           <Badge
+             variant="outline"
+-            data-testid={`device-card-offline-${device.id}`}
+-            className="h-5 gap-1 px-1.5 text-[10px] font-normal text-muted-foreground"
++            data-testid={`device-card-kind-${device.id}`}
++            className="max-w-full truncate px-1.5 py-0 text-[10px] font-normal"
+           >
+-            <WifiOff className="h-3 w-3" />
+-            {t('devices.nodes.deviceOffline')}
++            {kindLabel}
+           </Badge>
+-        ) : (
+-          <DeviceStatusBadge deviceId={device.id} />
+-        )}
+-        <div
+-          className="ml-auto flex shrink-0 items-center gap-1.5 text-[11px] text-muted-foreground"
+-          title={t('device.sidebar.hint')}
+-        >
+-          <span>{t('device.sidebar.show')}</span>
+-          <Switch
+-            size="sm"
+-            checked={sidebarVisible}
+-            data-testid={`device-card-sidebar-${device.id}`}
+-            aria-label={t('device.sidebar.show')}
+-            onCheckedChange={(checked) =>
+-              setSidebarVisible(sidebarDeviceVisibilityKey(nodeId, device.id), Boolean(checked))
+-            }
+-          />
+-        </div>
+-      </CardContent>
+-    </Card>
++          {device.session && (
++            <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
++              {device.session}
++            </Badge>
++          )}
++          {offline ? (
++            <Badge
++              variant="outline"
++              data-testid={`device-card-offline-${device.id}`}
++              className="h-5 gap-1 px-1.5 text-[10px] font-normal text-muted-foreground"
++            >
++              <WifiOff className="h-3 w-3" />
++              {t('devices.nodes.deviceOffline')}
++            </Badge>
++          ) : (
++            <DeviceStatusBadge deviceId={device.id} />
++          )}
++          <div
++            data-testid={`device-card-sidebar-group-${device.id}`}
++            className="ml-auto flex flex-wrap items-center justify-end gap-x-2.5 gap-y-1 text-[11px] text-muted-foreground"
++          >
++            <span className="shrink-0">{t('device.sidebar.group')}</span>
++            <SidebarVisibilityToggle
++              label={t('device.sidebar.terminal')}
++              hint={t('device.sidebar.terminalHint')}
++              checked={sidebarVisible}
++              testId={`device-card-sidebar-${device.id}`}
++              onCheckedChange={(checked) => setSidebarVisible(visibilityKey, checked)}
++            />
++            {filesUi && (
++              <SidebarVisibilityToggle
++                label={t('device.sidebar.files')}
++                hint={
++                  hasRoots ? t('device.sidebar.filesHint') : t('device.sidebar.filesDisabledHint')
++                }
++                checked={hasRoots && filesVisible}
++                disabled={!hasRoots}
++                testId={`device-card-sidebar-files-${device.id}`}
++                onCheckedChange={(checked) => setFilesVisible(visibilityKey, checked)}
++              />
++            )}
++          </div>
++        </CardContent>
++      </Card>
++      {filesModalMounted && (
++        <DeviceFilesModal
++          device={device}
++          nodeId={nodeId}
++          open={filesModalOpen}
++          onOpenChange={setFilesModalOpen}
++        />
++      )}
++    </>
+   );
+ }
+diff --git a/packages/panels/src/files/files-tab.test.tsx b/packages/panels/src/files/files-tab.test.tsx
+new file mode 100644
+index 00000000..35a052bb
+--- /dev/null
++++ b/packages/panels/src/files/files-tab.test.tsx
+@@ -0,0 +1,120 @@
++// 文件侧栏的外壳与过滤：bun test 无 DOM，用 react-dom/server 静态渲染断言 HTML。
++// 静态渲染下 zustand 走 `getInitialState`（可见性/连接表都是默认值），所以这里覆盖
++// 「默认显示」「设备没连上就不显示」「node 离线只留一行提示」这三条；
++// 「关掉开关就消失」由 root-visibility 的单测覆盖。
++
++import { describe, expect, test } from 'bun:test';
++import type { FileRootDto } from '@tmex/shared';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++
++installWindowStorage();
++
++// SidebarProvider 在构造 state 时就读 matchMedia；这里只需要一个稳定的桌面端读数。
++(globalThis.window as unknown as { matchMedia: unknown }).matchMedia = () => ({
++  matches: true,
++  addEventListener: () => undefined,
++  removeEventListener: () => undefined,
++});
++
++const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query');
++const { I18N_RESOURCES } = await import('@tmex/shared');
++const { createAppRuntime } = await import('@tmex/stores');
++const { RuntimeProvider } = await import('@tmex/stores/react');
++const i18next = (await import('i18next')).default;
++const { renderToStaticMarkup } = await import('react-dom/server');
++const { I18nextProvider } = await import('react-i18next');
++const { MemoryRouter } = await import('react-router');
++const { SidebarProvider } = await import('@tmex/ui/sidebar');
++const { FilesTab } = await import('./files-tab');
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++const LOCAL_ROOT: FileRootDto = {
++  id: 'r-local',
++  deviceId: 'd-local',
++  deviceName: '书房',
++  deviceType: 'local',
++  path: '/srv/local',
++  name: 'local',
++  enabled: true,
++  sortOrder: 0,
++};
++
++const SSH_ROOT: FileRootDto = {
++  ...LOCAL_ROOT,
++  id: 'r-ssh',
++  deviceId: 'd-ssh',
++  deviceName: '机房',
++  deviceType: 'ssh',
++  path: '/srv/ssh',
++  name: 'ssh',
++};
++
++let storageSeq = 0;
++
++function renderFilesTab(options: { roots?: FileRootDto[]; nodeOffline?: boolean } = {}): string {
++  const runtime = createAppRuntime({ storagePrefix: `files-tab-test-${storageSeq++}:` });
++  const queryClient = new QueryClient();
++  if (options.roots) {
++    queryClient.setQueryData(['files', 'roots'], { roots: options.roots });
++  }
++  const html = renderToStaticMarkup(
++    <MemoryRouter>
++      <I18nextProvider i18n={i18n}>
++        <QueryClientProvider client={queryClient}>
++          <RuntimeProvider runtime={runtime}>
++            <SidebarProvider>
++              <FilesTab nodeOffline={options.nodeOffline} />
++            </SidebarProvider>
++          </RuntimeProvider>
++        </QueryClientProvider>
++      </I18nextProvider>
++    </MemoryRouter>
++  );
++  runtime.dispose();
++  return html;
++}
++
++describe('FilesTab 的根目录过滤', () => {
++  test('本机设备的启用目录默认显示', () => {
++    const html = renderFilesTab({ roots: [LOCAL_ROOT] });
++    expect(html).toContain('/srv/local');
++    expect(html).not.toContain('没有可访问的目录');
++  });
++
++  test('未连接的 SSH 设备的目录不显示', () => {
++    const html = renderFilesTab({ roots: [LOCAL_ROOT, SSH_ROOT] });
++    expect(html).toContain('/srv/local');
++    expect(html).not.toContain('/srv/ssh');
++  });
++
++  test('禁用的目录不显示', () => {
++    const html = renderFilesTab({ roots: [{ ...LOCAL_ROOT, enabled: false }] });
++    expect(html).not.toContain('/srv/local');
++    expect(html).toContain('没有可访问的目录');
++  });
++});
++
++describe('FilesTab 在 node 离线时', () => {
++  test('只留一行「节点离线」，不显示陈旧目录，也没有错误/重试入口', () => {
++    const html = renderFilesTab({ roots: [LOCAL_ROOT], nodeOffline: true });
++    expect(html).toContain('data-testid="files-node-offline"');
++    expect(html).toContain('节点离线');
++    expect(html).not.toContain('/srv/local');
++    expect(html).not.toContain('data-testid="files-roots-error"');
++    expect(html).not.toContain('data-testid="files-refresh"');
++  });
++
++  test('node 在线时不出现离线提示', () => {
++    expect(renderFilesTab({ roots: [LOCAL_ROOT] })).not.toContain(
++      'data-testid="files-node-offline"'
++    );
++  });
++});
+diff --git a/packages/panels/src/files/files-tab.tsx b/packages/panels/src/files/files-tab.tsx
+index dd57b406..f2af1600 100644
+--- a/packages/panels/src/files/files-tab.tsx
++++ b/packages/panels/src/files/files-tab.tsx
+@@ -7,7 +7,7 @@ import { matchPath, useLocation, useNavigate } from 'react-router';
+ 
+ import { fetchDevices, fetchFileRoots, fetchLlmProviders } from '@tmex/api-client';
+ import { decodeFileRef, fileRoute, hostAppPath } from '@tmex/stores';
+-import { useFileTreeStore, useRuntime } from '@tmex/stores/react';
++import { useFileTreeStore, useRuntime, useTmuxStore, useUIStore } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import { Button } from '@tmex/ui/button';
+ import { ContextMenu, ContextMenuTrigger } from '@tmex/ui/context-menu';
+@@ -17,6 +17,7 @@ import { DirectoryNodeView } from './directory-node-view';
+ import { fileIconColor, fileIconFor } from './file-icon';
+ import { FileNodeMenuContent, useFileNodeActions } from './file-node-actions';
+ import { NodeError } from './node-menu';
++import { selectVisibleFileRoots } from './root-visibility';
+ import { useDirectoryListing } from './use-directory-listing';
+ import { hasExternalFiles, useDirectoryUpload } from './use-directory-upload';
+ import { useRsyncMissingToast } from './use-rsync-missing-toast';
+@@ -44,19 +45,35 @@ interface TreeContext {
+ export interface FilesTabProps {
+   /** 不渲染头部行（标题 + 刷新按钮）；宿主连续渲染多个实例时避免重复头部。 */
+   hideHeader?: boolean;
++  /** 该 runtime 所属 node 已离线：只留一行提示，不发请求也不显示陈旧目录。 */
++  nodeOffline?: boolean;
+ }
+ 
+-// 外壳门：runtime.features.filesUi 关断时不渲染文件树，也不发起 files 查询（内层 hooks 不执行）。
++// 外壳门：runtime.features.filesUi 关断、或所属 node 离线时都不渲染文件树，
++// 也不发起 files 查询（内层 hooks 不执行）；node 回线后内层重挂自动重新拉取。
+ export function FilesTab(props: FilesTabProps = {}) {
+   const { features } = useRuntime();
++  const { t } = useTranslation();
+   if (!features.filesUi) return null;
++  if (props.nodeOffline) {
++    return (
++      <SidebarGroup className="flex min-h-0 flex-1 flex-col pt-0" data-testid="files-tab">
++        <div
++          data-testid="files-node-offline"
++          className="px-3 py-6 text-center text-xs text-muted-foreground"
++        >
++          {t('files.nodeOffline')}
++        </div>
++      </SidebarGroup>
++    );
++  }
+   return <FilesTabInner {...props} />;
+ }
+ 
+ function FilesTabInner({ hideHeader }: FilesTabProps) {
+   const { t } = useTranslation();
+   const queryClient = useQueryClient();
+-  const { apiClient } = useRuntime();
++  const { apiClient, nodeId } = useRuntime();
+   const isFetching = useIsFetching({ queryKey: ['files'] });
+   const pruneStaleRoots = useFileTreeStore((s) => s.pruneStaleRoots);
+ 
+@@ -84,9 +101,17 @@ function FilesTabInner({ hideHeader }: FilesTabProps) {
+     throwOnError: false,
+   });
+ 
++  const filesVisibility = useUIStore((state) => state.sidebarFilesVisibility);
++  const deviceConnected = useTmuxStore((state) => state.deviceConnected);
+   const roots = useMemo(
+-    () => (rootsQuery.data?.roots ?? []).filter((r) => r.enabled),
+-    [rootsQuery.data]
++    () =>
++      selectVisibleFileRoots({
++        roots: rootsQuery.data?.roots ?? [],
++        runtimeNodeId: nodeId,
++        visibility: filesVisibility,
++        deviceConnected,
++      }),
++    [rootsQuery.data, nodeId, filesVisibility, deviceConnected]
+   );
+ 
+   // 加载后清理陈旧的持久化展开键（根/设备已不存在）
+diff --git a/packages/panels/src/files/root-visibility.test.ts b/packages/panels/src/files/root-visibility.test.ts
+new file mode 100644
+index 00000000..8f771981
+--- /dev/null
++++ b/packages/panels/src/files/root-visibility.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, test } from 'bun:test';
++import type { FileRootDto } from '@tmex/shared';
++import { isFileRootDeviceReachable, selectVisibleFileRoots } from './root-visibility';
++
++const NODE_A = '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a';
++
++function root(patch: Partial<FileRootDto> & Pick<FileRootDto, 'id' | 'deviceId'>): FileRootDto {
++  return {
++    deviceName: 'dev',
++    deviceType: 'local',
++    path: `/srv/${patch.id}`,
++    name: patch.id,
++    enabled: true,
++    sortOrder: 0,
++    ...patch,
++  };
++}
++
++const LOCAL = root({ id: 'r-local', deviceId: 'd-local', deviceType: 'local' });
++const SSH = root({ id: 'r-ssh', deviceId: 'd-ssh', deviceType: 'ssh' });
++
++function select(
++  roots: FileRootDto[],
++  options: {
++    runtimeNodeId?: string;
++    visibility?: Record<string, boolean>;
++    deviceConnected?: Record<string, boolean | undefined>;
++  } = {}
++): string[] {
++  return selectVisibleFileRoots({
++    roots,
++    runtimeNodeId: options.runtimeNodeId ?? 'self',
++    visibility: options.visibility ?? {},
++    deviceConnected: options.deviceConnected ?? {},
++  }).map((item) => item.id);
++}
++
++describe('isFileRootDeviceReachable', () => {
++  test('本机设备不需要显式连接', () => {
++    expect(isFileRootDeviceReachable('local', 'd-local', {})).toBe(true);
++  });
++
++  test('SSH 设备连上才可达', () => {
++    expect(isFileRootDeviceReachable('ssh', 'd-ssh', {})).toBe(false);
++    expect(isFileRootDeviceReachable('ssh', 'd-ssh', { 'd-ssh': false })).toBe(false);
++    expect(isFileRootDeviceReachable('ssh', 'd-ssh', { 'd-ssh': true })).toBe(true);
++  });
++
++  test('设备已不存在（deviceType 为 null）视为不可达', () => {
++    expect(isFileRootDeviceReachable(null, 'd-gone', { 'd-gone': true })).toBe(false);
++  });
++});
++
++describe('selectVisibleFileRoots', () => {
++  test('默认显示：本机设备的启用目录，远端 node 同样默认显示', () => {
++    expect(select([LOCAL])).toEqual(['r-local']);
++    expect(select([LOCAL], { runtimeNodeId: NODE_A })).toEqual(['r-local']);
++  });
++
++  test('禁用的目录不显示', () => {
++    expect(select([{ ...LOCAL, enabled: false }])).toEqual([]);
++  });
++
++  test('设备卡片上关掉「文件」开关后该设备的目录消失', () => {
++    expect(select([LOCAL], { visibility: { 'self:d-local': false } })).toEqual([]);
++    expect(
++      select([LOCAL], { runtimeNodeId: NODE_A, visibility: { [`${NODE_A}:d-local`]: false } })
++    ).toEqual([]);
++    // 开关按 node 归属复合：别的 node 的同名 device id 不受影响
++    expect(
++      select([LOCAL], { runtimeNodeId: NODE_A, visibility: { 'self:d-local': false } })
++    ).toEqual(['r-local']);
++  });
++
++  test('设备断开时它的目录消失，重连后回来', () => {
++    expect(select([LOCAL, SSH])).toEqual(['r-local']);
++    expect(select([LOCAL, SSH], { deviceConnected: { 'd-ssh': true } })).toEqual([
++      'r-local',
++      'r-ssh',
++    ]);
++    expect(select([LOCAL, SSH], { deviceConnected: { 'd-ssh': false } })).toEqual(['r-local']);
++  });
++});
+diff --git a/packages/panels/src/files/root-visibility.ts b/packages/panels/src/files/root-visibility.ts
+new file mode 100644
+index 00000000..1024569c
+--- /dev/null
++++ b/packages/panels/src/files/root-visibility.ts
+@@ -0,0 +1,42 @@
++// 文件侧栏要显示哪些根目录：启用 + 用户在设备卡片上开着「文件」开关 + 所属设备当前连着。
++//
++// 「所属设备连着」这一条是刻意的：SSH 设备断开后目录点开只会一路报错，留在树里纯属噪声。
++// 断开 / 重连由 tmux store 的 deviceConnected 驱动，React Query 的缓存不用动——过滤器负责隐藏。
++
++import type { DeviceType, FileRootDto } from '@tmex/shared';
++import { isSidebarFilesVisible } from '@tmex/stores';
++
++export interface FileRootVisibilityInput {
++  roots: readonly FileRootDto[];
++  /** 该 runtime 服务的 node；可见性偏好按 `${runtimeNodeId}:${deviceId}` 记 */
++  runtimeNodeId: string;
++  visibility: Record<string, boolean>;
++  /** tmux store 的设备连接表 */
++  deviceConnected: Record<string, boolean | undefined>;
++}
++
++/** 本机设备随网关一起在线，不需要显式连接；其余设备要连上才算可达，设备已不存在则不可达。 */
++export function isFileRootDeviceReachable(
++  deviceType: DeviceType | null,
++  deviceId: string,
++  deviceConnected: Record<string, boolean | undefined>
++): boolean {
++  if (deviceType === null) return false;
++  if (deviceType === 'local') return true;
++  return deviceConnected[deviceId] === true;
++}
++
++export function selectVisibleFileRoots({
++  roots,
++  runtimeNodeId,
++  visibility,
++  deviceConnected,
++}: FileRootVisibilityInput): FileRootDto[] {
++  return roots.filter(
++    (root) =>
++      root.enabled &&
++      // 这里的 root 本身就是「该设备配过目录」的证据，缺省即显示
++      isSidebarFilesVisible(visibility, runtimeNodeId, root.deviceId, true) &&
++      isFileRootDeviceReachable(root.deviceType, root.deviceId, deviceConnected)
++  );
++}
+diff --git a/packages/panels/src/files/rsync-install-flow.ts b/packages/panels/src/files/rsync-install-flow.ts
+index bafd4d0d..7c098366 100644
+--- a/packages/panels/src/files/rsync-install-flow.ts
++++ b/packages/panels/src/files/rsync-install-flow.ts
+@@ -1,6 +1,11 @@
+-import i18next from 'i18next';
+ import type { AppRuntime } from '@tmex/stores';
+-import { encodePaneIdForUrl, hostAppPath } from '@tmex/stores';
++import {
++  encodePaneIdForUrl,
++  hostAppPath,
++  normalizeAgentNodeId,
++  resolveAgentStore,
++} from '@tmex/stores';
++import i18next from 'i18next';
+ import { toast } from 'sonner';
+ 
+ const CONNECT_TIMEOUT_MS = 12_000;
+@@ -87,7 +92,15 @@ export async function openAgentInNewWindowWithPrompt(
+     }
+ 
+     // 3. 先起草（含预填 prompt）→ 再导航 → 切 agent → 手机强开 sidebar
+-    runtime.stores.agent.getState().startDraft(deviceId, win.paneId, win.paneTitle, promptText);
++    resolveAgentStore(runtime.stores.agent)
++      .getState()
++      .startDraft({
++        nodeId: normalizeAgentNodeId(runtime.nodeId),
++        deviceId,
++        paneId: win.paneId,
++        paneTitle: win.paneTitle,
++        prompt: promptText,
++      });
+     runtime.host.navigate(
+       hostAppPath(
+         runtime.host,
+diff --git a/packages/panels/src/settings/device-files-modal.tsx b/packages/panels/src/settings/device-files-modal.tsx
+new file mode 100644
+index 00000000..4b79debd
+--- /dev/null
++++ b/packages/panels/src/settings/device-files-modal.tsx
+@@ -0,0 +1,37 @@
++// 设备卡片上的「目录」弹窗：在设备所属节点的 runtime 里，用单设备模式复用文件根设置卡。
++// 卡片本身已经挂在该 node 的 `NodeRuntimeScope` 下，弹窗直接沿用 `useRuntime()` 的 client，
++// 增删改与列表都落在这台设备所属的 gateway 上。
++
++import type { Device } from '@tmex/shared';
++import { useTranslation } from 'react-i18next';
++
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@tmex/ui/dialog';
++
++import { FilesSettingsTab } from './files-tab';
++
++export interface DeviceFilesModalProps {
++  device: Device;
++  /** 设备所属节点（运行时 id），仅用于标记弹窗归属 */
++  nodeId: string;
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}
++
++export function DeviceFilesModal({ device, nodeId, open, onOpenChange }: DeviceFilesModalProps) {
++  const { t } = useTranslation();
++  return (
++    <Dialog open={open} onOpenChange={onOpenChange}>
++      <DialogContent
++        className="sm:max-w-2xl"
++        data-testid={`device-files-modal-${device.id}`}
++        data-node-id={nodeId}
++      >
++        <DialogHeader>
++          <DialogTitle>{t('settings.files.deviceModalTitle', { name: device.name })}</DialogTitle>
++        </DialogHeader>
++
++        <FilesSettingsTab lockedDeviceId={device.id} title={t('settings.files.roots')} />
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/packages/panels/src/settings/directory-picker-modal.test.tsx b/packages/panels/src/settings/directory-picker-modal.test.tsx
+new file mode 100644
+index 00000000..928b07e6
+--- /dev/null
++++ b/packages/panels/src/settings/directory-picker-modal.test.tsx
+@@ -0,0 +1,255 @@
++// 目录选择器：请求参数拼装、路径推导与状态迁移用纯函数覆盖，
++// 列表渲染（文件夹图标 / 符号链接 / 隐藏目录灰显 / 空态）用 react-dom/server 静态渲染断言。
++
++import { describe, expect, test } from 'bun:test';
++import { ApiClient } from '@tmex/api-client';
++import type { BrowseDirectoryEntryDto, BrowseDirectoryResponse } from '@tmex/shared';
++import { I18N_RESOURCES } from '@tmex/shared';
++import i18next from 'i18next';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
++
++import {
++  DirectoryEntryList,
++  createDirectoryPickerState,
++  directoryBreadcrumbs,
++  directoryBrowseQueryOptions,
++  directoryPickerReducer,
++  moveDirectoryHighlight,
++  resolvePickerInitialPath,
++  resolvePickerSelection,
++} from './directory-picker-modal';
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++function entry(
++  name: string,
++  extra: Partial<BrowseDirectoryEntryDto> = {}
++): BrowseDirectoryEntryDto {
++  return {
++    name,
++    path: `/home/k/${name}`,
++    hidden: name.startsWith('.'),
++    symlink: false,
++    ...extra,
++  };
++}
++
++function stubClient(response: BrowseDirectoryResponse, seen: string[]): ApiClient {
++  return new ApiClient('', (url) => {
++    seen.push(url);
++    return Promise.resolve(
++      new Response(JSON.stringify(response), {
++        status: 200,
++        headers: { 'Content-Type': 'application/json' },
++      })
++    );
++  });
++}
++
++describe('resolvePickerInitialPath', () => {
++  test('绝对路径原样带入，其余交给设备默认目录', () => {
++    expect(resolvePickerInitialPath('/srv/data')).toBe('/srv/data');
++    expect(resolvePickerInitialPath('  /srv/data  ')).toBe('/srv/data');
++    expect(resolvePickerInitialPath('srv')).toBe('');
++    expect(resolvePickerInitialPath('')).toBe('');
++    expect(resolvePickerInitialPath(undefined)).toBe('');
++  });
++});
++
++describe('directoryBreadcrumbs', () => {
++  test('逐级展开且每级都是可跳转的绝对路径', () => {
++    expect(directoryBreadcrumbs('/home/k/code')).toEqual([
++      { label: '/', path: '/' },
++      { label: 'home', path: '/home' },
++      { label: 'k', path: '/home/k' },
++      { label: 'code', path: '/home/k/code' },
++    ]);
++  });
++
++  test('根目录只有一级；未知目录没有面包屑', () => {
++    expect(directoryBreadcrumbs('/')).toEqual([{ label: '/', path: '/' }]);
++    expect(directoryBreadcrumbs('')).toEqual([]);
++  });
++});
++
++describe('moveDirectoryHighlight', () => {
++  test('从未高亮开始下移落到首项，上移不越界', () => {
++    expect(moveDirectoryHighlight(3, -1, 1)).toBe(0);
++    expect(moveDirectoryHighlight(3, 0, -1)).toBe(0);
++    expect(moveDirectoryHighlight(3, 2, 1)).toBe(2);
++    expect(moveDirectoryHighlight(3, 1, 1)).toBe(2);
++  });
++
++  test('空列表恒为未高亮', () => {
++    expect(moveDirectoryHighlight(0, 1, 1)).toBe(-1);
++  });
++});
++
++describe('directoryPickerReducer', () => {
++  test('进入子目录：请求路径与输入框同步，高亮复位', () => {
++    const state = { ...createDirectoryPickerState('/home/k'), highlight: 2 };
++    const next = directoryPickerReducer(state, { type: 'navigate', path: '/home/k/code' });
++    expect(next).toEqual({
++      path: '/home/k/code',
++      hidden: false,
++      draft: '/home/k/code',
++      highlight: -1,
++    });
++  });
++
++  test('输入框回车只接受绝对路径', () => {
++    const typed = directoryPickerReducer(createDirectoryPickerState('/home/k'), {
++      type: 'draft',
++      value: ' /srv ',
++    });
++    expect(directoryPickerReducer(typed, { type: 'submitDraft' }).path).toBe('/srv');
++
++    const bad = directoryPickerReducer(typed, { type: 'draft', value: 'srv' });
++    expect(directoryPickerReducer(bad, { type: 'submitDraft' })).toBe(bad);
++  });
++
++  test('切换隐藏目录保留当前路径但复位高亮', () => {
++    const state = { ...createDirectoryPickerState('/home/k'), highlight: 1 };
++    expect(directoryPickerReducer(state, { type: 'toggleHidden', hidden: true })).toEqual({
++      path: '/home/k',
++      hidden: true,
++      draft: '/home/k',
++      highlight: -1,
++    });
++  });
++
++  test('响应回来后把规范化路径同步进输入框；已一致则不产生新对象', () => {
++    const state = createDirectoryPickerState('');
++    const synced = directoryPickerReducer(state, { type: 'sync', path: '/home/k' });
++    expect(synced.draft).toBe('/home/k');
++    // 请求路径保持原样：同一目录不因回填再取一次
++    expect(synced.path).toBe('');
++    expect(directoryPickerReducer(synced, { type: 'sync', path: '/home/k' })).toBe(synced);
++  });
++
++  test('单击高亮，重开弹窗回到初始态', () => {
++    const highlighted = directoryPickerReducer(createDirectoryPickerState('/home/k'), {
++      type: 'highlight',
++      index: 1,
++    });
++    expect(highlighted.highlight).toBe(1);
++    expect(directoryPickerReducer(highlighted, { type: 'reset', path: '/srv' })).toEqual(
++      createDirectoryPickerState('/srv')
++    );
++  });
++});
++
++describe('resolvePickerSelection', () => {
++  const entries = [entry('code'), entry('srv')];
++
++  test('未高亮时确认当前所在目录', () => {
++    expect(resolvePickerSelection(entries, -1, '/home/k')).toBe('/home/k');
++  });
++
++  test('高亮子目录时确认该子目录', () => {
++    expect(resolvePickerSelection(entries, 1, '/home/k')).toBe('/home/k/srv');
++  });
++
++  test('列表刚换页、下标越界时退回当前目录', () => {
++    expect(resolvePickerSelection(entries, 5, '/home/k')).toBe('/home/k');
++  });
++});
++
++describe('directoryBrowseQueryOptions', () => {
++  const response: BrowseDirectoryResponse = {
++    path: '/home/k',
++    parent: '/home',
++    entries: [entry('code')],
++    truncated: false,
++  };
++
++  test('默认目录不带 path，隐藏目录关闭时不带 hidden', async () => {
++    const seen: string[] = [];
++    const options = directoryBrowseQueryOptions({
++      deviceId: 'd1',
++      path: '',
++      hidden: false,
++      client: stubClient(response, seen),
++    });
++    expect(options.queryKey).toEqual(['directory-browse', 'd1', '', false]);
++    await expect(options.queryFn()).resolves.toEqual(response);
++    expect(seen).toEqual(['/api/files/browse?deviceId=d1']);
++  });
++
++  test('指定目录与显示隐藏目录都进 query string', async () => {
++    const seen: string[] = [];
++    const options = directoryBrowseQueryOptions({
++      deviceId: 'd1',
++      path: '/home/k',
++      hidden: true,
++      client: stubClient(response, seen),
++    });
++    expect(options.queryKey).toEqual(['directory-browse', 'd1', '/home/k', true]);
++    await options.queryFn();
++    expect(seen).toEqual(['/api/files/browse?deviceId=d1&path=%2Fhome%2Fk&hidden=1']);
++  });
++
++  test('错误响应抛 FileApiError（由列表的错误态兜住）', async () => {
++    const client = new ApiClient('', () =>
++      Promise.resolve(
++        new Response(JSON.stringify({ error: '目录不存在', code: 'not_found' }), { status: 404 })
++      )
++    );
++    const options = directoryBrowseQueryOptions({
++      deviceId: 'd1',
++      path: '/nope',
++      hidden: false,
++      client,
++    });
++    await expect(options.queryFn()).rejects.toThrow('目录不存在');
++  });
++});
++
++function renderList(props: Parameters<typeof DirectoryEntryList>[0]): string {
++  return renderToStaticMarkup(
++    <I18nextProvider i18n={i18n}>
++      <DirectoryEntryList {...props} />
++    </I18nextProvider>
++  );
++}
++
++describe('DirectoryEntryList', () => {
++  test('渲染子目录，隐藏目录灰显、符号链接带标记、高亮项可断言', () => {
++    const html = renderList({
++      entries: [entry('code'), entry('.config'), entry('link', { symlink: true })],
++      highlight: 1,
++      onHighlight: () => undefined,
++      onEnter: () => undefined,
++    });
++    expect(html).toContain('data-testid="directory-picker-entry-code"');
++    expect(html).toContain('data-testid="directory-picker-entry-.config"');
++    expect(html).toContain('符号链接');
++    // 隐藏目录灰显
++    expect(
++      /data-testid="directory-picker-entry-\.config"[^>]*text-muted-foreground/.test(html)
++    ).toBe(true);
++    // 高亮项（.config）带 aria-current
++    expect(/data-testid="directory-picker-entry-\.config"[^>]*aria-current="true"/.test(html)).toBe(
++      true
++    );
++  });
++
++  test('没有子目录时给空态', () => {
++    const html = renderList({
++      entries: [],
++      highlight: -1,
++      onHighlight: () => undefined,
++      onEnter: () => undefined,
++    });
++    expect(html).toContain('没有子目录');
++    expect(html).not.toContain('directory-picker-list');
++  });
++});
+diff --git a/packages/panels/src/settings/directory-picker-modal.tsx b/packages/panels/src/settings/directory-picker-modal.tsx
+new file mode 100644
+index 00000000..9c03a5f4
+--- /dev/null
++++ b/packages/panels/src/settings/directory-picker-modal.tsx
+@@ -0,0 +1,449 @@
++// 图形化目录选择器：在指定设备上浏览任意目录（不受 file roots 白名单约束），
++// 选中后把绝对路径回填给调用方（文件根表单的路径输入框）。
++//
++// 无 DOM 的单测环境下交互无法点击，所以状态迁移全部收敛到 `directoryPickerReducer`，
++// 列表渲染拆成纯展示组件 `DirectoryEntryList`，两者都在 directory-picker-modal.test.tsx 里覆盖。
++
++import { useQuery } from '@tanstack/react-query';
++import type { BrowseDirectoryEntryDto } from '@tmex/shared';
++import { ArrowUp, ChevronRight, Folder, Link2, TriangleAlert } from 'lucide-react';
++import { type KeyboardEvent, useEffect, useReducer, useRef } from 'react';
++import { useTranslation } from 'react-i18next';
++
++import type { ApiClient } from '@tmex/api-client';
++import { browseDirectory } from '@tmex/api-client/file-resources';
++import { useRuntime } from '@tmex/stores/react';
++import { cn } from '@tmex/ui';
++import { Button } from '@tmex/ui/button';
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from '@tmex/ui/dialog';
++import { Input } from '@tmex/ui/input';
++import { ScrollArea } from '@tmex/ui/scroll-area';
++import { Skeleton } from '@tmex/ui/skeleton';
++import { Switch } from '@tmex/ui/switch';
++
++export const DIRECTORY_BROWSE_QUERY_KEY = 'directory-browse';
++
++export interface DirectoryBrowseQueryParams {
++  deviceId: string;
++  /** 空串表示从设备默认目录开始 */
++  path: string;
++  hidden: boolean;
++  client: ApiClient;
++}
++
++export function directoryBrowseQueryOptions({
++  deviceId,
++  path,
++  hidden,
++  client,
++}: DirectoryBrowseQueryParams) {
++  return {
++    queryKey: [DIRECTORY_BROWSE_QUERY_KEY, deviceId, path, hidden] as const,
++    queryFn: () => browseDirectory({ deviceId, path: path || undefined, hidden }, client),
++  };
++}
++
++/** 输入框里已是绝对路径就从那里打开，否则交给后端用设备默认目录。 */
++export function resolvePickerInitialPath(value: string | undefined): string {
++  const trimmed = (value ?? '').trim();
++  return trimmed.startsWith('/') ? trimmed : '';
++}
++
++export interface DirectoryBreadcrumb {
++  label: string;
++  path: string;
++}
++
++/** `/a/b` → 根 + 每一级；非绝对路径（设备默认目录未知）没有面包屑。 */
++export function directoryBreadcrumbs(path: string): DirectoryBreadcrumb[] {
++  if (!path.startsWith('/')) return [];
++  const crumbs: DirectoryBreadcrumb[] = [{ label: '/', path: '/' }];
++  let acc = '';
++  for (const segment of path.split('/').filter(Boolean)) {
++    acc += `/${segment}`;
++    crumbs.push({ label: segment, path: acc });
++  }
++  return crumbs;
++}
++
++/** 键盘上下移动高亮；-1 表示未高亮，越界按边界夹紧。 */
++export function moveDirectoryHighlight(count: number, current: number, delta: number): number {
++  if (count <= 0) return -1;
++  const next = current + delta;
++  if (next < 0) return 0;
++  return next > count - 1 ? count - 1 : next;
++}
++
++export interface DirectoryPickerState {
++  /** 请求目标路径；空串表示设备默认目录 */
++  path: string;
++  hidden: boolean;
++  /** 可编辑路径输入框的当前值 */
++  draft: string;
++  /** 高亮条目下标，-1 表示未高亮（此时确认按钮选中当前目录） */
++  highlight: number;
++}
++
++export type DirectoryPickerAction =
++  | { type: 'reset'; path: string }
++  | { type: 'navigate'; path: string }
++  | { type: 'draft'; value: string }
++  | { type: 'submitDraft' }
++  | { type: 'toggleHidden'; hidden: boolean }
++  | { type: 'highlight'; index: number }
++  | { type: 'move'; delta: number; count: number }
++  | { type: 'sync'; path: string };
++
++export function createDirectoryPickerState(path: string): DirectoryPickerState {
++  return { path, hidden: false, draft: path, highlight: -1 };
++}
++
++export function directoryPickerReducer(
++  state: DirectoryPickerState,
++  action: DirectoryPickerAction
++): DirectoryPickerState {
++  switch (action.type) {
++    case 'reset':
++      return createDirectoryPickerState(action.path);
++    case 'navigate':
++      return { ...state, path: action.path, draft: action.path, highlight: -1 };
++    case 'draft':
++      return { ...state, draft: action.value };
++    case 'submitDraft': {
++      const next = state.draft.trim();
++      if (!next.startsWith('/')) return state;
++      return { ...state, path: next, draft: next, highlight: -1 };
++    }
++    case 'toggleHidden':
++      return { ...state, hidden: action.hidden, highlight: -1 };
++    case 'highlight':
++      return { ...state, highlight: action.index };
++    case 'move':
++      return {
++        ...state,
++        highlight: moveDirectoryHighlight(action.count, state.highlight, action.delta),
++      };
++    case 'sync':
++      return state.draft === action.path ? state : { ...state, draft: action.path };
++  }
++}
++
++/** 确认按钮落到哪个目录：高亮了子目录就取它，否则取当前所在目录。 */
++export function resolvePickerSelection(
++  entries: BrowseDirectoryEntryDto[],
++  highlight: number,
++  currentPath: string
++): string {
++  const entry = highlight >= 0 ? entries[highlight] : undefined;
++  return entry?.path ?? currentPath;
++}
++
++export interface DirectoryEntryListProps {
++  entries: BrowseDirectoryEntryDto[];
++  highlight: number;
++  onHighlight: (index: number) => void;
++  onEnter: (path: string) => void;
++}
++
++export function DirectoryEntryList({
++  entries,
++  highlight,
++  onHighlight,
++  onEnter,
++}: DirectoryEntryListProps) {
++  const { t } = useTranslation();
++  if (entries.length === 0) {
++    return (
++      <div
++        className="py-8 text-center text-sm text-muted-foreground"
++        data-testid="directory-picker-empty"
++      >
++        {t('settings.files.pickerEmpty')}
++      </div>
++    );
++  }
++  return (
++    <div className="space-y-0.5 p-1" data-testid="directory-picker-list">
++      {entries.map((entry, index) => (
++        <button
++          key={entry.path}
++          type="button"
++          data-picker-index={index}
++          data-testid={`directory-picker-entry-${entry.name}`}
++          aria-current={index === highlight ? 'true' : undefined}
++          className={cn(
++            'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none',
++            index === highlight ? 'bg-muted' : 'hover:bg-muted/60',
++            entry.hidden && 'text-muted-foreground'
++          )}
++          onClick={() => onHighlight(index)}
++          onDoubleClick={() => onEnter(entry.path)}
++        >
++          <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
++          <span className="truncate font-mono text-xs">{entry.name}</span>
++          {entry.symlink && (
++            <Link2
++              className="h-3 w-3 shrink-0 text-muted-foreground"
++              aria-label={t('settings.files.pickerSymlink')}
++            />
++          )}
++        </button>
++      ))}
++    </div>
++  );
++}
++
++function DirectoryBreadcrumbBar({
++  path,
++  onNavigate,
++}: {
++  path: string;
++  onNavigate: (path: string) => void;
++}) {
++  const crumbs = directoryBreadcrumbs(path);
++  if (crumbs.length === 0) return null;
++  return (
++    <div
++      className="flex flex-wrap items-center gap-0.5 text-xs text-muted-foreground"
++      data-testid="directory-picker-breadcrumb"
++    >
++      {crumbs.map((crumb, index) => (
++        <span key={crumb.path} className="flex items-center gap-0.5">
++          {index > 0 && <ChevronRight className="h-3 w-3 shrink-0" />}
++          <button
++            type="button"
++            className="max-w-40 truncate rounded px-1 py-0.5 font-mono hover:bg-muted hover:text-foreground"
++            onClick={() => onNavigate(crumb.path)}
++          >
++            {crumb.label}
++          </button>
++        </span>
++      ))}
++    </div>
++  );
++}
++
++function DirectoryPickerError({ onRetry, retrying }: { onRetry: () => void; retrying: boolean }) {
++  const { t } = useTranslation();
++  return (
++    <div
++      className="flex flex-col items-center gap-2 py-8 text-center"
++      data-testid="directory-picker-error"
++    >
++      <span className="flex items-center gap-1.5 text-sm text-destructive">
++        <TriangleAlert className="h-4 w-4 shrink-0" />
++        {t('settings.files.pickerFailed')}
++      </span>
++      <Button variant="outline" size="sm" onClick={onRetry} disabled={retrying}>
++        {t('common.retry')}
++      </Button>
++    </div>
++  );
++}
++
++function DirectoryPickerSkeleton() {
++  return (
++    <div className="space-y-2 p-2" data-testid="directory-picker-loading">
++      {[0, 1, 2, 3, 4].map((row) => (
++        <Skeleton key={row} className="h-6 w-full" />
++      ))}
++    </div>
++  );
++}
++
++export interface DirectoryPickerModalProps {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  deviceId: string;
++  /** 打开时的初始路径；非绝对路径则从设备默认目录开始 */
++  initialPath?: string;
++  /** 设备所在 gateway 的 client；缺省用当前 runtime 的 */
++  client?: ApiClient;
++  onSelect: (path: string) => void;
++}
++
++export function DirectoryPickerModal({
++  open,
++  onOpenChange,
++  deviceId,
++  initialPath,
++  client,
++  onSelect,
++}: DirectoryPickerModalProps) {
++  const { t } = useTranslation();
++  const { apiClient } = useRuntime();
++  const browseClient = client ?? apiClient;
++
++  const [state, dispatch] = useReducer(
++    directoryPickerReducer,
++    resolvePickerInitialPath(initialPath),
++    createDirectoryPickerState
++  );
++
++  useEffect(() => {
++    if (!open) return;
++    dispatch({ type: 'reset', path: resolvePickerInitialPath(initialPath) });
++  }, [open, initialPath]);
++
++  const query = useQuery({
++    ...directoryBrowseQueryOptions({
++      deviceId,
++      path: state.path,
++      hidden: state.hidden,
++      client: browseClient,
++    }),
++    enabled: open && deviceId.length > 0,
++    retry: false,
++  });
++
++  const data = query.data;
++  const responsePath = data?.path;
++
++  useEffect(() => {
++    if (responsePath) dispatch({ type: 'sync', path: responsePath });
++  }, [responsePath]);
++
++  const entries = data?.entries ?? [];
++  const currentPath = responsePath ?? state.path;
++  const highlighted = state.highlight >= 0 ? entries[state.highlight] : undefined;
++  const selectedPath = resolvePickerSelection(entries, state.highlight, currentPath);
++
++  const navigate = (path: string) => dispatch({ type: 'navigate', path });
++
++  // 高亮跟着焦点走：方向键改高亮后把焦点挪到对应条目，后续 Enter 才落在它身上。
++  const listRef = useRef<HTMLDivElement>(null);
++  useEffect(() => {
++    if (state.highlight < 0) return;
++    listRef.current
++      ?.querySelector<HTMLElement>(`[data-picker-index="${state.highlight}"]`)
++      ?.focus();
++  }, [state.highlight]);
++
++  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
++    const target = event.target as HTMLElement;
++    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
++      // 路径输入框里的上下键留给光标
++      if (target.tagName === 'INPUT') return;
++      event.preventDefault();
++      dispatch({ type: 'move', delta: event.key === 'ArrowDown' ? 1 : -1, count: entries.length });
++      return;
++    }
++    // Enter 只在条目上改写成「进入目录」，面包屑等按钮保持原生激活
++    if (event.key === 'Enter' && highlighted && target.closest('[data-picker-index]')) {
++      event.preventDefault();
++      navigate(highlighted.path);
++    }
++  };
++
++  return (
++    <Dialog open={open} onOpenChange={onOpenChange}>
++      <DialogContent className="sm:max-w-lg" data-testid="directory-picker-modal">
++        <DialogHeader>
++          <DialogTitle>{t('settings.files.pickerTitle')}</DialogTitle>
++          <DialogDescription>{t('settings.files.pickerDescription')}</DialogDescription>
++        </DialogHeader>
++
++        {/* 方向键在整个内容区处理：焦点未必落在列表里（刚开窗时在工具栏） */}
++        <div className="space-y-2" onKeyDown={handleKeyDown}>
++          <DirectoryBreadcrumbBar path={currentPath} onNavigate={navigate} />
++
++          <div className="flex items-center gap-2">
++            <Button
++              variant="outline"
++              size="icon-lg"
++              title={t('settings.files.pickerUp')}
++              aria-label={t('settings.files.pickerUp')}
++              data-testid="directory-picker-up"
++              disabled={!data?.parent}
++              onClick={() => {
++                if (data?.parent) navigate(data.parent);
++              }}
++            >
++              <ArrowUp className="h-4 w-4" />
++            </Button>
++            <Input
++              data-testid="directory-picker-path-input"
++              aria-label={t('settings.files.path')}
++              className="h-9 font-mono"
++              value={state.draft}
++              placeholder={t('settings.files.pathPlaceholder')}
++              onChange={(event) => dispatch({ type: 'draft', value: event.target.value })}
++              onKeyDown={(event) => {
++                if (event.key !== 'Enter') return;
++                event.preventDefault();
++                dispatch({ type: 'submitDraft' });
++              }}
++            />
++          </div>
++
++          <ScrollArea className="h-64 rounded-lg border border-border">
++            <div ref={listRef}>
++              {query.isError ? (
++                <DirectoryPickerError
++                  onRetry={() => void query.refetch()}
++                  retrying={query.isFetching}
++                />
++              ) : query.isPending ? (
++                <DirectoryPickerSkeleton />
++              ) : (
++                <DirectoryEntryList
++                  entries={entries}
++                  highlight={state.highlight}
++                  onHighlight={(index) => dispatch({ type: 'highlight', index })}
++                  onEnter={navigate}
++                />
++              )}
++            </div>
++          </ScrollArea>
++
++          {data?.truncated && (
++            <p className="text-xs text-muted-foreground">{t('settings.files.pickerTruncated')}</p>
++          )}
++
++          <div className="flex items-center gap-2">
++            <Switch
++              checked={state.hidden}
++              onCheckedChange={(checked) =>
++                dispatch({ type: 'toggleHidden', hidden: Boolean(checked) })
++              }
++              data-testid="directory-picker-hidden-switch"
++            />
++            <span className="text-sm">{t('settings.files.pickerShowHidden')}</span>
++          </div>
++        </div>
++
++        <DialogFooter className="sm:items-center sm:justify-between">
++          <div className="min-w-0 text-xs text-muted-foreground">
++            <span>{t('settings.files.pickerCurrent')}</span>
++            <span className="ml-1 truncate font-mono" data-testid="directory-picker-selected">
++              {selectedPath}
++            </span>
++          </div>
++          <div className="flex gap-2">
++            <Button variant="outline" onClick={() => onOpenChange(false)}>
++              {t('common.cancel')}
++            </Button>
++            <Button
++              variant="secondary"
++              data-testid="directory-picker-confirm"
++              disabled={!selectedPath.startsWith('/')}
++              onClick={() => {
++                onSelect(selectedPath);
++                onOpenChange(false);
++              }}
++            >
++              {t('settings.files.pickerConfirm')}
++            </Button>
++          </div>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/packages/panels/src/settings/file-root-form-modal.tsx b/packages/panels/src/settings/file-root-form-modal.tsx
+index 602dbc05..361347fb 100644
+--- a/packages/panels/src/settings/file-root-form-modal.tsx
++++ b/packages/panels/src/settings/file-root-form-modal.tsx
+@@ -30,6 +30,8 @@ export interface FileRootFormModalProps {
+   editClient?: ApiClient;
+   devices: Device[];
+   deviceGroups?: FileRootDeviceGroup[];
++  /** 单设备模式：设备字段只读，新增只落该设备 */
++  lockedDeviceId?: string;
+   onRootsMutated?: () => void;
+ }
+ 
+@@ -40,6 +42,7 @@ export function FileRootFormModal({
+   editClient,
+   devices,
+   deviceGroups,
++  lockedDeviceId,
+   onRootsMutated,
+ }: FileRootFormModalProps) {
+   const { t } = useTranslation();
+@@ -49,6 +52,7 @@ export function FileRootFormModal({
+     editClient,
+     devices,
+     deviceGroups,
++    lockedDeviceId,
+     onOpenChange,
+     onRootsMutated,
+   });
+diff --git a/packages/panels/src/settings/file-root-form-sections.test.tsx b/packages/panels/src/settings/file-root-form-sections.test.tsx
+new file mode 100644
+index 00000000..7772f5e0
+--- /dev/null
++++ b/packages/panels/src/settings/file-root-form-sections.test.tsx
+@@ -0,0 +1,114 @@
++// 文件根表单的两个字段：路径行的「浏览…」按钮（选中设备前禁用），
++// 以及单设备模式下设备字段只读。无 DOM 环境用 react-dom/server 静态渲染断言结构。
++
++import { describe, expect, test } from 'bun:test';
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
++import { ApiClient } from '@tmex/api-client';
++import type { Device } from '@tmex/shared';
++import { I18N_RESOURCES } from '@tmex/shared';
++import { createAppRuntime } from '@tmex/stores';
++import { RuntimeProvider } from '@tmex/stores/react';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++import i18next from 'i18next';
++import type { ReactElement } from 'react';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
++
++import { FileRootDeviceField, FileRootPathField } from './file-root-form-sections';
++import type { FileRootFormModel } from './use-file-root-form';
++
++installWindowStorage();
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++const DEVICES = [
++  { id: 'd1', name: '书房', type: 'local' },
++  { id: 'd2', name: '服务器', type: 'ssh' },
++] as Device[];
++
++function formModel(overrides: Partial<FileRootFormModel> = {}): FileRootFormModel {
++  const deviceId = overrides.deviceId ?? '';
++  return {
++    isEdit: false,
++    locked: false,
++    deviceId,
++    setDeviceId: () => undefined,
++    path: '',
++    setPath: () => undefined,
++    enabled: true,
++    setEnabled: () => undefined,
++    deviceOptions: DEVICES,
++    selectedDevice: DEVICES.find((device) => device.id === deviceId),
++    canSubmit: false,
++    isPending: false,
++    submit: () => undefined,
++    browseClient: new ApiClient(''),
++    ...overrides,
++  };
++}
++
++let runtimeSeq = 0;
++
++function render(node: ReactElement): string {
++  const runtime = createAppRuntime({
++    nodeId: 'self',
++    storagePrefix: `file-root-form-test-${runtimeSeq++}:`,
++  });
++  return renderToStaticMarkup(
++    <I18nextProvider i18n={i18n}>
++      <QueryClientProvider client={new QueryClient()}>
++        <RuntimeProvider runtime={runtime}>{node}</RuntimeProvider>
++      </QueryClientProvider>
++    </I18nextProvider>
++  );
++}
++
++/** 取「浏览…」按钮的开始标签：class 里带 `disabled:` 前缀类，只能按属性判断禁用态。 */
++function browseButtonTag(html: string): string {
++  const match = html.match(/<button[^>]*data-testid="settings-files-path-browse"/);
++  expect(match).not.toBeNull();
++  return match?.[0] ?? '';
++}
++
++describe('FileRootPathField', () => {
++  test('未选设备时「浏览…」禁用', () => {
++    const html = render(<FileRootPathField form={formModel()} />);
++    expect(browseButtonTag(html)).toContain('disabled=""');
++  });
++
++  test('选中设备后「浏览…」可用，路径输入框保留当前值', () => {
++    const html = render(<FileRootPathField form={formModel({ deviceId: 'd1', path: '/srv' })} />);
++    expect(browseButtonTag(html)).not.toContain('disabled=""');
++    expect(html).toContain('value="/srv"');
++  });
++});
++
++describe('FileRootDeviceField', () => {
++  test('默认新增模式给出设备下拉', () => {
++    const html = render(
++      <FileRootDeviceField form={formModel()} devices={DEVICES} root={undefined} />
++    );
++    expect(html).toContain('data-testid="settings-files-device-select"');
++    expect(html).not.toContain('data-testid="settings-files-device-readonly"');
++  });
++
++  test('单设备模式隐藏下拉，只读展示锁定的设备', () => {
++    const html = render(
++      <FileRootDeviceField
++        form={formModel({ locked: true, deviceId: 'd2' })}
++        devices={DEVICES}
++        root={undefined}
++      />
++    );
++    expect(html).not.toContain('data-testid="settings-files-device-select"');
++    expect(html).toContain('data-testid="settings-files-device-readonly"');
++    expect(html).toContain('服务器');
++  });
++});
+diff --git a/packages/panels/src/settings/file-root-form-sections.tsx b/packages/panels/src/settings/file-root-form-sections.tsx
+index b99d120e..479a6eb9 100644
+--- a/packages/panels/src/settings/file-root-form-sections.tsx
++++ b/packages/panels/src/settings/file-root-form-sections.tsx
+@@ -1,6 +1,9 @@
+-import type { Device, FileRootDto } from '@tmex/shared';
++import type { Device, DeviceType, FileRootDto } from '@tmex/shared';
++import { FolderOpen } from 'lucide-react';
++import { useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
++import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+ import {
+   Select,
+@@ -13,6 +16,7 @@ import {
+ } from '@tmex/ui/select';
+ import { Switch } from '@tmex/ui/switch';
+ 
++import { DirectoryPickerModal } from './directory-picker-modal';
+ import { FileRootDeviceIcon } from './file-root-device-icon';
+ import type { FileRootDeviceGroup, FileRootDeviceOption } from './file-root-query';
+ import type { FileRootFormModel } from './use-file-root-form';
+@@ -41,12 +45,21 @@ function DeviceSelectValue({ selected }: { selected: FileRootDeviceOption | unde
+   );
+ }
+ 
+-function DeviceReadonlyValue({ root }: { root: FileRootDto | undefined }) {
++function DeviceReadonlyValue({
++  type,
++  name,
++}: {
++  type: DeviceType | null;
++  name: string | null | undefined;
++}) {
+   const { t } = useTranslation();
+   return (
+-    <div className="flex h-9 items-center gap-1.5 rounded-lg border border-input bg-muted/30 px-2.5 text-sm">
+-      <FileRootDeviceIcon type={root?.deviceType ?? null} className="h-4 w-4 shrink-0" />
+-      <span className="truncate">{root?.deviceName ?? t('settings.files.missing')}</span>
++    <div
++      className="flex h-9 items-center gap-1.5 rounded-lg border border-input bg-muted/30 px-2.5 text-sm"
++      data-testid="settings-files-device-readonly"
++    >
++      <FileRootDeviceIcon type={type} className="h-4 w-4 shrink-0" />
++      <span className="truncate">{name ?? t('settings.files.missing')}</span>
+     </div>
+   );
+ }
+@@ -94,46 +107,78 @@ export interface FileRootDeviceFieldProps extends DeviceSelectProps {
+   root?: FileRootDto;
+ }
+ 
+-export function FileRootDeviceField({
+-  form,
+-  root,
+-  devices,
+-  deviceGroups,
+-}: FileRootDeviceFieldProps) {
++/** 编辑模式设备不可改；单设备模式（locked）也只读，设备由宿主锁定。 */
++function FileRootDeviceValue({ form, root, devices, deviceGroups }: FileRootDeviceFieldProps) {
++  if (form.isEdit) {
++    return <DeviceReadonlyValue type={root?.deviceType ?? null} name={root?.deviceName} />;
++  }
++  if (form.locked) {
++    return (
++      <DeviceReadonlyValue
++        type={form.selectedDevice?.type ?? null}
++        name={form.selectedDevice?.name}
++      />
++    );
++  }
++  return <DeviceSelect form={form} devices={devices} deviceGroups={deviceGroups} />;
++}
++
++export function FileRootDeviceField(props: FileRootDeviceFieldProps) {
+   const { t } = useTranslation();
++  const { form } = props;
++  const showNoDevices = !form.isEdit && !form.locked && form.deviceOptions.length === 0;
+   return (
+     <div className="space-y-1.5">
+       <label className="block text-sm font-medium" htmlFor="files-form-device">
+         {t('settings.files.device')}
+       </label>
+-      {form.isEdit ? (
+-        <DeviceReadonlyValue root={root} />
+-      ) : (
+-        <DeviceSelect form={form} devices={devices} deviceGroups={deviceGroups} />
+-      )}
+-      {!form.isEdit && form.deviceOptions.length === 0 && (
+-        <p className="text-xs text-destructive">{t('settings.files.noDevices')}</p>
+-      )}
++      <FileRootDeviceValue {...props} />
++      {showNoDevices && <p className="text-xs text-destructive">{t('settings.files.noDevices')}</p>}
+     </div>
+   );
+ }
+ 
+ export function FileRootPathField({ form }: { form: FileRootFormModel }) {
+   const { t } = useTranslation();
++  const [pickerOpen, setPickerOpen] = useState(false);
++  const canBrowse = form.deviceId.length > 0;
+   return (
+     <div className="space-y-1.5">
+       <label className="block text-sm font-medium" htmlFor="files-form-path">
+         {t('settings.files.path')}
+       </label>
+-      <Input
+-        id="files-form-path"
+-        data-testid="settings-files-path-input"
+-        value={form.path}
+-        onChange={(event) => form.setPath(event.target.value)}
+-        placeholder={t('settings.files.pathPlaceholder')}
+-        className={`${FIELD_CLASS} font-mono`}
+-      />
++      <div className="flex items-center gap-2">
++        <Input
++          id="files-form-path"
++          data-testid="settings-files-path-input"
++          value={form.path}
++          onChange={(event) => form.setPath(event.target.value)}
++          placeholder={t('settings.files.pathPlaceholder')}
++          className={`${FIELD_CLASS} font-mono`}
++        />
++        <Button
++          variant="outline"
++          size="icon-lg"
++          title={t('settings.files.browse')}
++          aria-label={t('settings.files.browse')}
++          data-testid="settings-files-path-browse"
++          disabled={!canBrowse}
++          onClick={() => setPickerOpen(true)}
++        >
++          <FolderOpen className="h-4 w-4" />
++        </Button>
++      </div>
+       <p className="text-xs text-muted-foreground">{t('settings.files.pathHint')}</p>
++      {canBrowse && (
++        <DirectoryPickerModal
++          open={pickerOpen}
++          onOpenChange={setPickerOpen}
++          deviceId={form.deviceId}
++          initialPath={form.path}
++          client={form.browseClient}
++          onSelect={form.setPath}
++        />
++      )}
+     </div>
+   );
+ }
+diff --git a/packages/panels/src/settings/file-root-query.test.ts b/packages/panels/src/settings/file-root-query.test.ts
+index 99f6c64d..614def8b 100644
+--- a/packages/panels/src/settings/file-root-query.test.ts
++++ b/packages/panels/src/settings/file-root-query.test.ts
+@@ -2,9 +2,13 @@ import { describe, expect, test } from 'bun:test';
+ 
+ import type { ApiClient } from '@tmex/api-client';
+ 
++import type { FileRootDto } from '@tmex/shared';
++
+ import {
+   type FileRootDeviceGroup,
++  type FileRootEntry,
+   collectFileRootClients,
++  filterFileRootEntries,
+   resolveFileRootClient,
+   resolveFileRootsListState,
+ } from './file-root-query';
+@@ -85,3 +89,18 @@ describe('resolveFileRootClient', () => {
+     expect(resolveFileRootClient(undefined, fallback, 'd2')).toBe(fallback);
+   });
+ });
++
++describe('filterFileRootEntries', () => {
++  const entries: FileRootEntry[] = [
++    { root: { id: 'r1', deviceId: 'd1', path: '/a' } as FileRootDto, client: client('c1') },
++    { root: { id: 'r2', deviceId: 'd2', path: '/b' } as FileRootDto, client: client('c1') },
++  ];
++
++  test('单设备模式只留该设备的 roots', () => {
++    expect(filterFileRootEntries(entries, 'd2').map((entry) => entry.root.id)).toEqual(['r2']);
++  });
++
++  test('未锁定设备时原样返回', () => {
++    expect(filterFileRootEntries(entries, undefined)).toBe(entries);
++  });
++});
+diff --git a/packages/panels/src/settings/file-root-query.ts b/packages/panels/src/settings/file-root-query.ts
+index 26ef3505..a9e648da 100644
+--- a/packages/panels/src/settings/file-root-query.ts
++++ b/packages/panels/src/settings/file-root-query.ts
+@@ -47,6 +47,15 @@ export interface FileRootEntry {
+   client: ApiClient;
+ }
+ 
++/** 单设备模式只显示锁定设备的 roots；未锁定时原样返回。 */
++export function filterFileRootEntries(
++  entries: FileRootEntry[],
++  lockedDeviceId: string | undefined
++): FileRootEntry[] {
++  if (!lockedDeviceId) return entries;
++  return entries.filter((entry) => entry.root.deviceId === lockedDeviceId);
++}
++
+ export type FileRootsListState = 'loading' | 'error' | 'empty' | 'ready';
+ 
+ export interface FileRootsListStateInput {
+diff --git a/packages/panels/src/settings/files-tab.tsx b/packages/panels/src/settings/files-tab.tsx
+index d16a09ee..1db53587 100644
+--- a/packages/panels/src/settings/files-tab.tsx
++++ b/packages/panels/src/settings/files-tab.tsx
+@@ -12,6 +12,7 @@ import { FileRootFormModal } from './file-root-form-modal';
+ import {
+   type FileRootDeviceGroup,
+   type FileRootEntry,
++  filterFileRootEntries,
+   resolveFileRootsListState,
+   useFileRootsQuery,
+ } from './file-root-query';
+@@ -34,6 +35,13 @@ export interface FilesSettingsTabProps {
+    * 宿主若在其他缓存域（另一个 QueryClient）也展示 roots，可借此扇出失效。
+    */
+   onRootsMutated?: () => void;
++  /**
++   * 单设备模式：隐藏设备选择器（只读展示），新增的 root 一律落在该设备上，
++   * 列表也只显示该设备的 roots。设备卡片里的「目录」弹窗用它。
++   */
++  lockedDeviceId?: string;
++  /** 覆盖卡片标题；缺省用「文件」 */
++  title?: string;
+ }
+ 
+ // 外壳门：runtime.features.filesUi 关断时不渲染文件根设置卡，也不发起 files 查询（内层 hooks 不执行）。
+@@ -67,7 +75,12 @@ function FileRootsError({ onRetry, retrying }: { onRetry: () => void; retrying:
+   );
+ }
+ 
+-function FilesSettingsTabInner({ deviceGroups, onRootsMutated }: FilesSettingsTabProps) {
++function FilesSettingsTabInner({
++  deviceGroups,
++  onRootsMutated,
++  lockedDeviceId,
++  title,
++}: FilesSettingsTabProps) {
+   const { t } = useTranslation();
+   const { apiClient } = useRuntime();
+ 
+@@ -83,7 +96,7 @@ function FilesSettingsTabInner({ deviceGroups, onRootsMutated }: FilesSettingsTa
+     enabled: !deviceGroups,
+   });
+ 
+-  const entries = rootsQuery.data ?? [];
++  const entries = filterFileRootEntries(rootsQuery.data ?? [], lockedDeviceId);
+   const devices = devicesQuery.data?.devices ?? [];
+   const listState = resolveFileRootsListState({
+     isLoading: rootsQuery.isLoading,
+@@ -106,8 +119,12 @@ function FilesSettingsTabInner({ deviceGroups, onRootsMutated }: FilesSettingsTa
+       <Card className="border-0 ring-0" data-testid="settings-files-section">
+         <CardHeader className="flex flex-row items-center justify-between gap-2">
+           <div className="space-y-1">
+-            <CardTitle>{t('settings.files.title')}</CardTitle>
+-            <p className="text-sm text-muted-foreground">{t('settings.files.description')}</p>
++            <CardTitle>{title ?? t('settings.files.title')}</CardTitle>
++            <p className="text-sm text-muted-foreground">
++              {lockedDeviceId
++                ? t('settings.files.lockedDescription')
++                : t('settings.files.description')}
++            </p>
+           </div>
+           <Button variant="secondary" data-testid="settings-files-root-add" onClick={openAdd}>
+             <Plus className="h-4 w-4" />
+@@ -151,6 +168,7 @@ function FilesSettingsTabInner({ deviceGroups, onRootsMutated }: FilesSettingsTa
+         editClient={editingEntry?.client}
+         devices={devices}
+         deviceGroups={deviceGroups}
++        lockedDeviceId={lockedDeviceId}
+         onRootsMutated={onRootsMutated}
+       />
+     </>
+diff --git a/packages/panels/src/settings/index.ts b/packages/panels/src/settings/index.ts
+index 85a876e8..ea97edf1 100644
+--- a/packages/panels/src/settings/index.ts
++++ b/packages/panels/src/settings/index.ts
+@@ -1,6 +1,8 @@
+ // 设置面板全量出口：消费方（fe 设置页/设备页）按 featureset 决定渲染哪些 tab。
+ 
+ export { DeviceEntryCard } from './device-entry-card';
++export { DeviceFilesModal, type DeviceFilesModalProps } from './device-files-modal';
++export { DirectoryPickerModal, type DirectoryPickerModalProps } from './directory-picker-modal';
+ export {
+   FilesSettingsTab,
+   type FileRootDeviceGroup,
+diff --git a/packages/panels/src/settings/use-file-root-form.test.ts b/packages/panels/src/settings/use-file-root-form.test.ts
+index 68e398bd..b09831fb 100644
+--- a/packages/panels/src/settings/use-file-root-form.test.ts
++++ b/packages/panels/src/settings/use-file-root-form.test.ts
+@@ -1,9 +1,13 @@
+ import { describe, expect, test } from 'bun:test';
+ 
+-import type { Device } from '@tmex/shared';
++import type { Device, FileRootDto } from '@tmex/shared';
+ 
+ import type { FileRootDeviceGroup } from './file-root-query';
+-import { collectFileRootDeviceOptions, isFileRootFormSubmittable } from './use-file-root-form';
++import {
++  collectFileRootDeviceOptions,
++  isFileRootFormSubmittable,
++  resolveFileRootFormDeviceId,
++} from './use-file-root-form';
+ 
+ const devices = [
+   { id: 'd1', name: 'laptop', type: 'local' },
+@@ -56,3 +60,19 @@ describe('collectFileRootDeviceOptions', () => {
+     ]);
+   });
+ });
++
++describe('resolveFileRootFormDeviceId', () => {
++  const root = { id: 'r1', deviceId: 'd2', path: '/srv' } as FileRootDto;
++
++  test('单设备模式新增时强制用锁定设备', () => {
++    expect(resolveFileRootFormDeviceId(undefined, 'd1')).toBe('d1');
++  });
++
++  test('编辑模式始终跟随 root 自己的设备', () => {
++    expect(resolveFileRootFormDeviceId(root, 'd1')).toBe('d2');
++  });
++
++  test('未锁定时新增从空开始', () => {
++    expect(resolveFileRootFormDeviceId(undefined, undefined)).toBe('');
++  });
++});
+diff --git a/packages/panels/src/settings/use-file-root-form.ts b/packages/panels/src/settings/use-file-root-form.ts
+index 2a57d10b..b49d989b 100644
+--- a/packages/panels/src/settings/use-file-root-form.ts
++++ b/packages/panels/src/settings/use-file-root-form.ts
+@@ -2,10 +2,12 @@ import type { Device, FileRootDto } from '@tmex/shared';
+ import { useEffect, useState } from 'react';
+ 
+ import type { ApiClient } from '@tmex/api-client';
++import { useRuntime } from '@tmex/stores/react';
+ 
+ import {
+   type FileRootDeviceGroup,
+   type FileRootDeviceOption,
++  resolveFileRootClient,
+   useFileRootSaveMutation,
+ } from './file-root-query';
+ 
+@@ -28,6 +30,14 @@ export function isFileRootFormSubmittable(draft: FileRootFormDraft, isEdit: bool
+   return pathValid && (isEdit || draft.deviceId.length > 0);
+ }
+ 
++/** 编辑模式沿用 root 自己的设备；单设备模式（locked）新增时设备由宿主锁定。 */
++export function resolveFileRootFormDeviceId(
++  root: FileRootDto | undefined,
++  lockedDeviceId: string | undefined
++): string {
++  return root?.deviceId ?? lockedDeviceId ?? '';
++}
++
+ export interface FileRootFormParams {
+   open: boolean;
+   /** 缺省表示新增模式 */
+@@ -35,12 +45,16 @@ export interface FileRootFormParams {
+   editClient?: ApiClient;
+   devices: Device[];
+   deviceGroups?: FileRootDeviceGroup[];
++  /** 单设备模式：设备只读且新增只落该设备 */
++  lockedDeviceId?: string;
+   onOpenChange: (open: boolean) => void;
+   onRootsMutated?: () => void;
+ }
+ 
+ export interface FileRootFormModel {
+   isEdit: boolean;
++  /** 单设备模式：设备字段只读 */
++  locked: boolean;
+   deviceId: string;
+   setDeviceId: (deviceId: string) => void;
+   path: string;
+@@ -52,6 +66,8 @@ export interface FileRootFormModel {
+   canSubmit: boolean;
+   isPending: boolean;
+   submit: () => void;
++  /** 目录选择器要打的 gateway：与该设备 roots 的落盘 client 一致 */
++  browseClient: ApiClient;
+ }
+ 
+ export function useFileRootForm({
+@@ -60,11 +76,13 @@ export function useFileRootForm({
+   editClient,
+   devices,
+   deviceGroups,
++  lockedDeviceId,
+   onOpenChange,
+   onRootsMutated,
+ }: FileRootFormParams): FileRootFormModel {
+   const isEdit = Boolean(root);
+-  const [deviceId, setDeviceId] = useState('');
++  const { apiClient } = useRuntime();
++  const [deviceId, setDeviceId] = useState(() => resolveFileRootFormDeviceId(root, lockedDeviceId));
+   const [path, setPath] = useState('');
+   const [enabled, setEnabled] = useState(true);
+ 
+@@ -72,10 +90,10 @@ export function useFileRootForm({
+     if (!open) {
+       return;
+     }
+-    setDeviceId(root?.deviceId ?? '');
++    setDeviceId(resolveFileRootFormDeviceId(root, lockedDeviceId));
+     setPath(root?.path ?? '');
+     setEnabled(root?.enabled ?? true);
+-  }, [open, root]);
++  }, [open, root, lockedDeviceId]);
+ 
+   const saveMutation = useFileRootSaveMutation({
+     root,
+@@ -90,6 +108,7 @@ export function useFileRootForm({
+ 
+   return {
+     isEdit,
++    locked: !isEdit && Boolean(lockedDeviceId),
+     deviceId,
+     setDeviceId,
+     path,
+@@ -100,6 +119,9 @@ export function useFileRootForm({
+     selectedDevice: deviceOptions.find((device) => device.id === deviceId),
+     canSubmit,
+     isPending: saveMutation.isPending,
++    browseClient: isEdit
++      ? (editClient ?? apiClient)
++      : resolveFileRootClient(deviceGroups, apiClient, deviceId),
+     submit: () => {
+       if (!canSubmit || saveMutation.isPending) {
+         return;
+diff --git a/packages/shared/src/i18n/locales/zh_CN.json b/packages/shared/src/i18n/locales/zh_CN.json
+index 93114c1f..8ba2ebbe 100644
+--- a/packages/shared/src/i18n/locales/zh_CN.json
++++ b/packages/shared/src/i18n/locales/zh_CN.json
+@@ -119,7 +119,13 @@
+       "directFallbackToast": "直连已断开，最近输入可能未送达",
+       "sidebar": {
+         "show": "显示在侧栏",
+-        "hint": "仅本浏览器生效的偏好：该设备是否出现在侧栏设备列表里。"
++        "hint": "仅本浏览器生效的偏好：该设备是否出现在侧栏设备列表里。",
++        "group": "侧栏显示",
++        "terminal": "终端",
++        "files": "文件",
++        "terminalHint": "在侧栏的终端页显示该设备",
++        "filesHint": "在侧栏的文件页显示该设备的目录",
++        "filesDisabledHint": "尚未为该设备配置目录"
+       },
+       "addTo": {
+         "label": "添加设备到",
+@@ -221,7 +227,8 @@
+         "nodes": "多节点互联",
+         "notifications": "通知",
+         "ai": "AI",
+-        "terminal": "终端"
++        "terminal": "终端",
++        "remoteAccess": "远程访问"
+       },
+       "terminal": {
+         "title": "终端设置",
+@@ -263,6 +270,141 @@
+           "retry": "重试"
+         }
+       },
++      "remoteAccess": {
++        "title": "远程访问",
++        "wizardTitle": "配置向导",
++        "description": "通过 Cloudflare Tunnel 把本机的 tmex 暴露到公网，无需公网 IP 或端口映射。",
++        "remoteNodeNotice": "远程访问只能在当前连接的机器上配置。",
++        "loginRequired": "请先登录本机后再配置远程访问。",
++        "loadFailed": "无法读取远程访问状态。",
++        "unsupported": "当前系统（{{platform}}）不支持 Cloudflare Tunnel。",
++        "modeLabel": "方式",
++        "publicUrl": "公网地址",
++        "restartsLabel": "重启次数",
++        "restarts": "{{times}} 次",
++        "state": {
++          "notConfigured": "未配置",
++          "stopped": "已停止",
++          "starting": "启动中",
++          "running": "运行中",
++          "error": "错误"
++        },
++        "mode": {
++          "quick": {
++            "title": "临时隧道",
++            "description": "无需账号，地址随每次启动变化，适合测试。"
++          },
++          "named": {
++            "title": "命名隧道",
++            "description": "需要 Cloudflare 账号与已托管的域名，地址固定。"
++          }
++        },
++        "actions": {
++          "start": "启动",
++          "stop": "停止",
++          "remove": "移除",
++          "check": "检查连通性",
++          "open": "在新标签页打开",
++          "install": "安装",
++          "login": "登录 Cloudflare",
++          "openLoginUrl": "打开授权页面",
++          "cancelLogin": "取消",
++          "create": "创建并启动",
++          "quickStart": "启动"
++        },
++        "check": {
++          "reachable": "可访问",
++          "unreachable": "不可达"
++        },
++        "log": {
++          "title": "日志",
++          "empty": "暂无输出。"
++        },
++        "steps": {
++          "install": {
++            "title": "安装 cloudflared",
++            "description": "tmex 会把 cloudflared 下载到自己的数据目录，不改动系统。",
++            "version": "版本",
++            "path": "路径",
++            "source": "来源",
++            "sourceValue": {
++              "managed": "由 tmex 管理",
++              "system": "系统已安装"
++            }
++          },
++          "mode": {
++            "title": "选择方式",
++            "description": "建立隧道后如需更换方式，先移除现有隧道。",
++            "pending": "请先选择一种方式。"
++          },
++          "tunnel": {
++            "title": "建立隧道",
++            "description": "选择方式后在这里完成建立。"
++          },
++          "quick": {
++            "title": "临时隧道",
++            "description": "启动后生成一个 trycloudflare.com 的临时地址，停止即失效。",
++            "started": "临时隧道已启动。"
++          },
++          "named": {
++            "title": "命名隧道",
++            "description": "使用已托管在 Cloudflare 的域名，地址固定。",
++            "login": {
++              "description": "在打开的授权页面中选择域名并授权，完成后回到本页。",
++              "waiting": "等待在 Cloudflare 完成授权",
++              "done": "已登录 Cloudflare。"
++            },
++            "hostname": "主机名",
++            "hostnamePlaceholder": "tmex.example.com",
++            "hostnameHint": "填写已托管在 Cloudflare 的域名下的子域。",
++            "hostnameInvalid": "主机名格式不正确，请填写形如 tmex.example.com 的小写域名。",
++            "tunnelName": "隧道名称",
++            "tunnelNamePlaceholder": "tmex",
++            "tunnelNameHint": "可留空，留空时由 tmex 生成。",
++            "hubHint": "作为 Hub 时，请将 Hub 公开地址设为此主机名。",
++            "hubHintLink": "前往多节点互联设置"
++          },
++          "proxy": {
++            "title": "反向代理信任",
++            "description": "隧道会替换客户端地址与协议，需要相应调整 tmex 的信任设置。",
++            "trustProxy": "信任反向代理头",
++            "trustProxyHint": "tmex 位于隧道之后时需要开启，以便正确识别客户端地址与协议。",
++            "autoStart": "随 tmex 启动",
++            "autoStartHint": "网关启动时自动拉起隧道。",
++            "restartRequired": "配置已保存，重启后生效。",
++            "restartNow": "立即重启",
++            "restarting": "正在重启",
++            "restartTimeout": "重启超时，请手动重启 tmex。"
++          }
++        },
++        "jobStep": {
++          "download": "下载",
++          "extract": "解压",
++          "verify": "校验",
++          "create_tunnel": "创建隧道",
++          "route_dns": "配置 DNS",
++          "start": "启动",
++          "create": "创建隧道",
++          "wait_cert": "等待授权",
++          "login": "登录 Cloudflare",
++          "cancelled": "已取消"
++        },
++        "errors": {
++          "unsupported_platform": "当前系统不支持 Cloudflare Tunnel。",
++          "binary_missing": "未找到 cloudflared，请先完成安装。",
++          "download_failed": "下载 cloudflared 失败，请检查网络后重试。",
++          "not_logged_in": "尚未登录 Cloudflare，请先完成授权。",
++          "login_timeout": "授权超时，请重新发起登录。",
++          "invalid_hostname": "主机名格式不正确。",
++          "tunnel_exists": "同名隧道已存在，请更换名称。",
++          "dns_route_failed": "配置 DNS 记录失败，请确认该域名已托管在 Cloudflare。",
++          "process_failed": "cloudflared 进程启动失败，详见日志。",
++          "busy": "另一项操作正在进行。",
++          "not_configured": "尚未配置远程访问。",
++          "invalid_request": "请求无效。",
++          "unknown": "操作失败：{{message}}"
++        }
++      },
+       "deviceManagement": {
+         "title": "设备管理",
+         "description": "添加、编辑并连接你的本地与 SSH 设备。",
+@@ -346,6 +488,19 @@
+         "path": "路径",
+         "pathPlaceholder": "/绝对路径/到/目录",
+         "pathHint": "所选设备上的绝对路径。",
++        "browse": "浏览…",
++        "lockedDescription": "此设备上可在「文件」标签页浏览的目录。",
++        "deviceModalTitle": "{{name}} · 目录",
++        "pickerTitle": "选择目录",
++        "pickerDescription": "浏览设备上的目录，选中后填入路径。",
++        "pickerUp": "上一级",
++        "pickerShowHidden": "显示隐藏目录",
++        "pickerEmpty": "没有子目录",
++        "pickerFailed": "加载目录失败",
++        "pickerTruncated": "子目录过多，列表已截断",
++        "pickerSymlink": "符号链接",
++        "pickerCurrent": "当前目录",
++        "pickerConfirm": "选择此目录",
+         "enabled": "启用",
+         "addFailed": "添加目录失败",
+         "updateFailed": "更新目录失败",
+@@ -767,7 +922,7 @@
+         "none": "未选择会话",
+         "new": "新建 Agent 会话",
+         "switch": "切换会话",
+-        "selectPaneHint": "请在「终端」标签中选择一个 Pane 来开启会话",
++        "selectPaneHint": "选择一个会话",
+         "noSessions": "暂无会话",
+         "showAll": "显示全部会话",
+         "menu": "会话操作",
+@@ -783,6 +938,9 @@
+         "createDisabledNoPane": "请先打开一个终端 Pane 再创建会话",
+         "privacyNotice": "会话将把终端屏幕内容发送给配置的 LLM 服务。"
+       },
++      "node": {
++        "offlinePaused": "节点离线，会话已暂停"
++      },
+       "binding": {
+         "invalid": "已失效",
+         "mismatchTitle": "此会话绑定的 Pane 与当前终端不一致",
+@@ -978,6 +1136,7 @@
+       "title": "文件",
+       "refresh": "刷新文件列表",
+       "noRoots": "没有可访问的目录。请在「设置 → 文件」中添加。",
++      "nodeOffline": "节点离线",
+       "emptyDir": "空目录",
+       "truncated": "条目过多，列表已截断",
+       "download": "下载",
+@@ -1426,6 +1585,7 @@
+       },
+       "reach": {
+         "lan": "局域网",
++        "wan": "公网",
+         "relay": "经 Hub 中转",
+         "none": "不可达"
+       },
+@@ -1468,8 +1628,11 @@
+       },
+       "badge": {
+         "direct": "直连",
+-        "primary": "中转",
+-        "rttUnknown": "延迟未知",
++        "reachRow": "到达路径",
++        "transportRow": "承载",
++        "transportWs": "WebSocket",
++        "transportDc": "WebRTC",
++        "transportRelay": "Hub 中转",
+         "iceTitle": "连接详情",
+         "icePlaceholder": "直连未启用，暂无数据。",
+         "connectionState": "连接状态",

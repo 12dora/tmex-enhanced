@@ -1,0 +1,4159 @@
+diff --git a/apps/gateway/src/api/file-browser-routes.ts b/apps/gateway/src/api/file-browser-routes.ts
+index 323db1d0..8f151927 100644
+--- a/apps/gateway/src/api/file-browser-routes.ts
++++ b/apps/gateway/src/api/file-browser-routes.ts
+@@ -1,9 +1,20 @@
+ import { listDirectory, readRawFile, readTextFile, statFile } from '../files/device-storage';
++import { browseDirectory } from '../files/directory-browse';
+ import { t } from '../i18n';
+ import { codeError } from './file-http';
+ import { json } from './http';
+ import { type ApiRoute, route } from './route';
+ 
++async function handleBrowse(url: URL): Promise<Response> {
++  const deviceId = url.searchParams.get('deviceId');
++  if (!deviceId) return codeError('invalid');
++  const path = url.searchParams.get('path') ?? '';
++  const hidden = url.searchParams.get('hidden') === '1';
++  const result = await browseDirectory(deviceId, path, hidden);
++  if (!result.ok) return codeError(result.code, result.detail);
++  return json(result.data);
++}
++
+ async function handleList(url: URL): Promise<Response> {
+   const rootId = url.searchParams.get('rootId');
+   if (!rootId) return json({ error: t('apiError.invalidRequest') }, 400);
+@@ -51,6 +62,11 @@ async function handleRaw(url: URL): Promise<Response> {
+ }
+ 
+ export const fileBrowserRoutes: ApiRoute[] = [
++  route({
++    method: 'GET',
++    path: '/api/files/browse',
++    handler: (req) => handleBrowse(new URL(req.url)),
++  }),
+   route({ method: 'GET', path: '/api/files/list', handler: (req) => handleList(new URL(req.url)) }),
+   route({
+     method: 'GET',
+diff --git a/apps/gateway/src/api/index.ts b/apps/gateway/src/api/index.ts
+index 5bdab8a3..934f4e8b 100644
+--- a/apps/gateway/src/api/index.ts
++++ b/apps/gateway/src/api/index.ts
+@@ -20,6 +20,7 @@ import {
+   systemPrefixRoutes,
+   tmuxTreeRoutes,
+ } from './system-routes';
++import { tunnelRoutes } from './tunnel-routes';
+ import { watchRoutes } from './watch';
+ 
+ export type { SystemApiHandler };
+@@ -30,6 +31,7 @@ const apiRoutes: ApiRoute[] = [
+   ...deviceFolderRoutes,
+   ...tmuxTreeRoutes,
+   ...settingsRoutes,
++  ...tunnelRoutes,
+   ...telegramRoutes,
+   ...weixinRoutes,
+   ...llmRoutes,
+diff --git a/apps/gateway/src/api/tunnel-routes.ts b/apps/gateway/src/api/tunnel-routes.ts
+new file mode 100644
+index 00000000..cb980274
+--- /dev/null
++++ b/apps/gateway/src/api/tunnel-routes.ts
+@@ -0,0 +1,81 @@
++import type { TunnelActionRequest } from '@tmex/shared';
++import { TunnelError, tunnelErrorFrom, tunnelHttpStatus } from '../tunnel/errors';
++import { normalizeTunnelHostname } from '../tunnel/hostname';
++import { type TunnelManager, tunnelManager } from '../tunnel/manager';
++import { json, readJsonObjectBody } from './http';
++import { type ApiRoute, route } from './route';
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++function parseAction(body: Record<string, unknown>): TunnelActionRequest {
++  const action = body.action;
++  switch (action) {
++    case 'install':
++    case 'login':
++    case 'cancel_login':
++    case 'quick_start':
++    case 'start':
++    case 'stop':
++    case 'remove':
++    case 'check':
++      return { action };
++    case 'create': {
++      if (typeof body.hostname !== 'string') {
++        throw new TunnelError('invalid_request', 'hostname is required');
++      }
++      const hostname = normalizeTunnelHostname(body.hostname);
++      if (!hostname) {
++        throw new TunnelError('invalid_hostname', 'hostname is not a valid RFC 1123 name');
++      }
++      const tunnelName = typeof body.tunnelName === 'string' ? body.tunnelName : undefined;
++      return { action: 'create', hostname, ...(tunnelName !== undefined ? { tunnelName } : {}) };
++    }
++    case 'set_auto_start':
++      if (typeof body.autoStart !== 'boolean') {
++        throw new TunnelError('invalid_request', 'autoStart must be a boolean');
++      }
++      return { action: 'set_auto_start', autoStart: body.autoStart };
++    case 'set_trust_proxy':
++      if (typeof body.trustProxy !== 'boolean') {
++        throw new TunnelError('invalid_request', 'trustProxy must be a boolean');
++      }
++      return { action: 'set_trust_proxy', trustProxy: body.trustProxy };
++    default:
++      throw new TunnelError('invalid_request', 'unknown action');
++  }
++}
++
++export function createTunnelRoutes(manager: TunnelManager = tunnelManager): ApiRoute[] {
++  return [
++    route({
++      method: 'GET',
++      path: '/api/tunnel/status',
++      handler: () => json(manager.status()),
++    }),
++    route({
++      method: 'POST',
++      path: '/api/tunnel/actions',
++      handler: async (req) => {
++        const raw = await readJsonObjectBody(req);
++        if (!raw || !isRecord(raw)) {
++          const error = tunnelErrorFrom(
++            new TunnelError('invalid_request', 'request body must be a JSON object')
++          );
++          return json({ error }, tunnelHttpStatus(error.code));
++        }
++        try {
++          const parsed = parseAction(raw);
++          const result = await manager.handleAction(parsed);
++          return json(result.payload, result.httpStatus);
++        } catch (error) {
++          const parsed = tunnelErrorFrom(error);
++          return json({ error: parsed }, tunnelHttpStatus(parsed.code));
++        }
++      },
++    }),
++  ];
++}
++
++export const tunnelRoutes = createTunnelRoutes();
+diff --git a/apps/gateway/src/config.ts b/apps/gateway/src/config.ts
+index 06dcda51..900ec414 100644
+--- a/apps/gateway/src/config.ts
++++ b/apps/gateway/src/config.ts
+@@ -1,4 +1,5 @@
+-import { posix, win32 } from 'node:path';
++import { tmpdir } from 'node:os';
++import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
+ 
+ declare const TMEX_MANAGED_BUILD: boolean | undefined;
+ 
+@@ -130,6 +131,18 @@ function getOptionalEnv(key: string): string | null {
+   return value ? value : null;
+ }
+ 
++/** cloudflared 数据目录：显式 `TMEX_TUNNEL_DIR`，否则 sqlite 旁的 `tunnel/`。 */
++export function resolveTunnelDir(env: NodeJS.ProcessEnv = process.env): string {
++  const explicit = env.TMEX_TUNNEL_DIR?.trim();
++  if (explicit) return explicit;
++  const dbUrl = (env.DATABASE_URL ?? './tmex.db').trim();
++  if (dbUrl === ':memory:' || dbUrl.startsWith('file::memory:')) {
++    return join(tmpdir(), 'tmex-tunnel');
++  }
++  const dbPath = isAbsolute(dbUrl) ? dbUrl : resolve(dbUrl);
++  return join(dirname(dbPath), 'tunnel');
++}
++
+ export const config = {
+   // 核心安全配置（生产环境建议配置，用于加密敏感字段）
+   masterKey: process.env.TMEX_MASTER_KEY,
+@@ -142,6 +155,7 @@ export const config = {
+ 
+   // 数据库
+   databaseUrl: getEnv('DATABASE_URL', './tmex.db'),
++  tunnelDir: resolveTunnelDir(),
+ 
+   // 文件传输（上传/下载）单文件字节上限，默认 2GB；后端校验 + 前端上传前预校验共用
+   transferMaxBytes: Number.parseInt(getEnv('TMEX_TRANSFER_MAX_BYTES', '2147483648'), 10),
+diff --git a/apps/gateway/src/files/directory-browse.test.ts b/apps/gateway/src/files/directory-browse.test.ts
+new file mode 100644
+index 00000000..1183622a
+--- /dev/null
++++ b/apps/gateway/src/files/directory-browse.test.ts
+@@ -0,0 +1,377 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
++import { homedir, tmpdir } from 'node:os';
++import path from 'node:path';
++import type { BrowseDirectoryResponse, Device } from '@tmex/shared';
++import { type DirectoryBrowseDeps, type SshExecResult, browseDirectory } from './directory-browse';
++import type { RsyncDeviceSpec } from './ssh-command';
++
++const posix = path.posix;
++
++function localDevice(id = 'browse-local'): Device {
++  return {
++    id,
++    name: 'local',
++    type: 'local',
++    authMode: 'auto',
++    sortOrder: 0,
++    createdAt: '',
++    updatedAt: '',
++  };
++}
++
++function sshDevice(id = 'browse-ssh'): Device {
++  return {
++    id,
++    name: 'ssh',
++    type: 'ssh',
++    host: 'h',
++    port: 22,
++    username: 'u',
++    authMode: 'key',
++    sortOrder: 0,
++    createdAt: '',
++    updatedAt: '',
++  };
++}
++
++const fakeSpec: RsyncDeviceSpec = {
++  targetPrefix: 'u@h:',
++  rsh: 'ssh -p 22',
++  env: {},
++  cleanup: () => {},
++};
++
++function depsFor(device: Device, extra: Partial<DirectoryBrowseDeps> = {}): DirectoryBrowseDeps {
++  return {
++    getDevice: (id) => (id === device.id ? device : null),
++    enqueue: async (_deviceId, job) => job(),
++    buildSpec: async () => fakeSpec,
++    execSsh: async () => {
++      throw new Error('execSsh should not be called');
++    },
++    ...extra,
++  };
++}
++
++function expectOk(result: Awaited<ReturnType<typeof browseDirectory>>): BrowseDirectoryResponse {
++  expect(result.ok).toBe(true);
++  if (!result.ok) throw new Error('expected ok');
++  return result.data;
++}
++
++let sandbox: string | null = null;
++
++function makeSandbox(): string {
++  sandbox = mkdtempSync(path.join(tmpdir(), 'tmex-browse-'));
++  return sandbox;
++}
++
++afterEach(() => {
++  if (sandbox) {
++    rmSync(sandbox, { recursive: true, force: true });
++    sandbox = null;
++  }
++});
++
++describe('browseDirectory — local', () => {
++  test('lists directories, excludes files, flags symlink-to-dir, filters hidden', async () => {
++    const root = makeSandbox();
++    mkdirSync(path.join(root, 'Visible'));
++    mkdirSync(path.join(root, 'alpha'));
++    mkdirSync(path.join(root, '.secret'));
++    writeFileSync(path.join(root, 'file.txt'), 'x');
++    mkdirSync(path.join(root, 'real-dir'));
++    symlinkSync(path.join(root, 'real-dir'), path.join(root, 'link-dir'));
++    symlinkSync(path.join(root, 'file.txt'), path.join(root, 'link-file'));
++
++    const shown = expectOk(
++      await browseDirectory(localDevice().id, root, false, depsFor(localDevice()))
++    );
++    expect(shown.path).toBe(posix.resolve(root));
++    expect(shown.parent).toBe(posix.dirname(posix.resolve(root)));
++    expect(shown.truncated).toBe(false);
++    expect(shown.entries.map((e) => e.name)).toEqual(['alpha', 'link-dir', 'real-dir', 'Visible']);
++    const link = shown.entries.find((e) => e.name === 'link-dir');
++    expect(link).toEqual({
++      name: 'link-dir',
++      path: posix.join(posix.resolve(root), 'link-dir'),
++      hidden: false,
++      symlink: true,
++    });
++    expect(shown.entries.find((e) => e.name === 'real-dir')?.symlink).toBe(false);
++    expect(shown.entries.some((e) => e.name === '.secret' || e.name === 'file.txt')).toBe(false);
++
++    const withHidden = expectOk(
++      await browseDirectory(localDevice().id, root, true, depsFor(localDevice()))
++    );
++    expect(withHidden.entries.map((e) => e.name)).toEqual([
++      '.secret',
++      'alpha',
++      'link-dir',
++      'real-dir',
++      'Visible',
++    ]);
++    expect(withHidden.entries.find((e) => e.name === '.secret')).toEqual({
++      name: '.secret',
++      path: posix.join(posix.resolve(root), '.secret'),
++      hidden: true,
++      symlink: false,
++    });
++  });
++
++  test('skips entries that cannot be stat-ed (broken symlink)', async () => {
++    const root = makeSandbox();
++    mkdirSync(path.join(root, 'ok'));
++    symlinkSync(path.join(root, 'missing-target'), path.join(root, 'broken'));
++
++    const shown = expectOk(
++      await browseDirectory(localDevice().id, root, false, depsFor(localDevice()))
++    );
++    expect(shown.entries.map((e) => e.name)).toEqual(['ok']);
++  });
++
++  test('caps at 2000 entries and sets truncated', async () => {
++    const root = makeSandbox();
++    for (let i = 0; i < 2001; i++) {
++      mkdirSync(path.join(root, `d${String(i).padStart(4, '0')}`));
++    }
++    const shown = expectOk(
++      await browseDirectory(localDevice().id, root, false, depsFor(localDevice()))
++    );
++    expect(shown.entries).toHaveLength(2000);
++    expect(shown.truncated).toBe(true);
++  });
++
++  test('returns not_a_directory for a file path', async () => {
++    const root = makeSandbox();
++    const file = path.join(root, 'a.txt');
++    writeFileSync(file, 'x');
++    const result = await browseDirectory(localDevice().id, file, false, depsFor(localDevice()));
++    expect(result).toEqual({ ok: false, code: 'not_a_directory' });
++  });
++
++  test('returns not_found for a missing path', async () => {
++    const root = makeSandbox();
++    const result = await browseDirectory(
++      localDevice().id,
++      path.join(root, 'nope'),
++      false,
++      depsFor(localDevice())
++    );
++    expect(result).toEqual({ ok: false, code: 'not_found' });
++  });
++
++  test('returns permission_denied when the directory cannot be listed', async () => {
++    const root = makeSandbox();
++    const locked = path.join(root, 'locked');
++    mkdirSync(locked);
++    chmodSync(locked, 0);
++    try {
++      const result = await browseDirectory(localDevice().id, locked, false, depsFor(localDevice()));
++      expect(result).toEqual({ ok: false, code: 'permission_denied' });
++    } finally {
++      chmodSync(locked, 0o755);
++    }
++  });
++
++  test('empty path starts at os.homedir()', async () => {
++    const shown = expectOk(
++      await browseDirectory(localDevice().id, '', false, depsFor(localDevice()))
++    );
++    expect(shown.path).toBe(posix.resolve(homedir()));
++  });
++
++  test('rejects relative path and tilde', async () => {
++    const deps = depsFor(localDevice());
++    expect(await browseDirectory(localDevice().id, 'rel', false, deps)).toEqual({
++      ok: false,
++      code: 'invalid',
++    });
++    expect(await browseDirectory(localDevice().id, '~/code', false, deps)).toEqual({
++      ok: false,
++      code: 'invalid',
++    });
++  });
++
++  test('parent is null at filesystem root', async () => {
++    const shown = expectOk(
++      await browseDirectory(localDevice().id, '/', false, depsFor(localDevice()))
++    );
++    expect(shown.path).toBe('/');
++    expect(shown.parent).toBeNull();
++  });
++
++  test('unknown device → device_not_found', async () => {
++    const result = await browseDirectory('missing', '/tmp', false, depsFor(localDevice()));
++    expect(result).toEqual({ ok: false, code: 'device_not_found' });
++  });
++});
++
++function encodeSshListing(
++  resolvedPath: string,
++  entries: Array<{ type: 'd' | 'l'; name: string }>
++): Uint8Array {
++  const chunks: string[] = [`P${resolvedPath}`];
++  for (const entry of entries) {
++    chunks.push(entry.type, entry.name);
++  }
++  return new TextEncoder().encode(`${chunks.join('\0')}\0`);
++}
++
++describe('browseDirectory — SSH', () => {
++  test('parses find output, flags symlink dirs, filters hidden, sorts case-insensitively', async () => {
++    let seenCommand = '';
++    const execSsh = async (_spec: RsyncDeviceSpec, command: string): Promise<SshExecResult> => {
++      seenCommand = command;
++      return {
++        stdout: encodeSshListing('/home/u/My Docs', [
++          { type: 'd', name: 'Zebra' },
++          { type: 'l', name: 'link-dir' },
++          { type: 'd', name: '.cache' },
++          { type: 'd', name: 'alpha' },
++        ]),
++        stderr: '',
++        exitCode: 0,
++      };
++    };
++
++    const shown = expectOk(
++      await browseDirectory(
++        sshDevice().id,
++        '/home/u/My Docs',
++        false,
++        depsFor(sshDevice(), { execSsh })
++      )
++    );
++    expect(seenCommand).toContain('find ');
++    expect(seenCommand).toContain('-maxdepth 1');
++    expect(seenCommand).toContain('-type l');
++    expect(seenCommand).toContain("'/home/u/My Docs'");
++    expect(shown.path).toBe('/home/u/My Docs');
++    expect(shown.parent).toBe('/home/u');
++    expect(shown.entries.map((e) => e.name)).toEqual(['alpha', 'link-dir', 'Zebra']);
++    expect(shown.entries.find((e) => e.name === 'link-dir')?.symlink).toBe(true);
++    expect(shown.entries.find((e) => e.name === 'alpha')?.symlink).toBe(false);
++    expect(shown.entries.some((e) => e.name === '.cache')).toBe(false);
++
++    const withHidden = expectOk(
++      await browseDirectory(
++        sshDevice().id,
++        '/home/u/My Docs',
++        true,
++        depsFor(sshDevice(), { execSsh })
++      )
++    );
++    expect(withHidden.entries.map((e) => e.name)).toEqual(['.cache', 'alpha', 'link-dir', 'Zebra']);
++  });
++
++  test('quotes unicode and spaces in a single remote command', async () => {
++    let seenCommand = '';
++    const execSsh = async (_spec: RsyncDeviceSpec, command: string): Promise<SshExecResult> => {
++      seenCommand = command;
++      return {
++        stdout: encodeSshListing('/tmp/文档 夹', [{ type: 'd', name: '子目录' }]),
++        stderr: '',
++        exitCode: 0,
++      };
++    };
++    const shown = expectOk(
++      await browseDirectory(
++        sshDevice().id,
++        '/tmp/文档 夹',
++        false,
++        depsFor(sshDevice(), { execSsh })
++      )
++    );
++    expect(seenCommand).toContain("'/tmp/文档 夹'");
++    expect(shown.entries).toEqual([
++      {
++        name: '子目录',
++        path: '/tmp/文档 夹/子目录',
++        hidden: false,
++        symlink: false,
++      },
++    ]);
++  });
++
++  test('empty path uses $HOME via the remote script and falls back to /', async () => {
++    let seenCommand = '';
++    const execSsh = async (_spec: RsyncDeviceSpec, command: string): Promise<SshExecResult> => {
++      seenCommand = command;
++      return {
++        stdout: encodeSshListing('/home/u', [{ type: 'd', name: 'proj' }]),
++        stderr: '',
++        exitCode: 0,
++      };
++    };
++    const shown = expectOk(
++      await browseDirectory(sshDevice().id, '', false, depsFor(sshDevice(), { execSsh }))
++    );
++    expect(seenCommand).toContain('${HOME:-/}');
++    expect(shown.path).toBe('/home/u');
++    expect(shown.parent).toBe('/home');
++    expect(shown.entries.map((e) => e.name)).toEqual(['proj']);
++  });
++
++  test('parent is null when remote path is /', async () => {
++    const execSsh = async (): Promise<SshExecResult> => ({
++      stdout: encodeSshListing('/', [{ type: 'd', name: 'etc' }]),
++      stderr: '',
++      exitCode: 0,
++    });
++    const shown = expectOk(
++      await browseDirectory(sshDevice().id, '/', false, depsFor(sshDevice(), { execSsh }))
++    );
++    expect(shown.parent).toBeNull();
++  });
++
++  test('maps remote errors and timeout', async () => {
++    const device = sshDevice();
++    const run = (execSsh: DirectoryBrowseDeps['execSsh']) =>
++      browseDirectory(device.id, '/x', false, depsFor(device, { execSsh }));
++
++    async function expectCode(
++      execSsh: DirectoryBrowseDeps['execSsh'],
++      code: 'not_found' | 'not_a_directory' | 'permission_denied' | 'connection_failed' | 'timeout'
++    ) {
++      const result = await run(execSsh);
++      expect(result.ok).toBe(false);
++      if (result.ok) throw new Error('expected failure');
++      expect(result.code).toBe(code);
++    }
++
++    await expectCode(
++      async () => ({ stdout: new Uint8Array(), stderr: 'not_found', exitCode: 2 }),
++      'not_found'
++    );
++    await expectCode(
++      async () => ({ stdout: new Uint8Array(), stderr: 'not_a_directory', exitCode: 20 }),
++      'not_a_directory'
++    );
++    await expectCode(
++      async () => ({
++        stdout: new Uint8Array(),
++        stderr: 'find: ‘/x’: Permission denied',
++        exitCode: 1,
++      }),
++      'permission_denied'
++    );
++    await expectCode(
++      async () => ({
++        stdout: new Uint8Array(),
++        stderr: 'ssh: connect to host h port 22: Connection refused',
++        exitCode: 255,
++      }),
++      'connection_failed'
++    );
++    await expectCode(
++      async () => ({
++        stdout: new Uint8Array(),
++        stderr: '[tmex] ssh timed out',
++        exitCode: 124,
++      }),
++      'timeout'
++    );
++  });
++});
+diff --git a/apps/gateway/src/files/directory-browse.ts b/apps/gateway/src/files/directory-browse.ts
+new file mode 100644
+index 00000000..897e25ee
+--- /dev/null
++++ b/apps/gateway/src/files/directory-browse.ts
+@@ -0,0 +1,291 @@
++import type { Dirent } from 'node:fs';
++import { readdir, stat } from 'node:fs/promises';
++import { homedir } from 'node:os';
++import path from 'node:path';
++import type { BrowseDirectoryEntryDto, BrowseDirectoryResponse, Device } from '@tmex/shared';
++import { getDeviceById } from '../db';
++import { quoteShellArg } from '../tmux-client/command-builder';
++import { MAX_ENTRIES } from './categorize';
++import { classifyRsyncFailure } from './rsync';
++import {
++  type DeviceRsyncHooks,
++  type FileOpResult,
++  fail,
++  ok,
++  withDeviceRsync,
++} from './rsync-operation';
++import type { RsyncDeviceSpec } from './ssh-command';
++
++const posix = path.posix;
++const BROWSE_TIMEOUT_MS = 20_000;
++
++export type SshExecResult = {
++  stdout: Uint8Array;
++  stderr: string;
++  exitCode: number;
++};
++
++export type DirectoryBrowseDeps = {
++  getDevice?: (id: string) => Device | null;
++  enqueue?: DeviceRsyncHooks['enqueue'];
++  buildSpec?: DeviceRsyncHooks['buildSpec'];
++  execSsh?: (spec: RsyncDeviceSpec, command: string, timeoutMs?: number) => Promise<SshExecResult>;
++};
++
++function parentOf(absPath: string): string | null {
++  if (absPath === '/') return null;
++  return posix.dirname(absPath);
++}
++
++function isHiddenName(name: string): boolean {
++  return name.startsWith('.');
++}
++
++function sortBrowseEntries(entries: BrowseDirectoryEntryDto[]): void {
++  entries.sort((a, b) =>
++    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
++  );
++}
++
++function capEntries(entries: BrowseDirectoryEntryDto[]): {
++  entries: BrowseDirectoryEntryDto[];
++  truncated: boolean;
++} {
++  const truncated = entries.length > MAX_ENTRIES;
++  return { entries: truncated ? entries.slice(0, MAX_ENTRIES) : entries, truncated };
++}
++
++function mapNodeFsError(err: unknown): FileOpResult<never> {
++  const code =
++    err && typeof err === 'object' && 'code' in err ? String((err as { code: unknown }).code) : '';
++  if (code === 'ENOENT') return fail('not_found');
++  if (code === 'ENOTDIR') return fail('not_a_directory');
++  if (code === 'EACCES' || code === 'EPERM') return fail('permission_denied');
++  if (code === 'ETIMEDOUT') return fail('timeout');
++  return fail('unknown');
++}
++
++function normalizeRequestedPath(raw: string): FileOpResult<string | null> {
++  const trimmed = raw.trim();
++  if (trimmed === '') return ok(null);
++  if (trimmed.startsWith('~') || !trimmed.startsWith('/')) return fail('invalid');
++  return ok(posix.resolve(trimmed));
++}
++
++function toResponse(absPath: string, entries: BrowseDirectoryEntryDto[]): BrowseDirectoryResponse {
++  sortBrowseEntries(entries);
++  const capped = capEntries(entries);
++  return {
++    path: absPath,
++    parent: parentOf(absPath),
++    entries: capped.entries,
++    truncated: capped.truncated,
++  };
++}
++
++async function browseLocal(
++  absPath: string,
++  includeHidden: boolean
++): Promise<FileOpResult<BrowseDirectoryResponse>> {
++  let st: Awaited<ReturnType<typeof stat>>;
++  try {
++    st = await stat(absPath);
++  } catch (err) {
++    return mapNodeFsError(err);
++  }
++  if (!st.isDirectory()) return fail('not_a_directory');
++
++  let dirents: Dirent[];
++  try {
++    dirents = await readdir(absPath, { withFileTypes: true });
++  } catch (err) {
++    return mapNodeFsError(err);
++  }
++
++  const entries: BrowseDirectoryEntryDto[] = [];
++  for (const dirent of dirents) {
++    const name = dirent.name;
++    if (name === '.' || name === '..') continue;
++    const hidden = isHiddenName(name);
++    if (hidden && !includeHidden) continue;
++    const childPath = posix.join(absPath, name);
++    try {
++      let symlink = dirent.isSymbolicLink();
++      let isDir = dirent.isDirectory();
++      if (symlink || (!isDir && !dirent.isFile())) {
++        const followed = await stat(childPath);
++        isDir = followed.isDirectory();
++        if (!symlink) symlink = dirent.isSymbolicLink();
++      }
++      if (!isDir) continue;
++      entries.push({ name, path: childPath, hidden, symlink });
++    } catch {
++      // 无法 stat 的条目跳过（含悬空符号链接）
++    }
++  }
++  return ok(toResponse(absPath, entries));
++}
++
++// 远端 stdout：P<resolved>\0 后跟成对的 <d|l>\0<basename>\0（find -printf '%y\\0%f\\0'）
++function parseSshListing(stdout: Uint8Array): {
++  path: string;
++  items: Array<{ type: 'd' | 'l'; name: string }>;
++} | null {
++  const text = new TextDecoder().decode(stdout);
++  const tokens = text.split('\0');
++  if (tokens.length > 0 && tokens[tokens.length - 1] === '') tokens.pop();
++  if (tokens.length === 0) return null;
++  const header = tokens[0];
++  if (!header.startsWith('P')) return null;
++  const resolved = posix.resolve(header.slice(1));
++  if (!resolved.startsWith('/')) return null;
++  const items: Array<{ type: 'd' | 'l'; name: string }> = [];
++  for (let i = 1; i + 1 < tokens.length; i += 2) {
++    const type = tokens[i];
++    const name = posix.basename(tokens[i + 1] ?? '');
++    if ((type !== 'd' && type !== 'l') || !name || name === '.' || name === '..') continue;
++    items.push({ type, name });
++  }
++  return { path: resolved, items };
++}
++
++function classifyBrowseSsh(exitCode: number, stderr: string): ReturnType<typeof fail> {
++  const trimmed = stderr.trim();
++  if (exitCode === 2 || trimmed === 'not_found') return fail('not_found');
++  if (exitCode === 20 || trimmed === 'not_a_directory') return fail('not_a_directory');
++  return fail(classifyRsyncFailure(exitCode, stderr), stderr);
++}
++
++export function buildSshBrowseCommand(absPath: string | null): string {
++  const assign = absPath === null ? 'target="${HOME:-/}"' : `target=${quoteShellArg(absPath)}`;
++  return [
++    assign,
++    'if [ ! -e "$target" ]; then echo not_found >&2; exit 2; fi',
++    'if [ ! -d "$target" ]; then echo not_a_directory >&2; exit 20; fi',
++    'printf \'P%s\\0\' "$target"',
++    'find "$target" -maxdepth 1 -mindepth 1 \\( -type d -o \\( -type l -xtype d \\) \\) -printf \'%y\\0%f\\0\'',
++  ].join('; ');
++}
++
++export async function execSshCommand(
++  spec: RsyncDeviceSpec,
++  command: string,
++  timeoutMs = BROWSE_TIMEOUT_MS
++): Promise<SshExecResult> {
++  if (!spec.rsh) {
++    return { stdout: new Uint8Array(), stderr: 'not an ssh device', exitCode: 255 };
++  }
++  const dest = spec.targetPrefix.replace(/:$/, '');
++  const argv = [...spec.rsh.split(' '), dest, command];
++  const env: Record<string, string> = {};
++  for (const [key, value] of Object.entries(process.env)) {
++    if (value !== undefined) env[key] = value;
++  }
++  Object.assign(env, spec.env);
++
++  let proc: ReturnType<typeof Bun.spawn>;
++  try {
++    proc = Bun.spawn(argv, {
++      env,
++      stdout: 'pipe',
++      stderr: 'pipe',
++      stdin: 'ignore',
++    });
++  } catch (err) {
++    return {
++      stdout: new Uint8Array(),
++      stderr: err instanceof Error ? err.message : String(err),
++      exitCode: 255,
++    };
++  }
++
++  let timedOut = false;
++  const killProc = () => {
++    try {
++      proc.kill();
++    } catch {
++      // 已退出
++    }
++  };
++  const timer = setTimeout(() => {
++    timedOut = true;
++    killProc();
++  }, timeoutMs);
++
++  try {
++    const [stdoutBuf, stderr, exitCode] = await Promise.all([
++      new Response(proc.stdout as ReadableStream<Uint8Array>).arrayBuffer(),
++      new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
++      proc.exited,
++    ]);
++    if (timedOut) {
++      return {
++        stdout: new Uint8Array(stdoutBuf),
++        stderr: `${stderr}\n[tmex] ssh timed out`,
++        exitCode: 124,
++      };
++    }
++    return { stdout: new Uint8Array(stdoutBuf), stderr, exitCode };
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++export const directoryBrowseIo = {
++  execSsh: execSshCommand,
++};
++
++async function browseSsh(
++  spec: RsyncDeviceSpec,
++  absPath: string | null,
++  includeHidden: boolean,
++  execSsh: NonNullable<DirectoryBrowseDeps['execSsh']>
++): Promise<FileOpResult<BrowseDirectoryResponse>> {
++  const res = await execSsh(spec, buildSshBrowseCommand(absPath), BROWSE_TIMEOUT_MS);
++  if (res.exitCode !== 0) return classifyBrowseSsh(res.exitCode, res.stderr);
++
++  const parsed = parseSshListing(res.stdout);
++  if (!parsed) return fail('unknown', res.stderr);
++
++  const entries: BrowseDirectoryEntryDto[] = [];
++  for (const item of parsed.items) {
++    const hidden = isHiddenName(item.name);
++    if (hidden && !includeHidden) continue;
++    entries.push({
++      name: item.name,
++      path: posix.join(parsed.path, item.name),
++      hidden,
++      symlink: item.type === 'l',
++    });
++  }
++  return ok(toResponse(parsed.path, entries));
++}
++
++export async function browseDirectory(
++  deviceId: string,
++  inputPath: string,
++  includeHidden: boolean,
++  deps: DirectoryBrowseDeps = {}
++): Promise<FileOpResult<BrowseDirectoryResponse>> {
++  const getDevice = deps.getDevice ?? getDeviceById;
++  const device = getDevice(deviceId);
++  if (!device) return fail('device_not_found');
++
++  const normalized = normalizeRequestedPath(inputPath);
++  if (!normalized.ok) return normalized;
++
++  if (device.type === 'local') {
++    const absPath = normalized.data ?? posix.resolve(homedir());
++    return browseLocal(absPath, includeHidden);
++  }
++
++  return withDeviceRsync(
++    device,
++    (spec) =>
++      browseSsh(spec, normalized.data, includeHidden, deps.execSsh ?? directoryBrowseIo.execSsh),
++    {
++      enqueue: deps.enqueue,
++      buildSpec: deps.buildSpec,
++    }
++  );
++}
+diff --git a/apps/gateway/src/mesh/address-class.ts b/apps/gateway/src/mesh/address-class.ts
+new file mode 100644
+index 00000000..8e7f5fe3
+--- /dev/null
++++ b/apps/gateway/src/mesh/address-class.ts
+@@ -0,0 +1,150 @@
++import type { PeerReach, PeerTransportKind } from './types';
++
++export const RTT_MATERIAL_ABS_MS = 10;
++export const RTT_MATERIAL_REL = 0.2;
++export const RTT_EVENT_MIN_INTERVAL_MS = 10_000;
++
++export type AddressClass = 'lan' | 'wan';
++
++/** 有实测 peer 路径即为可达；`wan` 与 `lan` 同等视为在线。 */
++export function isPeerReachable(reach: PeerReach | undefined): boolean {
++  return reach === 'lan' || reach === 'wan' || reach === 'relay';
++}
++
++export function rttChangedMaterially(
++  prev: number | null | undefined,
++  next: number | null | undefined
++): boolean {
++  if (prev == null && next == null) return false;
++  if (prev == null || next == null) return true;
++  const delta = Math.abs(next - prev);
++  if (delta >= RTT_MATERIAL_ABS_MS) return true;
++  if (prev === 0) return delta > 0;
++  return delta / Math.abs(prev) >= RTT_MATERIAL_REL;
++}
++
++export function classifyPeerReach(
++  transport: PeerTransportKind | null | undefined,
++  remoteAddress: string | null | undefined
++): PeerReach {
++  if (transport == null) return null;
++  if (transport === 'relay') return 'relay';
++  return classifyRemoteAddress(remoteAddress);
++}
++
++/**
++ * 对端地址分类：无地址证据一律 `wan`，避免把公网链路标成局域网。
++ * 私网：loopback、RFC1918、链路本地、IPv6 ULA，以及它们的 IPv4-mapped 形式。
++ */
++export function classifyRemoteAddress(raw: string | null | undefined): AddressClass {
++  const host = normalizeHost(raw);
++  if (!host) return 'wan';
++  if (host === 'localhost') return 'lan';
++  const mapped = unwrapIpv4Mapped(host);
++  if (mapped && isLanIpv4(mapped)) return 'lan';
++  if (isLanIpv4(host) || isLanIpv6(host)) return 'lan';
++  return 'wan';
++}
++
++export function hostFromWsUrl(url: string): string | null {
++  try {
++    const parsed = new URL(url);
++    return normalizeHost(parsed.hostname);
++  } catch {
++    return null;
++  }
++}
++
++/** 从 ICE candidate 行取出远端 IP（`candidate:… <ip> <port> typ …`）。 */
++export function addressFromIceCandidate(candidate: string | null | undefined): string | null {
++  if (!candidate) return null;
++  const match = candidate.match(
++    /(?:^|\s)(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]+(?:%[0-9a-z._-]+)?)\s+\d+\s+typ\s+/i
++  );
++  return match?.[1] ?? null;
++}
++
++function normalizeHost(raw: string | null | undefined): string | null {
++  if (raw == null) return null;
++  let host = raw.trim();
++  if (!host || host === 'unknown') return null;
++  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
++  const zone = host.indexOf('%');
++  if (zone >= 0) host = host.slice(0, zone);
++  host = host.toLowerCase();
++  return host || null;
++}
++
++function unwrapIpv4Mapped(host: string): string | null {
++  const dotted = host.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
++  if (dotted) return dotted[1];
++  const hex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
++  if (!hex) return null;
++  const hi = Number.parseInt(hex[1] ?? '', 16);
++  const lo = Number.parseInt(hex[2] ?? '', 16);
++  if (!Number.isFinite(hi) || !Number.isFinite(lo)) return null;
++  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
++}
++
++function isLanIpv4(host: string): boolean {
++  const o = parseIpv4(host);
++  if (!o) return false;
++  const a = o[0] ?? 0;
++  const b = o[1] ?? 0;
++  if (a === 127) return true;
++  if (a === 10) return true;
++  if (a === 192 && b === 168) return true;
++  if (a === 172 && b >= 16 && b <= 31) return true;
++  if (a === 169 && b === 254) return true;
++  return false;
++}
++
++function isLanIpv6(host: string): boolean {
++  const w = parseIpv6(host);
++  if (!w) return false;
++  const w0 = w[0] ?? 0;
++  const isLoopback = w.slice(0, 7).every((x) => x === 0) && (w[7] ?? 0) === 1;
++  if (isLoopback) return true;
++  if ((w0 & 0xffc0) === 0xfe80) return true;
++  if ((w0 & 0xfe00) === 0xfc00) return true;
++  return false;
++}
++
++function parseIpv4(host: string): [number, number, number, number] | null {
++  const parts = host.split('.');
++  if (parts.length !== 4) return null;
++  const o: number[] = [];
++  for (const p of parts) {
++    if (!/^\d{1,3}$/.test(p)) return null;
++    const n = Number(p);
++    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
++    o.push(n);
++  }
++  return o as [number, number, number, number];
++}
++
++function parseIpv6(host: string): number[] | null {
++  if (host.includes('.')) return null;
++  const compressed = host.split('::');
++  if (compressed.length > 2) return null;
++  const parseGroup = (group: string): number[] | null => {
++    if (!group) return [];
++    const parts = group.split(':');
++    const words: number[] = [];
++    for (const p of parts) {
++      if (!/^[0-9a-f]{1,4}$/i.test(p)) return null;
++      words.push(Number.parseInt(p, 16));
++    }
++    return words;
++  };
++  if (compressed.length === 1) {
++    const words = parseGroup(compressed[0] ?? '');
++    return words && words.length === 8 ? words : null;
++  }
++  const left = parseGroup(compressed[0] ?? '');
++  const right = parseGroup(compressed[1] ?? '');
++  if (!left || !right) return null;
++  const missing = 8 - left.length - right.length;
++  if (missing < 0) return null;
++  return [...left, ...Array(missing).fill(0), ...right];
++}
+diff --git a/apps/gateway/src/mesh/mesh-deps.ts b/apps/gateway/src/mesh/mesh-deps.ts
+index 5eb1ed78..34ba5a4b 100644
+--- a/apps/gateway/src/mesh/mesh-deps.ts
++++ b/apps/gateway/src/mesh/mesh-deps.ts
+@@ -58,7 +58,7 @@ export type HubTlsInfo = {
+ 
+ export type HubTlsInfoProvider = () => HubTlsInfo | Promise<HubTlsInfo>;
+ 
+-export type PeerReachKind = 'lan' | 'relay' | null;
++export type PeerReachKind = 'lan' | 'wan' | 'relay' | null;
+ 
+ export type PeerTransportKind = 'ws-secure' | 'relay' | 'dc';
+ 
+@@ -68,6 +68,8 @@ export type NodeEventPayload = {
+   nodeId: string;
+   status: NodeEventStatus;
+   reach?: PeerReachKind;
++  transport?: PeerTransportKind | null;
++  rttMs?: number | null;
+   inventory?: string | null;
+   version?: string | null;
+   direct_capable?: boolean;
+@@ -79,6 +81,7 @@ export type PeerLinkProvider = {
+   listReach(): Map<string, PeerReachKind>;
+   listHubOnline?(): ReadonlySet<string>;
+   transportOf?(nodeId: string): PeerTransportKind | null;
++  rttOf?(nodeId: string): number | null;
+   onNodeEvent(cb: (event: NodeEventPayload) => void): () => void;
+ };
+ 
+diff --git a/apps/gateway/src/mesh/mesh-routes.ts b/apps/gateway/src/mesh/mesh-routes.ts
+index 64766ff1..859cad80 100644
+--- a/apps/gateway/src/mesh/mesh-routes.ts
++++ b/apps/gateway/src/mesh/mesh-routes.ts
+@@ -222,7 +222,8 @@ export class MeshRoutes {
+           selfName,
+           self,
+           hubNodeId,
+-          (nid) => this.deps.peers.transportOf?.(nid) ?? null
++          (nid) => this.deps.peers.transportOf?.(nid) ?? null,
++          (nid) => this.deps.peers.rttOf?.(nid) ?? null
+         )
+       )
+       .filter((n) => n != null);
+@@ -296,7 +297,9 @@ export class MeshRoutes {
+   private broadcastNodeEvent(event: {
+     nodeId: string;
+     status: string;
+-    reach?: 'lan' | 'relay' | null;
++    reach?: 'lan' | 'wan' | 'relay' | null;
++    transport?: 'ws-secure' | 'relay' | 'dc' | null;
++    rttMs?: number | null;
+     inventory?: string | null;
+     version?: string | null;
+     direct_capable?: boolean;
+@@ -310,6 +313,8 @@ export class MeshRoutes {
+       version: event.version ?? null,
+       directCapable: event.direct_capable ?? null,
+       name: event.name ?? null,
++      transport: event.transport ?? null,
++      rttMs: event.rttMs ?? null,
+     });
+     const frame = wsBorsh.encodeEnvelope(wsBorsh.KIND_NODE_EVENT, payload, ++this.seq);
+     this.broadcast(frame);
+diff --git a/apps/gateway/src/mesh/node-event-dedupe.ts b/apps/gateway/src/mesh/node-event-dedupe.ts
+index 0797e4d2..ef24f40c 100644
+--- a/apps/gateway/src/mesh/node-event-dedupe.ts
++++ b/apps/gateway/src/mesh/node-event-dedupe.ts
+@@ -22,6 +22,8 @@ export class NodeEventDedupe {
+     return JSON.stringify({
+       status: event.status,
+       reach: event.reach ?? null,
++      transport: event.transport ?? null,
++      rttMs: event.rttMs ?? null,
+       inventory: event.inventory ?? null,
+       version: event.version ?? null,
+       direct_capable: event.direct_capable ?? false,
+diff --git a/apps/gateway/src/mesh/node-list-projection.ts b/apps/gateway/src/mesh/node-list-projection.ts
+index ee21310a..bb5b37bb 100644
+--- a/apps/gateway/src/mesh/node-list-projection.ts
++++ b/apps/gateway/src/mesh/node-list-projection.ts
+@@ -1,5 +1,6 @@
+ import { decodeCertificate, encodeBase64url } from '@tmex/shared/auth';
+ import { nodeSessionCookieName } from '../auth/cookies';
++import { isPeerReachable } from './address-class';
+ import { MESH_VIA_SELF } from './mesh-deps';
+ 
+ type Meta = {
+@@ -14,8 +15,9 @@ export type MeshNodeDto = {
+   name: string;
+   publicKey: string;
+   online: boolean;
+-  reach: 'lan' | 'relay' | null;
++  reach: 'lan' | 'wan' | 'relay' | null;
+   transport: 'ws-secure' | 'relay' | 'dc' | null;
++  rttMs: number | null;
+   version: string | null;
+   direct_capable: boolean;
+   inventory: unknown;
+@@ -86,7 +88,7 @@ export function projectMeshListNode(
+   selfId: string,
+   selfPk: Uint8Array,
+   cookies: Map<string, string>,
+-  reach: Map<string, 'lan' | 'relay' | null>,
++  reach: Map<string, 'lan' | 'wan' | 'relay' | null>,
+   hubOnline: ReadonlySet<string>,
+   certById: Map<string, { certificateBytes: Uint8Array }>,
+   peerById: Map<string, { inventoryJson?: string | null; directCapable?: boolean }>,
+@@ -95,7 +97,8 @@ export function projectMeshListNode(
+   selfName: string | null,
+   self: { inventory?: unknown; direct_capable: boolean; version?: string } | undefined,
+   hubNodeId: string | null,
+-  transportOf?: (id: string) => 'ws-secure' | 'relay' | 'dc' | null
++  transportOf?: (id: string) => 'ws-secure' | 'relay' | 'dc' | null,
++  rttOf?: (id: string) => number | null
+ ): MeshNodeDto | null {
+   const isSelf = id === selfId;
+   const cert = certById.get(id);
+@@ -121,7 +124,7 @@ export function projectMeshListNode(
+       registryName: registryById.get(id),
+       selfName,
+     }),
+-    isSelf || hubOnline.has(id) || r === 'lan' || r === 'relay',
++    isSelf || hubOnline.has(id) || isPeerReachable(r),
+     {
+       inventory: inv,
+       directCapable: peer?.directCapable ?? false,
+@@ -142,6 +145,7 @@ export function projectMeshListNode(
+     online: core.online,
+     reach: r,
+     transport: isSelf ? null : (transportOf?.(id) ?? null),
++    rttMs: isSelf ? null : (rttOf?.(id) ?? null),
+     version: core.version || versionFromInventory(core.inventory),
+     direct_capable: core.direct_capable,
+     inventory: core.inventory,
+diff --git a/apps/gateway/src/mesh/peer-manager.ts b/apps/gateway/src/mesh/peer-manager.ts
+index 87f19d49..8001af1a 100644
+--- a/apps/gateway/src/mesh/peer-manager.ts
++++ b/apps/gateway/src/mesh/peer-manager.ts
+@@ -9,6 +9,13 @@ import {
+ import type { NodeSessionStore } from '../auth/node-session-store';
+ import type { UserStore } from '../auth/user-store';
+ import type { WebSocketServer } from '../ws';
++import {
++  RTT_EVENT_MIN_INTERVAL_MS,
++  addressFromIceCandidate,
++  classifyPeerReach,
++  hostFromWsUrl,
++  rttChangedMaterially,
++} from './address-class';
+ import {
+   backoffDelayMs,
+   defaultScheduler,
+@@ -111,6 +118,12 @@ export type PeerManagerOptions = {
+   onGatewaySessionClose?: (session: import('../ws/gateway-session').GatewaySession) => void;
+   onBrowserSignal?: (msg: RtcSignalMessage, fromNodeId?: string) => void;
+   ensureDcSession?: (peerNodeId: string, rtcSession: string) => void;
++  onLinkInfo?: (info: {
++    nodeId: string;
++    reach: PeerReach;
++    transport: PeerTransportKind | null;
++    rttMs: number | null;
++  }) => void;
+ };
+ 
+ export type PeerLinkFactory = (
+@@ -143,6 +156,11 @@ type LivePeer = {
+   quiesceCapable: boolean;
+   helloReplied: boolean;
+   probeSent: boolean;
++  remoteAddress: string | null;
++  rttMs: number | null;
++  pingSentAt: number | null;
++  lastRttEmitAt: number;
++  lastEmittedRttMs: number | null;
+ };
+ 
+ type UpgradeGate = {
+@@ -185,6 +203,7 @@ type ParkedInbound = {
+   generation: number;
+   at: number;
+   timer: { clear: () => void } | null;
++  remoteAddress: string | null;
+ };
+ 
+ function isServerSocketAdapter(value: WebSocketTransportInput): value is ServerSocketAdapter {
+@@ -298,6 +317,14 @@ export class PeerManager {
+     | null;
+   private readonly onBrowserSignal: ((msg: RtcSignalMessage, fromNodeId?: string) => void) | null;
+   private readonly ensureDcSession: ((peerNodeId: string, rtcSession: string) => void) | null;
++  private readonly onLinkInfo:
++    | ((info: {
++        nodeId: string;
++        reach: PeerReach;
++        transport: PeerTransportKind | null;
++        rttMs: number | null;
++      }) => void)
++    | null;
+   private readonly rtcListeners = new Map<string, Set<(msg: RtcSignalMessage) => void>>();
+   private readonly rtcInbox = new Map<string, RtcSignalMessage[]>();
+   private readonly server: PeerServer | null;
+@@ -344,6 +371,7 @@ export class PeerManager {
+     this.onGatewaySessionClose = opts.onGatewaySessionClose ?? null;
+     this.onBrowserSignal = opts.onBrowserSignal ?? null;
+     this.ensureDcSession = opts.ensureDcSession ?? null;
++    this.onLinkInfo = opts.onLinkInfo ?? null;
+     this.uplink.setOnRelayStream((stream, from) => {
+       void this.acceptRelay(stream, from);
+     });
+@@ -354,8 +382,8 @@ export class PeerManager {
+         port: opts.peerPort,
+         hostname: opts.hostname,
+         scheduler: this.scheduler,
+-        onAccept: (socket) => {
+-          void this.acceptDirect(socket);
++        onAccept: (socket, remoteIp) => {
++          void this.acceptDirect(socket, remoteIp === 'unknown' ? null : remoteIp);
+         },
+       });
+     }
+@@ -426,6 +454,10 @@ export class PeerManager {
+     return this.live.get(nodeId)?.transport ?? null;
+   }
+ 
++  rttOf(nodeId: string): number | null {
++    return this.live.get(nodeId)?.rttMs ?? null;
++  }
++
+   async waitForTransport(
+     nodeId: string,
+     kind: PeerTransportKind,
+@@ -474,9 +506,18 @@ export class PeerManager {
+     peerNodeId: string,
+     session: LinkSession,
+     transport: PeerTransportKind = 'ws-secure',
+-    initiatedBy?: string
++    initiatedBy?: string,
++    remoteAddress?: string | null
+   ): LinkSession | null {
+-    return this.track(session, peerNodeId, transport, initiatedBy ?? peerNodeId, this.generation);
++    return this.track(
++      session,
++      peerNodeId,
++      transport,
++      initiatedBy ?? peerNodeId,
++      this.generation,
++      false,
++      remoteAddress ?? null
++    );
+   }
+ 
+   receiveRtcSignal(fromNodeId: string, msg: RtcSignalMessage): void {
+@@ -587,7 +628,7 @@ export class PeerManager {
+         if (this.userStore.getCert(id)?.revokedLogSeq != null) this.onRevoked(id);
+         continue;
+       }
+-      out.set(id, live.transport === 'relay' ? 'relay' : 'lan');
++      out.set(id, classifyPeerReach(live.transport, live.remoteAddress));
+     }
+     return out;
+   }
+@@ -1215,7 +1256,18 @@ export class PeerManager {
+       }
+       const session = new LinkMux(result.link, { role: result.role });
+       const initiatedBy = result.role === 'initiator' ? this.identity.nodeId : result.peerNodeId;
+-      const kept = this.track(session, result.peerNodeId, 'dc', initiatedBy, gen);
++      const pair = result.pc.getSelectedCandidatePair?.();
++      const remoteAddress =
++        pair?.remote?.address ?? addressFromIceCandidate(pair?.remote?.candidate) ?? null;
++      const kept = this.track(
++        session,
++        result.peerNodeId,
++        'dc',
++        initiatedBy,
++        gen,
++        false,
++        remoteAddress
++      );
+       if (kept === session) {
+         const live = this.live.get(result.peerNodeId);
+         if (live) live.unsubRtc = unsub;
+@@ -1335,7 +1387,15 @@ export class PeerManager {
+             quiet(() => session.close('stopped'));
+             throw new NodeUnreachableError(nodeId, 'peer manager stopped');
+           }
+-          const kept = this.track(session, nodeId, 'ws-secure', this.identity.nodeId, gen);
++          const kept = this.track(
++            session,
++            nodeId,
++            'ws-secure',
++            this.identity.nodeId,
++            gen,
++            false,
++            null
++          );
+           if (kept) return kept;
+         }
+       } catch (err) {
+@@ -1389,14 +1449,19 @@ export class PeerManager {
+       result.peerNodeId,
+       'ws-secure',
+       this.identity.nodeId,
+-      gen
++      gen,
++      false,
++      hostFromWsUrl(url)
+     );
+     if (!kept) throw new Error('simultaneous-dial');
+     this.rememberKeys(result.peerNodeId, result.sendKey, result.recvKey);
+     return kept;
+   }
+ 
+-  private async acceptDirect(socket: ServerSocketAdapter): Promise<void> {
++  private async acceptDirect(
++    socket: ServerSocketAdapter,
++    remoteAddress: string | null
++  ): Promise<void> {
+     const gen = this.generation;
+     try {
+       const result = await handshakeWsDirect({
+@@ -1409,7 +1474,15 @@ export class PeerManager {
+         quiet(() => result.session.close('stopped'));
+         return;
+       }
+-      this.track(result.session, result.peerNodeId, 'ws-secure', result.peerNodeId, gen);
++      this.track(
++        result.session,
++        result.peerNodeId,
++        'ws-secure',
++        result.peerNodeId,
++        gen,
++        false,
++        remoteAddress
++      );
+       this.rememberKeys(result.peerNodeId, result.sendKey, result.recvKey);
+     } catch {
+       quiet(() => socket.close(1000, 'handshake-failed'));
+@@ -1442,7 +1515,8 @@ export class PeerManager {
+     transport: PeerTransportKind,
+     initiatedBy: string,
+     gen: number,
+-    quiesceCapable = false
++    quiesceCapable = false,
++    remoteAddress: string | null = null
+   ): LinkSession | null {
+     const reject = (reason: string, keep: LinkSession | null = null) => {
+       quiet(() => session.close(reason));
+@@ -1451,6 +1525,8 @@ export class PeerManager {
+     if (this.stale(gen)) return reject('stale');
+     if (!this.isTrusted(peerNodeId)) return reject('not-trusted');
+     const prev = this.live.get(peerNodeId);
++    const resolvedAddress =
++      remoteAddress ?? (transport === 'dc' ? (prev?.remoteAddress ?? null) : null);
+     if (prev && prev.session !== session) {
+       const rank = comparePeerTransport(transport, prev.transport);
+       if (rank < 0) return reject('lower-priority', prev.session);
+@@ -1461,13 +1537,21 @@ export class PeerManager {
+         }
+       }
+       if (!prev.quiesceCapable) {
+-        this.parkInbound(peerNodeId, session, transport, initiatedBy, gen);
++        this.parkInbound(peerNodeId, session, transport, initiatedBy, gen, resolvedAddress);
+         this.probeQuiesce(prev);
+         return prev.session;
+       }
+       this.retirePeer(prev, 'replaced');
+     }
+-    return this.installLive(session, peerNodeId, transport, initiatedBy, gen, quiesceCapable);
++    return this.installLive(
++      session,
++      peerNodeId,
++      transport,
++      initiatedBy,
++      gen,
++      quiesceCapable,
++      resolvedAddress
++    );
+   }
+ 
+   private installLive(
+@@ -1476,7 +1560,8 @@ export class PeerManager {
+     transport: PeerTransportKind,
+     initiatedBy: string,
+     gen: number,
+-    quiesceCapable: boolean
++    quiesceCapable: boolean,
++    remoteAddress: string | null
+   ): LinkSession {
+     const live: LivePeer = {
+       session,
+@@ -1501,6 +1586,11 @@ export class PeerManager {
+       quiesceCapable,
+       helloReplied: false,
+       probeSent: false,
++      remoteAddress,
++      rttMs: null,
++      pingSentAt: null,
++      lastRttEmitAt: 0,
++      lastEmittedRttMs: null,
+     };
+     this.live.set(peerNodeId, live);
+     this.bindSession(live);
+@@ -1510,6 +1600,7 @@ export class PeerManager {
+     this.sendPeerStatus(live);
+     this.notifyTransport(peerNodeId);
+     this.notifyLive(peerNodeId, session);
++    this.emitLinkInfo(live);
+     if (transport === 'dc') {
+       this.lostDirect.delete(peerNodeId);
+       this.cancelDcUpgradeRetry(peerNodeId);
+@@ -1626,7 +1717,7 @@ export class PeerManager {
+     const work = asyncCtl[t as keyof typeof asyncCtl];
+     if (work) this.runCtlAsync(t, live.peerNodeId, work);
+     else if (t === 'ping') this.sendPeerCtl(live, { t: 'pong' });
+-    else if (t === 'pong') live.missedPongs = 0;
++    else if (t === 'pong') this.onPeerPong(live);
+     else if (t === 'link.hello') {
+       if ((Array.isArray(msg.caps) ? msg.caps : []).includes('quiesce')) {
+         this.markQuiesceCapable(live);
+@@ -1769,10 +1860,39 @@ export class PeerManager {
+         return;
+       }
+       live.missedPongs += 1;
++      live.pingSentAt = performance.now();
+       this.sendPeerCtl(live, { t: 'ping' });
+     }, PEER_PING_INTERVAL_MS);
+   }
+ 
++  private onPeerPong(live: LivePeer): void {
++    live.missedPongs = 0;
++    if (live.pingSentAt == null) return;
++    live.rttMs = Math.max(0, Math.round(performance.now() - live.pingSentAt));
++    live.pingSentAt = null;
++    this.maybeEmitRtt(live);
++  }
++
++  private emitLinkInfo(live: LivePeer): void {
++    this.onLinkInfo?.({
++      nodeId: live.peerNodeId,
++      reach: classifyPeerReach(live.transport, live.remoteAddress),
++      transport: live.transport,
++      rttMs: live.rttMs,
++    });
++  }
++
++  private maybeEmitRtt(live: LivePeer): void {
++    if (!rttChangedMaterially(live.lastEmittedRttMs, live.rttMs)) return;
++    const now = this.scheduler.now();
++    if (live.lastEmittedRttMs != null && now - live.lastRttEmitAt < RTT_EVENT_MIN_INTERVAL_MS) {
++      return;
++    }
++    live.lastRttEmitAt = now;
++    live.lastEmittedRttMs = live.rttMs;
++    this.emitLinkInfo(live);
++  }
++
+   private armIdle(live: LivePeer): void {
+     this.clearIdle(live);
+     if (this.live.get(live.peerNodeId) !== live) return;
+@@ -1811,6 +1931,12 @@ export class PeerManager {
+       this.scheduler.now() + PEER_RTC_WAKE_COOLDOWN_MS
+     );
+     this.notifyTransport(nodeId);
++    this.onLinkInfo?.({
++      nodeId,
++      reach: this.listReach().get(nodeId) ?? null,
++      transport: this.transportOf(nodeId),
++      rttMs: this.rttOf(nodeId),
++    });
+     if (this.stopped || reason === 'revoked') {
+       this.cancelDcUpgradeRetry(nodeId);
+       this.lostDirect.delete(nodeId);
+@@ -1853,6 +1979,7 @@ export class PeerManager {
+     this.sendPeerStatus(best);
+     this.notifyTransport(nodeId);
+     this.notifyLive(nodeId, best.session);
++    this.emitLinkInfo(best);
+     return true;
+   }
+ 
+@@ -1861,7 +1988,8 @@ export class PeerManager {
+     session: LinkSession,
+     transport: PeerTransportKind,
+     initiatedBy: string,
+-    gen: number
++    gen: number,
++    remoteAddress: string | null
+   ): void {
+     const existing = this.parked.get(peerNodeId);
+     const parkedAt = existing?.at ?? this.scheduler.now();
+@@ -1880,6 +2008,7 @@ export class PeerManager {
+       generation: gen,
+       at: parkedAt,
+       timer: null,
++      remoteAddress,
+     };
+     parked.timer = this.scheduler.interval(() => {
+       if (this.parked.get(peerNodeId) !== parked) return;
+@@ -1927,7 +2056,15 @@ export class PeerManager {
+     this.parked.delete(nodeId);
+     parked.timer?.clear();
+     this.parkedSessions.delete(parked.session);
+-    this.track(parked.session, nodeId, parked.transport, parked.initiatedBy, parked.generation);
++    this.track(
++      parked.session,
++      nodeId,
++      parked.transport,
++      parked.initiatedBy,
++      parked.generation,
++      false,
++      parked.remoteAddress
++    );
+   }
+ 
+   private retirePeer(prev: LivePeer, reason: string): void {
+diff --git a/apps/gateway/src/mesh/types.ts b/apps/gateway/src/mesh/types.ts
+index 0ba67afc..20048885 100644
+--- a/apps/gateway/src/mesh/types.ts
++++ b/apps/gateway/src/mesh/types.ts
+@@ -64,7 +64,7 @@ export type DataChannelLinkSlot = {
+   session: LinkSession | null;
+ };
+ 
+-export type PeerReach = 'lan' | 'relay' | null;
++export type PeerReach = 'lan' | 'wan' | 'relay' | null;
+ 
+ export type EstablishedPeerLink = {
+   session: LinkSession;
+diff --git a/apps/gateway/src/runtime.ts b/apps/gateway/src/runtime.ts
+index 65767bdd..db2e1a6a 100644
+--- a/apps/gateway/src/runtime.ts
++++ b/apps/gateway/src/runtime.ts
+@@ -25,6 +25,7 @@ import { tmuxRuntimeRegistry } from './tmux-client/registry';
+ import { primeLocalShellPath } from './tmux/local-shell-path';
+ import { registerSnapshotLookup } from './tmux/snapshot-directory';
+ import { registerThemeBroadcaster } from './tmux/theme-broadcaster';
++import { tunnelManager } from './tunnel/manager';
+ import { watchService } from './watch/service';
+ import { weixinService } from './weixin/service';
+ import { WebSocketServer } from './ws';
+@@ -122,6 +123,7 @@ export async function createGatewayRuntime(
+   await pushSupervisor.start();
+   await agentSupervisor.start();
+   await watchService.start();
++  await tunnelManager.start();
+ 
+   try {
+     const settings = getSiteSettings();
+@@ -197,6 +199,7 @@ export async function createGatewayRuntime(
+       registerEventNotifyBroadcaster(null);
+       registerTreeOverlayBridge(null);
+       wsServer.closeAll();
++      await tunnelManager.stop();
+       await watchService.stop();
+       await agentSupervisor.stop();
+       await pushSupervisor.stopAll();
+diff --git a/apps/gateway/src/tunnel/config-store.test.ts b/apps/gateway/src/tunnel/config-store.test.ts
+new file mode 100644
+index 00000000..fd9147b1
+--- /dev/null
++++ b/apps/gateway/src/tunnel/config-store.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, test } from 'bun:test';
++import { createMigratedAuthDb } from '../auth/test-db';
++import { TunnelConfigStore } from './config-store';
++
++describe('tunnel_config migration', () => {
++  test('applies tunnel_config and round-trips a row', () => {
++    const { sqlite, db, close } = createMigratedAuthDb();
++    try {
++      const tables = sqlite
++        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tunnel_config'")
++        .all();
++      expect(tables.length).toBe(1);
++      const store = new TunnelConfigStore(db);
++      expect(store.get().mode).toBe('off');
++      const saved = store.save({
++        mode: 'named',
++        hostname: 'tmex.example.com',
++        tunnelName: 'tmex-tmex',
++        tunnelId: '550e8400-e29b-41d4-a716-446655440000',
++        autoStart: true,
++      });
++      expect(saved.mode).toBe('named');
++      expect(store.get()).toMatchObject({
++        mode: 'named',
++        hostname: 'tmex.example.com',
++        tunnelName: 'tmex-tmex',
++        autoStart: true,
++      });
++    } finally {
++      close();
++    }
++  });
++});
+diff --git a/apps/gateway/src/tunnel/config-store.ts b/apps/gateway/src/tunnel/config-store.ts
+new file mode 100644
+index 00000000..dc9f2170
+--- /dev/null
++++ b/apps/gateway/src/tunnel/config-store.ts
+@@ -0,0 +1,113 @@
++import type { TunnelMode } from '@tmex/shared';
++import { eq } from 'drizzle-orm';
++import type { AuthDb } from '../auth/types';
++import { tunnelConfig } from '../db/schema';
++
++export const TUNNEL_CONFIG_ID = 'default';
++
++export type TunnelPersisted = {
++  mode: TunnelMode;
++  hostname: string | null;
++  tunnelName: string | null;
++  tunnelId: string | null;
++  autoStart: boolean;
++  updatedAt: string;
++};
++
++export const DEFAULT_TUNNEL_CONFIG: TunnelPersisted = {
++  mode: 'off',
++  hostname: null,
++  tunnelName: null,
++  tunnelId: null,
++  autoStart: false,
++  updatedAt: '',
++};
++
++export interface TunnelConfigStoreLike {
++  get(): TunnelPersisted;
++  save(patch: Partial<Omit<TunnelPersisted, 'updatedAt'>>): TunnelPersisted;
++}
++
++function asMode(value: string | null | undefined): TunnelMode {
++  if (value === 'quick' || value === 'named' || value === 'off') return value;
++  return 'off';
++}
++
++export class MemoryTunnelConfigStore implements TunnelConfigStoreLike {
++  private row: TunnelPersisted = { ...DEFAULT_TUNNEL_CONFIG };
++
++  get(): TunnelPersisted {
++    return { ...this.row };
++  }
++
++  save(patch: Partial<Omit<TunnelPersisted, 'updatedAt'>>): TunnelPersisted {
++    this.row = {
++      ...this.row,
++      ...patch,
++      updatedAt: new Date().toISOString(),
++    };
++    return this.get();
++  }
++}
++
++export class TunnelConfigStore implements TunnelConfigStoreLike {
++  constructor(private readonly db: AuthDb) {}
++
++  get(): TunnelPersisted {
++    try {
++      const row = this.db
++        .select()
++        .from(tunnelConfig)
++        .where(eq(tunnelConfig.id, TUNNEL_CONFIG_ID))
++        .get();
++      if (!row) return { ...DEFAULT_TUNNEL_CONFIG };
++      return {
++        mode: asMode(row.mode),
++        hostname: row.hostname ?? null,
++        tunnelName: row.tunnelName ?? null,
++        tunnelId: row.tunnelId ?? null,
++        autoStart: Boolean(row.autoStart),
++        updatedAt: row.updatedAt,
++      };
++    } catch {
++      return { ...DEFAULT_TUNNEL_CONFIG };
++    }
++  }
++
++  save(patch: Partial<Omit<TunnelPersisted, 'updatedAt'>>): TunnelPersisted {
++    const current = this.get();
++    const next: TunnelPersisted = {
++      mode: patch.mode ?? current.mode,
++      hostname: patch.hostname !== undefined ? patch.hostname : current.hostname,
++      tunnelName: patch.tunnelName !== undefined ? patch.tunnelName : current.tunnelName,
++      tunnelId: patch.tunnelId !== undefined ? patch.tunnelId : current.tunnelId,
++      autoStart: patch.autoStart ?? current.autoStart,
++      updatedAt: new Date().toISOString(),
++    };
++    const values = {
++      id: TUNNEL_CONFIG_ID,
++      mode: next.mode,
++      hostname: next.hostname,
++      tunnelName: next.tunnelName,
++      tunnelId: next.tunnelId,
++      autoStart: next.autoStart,
++      updatedAt: next.updatedAt,
++    };
++    this.db
++      .insert(tunnelConfig)
++      .values(values)
++      .onConflictDoUpdate({
++        target: tunnelConfig.id,
++        set: {
++          mode: values.mode,
++          hostname: values.hostname,
++          tunnelName: values.tunnelName,
++          tunnelId: values.tunnelId,
++          autoStart: values.autoStart,
++          updatedAt: values.updatedAt,
++        },
++      })
++      .run();
++    return next;
++  }
++}
+diff --git a/apps/gateway/src/tunnel/download.ts b/apps/gateway/src/tunnel/download.ts
+new file mode 100644
+index 00000000..f87299b7
+--- /dev/null
++++ b/apps/gateway/src/tunnel/download.ts
+@@ -0,0 +1,78 @@
++import { chmod, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
++import { join } from 'node:path';
++import { TunnelError } from './errors';
++import { cloudflaredDownloadSpec } from './platform';
++
++export type Downloader = (url: string, destPath: string) => Promise<void>;
++
++export async function defaultDownloader(url: string, destPath: string): Promise<void> {
++  const res = await fetch(url, { redirect: 'follow' });
++  if (!res.ok) {
++    throw new TunnelError('download_failed', `download failed: HTTP ${res.status}`);
++  }
++  const bytes = new Uint8Array(await res.arrayBuffer());
++  await Bun.write(destPath, bytes);
++}
++
++async function findExtractedBinary(dir: string): Promise<string> {
++  const entries = await readdir(dir);
++  if (entries.includes('cloudflared')) {
++    return join(dir, 'cloudflared');
++  }
++  for (const name of entries) {
++    const full = join(dir, name);
++    const info = await stat(full);
++    if (info.isDirectory()) {
++      try {
++        return await findExtractedBinary(full);
++      } catch {
++        // 继续扫其他子目录
++      }
++    }
++  }
++  throw new TunnelError('download_failed', 'extracted archive does not contain cloudflared');
++}
++
++export async function installCloudflaredBinary(opts: {
++  tunnelDir: string;
++  destPath: string;
++  platform: NodeJS.Platform;
++  arch: string;
++  downloader: Downloader;
++}): Promise<void> {
++  await mkdir(opts.tunnelDir, { recursive: true });
++  const spec = cloudflaredDownloadSpec(opts.platform, opts.arch);
++  const tmpPath = `${opts.destPath}.${process.pid}.tmp`;
++  try {
++    await opts.downloader(spec.url, tmpPath);
++    if (spec.tgz) {
++      const extractDir = `${tmpPath}.extract`;
++      await mkdir(extractDir, { recursive: true });
++      const tar = Bun.spawn(['tar', '-xzf', tmpPath, '-C', extractDir], {
++        stdout: 'pipe',
++        stderr: 'pipe',
++        stdin: 'ignore',
++      });
++      const code = await tar.exited;
++      if (code !== 0) {
++        throw new TunnelError('download_failed', 'failed to extract cloudflared archive');
++      }
++      const binary = await findExtractedBinary(extractDir);
++      await chmod(binary, 0o755);
++      await rename(binary, opts.destPath);
++      await rm(extractDir, { recursive: true, force: true });
++      await rm(tmpPath, { force: true });
++    } else {
++      await chmod(tmpPath, 0o755);
++      await rename(tmpPath, opts.destPath);
++    }
++    await chmod(opts.destPath, 0o755);
++  } catch (error) {
++    await rm(tmpPath, { force: true }).catch(() => {});
++    if (error instanceof TunnelError) throw error;
++    throw new TunnelError(
++      'download_failed',
++      error instanceof Error ? error.message : String(error)
++    );
++  }
++}
+diff --git a/apps/gateway/src/tunnel/errors.ts b/apps/gateway/src/tunnel/errors.ts
+new file mode 100644
+index 00000000..eed45785
+--- /dev/null
++++ b/apps/gateway/src/tunnel/errors.ts
+@@ -0,0 +1,37 @@
++import type { TunnelErrorCode } from '@tmex/shared';
++
++export class TunnelError extends Error {
++  constructor(
++    readonly code: TunnelErrorCode,
++    message: string
++  ) {
++    super(message);
++    this.name = 'TunnelError';
++  }
++}
++
++export function tunnelErrorFrom(error: unknown): { code: TunnelErrorCode; message: string } {
++  if (error instanceof TunnelError) {
++    return { code: error.code, message: error.message };
++  }
++  return {
++    code: 'unknown',
++    message: error instanceof Error ? error.message : String(error),
++  };
++}
++
++export function tunnelHttpStatus(code: TunnelErrorCode): number {
++  switch (code) {
++    case 'busy':
++      return 409;
++    case 'invalid_request':
++    case 'invalid_hostname':
++    case 'not_configured':
++    case 'unsupported_platform':
++    case 'binary_missing':
++    case 'not_logged_in':
++      return 400;
++    default:
++      return 500;
++  }
++}
+diff --git a/apps/gateway/src/tunnel/fake-spawn.ts b/apps/gateway/src/tunnel/fake-spawn.ts
+new file mode 100644
+index 00000000..6cc5e30d
+--- /dev/null
++++ b/apps/gateway/src/tunnel/fake-spawn.ts
+@@ -0,0 +1,111 @@
++import type { SpawnHandle, SpawnSpec, Spawner } from './spawn';
++
++export type FakeScript = {
++  stdout?: string;
++  stderr?: string;
++  exitCode?: number;
++  hold?: boolean;
++  pid?: number;
++};
++
++type Rule = {
++  match: (spec: SpawnSpec) => boolean;
++  script: FakeScript;
++  remaining: number;
++};
++
++const encoder = new TextEncoder();
++let nextFakePid = 1000;
++
++export class FakeHandle implements SpawnHandle {
++  pid: number;
++  stdout: ReadableStream<Uint8Array>;
++  stderr: ReadableStream<Uint8Array>;
++  exited: Promise<number>;
++  private stdoutCtrl!: ReadableStreamDefaultController<Uint8Array>;
++  private stderrCtrl!: ReadableStreamDefaultController<Uint8Array>;
++  private resolveExit!: (code: number) => void;
++  private settled = false;
++
++  constructor(script: FakeScript) {
++    this.pid = script.pid ?? nextFakePid++;
++    this.stdout = new ReadableStream<Uint8Array>({
++      start: (controller) => {
++        this.stdoutCtrl = controller;
++        if (script.stdout) this.writeStdout(script.stdout);
++      },
++    });
++    this.stderr = new ReadableStream<Uint8Array>({
++      start: (controller) => {
++        this.stderrCtrl = controller;
++        if (script.stderr) this.writeStderr(script.stderr);
++      },
++    });
++    this.exited = new Promise((resolve) => {
++      this.resolveExit = resolve;
++    });
++    if (!script.hold) {
++      queueMicrotask(() => this.exit(script.exitCode ?? 0));
++    }
++  }
++
++  writeStdout(text: string): void {
++    if (this.settled) return;
++    this.stdoutCtrl.enqueue(encoder.encode(text.endsWith('\n') ? text : `${text}\n`));
++  }
++
++  writeStderr(text: string): void {
++    if (this.settled) return;
++    this.stderrCtrl.enqueue(encoder.encode(text.endsWith('\n') ? text : `${text}\n`));
++  }
++
++  kill(_signal?: NodeJS.Signals): void {
++    this.exit(1);
++  }
++
++  exit(code: number): void {
++    if (this.settled) return;
++    this.settled = true;
++    try {
++      this.stdoutCtrl.close();
++    } catch {}
++    try {
++      this.stderrCtrl.close();
++    } catch {}
++    this.resolveExit(code);
++  }
++}
++
++export class FakeSpawner {
++  readonly calls: SpawnSpec[] = [];
++  readonly handles: FakeHandle[] = [];
++  private readonly rules: Rule[] = [];
++
++  on(match: (spec: SpawnSpec) => boolean, script: FakeScript): this {
++    this.rules.push({ match, script, remaining: Number.POSITIVE_INFINITY });
++    return this;
++  }
++
++  once(match: (spec: SpawnSpec) => boolean, script: FakeScript): this {
++    this.rules.push({ match, script, remaining: 1 });
++    return this;
++  }
++
++  spawn: Spawner = (spec) => {
++    this.calls.push(spec);
++    const rule = this.rules.find((item) => item.remaining > 0 && item.match(spec));
++    const script = rule?.script ?? { exitCode: 0, stdout: '' };
++    if (rule && Number.isFinite(rule.remaining)) rule.remaining -= 1;
++    const handle = new FakeHandle(script);
++    this.handles.push(handle);
++    return handle;
++  };
++
++  lastHandle(): FakeHandle | undefined {
++    return this.handles[this.handles.length - 1];
++  }
++}
++
++export function argsInclude(spec: SpawnSpec, token: string): boolean {
++  return spec.args.includes(token);
++}
+diff --git a/apps/gateway/src/tunnel/hostname.ts b/apps/gateway/src/tunnel/hostname.ts
+new file mode 100644
+index 00000000..b226b3f5
+--- /dev/null
++++ b/apps/gateway/src/tunnel/hostname.ts
+@@ -0,0 +1,16 @@
++const HOSTNAME_RE = /^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))*$/;
++
++export function normalizeTunnelHostname(raw: string): string | null {
++  const hostname = raw.trim().toLowerCase();
++  if (!hostname || !HOSTNAME_RE.test(hostname)) return null;
++  return hostname;
++}
++
++export function firstHostnameLabel(hostname: string): string {
++  const label = hostname.split('.')[0]?.trim() ?? '';
++  return label || 'tmex';
++}
++
++export function defaultTunnelName(hostname: string): string {
++  return `tmex-${firstHostnameLabel(hostname)}`;
++}
+diff --git a/apps/gateway/src/tunnel/index.ts b/apps/gateway/src/tunnel/index.ts
+new file mode 100644
+index 00000000..e00bd9fe
+--- /dev/null
++++ b/apps/gateway/src/tunnel/index.ts
+@@ -0,0 +1,10 @@
++export { TunnelManager, tunnelManager } from './manager';
++export { TunnelConfigStore, MemoryTunnelConfigStore } from './config-store';
++export { redactSecrets } from './redact';
++export {
++  parseVersion,
++  parseLoginUrl,
++  parseCreateOutput,
++  parseQuickUrl,
++  parseTunnelList,
++} from './provider';
+diff --git a/apps/gateway/src/tunnel/log-buffer.ts b/apps/gateway/src/tunnel/log-buffer.ts
+new file mode 100644
+index 00000000..16cec942
+--- /dev/null
++++ b/apps/gateway/src/tunnel/log-buffer.ts
+@@ -0,0 +1,23 @@
++import { redactSecrets } from './redact';
++
++export class LogRingBuffer {
++  private readonly lines: string[] = [];
++
++  constructor(private readonly max = 200) {}
++
++  push(line: string): void {
++    const redacted = redactSecrets(line);
++    this.lines.push(redacted);
++    if (this.lines.length > this.max) {
++      this.lines.splice(0, this.lines.length - this.max);
++    }
++  }
++
++  snapshot(): string[] {
++    return this.lines.slice();
++  }
++
++  clear(): void {
++    this.lines.length = 0;
++  }
++}
+diff --git a/apps/gateway/src/tunnel/manager.test.ts b/apps/gateway/src/tunnel/manager.test.ts
+new file mode 100644
+index 00000000..251fd6cd
+--- /dev/null
++++ b/apps/gateway/src/tunnel/manager.test.ts
+@@ -0,0 +1,275 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { MemoryTunnelConfigStore } from './config-store';
++import { FakeSpawner, argsInclude } from './fake-spawn';
++import { TunnelManager } from './manager';
++
++async function waitJob(manager: TunnelManager, timeoutMs = 2_000) {
++  const start = Date.now();
++  while (Date.now() - start < timeoutMs) {
++    const job = manager.status().job;
++    if (job && job.state !== 'running') return job;
++    await Bun.sleep(5);
++  }
++  throw new Error(`job did not finish: ${JSON.stringify(manager.status().job)}`);
++}
++
++async function waitState(manager: TunnelManager, state: string, timeoutMs = 2_000) {
++  const start = Date.now();
++  while (Date.now() - start < timeoutMs) {
++    if (manager.status().process.state === state) return;
++    await Bun.sleep(5);
++  }
++  throw new Error(`state ${state} not reached: ${manager.status().process.state}`);
++}
++
++async function setup(overrides: ConstructorParameters<typeof TunnelManager>[0] = {}) {
++  const dir = await mkdtemp(join(tmpdir(), 'tmex-tun-'));
++  const spawner = new FakeSpawner();
++  spawner.on((s) => argsInclude(s, '--version'), {
++    stdout: 'cloudflared version 2025.8.1 (built 2025-08-01T00:00:00Z)\n',
++  });
++  const store = new MemoryTunnelConfigStore();
++  const manager = new TunnelManager({
++    tunnelDir: dir,
++    originPort: 19883,
++    platform: 'linux',
++    arch: 'arm64',
++    store,
++    spawner: spawner.spawn,
++    which: () => '/usr/bin/cloudflared',
++    downloader: async (_url, dest) => {
++      await Bun.write(dest, 'fake-cloudflared');
++    },
++    sleep: (ms) => Bun.sleep(Math.min(ms, 5)),
++    loginTimeoutMs: 200,
++    loginPollMs: 5,
++    killTimeoutMs: 20,
++    runningWaitMs: 800,
++    trustProxy: false,
++    healthzStartedAt: 111,
++    ...overrides,
++  });
++  return { dir, spawner, store, manager };
++}
++
++const dirs: string[] = [];
++
++afterEach(async () => {
++  while (dirs.length > 0) {
++    const dir = dirs.pop();
++    if (dir) await rm(dir, { recursive: true, force: true });
++  }
++});
++
++describe('TunnelManager', () => {
++  test('parses version via injected spawner', async () => {
++    const ctx = await setup();
++    dirs.push(ctx.dir);
++    const result = await ctx.manager.handleAction({ action: 'install' });
++    expect(result.httpStatus).toBe(202);
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    expect(job?.step).toBe('verify');
++    const status = ctx.manager.status();
++    expect(status.binary.installed).toBe(true);
++    expect(status.binary.source).toBe('managed');
++    expect(status.binary.version).toBe('2025.8.1');
++    expect(ctx.spawner.calls.some((c) => argsInclude(c, '--version'))).toBe(true);
++  });
++
++  test('login parses URL, completes when cert.pem appears, and times out', async () => {
++    const ctx = await setup({ loginTimeoutMs: 2_000 });
++    dirs.push(ctx.dir);
++    ctx.spawner.on((s) => argsInclude(s, 'login'), {
++      hold: true,
++      stdout: 'https://dash.cloudflare.com/argotunnel?aud=xyz\n',
++    });
++    const started = await ctx.manager.handleAction({ action: 'login' });
++    expect(started.httpStatus).toBe(202);
++    const start = Date.now();
++    while (Date.now() - start < 1_000 && !ctx.manager.status().auth.loginUrl) {
++      await Bun.sleep(5);
++    }
++    expect(ctx.manager.status().auth.loginUrl).toContain('dash.cloudflare.com/argotunnel');
++    await writeFile(join(ctx.dir, 'cert.pem'), 'CERT', 'utf8');
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    expect(ctx.manager.status().auth.loggedIn).toBe(true);
++
++    const ctx2 = await setup({ loginTimeoutMs: 40, loginPollMs: 5 });
++    dirs.push(ctx2.dir);
++    ctx2.spawner.on((s) => argsInclude(s, 'login'), {
++      hold: true,
++      stdout: 'https://dash.cloudflare.com/argotunnel\n',
++    });
++    await ctx2.manager.handleAction({ action: 'login' });
++    const timed = await waitJob(ctx2.manager, 1_000);
++    expect(timed?.state).toBe('error');
++    expect(timed?.error?.code).toBe('login_timeout');
++  });
++
++  test('create parses id, reuses existing, and surfaces dns_route_failed', async () => {
++    const ctx = await setup();
++    dirs.push(ctx.dir);
++    await writeFile(join(ctx.dir, 'cert.pem'), 'CERT', 'utf8');
++    ctx.spawner.once((s) => argsInclude(s, 'create'), {
++      stdout:
++        'Tunnel credentials written to /tmp/x.json\nCreated tunnel tmex-remote with id 550e8400-e29b-41d4-a716-446655440000\n',
++    });
++    ctx.spawner.on((s) => argsInclude(s, 'dns'), { stdout: 'ok\n' });
++    ctx.spawner.on((s) => argsInclude(s, 'run'), {
++      hold: true,
++      stdout: 'Registered tunnel connection connIndex=0\n',
++    });
++    await ctx.manager.handleAction({ action: 'create', hostname: 'Remote.Example.com' });
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    expect(ctx.manager.status().config.mode).toBe('named');
++    expect(ctx.manager.status().config.hostname).toBe('remote.example.com');
++    expect(ctx.manager.status().config.tunnelName).toBe('tmex-remote');
++    expect(ctx.manager.status().config.tunnelId).toBe('550e8400-e29b-41d4-a716-446655440000');
++    await waitState(ctx.manager, 'running');
++
++    const ctx2 = await setup();
++    dirs.push(ctx2.dir);
++    await writeFile(join(ctx2.dir, 'cert.pem'), 'CERT', 'utf8');
++    ctx2.spawner.once((s) => argsInclude(s, 'create'), {
++      stderr: 'failed: already exists\n',
++      exitCode: 1,
++    });
++    ctx2.spawner.on((s) => argsInclude(s, 'list'), {
++      stdout: JSON.stringify([{ id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', name: 'tmex-remote' }]),
++    });
++    ctx2.spawner.on((s) => argsInclude(s, 'dns'), { stdout: 'ok\n' });
++    ctx2.spawner.on((s) => argsInclude(s, 'run'), {
++      hold: true,
++      stdout: 'Registered tunnel connection\n',
++    });
++    await ctx2.manager.handleAction({ action: 'create', hostname: 'remote.example.com' });
++    const reused = await waitJob(ctx2.manager);
++    expect(reused?.state).toBe('done');
++    expect(ctx2.manager.status().config.tunnelId).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
++
++    const ctx3 = await setup();
++    dirs.push(ctx3.dir);
++    await writeFile(join(ctx3.dir, 'cert.pem'), 'CERT', 'utf8');
++    ctx3.spawner.once((s) => argsInclude(s, 'create'), {
++      stdout: 'Created tunnel tmex-remote with id 550e8400-e29b-41d4-a716-446655440000\n',
++    });
++    ctx3.spawner.on((s) => argsInclude(s, 'dns'), {
++      stderr: 'An A, AAAA, or CNAME record with that host already exists.\n',
++      exitCode: 1,
++    });
++    await ctx3.manager.handleAction({ action: 'create', hostname: 'remote.example.com' });
++    const failed = await waitJob(ctx3.manager);
++    expect(failed?.state).toBe('error');
++    expect(failed?.error?.code).toBe('dns_route_failed');
++    expect(failed?.error?.message).toContain('already exists');
++  });
++
++  test('quick_start parses trycloudflare URL into publicUrl', async () => {
++    const ctx = await setup();
++    dirs.push(ctx.dir);
++    ctx.spawner.on((s) => argsInclude(s, '--url'), {
++      hold: true,
++      stdout: 'https://lucky-cloud-9.trycloudflare.com\nRegistered tunnel connection\n',
++    });
++    await ctx.manager.handleAction({ action: 'quick_start' });
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    expect(ctx.manager.status().config.mode).toBe('quick');
++    expect(ctx.manager.status().process.publicUrl).toBe('https://lucky-cloud-9.trycloudflare.com');
++    expect(ctx.manager.status().process.state).toBe('running');
++  });
++
++  test('supervisor restarts with backoff and stop disables it', async () => {
++    const delays: number[] = [];
++    const ctx = await setup({
++      sleep: async (ms) => {
++        delays.push(ms);
++        await Bun.sleep(1);
++      },
++    });
++    dirs.push(ctx.dir);
++    ctx.spawner.on((s) => argsInclude(s, '--url'), {
++      hold: true,
++      stdout: 'Registered tunnel connection\nhttps://a.trycloudflare.com\n',
++    });
++    await ctx.manager.handleAction({ action: 'quick_start' });
++    await waitJob(ctx.manager);
++    await waitState(ctx.manager, 'running');
++    const firstPid = ctx.manager.status().process.pid;
++    ctx.spawner.lastHandle()?.exit(1);
++    const start = Date.now();
++    while (Date.now() - start < 1_500 && ctx.manager.status().process.restarts < 1) {
++      await Bun.sleep(5);
++    }
++    expect(ctx.manager.status().process.restarts).toBeGreaterThanOrEqual(1);
++    expect(delays[0]).toBe(1_000);
++    expect(ctx.manager.status().process.pid).not.toBe(firstPid);
++    await ctx.manager.handleAction({ action: 'stop' });
++    await waitJob(ctx.manager);
++    expect(ctx.manager.status().process.state).toBe('stopped');
++    const restarts = ctx.manager.status().process.restarts;
++    await Bun.sleep(30);
++    expect(ctx.manager.status().process.restarts).toBe(restarts);
++  });
++
++  test('redacts token-like strings in the log ring', async () => {
++    const ctx = await setup();
++    dirs.push(ctx.dir);
++    const token = 'f'.repeat(32);
++    ctx.spawner.on((s) => argsInclude(s, '--url'), {
++      hold: true,
++      stdout: `token ${token}\nRegistered tunnel connection\nhttps://b.trycloudflare.com\n`,
++    });
++    await ctx.manager.handleAction({ action: 'quick_start' });
++    await waitJob(ctx.manager);
++    const log = ctx.manager.status().log.join('\n');
++    expect(log).toContain('***');
++    expect(log).not.toContain(token);
++  });
++
++  test('check compares healthz startedAt via injected fetch', async () => {
++    const ctx = await setup({
++      fetchImpl: (async (input: RequestInfo | URL) => {
++        expect(String(input)).toBe('https://lucky-cloud-9.trycloudflare.com/healthz');
++        return Response.json({ startedAt: 111 });
++      }) as typeof fetch,
++    });
++    dirs.push(ctx.dir);
++    ctx.spawner.on((s) => argsInclude(s, '--url'), {
++      hold: true,
++      stdout: 'https://lucky-cloud-9.trycloudflare.com\nRegistered tunnel connection\n',
++    });
++    await ctx.manager.handleAction({ action: 'quick_start' });
++    await waitJob(ctx.manager);
++    await ctx.manager.handleAction({ action: 'check' });
++    const job = await waitJob(ctx.manager);
++    expect(job?.state).toBe('done');
++    expect(job?.step).toBe('ok');
++  });
++
++  test('set_trust_proxy requires injected host env patch', async () => {
++    const ctx = await setup();
++    dirs.push(ctx.dir);
++    const missing = await ctx.manager.handleAction({ action: 'set_trust_proxy', trustProxy: true });
++    expect(missing.httpStatus).toBe(400);
++    expect('error' in missing.payload && missing.payload.error.code).toBe('not_configured');
++
++    const writes: boolean[] = [];
++    ctx.manager.setPatchHostEnv(async (value) => {
++      writes.push(value);
++    });
++    const ok = await ctx.manager.handleAction({ action: 'set_trust_proxy', trustProxy: true });
++    expect(ok.httpStatus).toBe(200);
++    expect(writes).toEqual([true]);
++    if ('status' in ok.payload) {
++      expect(ok.payload.status.restartRequired).toBe(true);
++      expect(ok.payload.status.trustProxy).toBe(false);
++    }
++  });
++});
+diff --git a/apps/gateway/src/tunnel/manager.ts b/apps/gateway/src/tunnel/manager.ts
+new file mode 100644
+index 00000000..db1875dc
+--- /dev/null
++++ b/apps/gateway/src/tunnel/manager.ts
+@@ -0,0 +1,667 @@
++import { randomUUID } from 'node:crypto';
++import { existsSync } from 'node:fs';
++import { mkdir, rm, writeFile } from 'node:fs/promises';
++import type {
++  TunnelActionRequest,
++  TunnelActionResponse,
++  TunnelBinaryStatus,
++  TunnelErrorResponse,
++  TunnelJobKind,
++  TunnelJobStatus,
++  TunnelMode,
++  TunnelStatusResponse,
++} from '@tmex/shared';
++import { PROCESS_STARTED_AT } from '../api/system-routes';
++import { config } from '../config';
++import { getDb as getOrmDb } from '../db/client';
++import {
++  DEFAULT_TUNNEL_CONFIG,
++  TunnelConfigStore,
++  type TunnelConfigStoreLike,
++  type TunnelPersisted,
++} from './config-store';
++import { type Downloader, defaultDownloader, installCloudflaredBinary } from './download';
++import { TunnelError, tunnelErrorFrom, tunnelHttpStatus } from './errors';
++import { defaultTunnelName, normalizeTunnelHostname } from './hostname';
++import { LogRingBuffer } from './log-buffer';
++import { isTunnelPlatformSupported, tunnelPlatformLabel } from './platform';
++import {
++  CloudflaredProvider,
++  configYmlPath,
++  credentialsPathFor,
++  managedBinaryPath,
++  originCertPath,
++  parseLoginUrl,
++} from './provider';
++import { type Spawner, bunSpawner, consumeLines } from './spawn';
++import { TunnelSupervisor } from './supervisor';
++
++export type PatchHostEnv = (trustProxy: boolean) => Promise<void>;
++
++export type TunnelManagerOptions = {
++  tunnelDir?: string;
++  originPort?: number;
++  platform?: NodeJS.Platform;
++  arch?: string;
++  store?: TunnelConfigStoreLike;
++  spawner?: Spawner;
++  which?: (cmd: string) => string | null;
++  downloader?: Downloader;
++  fetchImpl?: typeof fetch;
++  patchHostEnv?: PatchHostEnv | null;
++  now?: () => number;
++  sleep?: (ms: number) => Promise<void>;
++  loginTimeoutMs?: number;
++  loginPollMs?: number;
++  killTimeoutMs?: number;
++  healthzStartedAt?: number;
++  trustProxy?: boolean;
++  probeVersionOnStart?: boolean;
++  runningWaitMs?: number;
++};
++
++type BinaryCache = {
++  path: string | null;
++  source: TunnelBinaryStatus['source'];
++  version: string | null;
++};
++
++const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
++const LOGIN_POLL_MS = 500;
++const HOST_ENV_MESSAGE = 'Host environment is not managed by tmex-cli';
++
++function yamlQuote(value: string): string {
++  if (/[:#\n]|^\s|\s$/.test(value)) {
++    return JSON.stringify(value);
++  }
++  return value;
++}
++
++export function writeNamedConfigYml(opts: {
++  tunnelId: string;
++  credentialsPath: string;
++  certPath: string;
++  hostname: string;
++  originPort: number;
++}): string {
++  return [
++    `tunnel: ${opts.tunnelId}`,
++    `credentials-file: ${yamlQuote(opts.credentialsPath)}`,
++    `origincert: ${yamlQuote(opts.certPath)}`,
++    'ingress:',
++    `  - hostname: ${opts.hostname}`,
++    `    service: http://127.0.0.1:${opts.originPort}`,
++    '  - service: http_status:404',
++    '',
++  ].join('\n');
++}
++
++export class TunnelManager {
++  private readonly tunnelDir: string;
++  private readonly originPort: number;
++  private readonly platform: NodeJS.Platform;
++  private readonly arch: string;
++  private readonly store: TunnelConfigStoreLike;
++  private readonly which: (cmd: string) => string | null;
++  private readonly downloader: Downloader;
++  private readonly fetchImpl: typeof fetch;
++  private readonly now: () => number;
++  private readonly sleep: (ms: number) => Promise<void>;
++  private readonly loginTimeoutMs: number;
++  private readonly loginPollMs: number;
++  private readonly healthzStartedAt: number;
++  private readonly runningWaitMs: number;
++  private readonly logs = new LogRingBuffer(200);
++  private readonly provider: CloudflaredProvider;
++  private readonly supervisor: TunnelSupervisor;
++  private readonly probeVersionOnStart: boolean;
++  private trustProxy: boolean;
++  private patchHostEnv: PatchHostEnv | null;
++  private restartRequired = false;
++  private job: TunnelJobStatus | null = null;
++  private loginHandle: { kill: (signal?: NodeJS.Signals) => void; exited: Promise<number> } | null =
++    null;
++  private loginCancelled = false;
++  private loginUrl: string | null = null;
++  private binary: BinaryCache = { path: null, source: null, version: null };
++  private lastStartOpts: {
++    bin: string;
++    mode: 'named' | 'quick';
++    originPort: number;
++    configPath: string;
++    namedPublicUrl: string | null;
++  } | null = null;
++
++  constructor(opts: TunnelManagerOptions = {}) {
++    this.tunnelDir = opts.tunnelDir ?? config.tunnelDir;
++    this.originPort = opts.originPort ?? config.port;
++    this.platform = opts.platform ?? process.platform;
++    this.arch = opts.arch ?? process.arch;
++    this.store = opts.store ?? new TunnelConfigStore(getOrmDb());
++    this.which = opts.which ?? ((cmd) => Bun.which(cmd) ?? null);
++    this.downloader = opts.downloader ?? defaultDownloader;
++    this.fetchImpl = opts.fetchImpl ?? fetch;
++    this.patchHostEnv = opts.patchHostEnv ?? null;
++    this.now = opts.now ?? Date.now;
++    this.sleep = opts.sleep ?? ((ms) => Bun.sleep(ms));
++    this.loginTimeoutMs = opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
++    this.loginPollMs = opts.loginPollMs ?? LOGIN_POLL_MS;
++    this.healthzStartedAt = opts.healthzStartedAt ?? PROCESS_STARTED_AT;
++    this.runningWaitMs = opts.runningWaitMs ?? 30_000;
++    this.trustProxy = opts.trustProxy ?? config.trustProxy;
++    this.probeVersionOnStart = opts.probeVersionOnStart ?? false;
++    const spawner: Spawner = opts.spawner ?? bunSpawner;
++    this.provider = new CloudflaredProvider(spawner, this.tunnelDir);
++    this.supervisor = new TunnelSupervisor({
++      provider: this.provider,
++      logs: this.logs,
++      sleep: this.sleep,
++      killTimeoutMs: opts.killTimeoutMs ?? 5_000,
++      onPublicUrl: (url) => {
++        this.supervisor.publicUrl = url;
++      },
++    });
++  }
++
++  setPatchHostEnv(fn: PatchHostEnv | null): void {
++    this.patchHostEnv = fn;
++  }
++
++  async start(): Promise<void> {
++    await mkdir(this.tunnelDir, { recursive: true }).catch(() => {});
++    this.refreshBinaryPresence();
++    if ((this.probeVersionOnStart || !config.isTest) && this.binary.path) {
++      await this.probeVersion();
++    }
++    const persisted = this.store.get();
++    if (persisted.autoStart && persisted.mode !== 'off') {
++      try {
++        await this.startProcess(persisted.mode);
++      } catch (error) {
++        this.supervisor.state = 'error';
++        this.supervisor.lastError = tunnelErrorFrom(error).message;
++      }
++    }
++  }
++
++  async stop(): Promise<void> {
++    this.loginHandle?.kill();
++    this.loginHandle = null;
++    await this.supervisor.stop();
++  }
++
++  status(): TunnelStatusResponse {
++    this.refreshBinaryPresence();
++    const persisted = this.safePersisted();
++    const loggedIn = existsSync(originCertPath(this.tunnelDir));
++    const namedUrl =
++      persisted.mode === 'named' && persisted.hostname ? `https://${persisted.hostname}` : null;
++    const publicUrl =
++      this.supervisor.publicUrl ??
++      (this.supervisor.state === 'running'
++        ? namedUrl
++        : persisted.mode === 'named'
++          ? namedUrl
++          : null);
++    return {
++      supported: isTunnelPlatformSupported(this.platform, this.arch),
++      platform: tunnelPlatformLabel(this.platform, this.arch),
++      binary: {
++        installed: Boolean(this.binary.path),
++        version: this.binary.version,
++        path: this.binary.path,
++        source: this.binary.source,
++      },
++      auth: {
++        loggedIn,
++        loginUrl:
++          this.job?.kind === 'login' && this.job.state === 'running'
++            ? this.loginUrl
++            : this.loginUrl,
++      },
++      config: {
++        mode: persisted.mode,
++        hostname: persisted.hostname,
++        tunnelName: persisted.tunnelName,
++        tunnelId: persisted.tunnelId,
++        autoStart: persisted.autoStart,
++        originPort: this.originPort,
++      },
++      process: {
++        state: this.supervisor.state,
++        pid: this.supervisor.pid,
++        startedAt: this.supervisor.startedAt,
++        publicUrl,
++        lastError: this.supervisor.lastError,
++        restarts: this.supervisor.restarts,
++      },
++      job: this.job ? { ...this.job } : null,
++      trustProxy: this.trustProxy,
++      restartRequired: this.restartRequired,
++      log: this.logs.snapshot(),
++    };
++  }
++
++  async handleAction(
++    body: TunnelActionRequest
++  ): Promise<{ httpStatus: number; payload: TunnelActionResponse | TunnelErrorResponse }> {
++    try {
++      switch (body.action) {
++        case 'install':
++          return await this.enqueueJob('install', (step) => this.jobInstall(step));
++        case 'login':
++          return await this.enqueueJob('login', (step) => this.jobLogin(step));
++        case 'cancel_login':
++          this.cancelLogin();
++          return this.ok(200);
++        case 'create':
++          return await this.enqueueJob('create', (step) =>
++            this.jobCreate(body.hostname, body.tunnelName, step)
++          );
++        case 'quick_start':
++          return await this.enqueueJob('start', (step) => this.jobQuickStart(step));
++        case 'start':
++          return await this.enqueueJob('start', (step) => this.jobStart(step));
++        case 'stop':
++          return await this.enqueueJob('stop', (step) => this.jobStop(step));
++        case 'remove':
++          return await this.enqueueJob('remove', (step) => this.jobRemove(step));
++        case 'check':
++          return await this.enqueueJob('check', (step) => this.jobCheck(step));
++        case 'set_auto_start':
++          this.store.save({ autoStart: body.autoStart });
++          return this.ok(200);
++        case 'set_trust_proxy':
++          await this.setTrustProxy(body.trustProxy);
++          return this.ok(200);
++        default:
++          throw new TunnelError('invalid_request', 'unknown action');
++      }
++    } catch (error) {
++      const parsed = tunnelErrorFrom(error);
++      return {
++        httpStatus: tunnelHttpStatus(parsed.code),
++        payload: { error: parsed },
++      };
++    }
++  }
++
++  private ok(httpStatus: number): { httpStatus: number; payload: TunnelActionResponse } {
++    const status = this.status();
++    return { httpStatus, payload: { status, job: status.job } };
++  }
++
++  private async enqueueJob(
++    kind: TunnelJobKind,
++    run: (step: (name: string) => void) => Promise<void>
++  ): Promise<{ httpStatus: number; payload: TunnelActionResponse }> {
++    if (this.job?.state === 'running') {
++      throw new TunnelError('busy', 'A tunnel job is already running');
++    }
++    const job: TunnelJobStatus = {
++      id: randomUUID(),
++      kind,
++      state: 'running',
++      step: null,
++      error: null,
++      startedAt: new Date(this.now()).toISOString(),
++      finishedAt: null,
++    };
++    this.job = job;
++    if (kind === 'login') this.loginCancelled = false;
++    void this.executeJob(job, run);
++    return this.ok(202);
++  }
++
++  private async executeJob(
++    job: TunnelJobStatus,
++    run: (step: (name: string) => void) => Promise<void>
++  ): Promise<void> {
++    try {
++      await run((name) => {
++        job.step = name;
++      });
++      job.state = 'done';
++    } catch (error) {
++      const parsed = tunnelErrorFrom(error);
++      job.state = 'error';
++      job.error = parsed;
++    } finally {
++      job.finishedAt = new Date(this.now()).toISOString();
++      if (job.kind === 'login' && job.state !== 'running') {
++        this.loginHandle = null;
++        if (job.state !== 'done') this.loginUrl = null;
++      }
++    }
++  }
++
++  private requireSupported(): void {
++    if (!isTunnelPlatformSupported(this.platform, this.arch)) {
++      throw new TunnelError(
++        'unsupported_platform',
++        `unsupported platform ${tunnelPlatformLabel(this.platform, this.arch)}`
++      );
++    }
++  }
++
++  private requireBinary(): string {
++    this.refreshBinaryPresence();
++    if (!this.binary.path) {
++      throw new TunnelError('binary_missing', 'cloudflared is not installed');
++    }
++    return this.binary.path;
++  }
++
++  private requireLogin(): void {
++    if (!existsSync(originCertPath(this.tunnelDir))) {
++      throw new TunnelError('not_logged_in', 'cloudflared is not logged in');
++    }
++  }
++
++  private refreshBinaryPresence(): void {
++    const managed = managedBinaryPath(this.tunnelDir);
++    if (existsSync(managed)) {
++      if (this.binary.path !== managed) {
++        this.binary = { path: managed, source: 'managed', version: null };
++      } else {
++        this.binary.source = 'managed';
++        this.binary.path = managed;
++      }
++      return;
++    }
++    const system = this.which('cloudflared');
++    if (system) {
++      if (this.binary.path !== system) {
++        this.binary = { path: system, source: 'system', version: null };
++      } else {
++        this.binary.source = 'system';
++        this.binary.path = system;
++      }
++      return;
++    }
++    this.binary = { path: null, source: null, version: null };
++  }
++
++  private async probeVersion(): Promise<void> {
++    if (!this.binary.path) return;
++    try {
++      this.binary.version = await this.provider.version(this.binary.path);
++    } catch {
++      this.binary.version = null;
++    }
++  }
++
++  private async jobInstall(step: (name: string) => void): Promise<void> {
++    this.requireSupported();
++    await mkdir(this.tunnelDir, { recursive: true });
++    const dest = managedBinaryPath(this.tunnelDir);
++    step('download');
++    step('extract');
++    await installCloudflaredBinary({
++      tunnelDir: this.tunnelDir,
++      destPath: dest,
++      platform: this.platform,
++      arch: this.arch,
++      downloader: this.downloader,
++    });
++    this.binary = { path: dest, source: 'managed', version: null };
++    step('verify');
++    const version = await this.provider.version(dest);
++    if (!version) {
++      throw new TunnelError('download_failed', 'cloudflared --version did not produce a version');
++    }
++    this.binary.version = version;
++  }
++
++  private async jobLogin(step: (name: string) => void): Promise<void> {
++    this.requireSupported();
++    const bin = this.requireBinary();
++    await mkdir(this.tunnelDir, { recursive: true });
++    const cert = originCertPath(this.tunnelDir);
++    if (existsSync(cert)) {
++      step('wait_cert');
++      return;
++    }
++    step('login');
++    const handle = this.provider.spawnLogin(bin);
++    this.loginHandle = handle;
++    this.loginUrl = null;
++    const onLine = (line: string): void => {
++      this.logs.push(line);
++      const url = parseLoginUrl(line);
++      if (url) this.loginUrl = url;
++    };
++    void consumeLines(handle.stdout, onLine);
++    void consumeLines(handle.stderr, onLine);
++    const deadline = this.now() + this.loginTimeoutMs;
++    while (this.now() < deadline) {
++      if (this.loginCancelled) {
++        step('cancelled');
++        return;
++      }
++      if (existsSync(cert)) {
++        step('wait_cert');
++        handle.kill('SIGTERM');
++        await handle.exited.catch(() => {});
++        this.loginHandle = null;
++        return;
++      }
++      const exited = await Promise.race([
++        handle.exited.then((code) => code),
++        this.sleep(this.loginPollMs).then(() => null),
++      ]);
++      if (this.loginCancelled) {
++        step('cancelled');
++        return;
++      }
++      if (exited !== null && !existsSync(cert)) {
++        throw new TunnelError('process_failed', `cloudflared login exited with code ${exited}`);
++      }
++    }
++    handle.kill('SIGKILL');
++    throw new TunnelError('login_timeout', 'cloudflared login timed out');
++  }
++
++  private cancelLogin(): void {
++    this.loginCancelled = true;
++    this.loginHandle?.kill();
++  }
++
++  private async jobCreate(
++    hostnameRaw: string,
++    tunnelNameRaw: string | undefined,
++    step: (name: string) => void
++  ): Promise<void> {
++    this.requireSupported();
++    const bin = this.requireBinary();
++    this.requireLogin();
++    const hostname = normalizeTunnelHostname(hostnameRaw);
++    if (!hostname) {
++      throw new TunnelError('invalid_hostname', 'hostname is not a valid RFC 1123 name');
++    }
++    const tunnelName = (tunnelNameRaw?.trim() || defaultTunnelName(hostname)).toLowerCase();
++    await mkdir(this.tunnelDir, { recursive: true });
++    const credFile = credentialsPathFor(this.tunnelDir, tunnelName);
++    step('create');
++    const created = await this.provider.createTunnel(bin, tunnelName, credFile);
++    const credentialsPath = existsSync(created.credentialsPath)
++      ? created.credentialsPath
++      : existsSync(credFile)
++        ? credFile
++        : credentialsPathFor(this.tunnelDir, created.tunnelId);
++    step('route_dns');
++    await this.provider.routeDns(bin, tunnelName, hostname);
++    const cert = originCertPath(this.tunnelDir);
++    const yml = writeNamedConfigYml({
++      tunnelId: created.tunnelId,
++      credentialsPath,
++      certPath: cert,
++      hostname,
++      originPort: this.originPort,
++    });
++    await writeFile(configYmlPath(this.tunnelDir), yml, 'utf8');
++    this.store.save({
++      mode: 'named',
++      hostname,
++      tunnelName,
++      tunnelId: created.tunnelId,
++    });
++    step('start');
++    await this.startProcess('named');
++  }
++
++  private async jobQuickStart(step: (name: string) => void): Promise<void> {
++    this.requireSupported();
++    this.requireBinary();
++    this.store.save({
++      mode: 'quick',
++      hostname: null,
++      tunnelName: null,
++      tunnelId: null,
++    });
++    step('start');
++    await this.startProcess('quick');
++  }
++
++  private async jobStart(step: (name: string) => void): Promise<void> {
++    this.requireSupported();
++    this.requireBinary();
++    const persisted = this.store.get();
++    if (persisted.mode === 'off') {
++      throw new TunnelError('not_configured', 'tunnel is not configured');
++    }
++    step('start');
++    await this.startProcess(persisted.mode);
++  }
++
++  private async jobStop(step: (name: string) => void): Promise<void> {
++    step('stop');
++    await this.supervisor.stop();
++  }
++
++  private async jobRemove(step: (name: string) => void): Promise<void> {
++    step('stop');
++    await this.supervisor.stop();
++    const persisted = this.store.get();
++    await rm(configYmlPath(this.tunnelDir), { force: true }).catch(() => {});
++    if (persisted.tunnelName) {
++      await rm(credentialsPathFor(this.tunnelDir, persisted.tunnelName), { force: true }).catch(
++        () => {}
++      );
++    }
++    if (persisted.tunnelId) {
++      await rm(credentialsPathFor(this.tunnelDir, persisted.tunnelId), { force: true }).catch(
++        () => {}
++      );
++    }
++    const bin = this.binary.path;
++    if (bin && persisted.tunnelName) {
++      await this.provider.deleteTunnel(bin, persisted.tunnelName).catch(() => {});
++    }
++    this.store.save({
++      mode: 'off',
++      hostname: null,
++      tunnelName: null,
++      tunnelId: null,
++    });
++    this.supervisor.publicUrl = null;
++    this.supervisor.lastError = null;
++    this.supervisor.restarts = 0;
++  }
++
++  private async jobCheck(step: (name: string) => void): Promise<void> {
++    const status = this.status();
++    const target =
++      status.process.publicUrl ??
++      (status.config.hostname ? `https://${status.config.hostname}` : null);
++    if (!target) {
++      throw new TunnelError('not_configured', 'no hostname or public URL to check');
++    }
++    const url = `${target.replace(/\/$/, '')}/healthz`;
++    step('check');
++    const ac = new AbortController();
++    const timer = setTimeout(() => ac.abort(), 5_000);
++    try {
++      const res = await this.fetchImpl(url, { signal: ac.signal });
++      if (!res.ok) {
++        throw new TunnelError('unknown', `health check HTTP ${res.status}`);
++      }
++      const body = (await res.json()) as { startedAt?: unknown };
++      if (body.startedAt !== this.healthzStartedAt) {
++        throw new TunnelError(
++          'unknown',
++          `health check startedAt mismatch: got ${String(body.startedAt)}, expected ${this.healthzStartedAt}`
++        );
++      }
++      step('ok');
++    } catch (error) {
++      if (error instanceof TunnelError) throw error;
++      const message = error instanceof Error ? error.message : String(error);
++      throw new TunnelError('unknown', `health check failed: ${message}`);
++    } finally {
++      clearTimeout(timer);
++    }
++  }
++
++  private async setTrustProxy(trustProxy: boolean): Promise<void> {
++    if (!this.patchHostEnv) {
++      throw new TunnelError('not_configured', HOST_ENV_MESSAGE);
++    }
++    await this.patchHostEnv(trustProxy);
++    this.restartRequired = trustProxy !== this.trustProxy;
++  }
++
++  private async startProcess(mode: TunnelMode): Promise<void> {
++    if (mode === 'off') {
++      throw new TunnelError('not_configured', 'tunnel is not configured');
++    }
++    const bin = this.requireBinary();
++    if (
++      this.supervisor.runningEnabled ||
++      this.supervisor.state === 'running' ||
++      this.supervisor.state === 'starting'
++    ) {
++      await this.supervisor.stop();
++    }
++    const persisted = this.store.get();
++    const namedPublicUrl =
++      mode === 'named' && persisted.hostname ? `https://${persisted.hostname}` : null;
++    this.lastStartOpts = {
++      bin,
++      mode,
++      originPort: this.originPort,
++      configPath: configYmlPath(this.tunnelDir),
++      namedPublicUrl,
++    };
++    this.logs.clear();
++    await this.supervisor.start(this.lastStartOpts);
++    await this.waitUntilRunning();
++  }
++
++  private async waitUntilRunning(): Promise<void> {
++    const deadline = this.now() + this.runningWaitMs;
++    while (this.now() < deadline) {
++      if (this.supervisor.state === 'running') return;
++      if (this.supervisor.state === 'error' && !this.supervisor.runningEnabled) {
++        throw new TunnelError(
++          'process_failed',
++          this.supervisor.lastError ?? 'cloudflared failed to start'
++        );
++      }
++      await Bun.sleep(5);
++    }
++    if (this.supervisor.state !== 'running') {
++      throw new TunnelError('process_failed', 'cloudflared did not register a connection in time');
++    }
++  }
++
++  private safePersisted(): TunnelPersisted {
++    try {
++      return this.store.get();
++    } catch {
++      return { ...DEFAULT_TUNNEL_CONFIG };
++    }
++  }
++}
++
++export const tunnelManager = new TunnelManager();
+diff --git a/apps/gateway/src/tunnel/platform.ts b/apps/gateway/src/tunnel/platform.ts
+new file mode 100644
+index 00000000..4bf861f0
+--- /dev/null
++++ b/apps/gateway/src/tunnel/platform.ts
+@@ -0,0 +1,31 @@
++export type TunnelOsArch = { platform: NodeJS.Platform; arch: string };
++
++export function isTunnelPlatformSupported(
++  platform: NodeJS.Platform = process.platform,
++  arch: string = process.arch
++): boolean {
++  return (platform === 'darwin' || platform === 'linux') && (arch === 'x64' || arch === 'arm64');
++}
++
++export function tunnelPlatformLabel(
++  platform: NodeJS.Platform = process.platform,
++  arch: string = process.arch
++): string {
++  return `${platform}-${arch}`;
++}
++
++export function cloudflaredDownloadSpec(
++  platform: NodeJS.Platform,
++  arch: string
++): { url: string; fileName: string; tgz: boolean } {
++  const cfArch = arch === 'x64' ? 'amd64' : arch;
++  const tgz = platform === 'darwin';
++  const fileName = tgz
++    ? `cloudflared-${platform}-${cfArch}.tgz`
++    : `cloudflared-${platform}-${cfArch}`;
++  return {
++    url: `https://github.com/cloudflare/cloudflared/releases/latest/download/${fileName}`,
++    fileName,
++    tgz,
++  };
++}
+diff --git a/apps/gateway/src/tunnel/provider.ts b/apps/gateway/src/tunnel/provider.ts
+new file mode 100644
+index 00000000..131fce0f
+--- /dev/null
++++ b/apps/gateway/src/tunnel/provider.ts
+@@ -0,0 +1,204 @@
++import { join } from 'node:path';
++import { TunnelError } from './errors';
++import { type SpawnHandle, type Spawner, collectOutput } from './spawn';
++
++export const VERSION_RE = /cloudflared version (\S+)/i;
++export const LOGIN_URL_RE = /https:\/\/[^\s]+/g;
++export const CREATE_ID_RE = /created tunnel .+ with id ([0-9a-f-]{36})/i;
++export const CREDENTIALS_PATH_RE = /credentials written to ([^\s]+\.json)/i;
++export const QUICK_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
++export const REGISTERED_RE = /Registered tunnel connection/i;
++
++export function parseVersion(output: string): string | null {
++  const match = VERSION_RE.exec(output);
++  return match?.[1] ?? null;
++}
++
++export function parseLoginUrl(output: string): string | null {
++  const matches = output.match(LOGIN_URL_RE);
++  if (!matches || matches.length === 0) return null;
++  const preferred = matches.find((url) => /cloudflare/i.test(url));
++  return preferred ?? matches[0] ?? null;
++}
++
++export function parseCreateOutput(output: string): {
++  tunnelId: string | null;
++  credentialsPath: string | null;
++} {
++  const id = CREATE_ID_RE.exec(output)?.[1] ?? null;
++  const credentialsPath = CREDENTIALS_PATH_RE.exec(output)?.[1]?.trim() ?? null;
++  return { tunnelId: id, credentialsPath };
++}
++
++export function parseQuickUrl(output: string): string | null {
++  return QUICK_URL_RE.exec(output)?.[0] ?? null;
++}
++
++export function isRegisteredLine(line: string): boolean {
++  return REGISTERED_RE.test(line);
++}
++
++export type TunnelListEntry = { id: string; name: string };
++
++export function parseTunnelList(output: string): TunnelListEntry[] {
++  try {
++    const parsed = JSON.parse(output) as unknown;
++    if (!Array.isArray(parsed)) return [];
++    const out: TunnelListEntry[] = [];
++    for (const item of parsed) {
++      if (!item || typeof item !== 'object') continue;
++      const rec = item as { id?: unknown; name?: unknown };
++      if (typeof rec.id === 'string' && typeof rec.name === 'string') {
++        out.push({ id: rec.id, name: rec.name });
++      }
++    }
++    return out;
++  } catch {
++    return [];
++  }
++}
++
++export function originCertPath(tunnelDir: string): string {
++  return join(tunnelDir, 'cert.pem');
++}
++
++export function managedBinaryPath(tunnelDir: string): string {
++  return join(tunnelDir, 'cloudflared');
++}
++
++export function configYmlPath(tunnelDir: string): string {
++  return join(tunnelDir, 'config.yml');
++}
++
++export function credentialsPathFor(tunnelDir: string, tunnelIdOrName: string): string {
++  return join(tunnelDir, `${tunnelIdOrName}.json`);
++}
++
++export type CloudflaredEnv = {
++  originCert: string;
++  extra?: Record<string, string>;
++};
++
++function tunnelEnv(originCert: string, extra?: Record<string, string>): Record<string, string> {
++  const env: Record<string, string> = {};
++  for (const [key, value] of Object.entries(process.env)) {
++    if (value !== undefined) env[key] = value;
++  }
++  env.TUNNEL_ORIGIN_CERT = originCert;
++  env.NO_AUTOUPDATE = 'true';
++  if (extra) Object.assign(env, extra);
++  return env;
++}
++
++function tunnelBaseArgs(originCert: string): string[] {
++  return ['tunnel', '--origincert', originCert, '--no-autoupdate'];
++}
++
++export class CloudflaredProvider {
++  constructor(
++    private readonly spawner: Spawner,
++    private readonly tunnelDir: string
++  ) {}
++
++  spawn(command: string, args: string[], env?: Record<string, string>): SpawnHandle {
++    return this.spawner({ command, args, env, cwd: this.tunnelDir });
++  }
++
++  async version(bin: string): Promise<string | null> {
++    const handle = this.spawn(bin, ['--version']);
++    const { stdout, stderr } = await collectOutput(handle);
++    return parseVersion(`${stdout}\n${stderr}`);
++  }
++
++  spawnLogin(bin: string): SpawnHandle {
++    const cert = originCertPath(this.tunnelDir);
++    return this.spawn(bin, [...tunnelBaseArgs(cert), 'login'], tunnelEnv(cert));
++  }
++
++  async createTunnel(
++    bin: string,
++    name: string,
++    credFile: string
++  ): Promise<{ tunnelId: string; credentialsPath: string }> {
++    const cert = originCertPath(this.tunnelDir);
++    const handle = this.spawn(
++      bin,
++      [...tunnelBaseArgs(cert), 'create', '--credentials-file', credFile, name],
++      tunnelEnv(cert)
++    );
++    const { stdout, stderr, exitCode } = await collectOutput(handle);
++    const combined = `${stdout}\n${stderr}`;
++    if (exitCode === 0) {
++      const parsed = parseCreateOutput(combined);
++      const tunnelId = parsed.tunnelId;
++      if (!tunnelId) {
++        throw new TunnelError('process_failed', combined.trim() || 'tunnel create produced no id');
++      }
++      return { tunnelId, credentialsPath: parsed.credentialsPath ?? credFile };
++    }
++    if (/already exists/i.test(combined)) {
++      const existing = await this.findTunnel(bin, name);
++      if (existing) {
++        return { tunnelId: existing.id, credentialsPath: credFile };
++      }
++    }
++    throw new TunnelError('process_failed', combined.trim() || `tunnel create exited ${exitCode}`);
++  }
++
++  async findTunnel(bin: string, name: string): Promise<TunnelListEntry | null> {
++    const cert = originCertPath(this.tunnelDir);
++    const handle = this.spawn(
++      bin,
++      [...tunnelBaseArgs(cert), 'list', '-o', 'json', '--name', name],
++      tunnelEnv(cert)
++    );
++    const { stdout, stderr, exitCode } = await collectOutput(handle);
++    const entries = parseTunnelList(stdout || stderr);
++    const exact = entries.find((entry) => entry.name === name);
++    if (exact) return exact;
++    if (exitCode !== 0 && entries.length === 0) return null;
++    return entries[0] ?? null;
++  }
++
++  async routeDns(bin: string, name: string, hostname: string): Promise<void> {
++    const cert = originCertPath(this.tunnelDir);
++    const handle = this.spawn(
++      bin,
++      [...tunnelBaseArgs(cert), 'route', 'dns', name, hostname],
++      tunnelEnv(cert)
++    );
++    const { stdout, stderr, exitCode } = await collectOutput(handle);
++    if (exitCode !== 0) {
++      const message = `${stderr}\n${stdout}`.trim() || `dns route exited ${exitCode}`;
++      throw new TunnelError('dns_route_failed', message);
++    }
++  }
++
++  async deleteTunnel(bin: string, name: string): Promise<void> {
++    const cert = originCertPath(this.tunnelDir);
++    const handle = this.spawn(
++      bin,
++      [...tunnelBaseArgs(cert), 'delete', '-f', name],
++      tunnelEnv(cert)
++    );
++    await collectOutput(handle);
++  }
++
++  spawnNamedRun(bin: string, configPath: string): SpawnHandle {
++    const cert = originCertPath(this.tunnelDir);
++    return this.spawn(
++      bin,
++      [...tunnelBaseArgs(cert), '--config', configPath, 'run'],
++      tunnelEnv(cert)
++    );
++  }
++
++  spawnQuickRun(bin: string, originPort: number): SpawnHandle {
++    return this.spawn(bin, [
++      'tunnel',
++      '--no-autoupdate',
++      '--url',
++      `http://127.0.0.1:${originPort}`,
++    ]);
++  }
++}
+diff --git a/apps/gateway/src/tunnel/redact.ts b/apps/gateway/src/tunnel/redact.ts
+new file mode 100644
+index 00000000..f760c6b2
+--- /dev/null
++++ b/apps/gateway/src/tunnel/redact.ts
+@@ -0,0 +1,3 @@
++export function redactSecrets(line: string): string {
++  return line.replace(/[A-Za-z0-9+/]{32,}={0,2}|\b[0-9a-fA-F]{32,}\b/g, '***');
++}
+diff --git a/apps/gateway/src/tunnel/spawn.ts b/apps/gateway/src/tunnel/spawn.ts
+new file mode 100644
+index 00000000..aa839f1f
+--- /dev/null
++++ b/apps/gateway/src/tunnel/spawn.ts
+@@ -0,0 +1,91 @@
++export type SpawnSpec = {
++  command: string;
++  args: string[];
++  env?: Record<string, string>;
++  cwd?: string;
++};
++
++export type SpawnHandle = {
++  pid: number;
++  stdout: ReadableStream<Uint8Array> | null;
++  stderr: ReadableStream<Uint8Array> | null;
++  exited: Promise<number>;
++  kill: (signal?: NodeJS.Signals) => void;
++};
++
++export type Spawner = (spec: SpawnSpec) => SpawnHandle;
++
++function envRecord(env?: Record<string, string>): Record<string, string> | undefined {
++  if (!env) return undefined;
++  const out: Record<string, string> = {};
++  for (const [key, value] of Object.entries(env)) {
++    if (value !== undefined) out[key] = value;
++  }
++  return out;
++}
++
++export function bunSpawner(spec: SpawnSpec): SpawnHandle {
++  const proc = Bun.spawn([spec.command, ...spec.args], {
++    stdout: 'pipe',
++    stderr: 'pipe',
++    stdin: 'ignore',
++    env: envRecord(spec.env) ?? process.env,
++    cwd: spec.cwd,
++  });
++  return {
++    pid: proc.pid,
++    stdout: proc.stdout,
++    stderr: proc.stderr,
++    exited: proc.exited.then((code) => code ?? 1),
++    kill(signal?: NodeJS.Signals) {
++      try {
++        proc.kill(signal ?? 'SIGTERM');
++      } catch {}
++    },
++  };
++}
++
++export async function consumeLines(
++  stream: ReadableStream<Uint8Array> | null,
++  onLine: (line: string) => void
++): Promise<void> {
++  if (!stream) return;
++  const reader = stream.getReader();
++  const decoder = new TextDecoder();
++  let buf = '';
++  try {
++    for (;;) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      buf += decoder.decode(value, { stream: true });
++      const parts = buf.split(/\r?\n/);
++      buf = parts.pop() ?? '';
++      for (const line of parts) {
++        if (line.length > 0) onLine(line);
++      }
++    }
++    buf += decoder.decode();
++    if (buf.length > 0) onLine(buf);
++  } catch {
++    // 子进程被杀时 reader 可能抛错，忽略即可
++  }
++}
++
++export async function collectOutput(handle: SpawnHandle): Promise<{
++  stdout: string;
++  stderr: string;
++  exitCode: number;
++}> {
++  let stdout = '';
++  let stderr = '';
++  await Promise.all([
++    consumeLines(handle.stdout, (line) => {
++      stdout += `${line}\n`;
++    }),
++    consumeLines(handle.stderr, (line) => {
++      stderr += `${line}\n`;
++    }),
++  ]);
++  const exitCode = await handle.exited;
++  return { stdout, stderr, exitCode };
++}
+diff --git a/apps/gateway/src/tunnel/supervisor.ts b/apps/gateway/src/tunnel/supervisor.ts
+new file mode 100644
+index 00000000..7d1e6a6f
+--- /dev/null
++++ b/apps/gateway/src/tunnel/supervisor.ts
+@@ -0,0 +1,163 @@
++import type { TunnelProcessState } from '@tmex/shared';
++import type { LogRingBuffer } from './log-buffer';
++import { type CloudflaredProvider, isRegisteredLine, parseQuickUrl } from './provider';
++import { type SpawnHandle, consumeLines } from './spawn';
++
++export type SupervisorMode = 'named' | 'quick';
++
++export interface SupervisorDeps {
++  provider: CloudflaredProvider;
++  logs: LogRingBuffer;
++  sleep: (ms: number) => Promise<void>;
++  killTimeoutMs: number;
++  onPublicUrl?: (url: string) => void;
++  maxBackoffMs?: number;
++}
++
++const MIN_BACKOFF_MS = 1_000;
++const DEFAULT_MAX_BACKOFF_MS = 30_000;
++
++export class TunnelSupervisor {
++  state: TunnelProcessState = 'stopped';
++  pid: number | null = null;
++  startedAt: string | null = null;
++  publicUrl: string | null = null;
++  lastError: string | null = null;
++  restarts = 0;
++
++  private child: SpawnHandle | null = null;
++  private enabled = false;
++  private generation = 0;
++  private backoffMs = MIN_BACKOFF_MS;
++  private killTimer: ReturnType<typeof setTimeout> | null = null;
++  private readonly maxBackoffMs: number;
++
++  constructor(private readonly deps: SupervisorDeps) {
++    this.maxBackoffMs = deps.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
++  }
++
++  get runningEnabled(): boolean {
++    return this.enabled;
++  }
++
++  async start(opts: {
++    bin: string;
++    mode: SupervisorMode;
++    originPort: number;
++    configPath: string;
++    namedPublicUrl: string | null;
++  }): Promise<void> {
++    this.enabled = true;
++    this.generation += 1;
++    this.lastError = null;
++    this.backoffMs = MIN_BACKOFF_MS;
++    await this.spawnChild(opts, this.generation);
++  }
++
++  async stop(): Promise<void> {
++    this.enabled = false;
++    this.generation += 1;
++    const child = this.child;
++    this.child = null;
++    if (!child) {
++      this.state = 'stopped';
++      this.pid = null;
++      this.startedAt = null;
++      return;
++    }
++    await this.terminate(child);
++    this.state = 'stopped';
++    this.pid = null;
++  }
++
++  private async spawnChild(
++    opts: {
++      bin: string;
++      mode: SupervisorMode;
++      originPort: number;
++      configPath: string;
++      namedPublicUrl: string | null;
++    },
++    generation: number
++  ): Promise<void> {
++    if (!this.enabled || generation !== this.generation) return;
++    this.state = 'starting';
++    this.publicUrl = opts.mode === 'named' ? opts.namedPublicUrl : this.publicUrl;
++    const child =
++      opts.mode === 'named'
++        ? this.deps.provider.spawnNamedRun(opts.bin, opts.configPath)
++        : this.deps.provider.spawnQuickRun(opts.bin, opts.originPort);
++    this.child = child;
++    this.pid = child.pid;
++    this.startedAt = new Date().toISOString();
++
++    const onLine = (line: string): void => {
++      this.deps.logs.push(line);
++      const quickUrl = parseQuickUrl(line);
++      if (quickUrl) {
++        this.publicUrl = quickUrl;
++        this.deps.onPublicUrl?.(quickUrl);
++        if (this.state === 'starting') this.state = 'running';
++      }
++      if (isRegisteredLine(line) && this.state === 'starting') {
++        this.state = 'running';
++        this.backoffMs = MIN_BACKOFF_MS;
++      }
++    };
++
++    void consumeLines(child.stdout, onLine);
++    void consumeLines(child.stderr, onLine);
++
++    void child.exited.then((code) => {
++      void this.onExit(code, opts, generation);
++    });
++  }
++
++  private async onExit(
++    code: number,
++    opts: {
++      bin: string;
++      mode: SupervisorMode;
++      originPort: number;
++      configPath: string;
++      namedPublicUrl: string | null;
++    },
++    generation: number
++  ): Promise<void> {
++    if (generation !== this.generation) return;
++    this.child = null;
++    this.pid = null;
++    if (!this.enabled) {
++      this.state = 'stopped';
++      return;
++    }
++    this.lastError = `cloudflared exited with code ${code}`;
++    this.state = 'starting';
++    this.restarts += 1;
++    const wait = this.backoffMs;
++    this.backoffMs = Math.min(this.maxBackoffMs, this.backoffMs * 2);
++    await this.deps.sleep(wait);
++    if (!this.enabled || generation !== this.generation) return;
++    await this.spawnChild(opts, generation);
++  }
++
++  private async terminate(child: SpawnHandle): Promise<void> {
++    let settled = false;
++    const done = child.exited.then(() => {
++      settled = true;
++    });
++    child.kill('SIGTERM');
++    const timeout = new Promise<void>((resolve) => {
++      this.killTimer = setTimeout(resolve, this.deps.killTimeoutMs);
++    });
++    await Promise.race([done, timeout]);
++    if (this.killTimer) {
++      clearTimeout(this.killTimer);
++      this.killTimer = null;
++    }
++    if (!settled) {
++      child.kill('SIGKILL');
++      await child.exited.catch(() => {});
++    }
++  }
++}
+diff --git a/apps/gateway/src/tunnel/util.test.ts b/apps/gateway/src/tunnel/util.test.ts
+new file mode 100644
+index 00000000..912ecc61
+--- /dev/null
++++ b/apps/gateway/src/tunnel/util.test.ts
+@@ -0,0 +1,112 @@
++import { describe, expect, test } from 'bun:test';
++import { resolveTunnelDir } from '../config';
++import { defaultTunnelName, normalizeTunnelHostname } from './hostname';
++import { LogRingBuffer } from './log-buffer';
++import { cloudflaredDownloadSpec, isTunnelPlatformSupported } from './platform';
++import {
++  parseCreateOutput,
++  parseLoginUrl,
++  parseQuickUrl,
++  parseTunnelList,
++  parseVersion,
++} from './provider';
++import { redactSecrets } from './redact';
++
++describe('normalizeTunnelHostname', () => {
++  test('accepts RFC 1123 lowercase names and rejects junk', () => {
++    expect(normalizeTunnelHostname('Tmex.Example.COM')).toBe('tmex.example.com');
++    expect(normalizeTunnelHostname('localhost')).toBe('localhost');
++    expect(normalizeTunnelHostname('')).toBeNull();
++    expect(normalizeTunnelHostname('-bad.com')).toBeNull();
++    expect(normalizeTunnelHostname('not_a_host')).toBeNull();
++  });
++
++  test('default tunnel name uses the first label', () => {
++    expect(defaultTunnelName('remote.example.com')).toBe('tmex-remote');
++  });
++});
++
++describe('redactSecrets', () => {
++  test('redacts hex and base64 tokens of at least 32 characters', () => {
++    const hex = 'a'.repeat(32);
++    const b64 = `${'A'.repeat(40)}==`;
++    expect(redactSecrets(`token=${hex} keep`)).toBe('token=*** keep');
++    expect(redactSecrets(`secret ${b64}`)).toBe('secret ***');
++    expect(redactSecrets('short abcdef1234567890')).toBe('short abcdef1234567890');
++  });
++});
++
++describe('LogRingBuffer', () => {
++  test('keeps the last 200 redacted lines', () => {
++    const buf = new LogRingBuffer(3);
++    buf.push(`one ${'a'.repeat(32)}`);
++    buf.push('two');
++    buf.push('three');
++    buf.push('four');
++    expect(buf.snapshot()).toEqual(['two', 'three', 'four']);
++  });
++});
++
++describe('platform', () => {
++  test('supports darwin/linux x64/arm64 only', () => {
++    expect(isTunnelPlatformSupported('darwin', 'arm64')).toBe(true);
++    expect(isTunnelPlatformSupported('linux', 'x64')).toBe(true);
++    expect(isTunnelPlatformSupported('win32', 'x64')).toBe(false);
++    expect(isTunnelPlatformSupported('darwin', 'ia32')).toBe(false);
++  });
++
++  test('download URL uses amd64 and darwin tgz', () => {
++    expect(cloudflaredDownloadSpec('linux', 'x64')).toEqual({
++      url: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
++      fileName: 'cloudflared-linux-amd64',
++      tgz: false,
++    });
++    expect(cloudflaredDownloadSpec('darwin', 'arm64').fileName).toBe(
++      'cloudflared-darwin-arm64.tgz'
++    );
++    expect(cloudflaredDownloadSpec('darwin', 'arm64').tgz).toBe(true);
++  });
++});
++
++describe('cloudflared output parsers', () => {
++  test('parses version', () => {
++    expect(parseVersion('cloudflared version 2025.8.1 (built 2025-08-01T00:00:00Z)')).toBe(
++      '2025.8.1'
++    );
++    expect(parseVersion('nope')).toBeNull();
++  });
++
++  test('parses login URL from mixed output', () => {
++    const out = 'Please visit:\nhttps://dash.cloudflare.com/argotunnel?aud=abc\nLeave running\n';
++    expect(parseLoginUrl(out)).toBe('https://dash.cloudflare.com/argotunnel?aud=abc');
++  });
++
++  test('parses create id and credentials path', () => {
++    const out = [
++      'Tunnel credentials written to /tmp/tunnel/foo.json. Keep this file secret.',
++      'Created tunnel tmex-foo with id 550e8400-e29b-41d4-a716-446655440000',
++    ].join('\n');
++    expect(parseCreateOutput(out)).toEqual({
++      tunnelId: '550e8400-e29b-41d4-a716-446655440000',
++      credentialsPath: '/tmp/tunnel/foo.json',
++    });
++  });
++
++  test('parses trycloudflare URL and list json', () => {
++    expect(parseQuickUrl('Visit https://random-words-123.trycloudflare.com now')).toBe(
++      'https://random-words-123.trycloudflare.com'
++    );
++    expect(
++      parseTunnelList(JSON.stringify([{ id: 'abc-def', name: 'tmex-foo', created_at: 'x' }]))
++    ).toEqual([{ id: 'abc-def', name: 'tmex-foo' }]);
++  });
++});
++
++describe('resolveTunnelDir', () => {
++  test('uses TMEX_TUNNEL_DIR or a tunnel directory next to the sqlite file', () => {
++    expect(resolveTunnelDir({ TMEX_TUNNEL_DIR: '/data/tun' })).toBe('/data/tun');
++    expect(
++      resolveTunnelDir({ DATABASE_URL: '/var/tmex/tmex.db', TMEX_TUNNEL_DIR: undefined })
++    ).toBe('/var/tmex/tunnel');
++  });
++});
+diff --git a/packages/api-client/src/auth/types.ts b/packages/api-client/src/auth/types.ts
+index 5ac613c9..4e722c0c 100644
+--- a/packages/api-client/src/auth/types.ts
++++ b/packages/api-client/src/auth/types.ts
+@@ -136,6 +136,9 @@ export interface NodeLoginRequiredBody {
+   nodeId: string;
+ }
+ 
++export type MeshNodeReach = 'lan' | 'wan' | 'relay' | null;
++export type MeshNodeTransport = 'ws-secure' | 'relay' | 'dc' | null;
++
+ /** `GET /api/mesh/nodes` 的单行（**需会话**）。 */
+ export interface MeshNode {
+   id: string;
+@@ -143,10 +146,15 @@ export interface MeshNode {
+   /** base64url，32 字节 */
+   publicKey: string;
+   online: boolean;
+-  /** `lan` / `relay` / null（不可达） */
+-  reach: string | null;
+-  /** Actual peer-link transport. `reach` stays lan/relay/null for compatibility. */
+-  transport?: 'ws-secure' | 'relay' | 'dc' | null;
++  /**
++   * entry ↔ node 的到达路径：`lan`（对端地址为私网/本机）、`wan`（公网直连）、
++   * `relay`（经 hub 中转）、null（不可达）。
++   */
++  reach: MeshNodeReach;
++  /** 实际 peer link 承载。 */
++  transport?: MeshNodeTransport;
++  /** entry ↔ node 最近一次 ping/pong 往返毫秒数；未测得为 null。 */
++  rttMs?: number | null;
+   version: string | null;
+   direct_capable: boolean;
+   inventory?: unknown;
+diff --git a/packages/api-client/src/file-resources.ts b/packages/api-client/src/file-resources.ts
+index f4d75588..1c49fd82 100644
+--- a/packages/api-client/src/file-resources.ts
++++ b/packages/api-client/src/file-resources.ts
+@@ -1,6 +1,7 @@
+ // 文件根与目录/文件元信息的 REST 端点。
+ 
+ import type {
++  BrowseDirectoryResponse,
+   CreateFileRootRequest,
+   FileContentResponse,
+   FileRootResponse,
+@@ -87,3 +88,16 @@ export async function fetchFileContent(
+   if (!res.ok) throw await parseError(res);
+   return (await res.json()) as FileContentResponse;
+ }
++
++/** 图形化路径选择器：列出设备上任意目录的子目录（不受 roots 白名单约束）。 */
++export async function browseDirectory(
++  params: { deviceId: string; path?: string; hidden?: boolean },
++  client: ApiClient = defaultApiClient
++): Promise<BrowseDirectoryResponse> {
++  const search = new URLSearchParams({ deviceId: params.deviceId });
++  if (params.path) search.set('path', params.path);
++  if (params.hidden) search.set('hidden', '1');
++  const res = await client.fetch(`/api/files/browse?${search.toString()}`);
++  if (!res.ok) throw await parseError(res);
++  return (await res.json()) as BrowseDirectoryResponse;
++}
+diff --git a/packages/api-client/src/local/index.ts b/packages/api-client/src/local/index.ts
+index 21a1906f..f6646e4f 100644
+--- a/packages/api-client/src/local/index.ts
++++ b/packages/api-client/src/local/index.ts
+@@ -3,3 +3,4 @@ export * from './local-api';
+ export * from './setup-api';
+ export * from './tls-types';
+ export * from './tls-api';
++export * from './tunnel-api';
+diff --git a/packages/api-client/src/local/tunnel-api.ts b/packages/api-client/src/local/tunnel-api.ts
+new file mode 100644
+index 00000000..b49a7825
+--- /dev/null
++++ b/packages/api-client/src/local/tunnel-api.ts
+@@ -0,0 +1,59 @@
++// 远程访问（Cloudflare Tunnel）客户端。与 TLS/LocalApi 一样只问浏览器直连的那台机器，
++// 路径经 `resolveNodeUrl(SELF_NODE_ID, ...)` 走 entry 自身，不加 `/n/<id>` 前缀。
++
++import type {
++  TunnelActionRequest,
++  TunnelActionResponse,
++  TunnelErrorCode,
++  TunnelStatusResponse,
++} from '@tmex/shared';
++import { type ApiClient, defaultApiClient } from '../client';
++import { SELF_NODE_ID, resolveNodeUrl } from '../node-url';
++
++export class TunnelApiError extends Error {
++  constructor(
++    readonly code: TunnelErrorCode,
++    message: string,
++    readonly status: number
++  ) {
++    super(message);
++    this.name = 'TunnelApiError';
++  }
++}
++
++async function readError(res: Response, fallback: string): Promise<TunnelApiError> {
++  try {
++    const body = (await res.json()) as { error?: { code?: unknown; message?: unknown } };
++    const code = body.error?.code;
++    if (typeof code === 'string') {
++      const message = body.error?.message;
++      return new TunnelApiError(
++        code as TunnelErrorCode,
++        typeof message === 'string' ? message : code,
++        res.status
++      );
++    }
++  } catch {}
++  return new TunnelApiError('unknown', fallback, res.status);
++}
++
++export async function fetchTunnelStatus(
++  client: ApiClient = defaultApiClient
++): Promise<TunnelStatusResponse> {
++  const res = await client.fetch(resolveNodeUrl(SELF_NODE_ID, '/api/tunnel/status'));
++  if (!res.ok) throw await readError(res, 'Failed to load tunnel status');
++  return (await res.json()) as TunnelStatusResponse;
++}
++
++export async function runTunnelAction(
++  body: TunnelActionRequest,
++  client: ApiClient = defaultApiClient
++): Promise<TunnelActionResponse> {
++  const res = await client.fetch(resolveNodeUrl(SELF_NODE_ID, '/api/tunnel/actions'), {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(body),
++  });
++  if (!res.ok) throw await readError(res, 'Tunnel action failed');
++  return (await res.json()) as TunnelActionResponse;
++}
+diff --git a/packages/app/src/runtime/assemble.ts b/packages/app/src/runtime/assemble.ts
+index 2b47a71a..ce676f3d 100644
+--- a/packages/app/src/runtime/assemble.ts
++++ b/packages/app/src/runtime/assemble.ts
+@@ -32,10 +32,13 @@ import {
+ import type { GatewayRuntime } from '../../../../apps/gateway/src/runtime';
+ import { resolveInstallDir as resolveGatewayInstallDir } from '../../../../apps/gateway/src/system/install-info';
+ import { TlsConfigStore } from '../../../../apps/gateway/src/tls/tls-config-store';
++import { tunnelManager } from '../../../../apps/gateway/src/tunnel/manager';
+ import type { GatewaySession } from '../../../../apps/gateway/src/ws/gateway-session';
+ import { readNodeEnv } from '../../../../packages/shared/src/env/load-env';
+ import { disableDirect, enableDirect } from '../commands/direct';
+ import { performHubJoin } from '../commands/hub';
++import { readEnvFile, writeEnvFile } from '../lib/env-file';
++import { withEnvLock } from '../lib/env-mutation';
+ import { createAuthContextFromDb } from '../lib/local-auth';
+ import { loadNodeDatachannel } from '../lib/native-datachannel';
+ import { detectCurrentNativePin } from '../lib/native-manifest';
+@@ -310,6 +313,21 @@ function buildTlsLifecycle(
+     trustProxy: gatewayConfig.trustProxy,
+   });
+   tlsSlot.service = tls;
++  tunnelManager.setPatchHostEnv(async (trustProxy) => {
++    const envPath = resolveSetupEnvPath();
++    await withEnvLock(async () => {
++      let existing: Record<string, string> = {};
++      try {
++        existing = await readEnvFile(envPath);
++      } catch (error) {
++        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
++      }
++      await writeEnvFile(envPath, {
++        ...existing,
++        TMEX_TRUST_PROXY: trustProxy ? 'true' : 'false',
++      });
++    });
++  });
+   return {
+     tls,
+     httpsListener,
+diff --git a/packages/shared/src/contracts/files.ts b/packages/shared/src/contracts/files.ts
+index fdcd79e5..c5a6c432 100644
+--- a/packages/shared/src/contracts/files.ts
++++ b/packages/shared/src/contracts/files.ts
+@@ -143,3 +143,27 @@ export type UploadCommitEvent =
+   | { type: 'progress'; transferred: number; pct: number; rate: string }
+   | { type: 'done'; uploaded: string }
+   | { type: 'error'; code: FileErrorCode; detail?: string };
++
++/** `GET /api/files/browse` 的单个子目录条目（图形化路径选择器，不受 file roots 白名单约束） */
++export interface BrowseDirectoryEntryDto {
++  name: string;
++  /** 绝对路径 */
++  path: string;
++  hidden: boolean;
++  /** 指向目录的符号链接 */
++  symlink: boolean;
++}
++
++/**
++ * `GET /api/files/browse?deviceId=&path=&hidden=` 响应。
++ * `path` 为空时从设备默认目录（SSH 为登录用户 home，本机为 `os.homedir()`）开始；
++ * 响应里的 `path` 为规范化后的绝对路径，`parent` 到根为 null。
++ */
++export interface BrowseDirectoryResponse {
++  path: string;
++  parent: string | null;
++  /** 按名称排序，隐藏目录在 `hidden=true` 时才返回 */
++  entries: BrowseDirectoryEntryDto[];
++  /** 条目数达到上限被截断 */
++  truncated: boolean;
++}
+diff --git a/packages/shared/src/contracts/tunnel.ts b/packages/shared/src/contracts/tunnel.ts
+new file mode 100644
+index 00000000..95904120
+--- /dev/null
++++ b/packages/shared/src/contracts/tunnel.ts
+@@ -0,0 +1,120 @@
++// 远程访问（Cloudflare Tunnel）契约。只描述浏览器直连的那台机器（entry 自身），
++// 路径固定 `/api/tunnel/*`，与 TLS/LocalApi 一样不带 `/n/<id>` 前缀。
++
++export type TunnelMode = 'off' | 'quick' | 'named';
++
++export type TunnelProcessState = 'stopped' | 'starting' | 'running' | 'error';
++
++export type TunnelJobKind =
++  | 'install'
++  | 'login'
++  | 'create'
++  | 'start'
++  | 'stop'
++  | 'remove'
++  | 'check';
++
++export type TunnelJobState = 'running' | 'done' | 'error';
++
++export type TunnelErrorCode =
++  | 'unsupported_platform'
++  | 'binary_missing'
++  | 'download_failed'
++  | 'not_logged_in'
++  | 'login_timeout'
++  | 'invalid_hostname'
++  | 'tunnel_exists'
++  | 'dns_route_failed'
++  | 'process_failed'
++  | 'busy'
++  | 'not_configured'
++  | 'invalid_request'
++  | 'unknown';
++
++export interface TunnelBinaryStatus {
++  installed: boolean;
++  version: string | null;
++  path: string | null;
++  /** managed = tmex 自己下载到数据目录；system = PATH 里已有 */
++  source: 'managed' | 'system' | null;
++}
++
++export interface TunnelAuthStatus {
++  /** `cert.pem`（`cloudflared tunnel login` 产物）是否存在 */
++  loggedIn: boolean;
++  /** login job 进行中时供用户打开的授权 URL */
++  loginUrl: string | null;
++}
++
++export interface TunnelConfigStatus {
++  mode: TunnelMode;
++  /** named 模式的公网主机名（如 tmex.example.com） */
++  hostname: string | null;
++  tunnelName: string | null;
++  tunnelId: string | null;
++  /** 随 gateway 启动自动拉起 */
++  autoStart: boolean;
++  /** 本机监听端口（cloudflared ingress 的 origin） */
++  originPort: number;
++}
++
++export interface TunnelProcessStatus {
++  state: TunnelProcessState;
++  pid: number | null;
++  startedAt: string | null;
++  /** quick 模式为 trycloudflare 临时地址；named 模式为 https://hostname */
++  publicUrl: string | null;
++  lastError: string | null;
++  restarts: number;
++}
++
++export interface TunnelJobStatus {
++  id: string;
++  kind: TunnelJobKind;
++  state: TunnelJobState;
++  /** 当前步骤的简短机器可读标识（前端映射文案），如 download / verify / route_dns */
++  step: string | null;
++  error: { code: TunnelErrorCode; message: string } | null;
++  startedAt: string;
++  finishedAt: string | null;
++}
++
++export interface TunnelStatusResponse {
++  supported: boolean;
++  platform: string;
++  binary: TunnelBinaryStatus;
++  auth: TunnelAuthStatus;
++  config: TunnelConfigStatus;
++  process: TunnelProcessStatus;
++  /** 进行中或最近一次结束的 job */
++  job: TunnelJobStatus | null;
++  /** 当前进程是否已按 TMEX_TRUST_PROXY=true 运行 */
++  trustProxy: boolean;
++  /** 已写入 env 但需重启才生效 */
++  restartRequired: boolean;
++  /** 最近若干行 cloudflared 输出（已脱敏） */
++  log: string[];
++}
++
++/** `POST /api/tunnel/actions`，异步动作返回 202 + job，同步动作返回 200 + status */
++export type TunnelActionRequest =
++  | { action: 'install' }
++  | { action: 'login' }
++  | { action: 'cancel_login' }
++  | { action: 'create'; hostname: string; tunnelName?: string }
++  | { action: 'quick_start' }
++  | { action: 'start' }
++  | { action: 'stop' }
++  | { action: 'remove' }
++  | { action: 'check' }
++  | { action: 'set_auto_start'; autoStart: boolean }
++  | { action: 'set_trust_proxy'; trustProxy: boolean };
++
++export interface TunnelActionResponse {
++  status: TunnelStatusResponse;
++  job: TunnelJobStatus | null;
++}
++
++export interface TunnelErrorResponse {
++  error: { code: TunnelErrorCode; message: string };
++}
+diff --git a/packages/shared/src/ws-borsh/index.test.ts b/packages/shared/src/ws-borsh/index.test.ts
+index 11e8d343..9976a5ff 100644
+--- a/packages/shared/src/ws-borsh/index.test.ts
++++ b/packages/shared/src/ws-borsh/index.test.ts
+@@ -33,6 +33,7 @@ import {
+   decodePayload,
+   encodeChunk,
+   encodeEnvelope,
++  encodeNodeEvent,
+   encodePayload,
+   generateChunkStreamId,
+   getErrorMessage,
+@@ -65,6 +66,7 @@ import {
+   NODE_EVENT_STATUS_REVOKED,
+   NodeEventLegacySchema,
+   NodeEventSchema,
++  NodeEventV2Schema,
+   PingPongSchema,
+   RTC_SIGNAL_FROM_BROWSER,
+   RTC_SIGNAL_FROM_NODE,
+@@ -707,6 +709,8 @@ describe('mesh / hub 协议消息', () => {
+       version: null,
+       directCapable: null,
+       name: null,
++      transport: null,
++      rttMs: null,
+     };
+     const decoded = decodePayload(NodeEventSchema, encodePayload(NodeEventSchema, data));
+     expect(decoded).toEqual(data);
+@@ -721,6 +725,8 @@ describe('mesh / hub 协议消息', () => {
+         version: null,
+         directCapable: null,
+         name: null,
++        transport: null,
++        rttMs: null,
+       })
+     );
+     expect(offline.status).toBe(NODE_EVENT_STATUS_OFFLINE);
+@@ -738,6 +744,8 @@ describe('mesh / hub 协议消息', () => {
+       version: '1.2.3',
+       directCapable: true,
+       name: 'studio',
++      transport: 'dc',
++      rttMs: 7,
+     };
+     const decoded = decodePayload(NodeEventSchema, encodePayload(NodeEventSchema, data));
+     expect(decoded).toEqual(data);
+@@ -752,6 +760,8 @@ describe('mesh / hub 协议消息', () => {
+         version: null,
+         directCapable: null,
+         name: null,
++        transport: null,
++        rttMs: null,
+       })
+     );
+     expect(omitted.version).toBeNull();
+@@ -774,7 +784,36 @@ describe('mesh / hub 协议消息', () => {
+       version: null,
+       directCapable: null,
+       name: null,
++      transport: null,
++      rttMs: null,
+     });
++
++    const v2 = decodeNodeEvent(
++      encodePayload(NodeEventV2Schema, {
++        nodeId: 'n3',
++        status: NODE_EVENT_STATUS_ONLINE,
++        reach: 'lan',
++        inventory: null,
++        version: '1.0.0',
++        directCapable: true,
++        name: 'n3',
++      })
++    );
++    expect(v2.transport).toBeNull();
++    expect(v2.rttMs).toBeNull();
++    expect(v2.version).toBe('1.0.0');
++
++    const v3 = decodeNodeEvent(
++      encodeNodeEvent({
++        nodeId: 'n4',
++        status: NODE_EVENT_STATUS_ONLINE,
++        reach: 'wan',
++        transport: 'ws-secure',
++        rttMs: 12.6,
++      })
++    );
++    expect(v3.transport).toBe('ws-secure');
++    expect(v3.rttMs).toBe(13);
+   });
+ 
+   it('RTC_SIGNAL payload roundtrip', () => {
+diff --git a/packages/shared/src/ws-borsh/schema.ts b/packages/shared/src/ws-borsh/schema.ts
+index a4ef5cd4..ebdcf95f 100644
+--- a/packages/shared/src/ws-borsh/schema.ts
++++ b/packages/shared/src/ws-borsh/schema.ts
+@@ -473,6 +473,16 @@ export const NodeEventLegacySchema = b.struct({
+   inventory: OptionStringSchema,
+ });
+ 
++export const NodeEventV2Schema = b.struct({
++  nodeId: b.string(),
++  status: b.u8(),
++  reach: OptionStringSchema,
++  inventory: OptionStringSchema,
++  version: OptionStringSchema,
++  directCapable: OptionBoolSchema,
++  name: OptionStringSchema,
++});
++
+ export const NodeEventSchema = b.struct({
+   nodeId: b.string(),
+   status: b.u8(),
+@@ -481,6 +491,8 @@ export const NodeEventSchema = b.struct({
+   version: OptionStringSchema,
+   directCapable: OptionBoolSchema,
+   name: OptionStringSchema,
++  transport: OptionStringSchema,
++  rttMs: OptionU32Schema,
+ });
+ 
+ export type NodeEventWire = {
+@@ -491,6 +503,8 @@ export type NodeEventWire = {
+   version: string | null;
+   directCapable: boolean | null;
+   name: string | null;
++  transport: string | null;
++  rttMs: number | null;
+ };
+ 
+ export function encodeNodeEvent(data: {
+@@ -501,7 +515,10 @@ export function encodeNodeEvent(data: {
+   version?: string | null;
+   directCapable?: boolean | null;
+   name?: string | null;
++  transport?: string | null;
++  rttMs?: number | null;
+ }): Uint8Array {
++  const rtt = data.rttMs;
+   return NodeEventSchema.serialize({
+     nodeId: data.nodeId,
+     status: data.status,
+@@ -510,24 +527,31 @@ export function encodeNodeEvent(data: {
+     version: data.version ?? null,
+     directCapable: data.directCapable ?? null,
+     name: data.name ?? null,
++    transport: data.transport ?? null,
++    rttMs: typeof rtt === 'number' && Number.isFinite(rtt) && rtt >= 0 ? Math.round(rtt) : null,
+   });
+ }
+ 
++// 三代帧按新→旧依次尝试；老 node 发来的帧缺后加字段时补 null。
+ export function decodeNodeEvent(bytes: Uint8Array): NodeEventWire {
+   try {
+     return NodeEventSchema.deserialize(bytes);
+-  } catch {
+-    const legacy = NodeEventLegacySchema.deserialize(bytes);
+-    return {
+-      nodeId: legacy.nodeId,
+-      status: legacy.status,
+-      reach: legacy.reach,
+-      inventory: legacy.inventory,
+-      version: null,
+-      directCapable: null,
+-      name: null,
+-    };
+-  }
++  } catch {}
++  try {
++    return { ...NodeEventV2Schema.deserialize(bytes), transport: null, rttMs: null };
++  } catch {}
++  const legacy = NodeEventLegacySchema.deserialize(bytes);
++  return {
++    nodeId: legacy.nodeId,
++    status: legacy.status,
++    reach: legacy.reach,
++    inventory: legacy.inventory,
++    version: null,
++    directCapable: null,
++    name: null,
++    transport: null,
++    rttMs: null,
++  };
+ }
+ 
+ export const RtcSignalSchema = b.struct({
