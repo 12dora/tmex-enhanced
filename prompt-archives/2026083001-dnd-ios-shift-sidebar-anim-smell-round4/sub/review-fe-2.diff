@@ -1,0 +1,1104 @@
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+index 9e1d8274..bc93fd98 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+@@ -5,6 +5,7 @@ import { useGlobalDevice } from '@/components/global-device-provider';
+ import {
+   SideBarDeviceList as DeviceTreeSideBarDeviceList,
+   shouldHideSidebarNodeSection,
++  useDeviceTreeSelection,
+   useSidebarDeviceStats,
+ } from '@tmex/panels/device-tree';
+ import { useRuntime } from '@tmex/stores/react';
+@@ -39,7 +40,8 @@ export interface SideBarDeviceListForRuntimeProps {
+ function DeviceTree({
+   expansionKeyFor,
+   emptyLabel,
+-}: Omit<SideBarDeviceListForRuntimeProps, 'section'>) {
++  pinnedDeviceId,
++}: Omit<SideBarDeviceListForRuntimeProps, 'section'> & { pinnedDeviceId?: string }) {
+   const { ensureDeviceSubscribed, connection } = useGlobalDevice();
+   const agentUi = useRuntime().features.agentUi;
+   const agentAdapter = useSidebarAgentAdapter();
+@@ -51,6 +53,7 @@ function DeviceTree({
+       agent={agentUi ? agentAdapter : undefined}
+       expansionKeyFor={expansionKeyFor}
+       emptyLabel={emptyLabel}
++      pinnedDeviceId={pinnedDeviceId}
+     />
+   );
+ 
+@@ -71,8 +74,10 @@ function NodeSection({
+   const stats = useSidebarDeviceStats();
+   const visible =
+     stats.failed || !shouldHideSidebarNodeSection(stats, section.keepWhenNoDevices ?? false);
+-  // 切 node 会让「选中的那台无条件保留」失效，整节可能就此隐藏：淡出后再卸载，别硬切
+-  const presence = useSectionPresence(visible, null);
++  // 切 node 会让「选中的那台无条件保留」失效，整节可能就此隐藏：淡出后再卸载，别硬切；
++  // 退场期间把上一个选中设备钉住，否则设备行先消失、只剩分节头在淡
++  const { selectedDeviceId } = useDeviceTreeSelection();
++  const presence = useSectionPresence(visible, selectedDeviceId);
+   if (!presence.rendered) {
+     return null;
+   }
+@@ -85,7 +90,7 @@ function NodeSection({
+       className={cn('space-y-0.5', presence.className, section.containerClassName)}
+     >
+       {section.header}
+-      <DeviceTree {...rest} />
++      <DeviceTree {...rest} pinnedDeviceId={presence.value} />
+     </div>
+   );
+ }
+diff --git a/apps/fe/src/pages/settings/nodes/https/parts.tsx b/apps/fe/src/pages/settings/nodes/https/parts.tsx
+index c0c5ce25..b37fdafc 100644
+--- a/apps/fe/src/pages/settings/nodes/https/parts.tsx
++++ b/apps/fe/src/pages/settings/nodes/https/parts.tsx
+@@ -1,11 +1,10 @@
+ // HTTPS 区块内部共用的展示件（与 setup/ 的同类件刻意各自独立，两者文件范围不同）。
+ 
+-import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+-import { CircleCheck, CircleX, Copy, Info, TriangleAlert } from 'lucide-react';
++import { CircleCheck, CircleX, Info, TriangleAlert } from 'lucide-react';
+ import type { ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { CopyLabel, useCopyToClipboard } from '../copy-feedback';
++import { CopyButton } from '../copy-feedback';
+ 
+ export type NoticeTone = 'info' | 'success' | 'warning' | 'error';
+ 
+@@ -149,7 +148,6 @@ export function ListenerFields({
+ }
+ 
+ export function CopyableCode({ value, testId }: { value: string; testId: string }) {
+-  const { copied, copy } = useCopyToClipboard(value);
+   return (
+     <span className="flex min-w-0 items-center gap-1">
+       <code
+@@ -158,10 +156,7 @@ export function CopyableCode({ value, testId }: { value: string; testId: string
+       >
+         {value}
+       </code>
+-      <Button type="button" size="xs" variant="ghost" onClick={copy} data-testid={`${testId}-copy`}>
+-        {copied ? <CircleCheck className="tmex-scale-in" /> : <Copy className="tmex-scale-in" />}
+-        <CopyLabel copied={copied} />
+-      </Button>
++      <CopyButton value={value} testId={testId} />
+     </span>
+   );
+ }
+diff --git a/apps/fe/src/pages/settings/nodes/local-machine-card.tsx b/apps/fe/src/pages/settings/nodes/local-machine-card.tsx
+index 5ac594d2..d1794968 100644
+--- a/apps/fe/src/pages/settings/nodes/local-machine-card.tsx
++++ b/apps/fe/src/pages/settings/nodes/local-machine-card.tsx
+@@ -28,7 +28,7 @@ import {
+ } from './direct-section';
+ import type { SetupIntent } from './membership/intent';
+ import { LeaveDialog, type LeaveDialogRequest } from './membership/leave-dialog';
+-import { classifyRoleChange } from './membership/role-transition';
++import { ROLE_LABEL_KEY, classifyRoleChange } from './membership/role-transition';
+ import { useLeaveMesh } from './membership/use-leave-mesh';
+ import {
+   type RestartGateway,
+@@ -49,12 +49,6 @@ export interface LocalMachineCardProps {
+   onSelectSetupPath?: (path: SetupIntent) => void;
+ }
+ 
+-const ROLE_LABEL_KEY: Record<LocalRole, string> = {
+-  standalone: 'nodes.machine.roleStandalone',
+-  node: 'nodes.machine.roleNode',
+-  'hub,node': 'nodes.machine.roleHub',
+-};
+-
+ /** 后端只认这三个角色串（`packages/app/src/lib/roles.ts`）。 */
+ const SELECTABLE_ROLES: LocalRole[] = ['standalone', 'node', 'hub,node'];
+ 
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx
+index 5d6c5b70..7730b98a 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx
+@@ -13,7 +13,7 @@ const { MemoryRouter } = await import('react-router');
+ const { resetMeshNodesStateForTest, setMeshNodesStateForTest } = await import('@/node/mesh-nodes');
+ const { setPendingStorage, clearPendingEnrollments } = await import('@/node/enrollment');
+ const { NodesManagement } = await import('./nodes-management');
+-const { canAutoSignAdmit } = await import('./use-admit-action');
++const { canAutoSignAdmit, invalidCertificateKey } = await import('./use-admit-action');
+ const { resolveHubPublicUrl } = await import('./enrollment-section');
+ const { rootKeyFromSeed } = await import('@tmex/shared/auth');
+ 
+@@ -139,6 +139,13 @@ describe('canAutoSignAdmit', () => {
+   });
+ });
+ 
++describe('invalidCertificateKey', () => {
++  test('过期与验签失败分开提示', () => {
++    expect(invalidCertificateKey('expired')).toBe('nodes.enrollment.expired');
++    expect(invalidCertificateKey('bad_sig')).toBe('nodes.enrollment.badCertSig');
++  });
++});
++
+ describe('resolveHubPublicUrl', () => {
+   test('优先用 enrollment 创建响应里的 public_url', () => {
+     expect(
+diff --git a/apps/fe/src/pages/settings/nodes/management/use-admit-action.ts b/apps/fe/src/pages/settings/nodes/management/use-admit-action.ts
+index 2655c3a4..5f966101 100644
+--- a/apps/fe/src/pages/settings/nodes/management/use-admit-action.ts
++++ b/apps/fe/src/pages/settings/nodes/management/use-admit-action.ts
+@@ -44,6 +44,11 @@ export function canAutoSignAdmit(signer: RecordSigner | null): boolean {
+   return signer?.kind === 'root';
+ }
+ 
++/** 证书对不上时的提示：过期与验签失败要分开讲，其余情况一律按验签失败处理。 */
++export function invalidCertificateKey(reason: string): string {
++  return reason === 'expired' ? 'nodes.enrollment.expired' : 'nodes.enrollment.badCertSig';
++}
++
+ export function useAdmitAction({
+   api,
+   mode,
+@@ -71,6 +76,18 @@ export function useAdmitAction({
+     listUnconfirmedRecordIds
+   );
+ 
++  /** 置忙 → 跑动作 → 失败弹 toast → 复位；三处 admit 入口共用同一套忙态与错误处理。 */
++  const withBusy = useCallback(async (id: string, run: () => Promise<void>) => {
++    setBusyPendingId(id);
++    try {
++      await run();
++    } catch (err) {
++      toast.error(err instanceof Error ? err.message : String(err));
++    } finally {
++      setBusyPendingId(null);
++    }
++  }, []);
++
+   /** 把一条**已签好**的 admit 记录送出去，并按 B2-6 的码处理结果。 */
+   const submitAdmit = useCallback(
+     async (pending: PendingEnrollment, record: SignedRecord) => {
+@@ -141,11 +158,7 @@ export function useAdmitAction({
+         return;
+       }
+       if (outcome.kind === 'invalid') {
+-        toast.error(
+-          outcome.reason === 'expired'
+-            ? t('nodes.enrollment.expired')
+-            : t('nodes.enrollment.badCertSig')
+-        );
++        toast.error(t(invalidCertificateKey(outcome.reason)));
+         return;
+       }
+       const id = outcome.pending.hubEnrollmentId;
+@@ -153,20 +166,15 @@ export function useAdmitAction({
+       // 复用窗口已过、或窗口里是 passkey：都留在「待确认」，等用户点按钮。
+       const plan = admitPlan(id, canAutoSignAdmit(signer));
+       if (plan === 'wait') return;
+-      setBusyPendingId(id);
+-      try {
++      await withBusy(id, async () => {
+         const stored = unconfirmedRecord(id);
+         if (plan === 'resend' && stored) await submitAdmit(outcome.pending, stored);
+         else if (signer) {
+           await signAdmit(outcome.pending, outcome.certificateBytes, outcome.certSig, signer);
+         }
+-      } catch (err) {
+-        toast.error(err instanceof Error ? err.message : String(err));
+-      } finally {
+-        setBusyPendingId(null);
+-      }
++      });
+     },
+-    [signAdmit, submitAdmit, t]
++    [signAdmit, submitAdmit, t, withBusy]
+   );
+ 
+   /**
+@@ -181,14 +189,7 @@ export function useAdmitAction({
+       if (!mode) return;
+       const stored = unconfirmedRecord(pending.hubEnrollmentId);
+       if (stored) {
+-        setBusyPendingId(pending.hubEnrollmentId);
+-        try {
+-          await submitAdmit(pending, stored);
+-        } catch (err) {
+-          toast.error(err instanceof Error ? err.message : String(err));
+-        } finally {
+-          setBusyPendingId(null);
+-        }
++        await withBusy(pending.hubEnrollmentId, () => submitAdmit(pending, stored));
+         return;
+       }
+       let signer: RecordSigner | null;
+@@ -200,8 +201,7 @@ export function useAdmitAction({
+         return;
+       }
+       if (!signer) return;
+-      setBusyPendingId(pending.hubEnrollmentId);
+-      try {
++      await withBusy(pending.hubEnrollmentId, async () => {
+         const candidates = hubApi ? await collectRedeemedCertificates(hubApi, [pending]) : [];
+         for (const candidate of candidates) {
+           const outcome = offerCertificate([pending], candidate, Date.now());
+@@ -210,22 +210,14 @@ export function useAdmitAction({
+             return;
+           }
+           if (outcome.kind === 'invalid') {
+-            toast.error(
+-              outcome.reason === 'expired'
+-                ? t('nodes.enrollment.expired')
+-                : t('nodes.enrollment.badCertSig')
+-            );
++            toast.error(t(invalidCertificateKey(outcome.reason)));
+             return;
+           }
+         }
+         toast.error(t('nodes.enrollment.noCertificateYet'));
+-      } catch (err) {
+-        toast.error(err instanceof Error ? err.message : String(err));
+-      } finally {
+-        setBusyPendingId(null);
+-      }
++      });
+     },
+-    [hubApi, mode, prompt, signAdmit, submitAdmit, t]
++    [hubApi, mode, prompt, signAdmit, submitAdmit, t, withBusy]
+   );
+ 
+   return { handleOutcome, confirmManually, busyPendingId, hubUnconfirmedIds, admittedIds };
+diff --git a/apps/fe/src/pages/settings/nodes/membership/leave-dialog.tsx b/apps/fe/src/pages/settings/nodes/membership/leave-dialog.tsx
+index 5d20186f..a409acbe 100644
+--- a/apps/fe/src/pages/settings/nodes/membership/leave-dialog.tsx
++++ b/apps/fe/src/pages/settings/nodes/membership/leave-dialog.tsx
+@@ -18,7 +18,7 @@ import {
+ import { Loader2 } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import type { SetupIntent } from './intent';
+-import type { MeshRole } from './role-transition';
++import { type MeshRole, ROLE_LABEL_KEY } from './role-transition';
+ import type { LeaveMesh } from './use-leave-mesh';
+ 
+ export type LeaveDialogKind = 'leave' | 'switch' | 'change-hub';
+@@ -32,12 +32,6 @@ export interface LeaveDialogRequest {
+   intent: SetupIntent | null;
+ }
+ 
+-const ROLE_LABEL_KEY: Record<LocalRole, string> = {
+-  standalone: 'nodes.machine.roleStandalone',
+-  node: 'nodes.machine.roleNode',
+-  'hub,node': 'nodes.machine.roleHub',
+-};
+-
+ const TITLE_KEY: Record<LeaveDialogKind, string> = {
+   leave: 'nodes.membership.leaveConfirm.title',
+   switch: 'nodes.membership.switchConfirm.title',
+diff --git a/apps/fe/src/pages/settings/nodes/membership/role-transition.ts b/apps/fe/src/pages/settings/nodes/membership/role-transition.ts
+index ad451557..fae90ebd 100644
+--- a/apps/fe/src/pages/settings/nodes/membership/role-transition.ts
++++ b/apps/fe/src/pages/settings/nodes/membership/role-transition.ts
+@@ -9,6 +9,13 @@ import type { SetupIntent } from './intent';
+ 
+ export type MeshRole = Exclude<LocalRole, 'standalone'>;
+ 
++/** 角色的展示文案 key：本机卡片的下拉与退出对话框共用一套，别各写各的。 */
++export const ROLE_LABEL_KEY: Record<LocalRole, string> = {
++  standalone: 'nodes.machine.roleStandalone',
++  node: 'nodes.machine.roleNode',
++  'hub,node': 'nodes.machine.roleHub',
++};
++
+ export type RoleTransition =
+   /** 目标就是当前角色。 */
+   | { kind: 'none' }
+diff --git a/packages/panels/src/device-management/use-device-management-state.ts b/packages/panels/src/device-management/use-device-management-state.ts
+index 0b634718..6017f028 100644
+--- a/packages/panels/src/device-management/use-device-management-state.ts
++++ b/packages/panels/src/device-management/use-device-management-state.ts
+@@ -5,13 +5,13 @@ import type { DragEndEvent } from '@dnd-kit/core';
+ import { arrayMove } from '@dnd-kit/sortable';
+ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+ import { type DevicesResponse, fetchDevices, reorderDevices } from '@tmex/api-client';
+-import type { Device, LocaleCode } from '@tmex/shared';
+-import { toBCP47 } from '@tmex/shared';
++import type { Device } from '@tmex/shared';
+ import { useRuntime, useSiteStore, useTmuxStore } from '@tmex/stores/react';
+ import { staggerItemStyle } from '@tmex/ui/motion';
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
++import { sortDevices } from '../device-tree/device-tree-selectors';
+ 
+ /** 首屏逐项入场的延迟档位上限（35ms/档），超出的卡片与最后一档同时进场 */
+ const STAGGER_MAX_INDEX = 11;
+@@ -20,20 +20,6 @@ const STAGGER_FALLBACK_MS = 1500;
+ 
+ const NO_DEVICES: Device[] = [];
+ 
+-// 顺序与侧边栏 Panes Tab 一致：先 sortOrder 再按设备名 locale 感知排序；顺带按 id 去重
+-// （列表可能来自缓存 + 快照 + 节点 inventory 几处，撞 id 会渲染出两张一样的卡片）。
+-function sortDevices(devices: readonly Device[], language: LocaleCode): Device[] {
+-  const byId = new Map<string, Device>();
+-  for (const device of devices) {
+-    if (!byId.has(device.id)) byId.set(device.id, device);
+-  }
+-  return [...byId.values()].sort(
+-    (a, b) =>
+-      a.sortOrder - b.sortOrder ||
+-      a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
+-  );
+-}
+-
+ export function useDeviceManagementState({
+   devicesQueryKey,
+   offline,
+diff --git a/packages/panels/src/device-tree/device-tree-selectors.ts b/packages/panels/src/device-tree/device-tree-selectors.ts
+index b9c1f9f8..3d158267 100644
+--- a/packages/panels/src/device-tree/device-tree-selectors.ts
++++ b/packages/panels/src/device-tree/device-tree-selectors.ts
+@@ -2,7 +2,8 @@
+ // 避免整棵树跟着 snapshots 这张大表在每次 metadata patch 上重渲染。
+ // 返回值要么是原始值，要么是 store 里原样透出的引用，故无需额外的相等性比较。
+ 
+-import type { StateSnapshotPayload, TmuxWindow } from '@tmex/shared';
++import type { Device, LocaleCode, StateSnapshotPayload, TmuxWindow } from '@tmex/shared';
++import { toBCP47 } from '@tmex/shared';
+ import { isSidebarDeviceVisible } from '@tmex/stores';
+ import { useTmuxStore } from '@tmex/stores/react';
+ import { useCallback } from 'react';
+@@ -131,3 +132,14 @@ export function mergeReorderedVisibleIds(
+   }
+   return merged;
+ }
++
++// 设备列表的统一顺序：先 sortOrder 再按名称做 locale 感知比较；顺带按 id 去重（缓存 / 快照 / 节点 inventory 会撞 id）
++export function sortDevices<T extends Device>(devices: readonly T[], language: LocaleCode): T[] {
++  const byId = new Map<string, T>();
++  for (const device of devices) if (!byId.has(device.id)) byId.set(device.id, device);
++  return [...byId.values()].sort(
++    (a, b) =>
++      a.sortOrder - b.sortOrder ||
++      a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
++  );
++}
+diff --git a/packages/panels/src/device-tree/index.ts b/packages/panels/src/device-tree/index.ts
+index e9580025..ceea44e4 100644
+--- a/packages/panels/src/device-tree/index.ts
++++ b/packages/panels/src/device-tree/index.ts
+@@ -1,4 +1,5 @@
+ export { SideBarDeviceList, type SideBarDeviceListProps } from './sidebar-device-list';
++export { useDeviceTreeSelection } from './device-tree-navigation';
+ export type { DeviceTreeNavigation, SidebarAgentAdapter } from './agent-adapter';
+ export {
+   shouldHideSidebarNodeSection,
+diff --git a/packages/panels/src/device-tree/sidebar-device-list.tsx b/packages/panels/src/device-tree/sidebar-device-list.tsx
+index 24cb7c46..58732437 100644
+--- a/packages/panels/src/device-tree/sidebar-device-list.tsx
++++ b/packages/panels/src/device-tree/sidebar-device-list.tsx
+@@ -5,7 +5,6 @@ import {
+   reorderDevices,
+ } from '@tmex/api-client';
+ import type { Device } from '@tmex/shared';
+-import { toBCP47 } from '@tmex/shared';
+ import { hostAppPath } from '@tmex/stores';
+ import { useRuntime, useSiteStore, useTmuxStore, useUIStore } from '@tmex/stores/react';
+ import { Button } from '@tmex/ui/button';
+@@ -20,7 +19,11 @@ import { DeviceRow } from './device-row';
+ import { useDeviceTreeDialogs } from './device-tree-dialogs';
+ import { SortableVerticalList } from './device-tree-dnd';
+ import { useDeviceTreeNavigationApi, useDeviceTreeSelection } from './device-tree-navigation';
+-import { mergeReorderedVisibleIds, selectSidebarVisibleDevices } from './device-tree-selectors';
++import {
++  mergeReorderedVisibleIds,
++  selectSidebarVisibleDevices,
++  sortDevices,
++} from './device-tree-selectors';
+ 
+ type DeviceListItem = Device & {
+   lastError?: string | null;
+@@ -42,6 +45,8 @@ export interface SideBarDeviceListProps {
+   emptyLabel?: string;
+   /** 宿主连接管理；未传时不渲染连接开关，展开仍走 ensureDeviceSubscribed */
+   connection?: DeviceConnectionAdapter;
++  /** 分节退场期间要继续显示的设备（宿主锁存的上一个选中设备），替代路由选中 */
++  pinnedDeviceId?: string;
+ }
+ 
+ export function SideBarDeviceList({
+@@ -51,6 +56,7 @@ export function SideBarDeviceList({
+   agent,
+   emptyLabel,
+   connection,
++  pinnedDeviceId,
+ }: SideBarDeviceListProps) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+@@ -160,9 +166,9 @@ export function SideBarDeviceList({
+         devices,
+         sidebarDeviceVisibility,
+         runtime.nodeId,
+-        selectedDeviceId
++        pinnedDeviceId ?? selectedDeviceId
+       ),
+-    [devices, selectedDeviceId, sidebarDeviceVisibility, runtime.nodeId]
++    [devices, selectedDeviceId, pinnedDeviceId, sidebarDeviceVisibility, runtime.nodeId]
+   );
+ 
+   const autoExpandedDeviceIdsRef = useRef(new Set<string>());
+@@ -210,15 +216,7 @@ export function SideBarDeviceList({
+   }, [visibleDevices, ensureDeviceSubscribed, sidebarDeviceExpanded, expansionKey]);
+ 
+   // 隐藏设备也要参与排序：重排提交的是完整顺序，隐藏设备必须留在自己的槽位上
+-  const allSortedDevices = useMemo(
+-    () =>
+-      [...devices].sort(
+-        (a, b) =>
+-          a.sortOrder - b.sortOrder ||
+-          a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
+-      ),
+-    [devices, language]
+-  );
++  const allSortedDevices = useMemo(() => sortDevices(devices, language), [devices, language]);
+ 
+   const visibleDeviceIdSet = useMemo(
+     () => new Set(visibleDevices.map((device) => device.id)),
+diff --git a/packages/ws-client/src/direct/direct-carrier-controller.test.ts b/packages/ws-client/src/direct/direct-carrier-controller.test.ts
+index dda39a49..1e149580 100644
+--- a/packages/ws-client/src/direct/direct-carrier-controller.test.ts
++++ b/packages/ws-client/src/direct/direct-carrier-controller.test.ts
+@@ -771,6 +771,27 @@ describe('DirectCarrierController 退避与网络变化', () => {
+     expect(s.controller.getState()).toBe('idle');
+   });
+ 
++  test('stop() 后再 start()：网络监听只挂一份，online 只重连一次', async () => {
++    const s = setup({ maxAttempts: 1 });
++    s.api.routes.set(RTC_AUTHORIZE_PATH, { status: 503, body: {} });
++    s.controller.start();
++    await flush();
++    s.controller.stop();
++    expect(s.network.count('online')).toBe(0);
++
++    s.controller.start();
++    await flush();
++    s.clock.advance(1000);
++    await flush();
++    expect(s.network.count('online')).toBe(1);
++    expect(s.netInfo.count('change')).toBe(1);
++
++    const before = s.peers.length;
++    s.network.emit('online');
++    await flush();
++    expect(s.peers.length).toBe(before + 1);
++  });
++
+   test('navigator.connection 的 change 去抖后重连（Wi-Fi → 蜂窝不发 online）', async () => {
+     const s = setup({ maxAttempts: 1, networkChangeDebounceMs: 800 });
+     s.api.routes.set(RTC_AUTHORIZE_PATH, { status: 503, body: {} });
+diff --git a/packages/ws-client/src/direct/direct-carrier-controller.ts b/packages/ws-client/src/direct/direct-carrier-controller.ts
+index d777e4f5..29a22a43 100644
+--- a/packages/ws-client/src/direct/direct-carrier-controller.ts
++++ b/packages/ws-client/src/direct/direct-carrier-controller.ts
+@@ -73,15 +73,15 @@ export function meshConnectionPath(cid?: string | null): string {
+   return cid ? `${MESH_CONNECTION_PATH}?cid=${encodeURIComponent(cid)}` : MESH_CONNECTION_PATH;
+ }
+ 
+-export const DEFAULT_RETRY_BASE_MS = 1000;
+-export const DEFAULT_RETRY_MAX_MS = 30_000;
+-export const DEFAULT_MAX_ATTEMPTS = 5;
+-export const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+-export const DEFAULT_STATS_INTERVAL_MS = 2000;
++const DEFAULT_RETRY_BASE_MS = 1000;
++const DEFAULT_RETRY_MAX_MS = 30_000;
++const DEFAULT_MAX_ATTEMPTS = 5;
++const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
++const DEFAULT_STATS_INTERVAL_MS = 2000;
+ /** `iceConnectionState === 'disconnected'` 的宽限期：撑过短暂抖动，超时就回落 primary。 */
+-export const DEFAULT_ICE_DISCONNECT_GRACE_MS = 5000;
++const DEFAULT_ICE_DISCONNECT_GRACE_MS = 5000;
+ /** `navigator.connection` 的 `change` 抖动很密，去抖后再重连。 */
+-export const DEFAULT_NETWORK_CHANGE_DEBOUNCE_MS = 800;
++const DEFAULT_NETWORK_CHANGE_DEBOUNCE_MS = 800;
+ 
+ /**
+  * primary（Gateway WS）的状态源。`BorshWebSocketClient` 结构上即满足，
+@@ -106,7 +106,7 @@ export interface GatewayConnectionLike {
+ }
+ 
+ /** 事件源的最小结构子集（`window` / `navigator.connection` 都满足）。 */
+-export interface EventTargetLike {
++interface EventTargetLike {
+   addEventListener(type: string, cb: () => void): void;
+   removeEventListener(type: string, cb: () => void): void;
+ }
+@@ -181,6 +181,15 @@ interface Attempt {
+   chain: Promise<void>;
+ }
+ 
++/** 清理路径（注销订阅 / 关闭已关闭的对象）不该因二次调用抛出而中断。 */
++function quietly(fn: (() => void) | null | undefined): void {
++  try {
++    fn?.();
++  } catch {
++    // 已注销 / 已关闭
++  }
++}
++
+ function toStringArray(value: unknown): string[] {
+   if (!Array.isArray(value)) return typeof value === 'string' && value ? [value] : [];
+   return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+@@ -252,8 +261,7 @@ export class DirectCarrierController {
+   private statsHandle: unknown = null;
+   private networkDebounceHandle: unknown = null;
+   private started = false;
+-  private onlineHandler: (() => void) | null = null;
+-  private connectionChangeHandler: (() => void) | null = null;
++  private readonly networkCleanups: (() => void)[] = [];
+   private unsubscribeSignalingReady: (() => void) | null = null;
+   private unsubscribeCarrierChange: (() => void) | null = null;
+   private unsubscribePrimaryWait: (() => void) | null = null;
+@@ -274,6 +282,12 @@ export class DirectCarrierController {
+       ((handle) => (globalThis as typeof global).clearTimeout(handle as never));
+   }
+ 
++  /** 撤销一个定时器句柄并交回 `null`：`x = this.clearHandle(x)`。 */
++  private clearHandle(handle: unknown): null {
++    if (handle != null) this.cancelTimer(handle);
++    return null;
++  }
++
+   // ========== 对外只读状态 ==========
+ 
+   getState(): DirectCarrierState {
+@@ -345,20 +359,20 @@ export class DirectCarrierController {
+       return;
+     }
+     this.attempts = 0;
+-    this.clearRetryTimer();
++    this.retryHandle = this.clearHandle(this.retryHandle);
+     this.clearPrimaryWait();
+-    this.teardownAttempt('retry');
++    this.teardownAttempt();
+     this.connect();
+   }
+ 
+   stop(): void {
+     this.started = false;
+-    this.clearRetryTimer();
++    this.retryHandle = this.clearHandle(this.retryHandle);
++    this.statsHandle = this.clearHandle(this.statsHandle);
+     this.clearPrimaryWait();
+-    this.stopStatsPolling();
+     this.removeNetworkListeners();
+     this.removeSignalingReadyListener();
+-    this.teardownAttempt('stopped');
++    this.teardownAttempt();
+     this.setState('idle', null);
+   }
+ 
+@@ -439,38 +453,13 @@ export class DirectCarrierController {
+     const pc = factory({ iceServers: buildIceServers(config) });
+     if (this.stale(attempt)) {
+       // 这一代已被替换：新建的 PC 必须就地关掉，否则泄漏
+-      closeQuietly(pc);
++      quietly(() => pc.close());
+       return;
+     }
+     attempt.pc = pc;
+     const channel = pc.createDataChannel(SESS_CHANNEL_LABEL, { ordered: true });
+     attempt.channel = channel;
+-
+-    pc.onicecandidate = (event) => {
+-      if (this.stale(attempt)) return;
+-      const candidate = event.candidate;
+-      if (!candidate || !candidate.candidate) return;
+-      const part: SignalPart = {
+-        candidate: JSON.stringify({ candidate: candidate.candidate, mid: candidate.sdpMid ?? '0' }),
+-      };
+-      // offer 还没排上队时先攒着：entry 要先见到本 rtcSession 的 offer 才认候选。
+-      if (!attempt.offerQueued) {
+-        attempt.pendingLocalCandidates.push(part);
+-        return;
+-      }
+-      this.queueSignal(attempt, part);
+-    };
+-    pc.onconnectionstatechange = () => {
+-      if (this.stale(attempt)) return;
+-      this.refreshIceSnapshot();
+-      const s = pc.connectionState;
+-      if (s === 'failed' || s === 'closed') this.failAttempt(`peer connection ${s}`, true);
+-    };
+-    pc.oniceconnectionstatechange = () => {
+-      if (this.stale(attempt)) return;
+-      this.refreshIceSnapshot();
+-      this.handleIceConnectionState(attempt, pc.iceConnectionState);
+-    };
++    this.watchPeer(attempt, pc);
+ 
+     const offer = await pc.createOffer();
+     await pc.setLocalDescription(offer);
+@@ -500,11 +489,40 @@ export class DirectCarrierController {
+     };
+     channel.onclose = () => {
+       if (this.stale(attempt)) return;
+-      this.handleCarrierGone('direct channel closed');
++      this.failAttempt('direct channel closed', true);
+     };
+     if (channel.readyState === 'open') this.mountCarrier(attempt);
+   }
+ 
++  /** PC 侧的三个回调：本地候选出站、连接态、ICE 态；一律先比对 generation。 */
++  private watchPeer(attempt: Attempt, pc: RTCPeerConnectionLike): void {
++    pc.onicecandidate = (event) => {
++      if (this.stale(attempt)) return;
++      const candidate = event.candidate;
++      if (!candidate || !candidate.candidate) return;
++      const part: SignalPart = {
++        candidate: JSON.stringify({ candidate: candidate.candidate, mid: candidate.sdpMid ?? '0' }),
++      };
++      // offer 还没排上队时先攒着：entry 要先见到本 rtcSession 的 offer 才认候选。
++      if (!attempt.offerQueued) {
++        attempt.pendingLocalCandidates.push(part);
++        return;
++      }
++      this.queueSignal(attempt, part);
++    };
++    pc.onconnectionstatechange = () => {
++      if (this.stale(attempt)) return;
++      this.refreshIceSnapshot();
++      const s = pc.connectionState;
++      if (s === 'failed' || s === 'closed') this.failAttempt(`peer connection ${s}`, true);
++    };
++    pc.oniceconnectionstatechange = () => {
++      if (this.stale(attempt)) return;
++      this.refreshIceSnapshot();
++      this.handleIceConnectionState(attempt, pc.iceConnectionState);
++    };
++  }
++
+   private async fetchRtcConfig(attempt: Attempt): Promise<RtcConfigResponse | null> {
+     try {
+       const res = await this.options.apiClient.fetch(RTC_CONFIG_PATH, {
+@@ -527,11 +545,9 @@ export class DirectCarrierController {
+    * HELLO 帧（Borsh）在 B2-10 里也明确不改，所以身份只能靠握手 URL 上的 `?cid=` nonce
+    * 加这一条 REST 换取。返回的是 node **自己生成**的 id，nonce 绝不能拿去 authorize。
+    *
+-   * - `404 NO_CONNECTION`：primary 还没在 node 上登记（刚开页面 / 刚断线）→ 等 primary 连上再来。
+-   * - `409 MULTIPLE_CONNECTIONS`：同 sid 多条 live WS，node 无法定位到本标签页 → 这段时间
+-   *   直连建不了，等 primary 重连过再试（届时 sid 上的连接分布会变）。
+-   * - 其它非 2xx（老 node 上该路由返回 405、5xx 等）：5xx 退避重试，其余退化成不带
+-   *   connectionId 的旧行为——单连接时 node 侧照样能唯一定位。
++   * 非 2xx 时：`NO_CONNECTION` / `MULTIPLE_CONNECTIONS` 交给 `throwIfPrimaryWait` 转成等待，
++   * 5xx 退避重试，其余（老 node 上该路由返回的 405 等）退化成不带 connectionId 的旧行为
++   * ——单连接时 node 侧照样能唯一定位。
+    */
+   private async fetchConnectionId(attempt: Attempt): Promise<string | null> {
+     let res: Response;
+@@ -553,9 +569,7 @@ export class DirectCarrierController {
+       if (typeof body?.connectionId === 'string' && body.connectionId) return body.connectionId;
+       throw new DirectAuthorizeError('connection lookup response malformed', true);
+     }
+-    const code = await readErrorCode(res);
+-    const wait = primaryWaitFor(res.status, code);
+-    if (wait) throw new DirectPrimaryWaitError(`connection lookup: ${code}`, wait);
++    await throwIfPrimaryWait(res, 'connection lookup');
+     if (res.status >= 500) {
+       throw new DirectAuthorizeError(`connection lookup failed (${res.status})`, false);
+     }
+@@ -583,9 +597,7 @@ export class DirectCarrierController {
+     if (!res.ok) {
+       // connectionId 在 GET 与 authorize 之间失效（primary 重连 / 又开了一个标签页）：
+       // 这不是配置错误，按「等 primary」处理，别当成 4xx 永久失败卡死在 failed。
+-      const code = await readErrorCode(res);
+-      const wait = primaryWaitFor(res.status, code);
+-      if (wait) throw new DirectPrimaryWaitError(`authorize: ${code}`, wait);
++      await throwIfPrimaryWait(res, 'authorize');
+       // 4xx 是配置/权限问题，重试没有意义；5xx（如 DIRECT_UNAVAILABLE）才退避重试。
+       throw new DirectAuthorizeError(`authorize failed (${res.status})`, res.status < 500);
+     }
+@@ -593,9 +605,8 @@ export class DirectCarrierController {
+     const fp = body.fp_node as { algorithm?: unknown; value?: unknown } | undefined;
+     if (
+       typeof body.nonce !== 'string' ||
+-      !fp ||
+-      typeof fp.algorithm !== 'string' ||
+-      typeof fp.value !== 'string'
++      typeof fp?.algorithm !== 'string' ||
++      typeof fp?.value !== 'string'
+     ) {
+       throw new DirectAuthorizeError('authorize response malformed', true);
+     }
+@@ -631,16 +642,14 @@ export class DirectCarrierController {
+       if (typeof parsed.sdp !== 'string') return;
+       const type = typeof parsed.type === 'string' ? parsed.type : 'answer';
+       // 指纹绑定：先核对再 setRemoteDescription，不一致就不让 DTLS 起来。
+-      const fpRemote = parseSdpFingerprint(parsed.sdp);
+-      if (!fingerprintsEqual(fpRemote, attempt.fpNode)) {
++      if (!fingerprintsEqual(parseSdpFingerprint(parsed.sdp), attempt.fpNode)) {
+         this.failAttempt('node DTLS fingerprint mismatch', false);
+         return;
+       }
+       await pc.setRemoteDescription({ type, sdp: parsed.sdp });
+       if (this.stale(attempt)) return;
+       attempt.remoteReady = true;
+-      const queued = attempt.pendingRemoteCandidates.splice(0);
+-      for (const candidate of queued) {
++      for (const candidate of attempt.pendingRemoteCandidates.splice(0)) {
+         try {
+           await pc.addIceCandidate(candidate);
+         } catch {
+@@ -714,7 +723,7 @@ export class DirectCarrierController {
+         void this.pumpOutbox(attempt);
+         return;
+       }
+-      this.clearRetryTimer();
++      this.retryHandle = this.clearHandle(this.retryHandle);
+       this.connect();
+     });
+   }
+@@ -722,11 +731,7 @@ export class DirectCarrierController {
+   private removeSignalingReadyListener(): void {
+     const unsubscribe = this.unsubscribeSignalingReady;
+     this.unsubscribeSignalingReady = null;
+-    try {
+-      unsubscribe?.();
+-    } catch {
+-      // 已注销
+-    }
++    quietly(unsubscribe);
+   }
+ 
+   // ========== 载体挂载与激活 ==========
+@@ -759,8 +764,9 @@ export class DirectCarrierController {
+     attempt.carrier = carrier;
+     carrier.onClose(() => {
+       if (this.stale(attempt)) return;
+-      this.handleCarrierGone(
+-        failure.reason ? `direct protocol violation: ${failure.reason}` : 'direct channel closed'
++      this.failAttempt(
++        failure.reason ? `direct protocol violation: ${failure.reason}` : 'direct channel closed',
++        true
+       );
+     });
+     this.subscribeCarrierChange(attempt);
+@@ -773,7 +779,7 @@ export class DirectCarrierController {
+   private subscribeCarrierChange(attempt: Attempt): void {
+     const subscribe = this.options.connection.onCarrierChange;
+     if (!subscribe) return;
+-    this.unsubscribeCarrierChange?.();
++    quietly(this.unsubscribeCarrierChange);
+     this.unsubscribeCarrierChange = subscribe.call(this.options.connection, (active) => {
+       if (this.stale(attempt)) return;
+       if (active === 'direct') {
+@@ -781,7 +787,7 @@ export class DirectCarrierController {
+         return;
+       }
+       // 切回 primary：这条直连已经不承载业务了，按载体失效处理（退避后重来）。
+-      if (this.state === 'active') this.handleCarrierGone('switched back to primary');
++      if (this.state === 'active') this.failAttempt('switched back to primary', true);
+     });
+   }
+ 
+@@ -790,7 +796,7 @@ export class DirectCarrierController {
+     if (this.stale(attempt) || !attempt.carrier) return;
+     if (this.state === 'active') return;
+     this.attempts = 0;
+-    this.clearAttemptTimeout(attempt);
++    attempt.timeoutHandle = this.clearHandle(attempt.timeoutHandle);
+     this.setState('active', null);
+     this.startStatsPolling();
+   }
+@@ -798,13 +804,12 @@ export class DirectCarrierController {
+   // ========== 失败与退避 ==========
+ 
+   private failAttempt(reason: string, retryable: boolean): void {
+-    this.teardownAttempt(reason);
+-    this.stopStatsPolling();
++    this.teardownAttempt();
++    this.statsHandle = this.clearHandle(this.statsHandle);
+     this.route = null;
+     this.rttMs = null;
+     this.setState('failed', reason);
+-    if (!retryable || !this.started) return;
+-    this.scheduleRetry();
++    if (retryable && this.started) this.scheduleRetry();
+   }
+ 
+   /**
+@@ -812,13 +817,8 @@ export class DirectCarrierController {
+    * 所以**不消耗重试次数**，挂在 primary 的状态上等它重连过再来一轮。
+    */
+   private failWaitingPrimary(reason: string, mode: PrimaryWaitMode): void {
+-    this.teardownAttempt(reason);
+-    this.stopStatsPolling();
+-    this.route = null;
+-    this.rttMs = null;
+-    this.setState('failed', reason);
+-    if (!this.started) return;
+-    this.waitForPrimary(mode);
++    this.failAttempt(reason, false);
++    if (this.started) this.waitForPrimary(mode);
+   }
+ 
+   /**
+@@ -849,7 +849,7 @@ export class DirectCarrierController {
+       if (!sawDown) return;
+       this.clearPrimaryWait();
+       this.attempts = 0;
+-      this.clearRetryTimer();
++      this.retryHandle = this.clearHandle(this.retryHandle);
+       this.connect();
+     });
+   }
+@@ -857,16 +857,7 @@ export class DirectCarrierController {
+   private clearPrimaryWait(): void {
+     const unsubscribe = this.unsubscribePrimaryWait;
+     this.unsubscribePrimaryWait = null;
+-    try {
+-      unsubscribe?.();
+-    } catch {
+-      // 已注销
+-    }
+-  }
+-
+-  /** 直连载体没了（通道关闭 / primary 断开导致屏障关掉直连）：退避重连。 */
+-  private handleCarrierGone(reason: string): void {
+-    this.failAttempt(reason, true);
++    quietly(unsubscribe);
+   }
+ 
+   /**
+@@ -884,22 +875,18 @@ export class DirectCarrierController {
+       }, this.options.iceDisconnectGraceMs ?? DEFAULT_ICE_DISCONNECT_GRACE_MS);
+       return;
+     }
+-    if (attempt.iceGraceHandle != null && (state === 'connected' || state === 'completed')) {
+-      this.cancelTimer(attempt.iceGraceHandle);
+-      attempt.iceGraceHandle = null;
+-    }
+-    if (state === 'failed' || state === 'closed') {
+-      this.failAttempt(`ice ${state}`, true);
++    if (state === 'connected' || state === 'completed') {
++      attempt.iceGraceHandle = this.clearHandle(attempt.iceGraceHandle);
++      return;
+     }
++    if (state === 'failed' || state === 'closed') this.failAttempt(`ice ${state}`, true);
+   }
+ 
+   private scheduleRetry(): void {
+     if (this.retryHandle != null) return;
+-    const maxAttempts = this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+-    if (this.attempts >= maxAttempts) return; // 停在 failed，等 retry() / 网络或信令恢复
+-    const base = this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
+-    const max = this.options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS;
+-    const delay = Math.min(max, base * 2 ** this.attempts);
++    // 停在 failed，等 retry() / 网络或信令恢复
++    if (this.attempts >= (this.options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)) return;
++    const delay = this.retryDelay(this.attempts);
+     this.attempts += 1;
+     this.retryHandle = this.schedule(() => {
+       this.retryHandle = null;
+@@ -915,43 +902,16 @@ export class DirectCarrierController {
+     return Math.min(max, base * 2 ** Math.max(0, attempt));
+   }
+ 
+-  private clearRetryTimer(): void {
+-    if (this.retryHandle == null) return;
+-    this.cancelTimer(this.retryHandle);
+-    this.retryHandle = null;
+-  }
+-
+-  private clearAttemptTimeout(attempt: Attempt): void {
+-    if (attempt.timeoutHandle == null) return;
+-    this.cancelTimer(attempt.timeoutHandle);
+-    attempt.timeoutHandle = null;
+-  }
+-
+-  private teardownAttempt(_reason: string): void {
++  private teardownAttempt(): void {
+     const attempt = this.attempt;
+     if (!attempt) return;
+     this.attempt = null;
+     attempt.cancelled = true;
+-    this.clearAttemptTimeout(attempt);
+-    if (attempt.iceGraceHandle != null) {
+-      this.cancelTimer(attempt.iceGraceHandle);
+-      attempt.iceGraceHandle = null;
+-    }
+-    try {
+-      attempt.abort.abort();
+-    } catch {
+-      // AbortController 不会抛，保险起见
+-    }
+-    try {
+-      attempt.unsubscribeSignal();
+-    } catch {
+-      // 信令已注销
+-    }
+-    try {
+-      this.unsubscribeCarrierChange?.();
+-    } catch {
+-      // 已注销
+-    }
++    attempt.timeoutHandle = this.clearHandle(attempt.timeoutHandle);
++    attempt.iceGraceHandle = this.clearHandle(attempt.iceGraceHandle);
++    quietly(() => attempt.abort.abort());
++    quietly(attempt.unsubscribeSignal);
++    quietly(this.unsubscribeCarrierChange);
+     this.unsubscribeCarrierChange = null;
+     if (attempt.channel) {
+       attempt.channel.onopen = null;
+@@ -962,19 +922,15 @@ export class DirectCarrierController {
+       attempt.pc.onconnectionstatechange = null;
+       attempt.pc.oniceconnectionstatechange = null;
+     }
+-    try {
+-      attempt.carrier?.close();
+-    } catch {
+-      // 已关闭
+-    }
+-    if (attempt.pc) closeQuietly(attempt.pc);
++    quietly(() => attempt.carrier?.close());
++    quietly(() => attempt.pc?.close());
+     this.options.connection.detachDirectCarrier?.();
+   }
+ 
+   // ========== 诊断 ==========
+ 
+   private startStatsPolling(): void {
+-    this.stopStatsPolling();
++    this.statsHandle = this.clearHandle(this.statsHandle);
+     const interval = this.options.statsIntervalMs ?? DEFAULT_STATS_INTERVAL_MS;
+     const tick = () => {
+       this.statsHandle = null;
+@@ -989,12 +945,6 @@ export class DirectCarrierController {
+     this.statsHandle = this.schedule(tick, interval);
+   }
+ 
+-  private stopStatsPolling(): void {
+-    if (this.statsHandle == null) return;
+-    this.cancelTimer(this.statsHandle);
+-    this.statsHandle = null;
+-  }
+-
+   /** 立即抓一次 stats（测试用；正常由轮询驱动）。 */
+   async pollStats(): Promise<void> {
+     const attempt = this.attempt;
+@@ -1019,6 +969,7 @@ export class DirectCarrierController {
+     this.publish();
+   }
+ 
++  /** PC 回调里只刷新两个状态字段，选中候选对仍沿用上一次 `pollStats` 的结果。 */
+   private refreshIceSnapshot(): void {
+     const pc = this.attempt?.pc;
+     if (!pc) return;
+@@ -1050,13 +1001,7 @@ export class DirectCarrierController {
+       return;
+     }
+     this.snapshot = next;
+-    for (const listener of this.listeners) {
+-      try {
+-        listener();
+-      } catch {
+-        // 订阅者异常不得影响其他订阅者
+-      }
+-    }
++    for (const listener of this.listeners) quietly(listener);
+   }
+ 
+   // ========== 状态与网络事件 ==========
+@@ -1074,30 +1019,22 @@ export class DirectCarrierController {
+   }
+ 
+   private installNetworkListeners(): void {
+-    const online = this.resolveNetworkEvents();
+-    if (online?.addEventListener && !this.onlineHandler) {
+-      const handler = () => this.handleNetworkChange(0);
+-      online.addEventListener('online', handler);
+-      this.onlineHandler = handler;
+-    }
++    const bind = (target: EventTargetLike | null, type: string, debounceMs: number) => {
++      if (!target?.addEventListener) return;
++      const handler = () => this.handleNetworkChange(debounceMs);
++      target.addEventListener(type, handler);
++      this.networkCleanups.push(() => target.removeEventListener?.(type, handler));
++    };
++    bind(this.options.networkEvents ?? (globalThis as unknown as EventTargetLike), 'online', 0);
+     // Wi-Fi ↔ 蜂窝切换通常不触发 `online`，只有 Network Information API 的 change。
+-    const conn = this.resolveConnectionEvents();
+-    if (conn?.addEventListener && !this.connectionChangeHandler) {
+-      const handler = () =>
+-        this.handleNetworkChange(
+-          this.options.networkChangeDebounceMs ?? DEFAULT_NETWORK_CHANGE_DEBOUNCE_MS
+-        );
+-      conn.addEventListener('change', handler);
+-      this.connectionChangeHandler = handler;
+-    }
++    const events = this.options.connectionEvents;
++    const debounce = this.options.networkChangeDebounceMs ?? DEFAULT_NETWORK_CHANGE_DEBOUNCE_MS;
++    bind(events !== undefined ? events : defaultConnectionEvents(), 'change', debounce);
+   }
+ 
+   private handleNetworkChange(debounceMs: number): void {
+     if (!this.started) return;
+-    if (this.networkDebounceHandle != null) {
+-      this.cancelTimer(this.networkDebounceHandle);
+-      this.networkDebounceHandle = null;
+-    }
++    this.networkDebounceHandle = this.clearHandle(this.networkDebounceHandle);
+     if (debounceMs <= 0) {
+       this.retry();
+       return;
+@@ -1110,33 +1047,8 @@ export class DirectCarrierController {
+   }
+ 
+   private removeNetworkListeners(): void {
+-    if (this.networkDebounceHandle != null) {
+-      this.cancelTimer(this.networkDebounceHandle);
+-      this.networkDebounceHandle = null;
+-    }
+-    const onlineHandler = this.onlineHandler;
+-    this.onlineHandler = null;
+-    if (onlineHandler) this.resolveNetworkEvents()?.removeEventListener?.('online', onlineHandler);
+-    const connHandler = this.connectionChangeHandler;
+-    this.connectionChangeHandler = null;
+-    if (connHandler) this.resolveConnectionEvents()?.removeEventListener?.('change', connHandler);
+-  }
+-
+-  private resolveNetworkEvents(): EventTargetLike | null {
+-    return this.options.networkEvents ?? (globalThis as unknown as EventTargetLike) ?? null;
+-  }
+-
+-  private resolveConnectionEvents(): EventTargetLike | null {
+-    if (this.options.connectionEvents !== undefined) return this.options.connectionEvents;
+-    return defaultConnectionEvents();
+-  }
+-}
+-
+-function closeQuietly(pc: RTCPeerConnectionLike): void {
+-  try {
+-    pc.close();
+-  } catch {
+-    // 已关闭
++    this.networkDebounceHandle = this.clearHandle(this.networkDebounceHandle);
++    for (const off of this.networkCleanups.splice(0)) quietly(off);
+   }
+ }
+ 
+@@ -1170,10 +1082,15 @@ class DirectPrimaryWaitError extends Error {
+  * 只认**带明确 code** 的那两个状态：老 node 上 `/api/mesh/connection` 落到
+  * `/api/mesh/*` 的 405、或路由缺失的裸 404，都不该被误判成「等 primary」而永久挂起。
+  */
+-function primaryWaitFor(status: number, code: string): PrimaryWaitMode | null {
+-  if (status === 404 && code === 'NO_CONNECTION') return 'open';
+-  if (status === 409 && code === 'MULTIPLE_CONNECTIONS') return 'reconnect';
+-  return null;
++async function throwIfPrimaryWait(res: Response, label: string): Promise<void> {
++  const code = await readErrorCode(res);
++  const mode: PrimaryWaitMode | null =
++    res.status === 404 && code === 'NO_CONNECTION'
++      ? 'open'
++      : res.status === 409 && code === 'MULTIPLE_CONNECTIONS'
++        ? 'reconnect'
++        : null;
++  if (mode) throw new DirectPrimaryWaitError(`${label}: ${code}`, mode);
+ }
+ 
+ async function readErrorCode(res: Response): Promise<string> {

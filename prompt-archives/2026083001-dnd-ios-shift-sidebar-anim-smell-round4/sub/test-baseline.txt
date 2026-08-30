@@ -1,0 +1,40 @@
+== packages/panels
+ 496 pass
+ 0 fail
+Ran 496 tests across 36 files. [476.00ms]
+tsc: 0
+== packages/shared
+ 358 pass
+ 0 fail
+Ran 358 tests across 34 files. [1434.00ms]
+tsc: 0
+== packages/ws-client
+ 261 pass
+ 0 fail
+Ran 261 tests across 17 files. [1038.00ms]
+tsc: 0
+== packages/stores
+ 282 pass
+ 0 fail
+Ran 282 tests across 27 files. [106.00ms]
+tsc: 1
+== packages/ui
+ 47 pass
+ 0 fail
+Ran 47 tests across 5 files. [74.00ms]
+tsc: 0
+== packages/app
+ 407 pass
+ 1 fail
+Ran 408 tests across 44 files. [16.47s]
+tsc: 1
+== apps/gateway
+ 2482 pass
+ 0 fail
+Ran 2482 tests across 254 files. [120.51s]
+tsc: 21
+== apps/fe
+ 668 pass
+ 0 fail
+Ran 668 tests across 52 files. [1041.00ms]
+tsc: 0

@@ -1,0 +1,23 @@
+You are a senior backend engineer working in the Bun + TypeScript monorepo at the current working directory (a git worktree of tmex, branch `chore/round4-dnd-sidebar-smell`). Read `AGENTS.md` at the repo root first and obey it (Bun only — `bun`, `bunx`, never node/npm; no unnecessary comments; any comment you do write is Simplified Chinese; never lint/format generated files such as `packages/shared/src/i18n/resources.ts`).
+
+HARD RULES
+- Other agents edit OTHER files in this worktree at the same time. You may only modify the files listed in YOUR SCOPE below (plus their `*.test.ts` siblings and brand-new files you are told to create). If you believe you need to touch anything else, stop and note it in your result instead.
+- Never run git commands that change state (no add/commit/stash/checkout/reset). `git diff` / `git status` / `git log` are fine.
+- This is a code-smell cleanup whose #1 metric is NET LINE COUNT REDUCTION. Every refactor must delete more than it adds. Do not introduce interfaces, classes, wrapper layers, option bags, or "helpers" that merely move code around. Prefer deleting duplicated logic, collapsing repeated branches into table-driven code only when the table is clearly smaller, removing dead exports (drop the `export` keyword or delete the symbol if unused), and simplifying control flow. Preserve every observable behaviour (wire formats, error codes/messages that tests or clients depend on, ordering, transaction boundaries, stop/cleanup order).
+- Do not touch the previous rounds' intentionally-retained hotspots even if they are in your file: `emitOsc`, `encodeMouseEvent`, `classifySshError`, control-mode `parse`, `dispatchPaneStreamByte`, `runInit`, `sanitizeBunPath`.
+- Do not change version numbers, CHANGELOG, build scripts or anything release-related.
+- Fix real bugs you are pointed at (and ones you find in scope), each with a regression test where feasible.
+- Test discipline: run the package's tests before you start to know the baseline, again when done. Commands: `cd apps/gateway && bun test` (baseline 2497 pass / 0 fail (other agents still editing stream-targets.ts, uplink-server.ts, mesh-routes.ts, rtc/fragmenter.ts, link-stream-carrier.ts — transient failures there are not yours); `bunx tsc --noEmit -p .` has 21 pre-existing errors — do not increase them), `cd packages/app && bun test` (baseline 409 pass / 1 pre-existing fail (cpu-features stub plugin); tsc 1 pre-existing error), `cd packages/shared && bun test` (358 pass; tsc 0), `cd packages/ws-client && bun test` (261 pass; tsc 0). Run `bunx biome check <each changed file>` and fix findings (biome config is at repo root). macOS has no `timeout` command. bun test summary lines contain ANSI colours; strip with `sed 's/\x1b\[[0-9;]*m//g'`.
+- No file may end up with a hard-coded credential. No network access needed.
+- Never touch the production tmex service (port 9883, `~/Library/Application Support/tmex/`) or any tmux session named `tmex`.
+
+RESULT: when finished, write a markdown report to the path given in YOUR SCOPE (`RESULT FILE`) containing: files changed with one-line summaries, `git diff --stat` output, line delta (before/after per file, from `wc -l`), test/tsc/biome results before and after, bugs fixed, and anything you deliberately skipped and why. The report is how the commander learns you are done, so write it last, and write it even if you had to stop early.
+
+RESULT FILE: /Users/konata/code/tmex-enhanced/prompt-archives/2026083001-dnd-ios-shift-sidebar-anim-smell-round4/sub/R3-result.md
+
+YOUR SCOPE (R3 — UserKeyService batch apply / replay / persistence):
+File: `apps/gateway/src/auth/user-key-service.ts` (1229 lines) + `user-key-service.test.ts`. Nothing else.
+- `applyMany` (~351, CC18/155), `replayJoinChain` (~839, CC20/86), `persistApplied` (~1121, CC17/109): validation, state advance, CAS transaction, record effects and session effects are all in one layer. Separate prepare/replay from the transaction commit, and dispatch per-record-type effects through a small map (only if shorter). The transaction boundary, CAS semantics, ordering of effects and every thrown error code must be preserved (tests around `user-key-service.test.ts:330`, `:867`, `:915`).
+- `persistJoinReplay` (~926, 97 lines, CC4) likely shares code with `persistApplied` — dedupe.
+- Drop `export` from symbols with no importer outside the file (verify with `rg`).
+Target: net -70 lines or better; largest function CC under 15.

@@ -1,0 +1,4915 @@
+diff --git a/apps/gateway/src/hub/uplink-server.ts b/apps/gateway/src/hub/uplink-server.ts
+index 07a386d6..93ac253d 100644
+--- a/apps/gateway/src/hub/uplink-server.ts
++++ b/apps/gateway/src/hub/uplink-server.ts
+@@ -14,6 +14,8 @@ import {
+ import type { LinkSession, LinkStream } from '@tmex/shared/link';
+ import type { AuthDb } from '../auth/types';
+ import type { UserStore } from '../auth/user-store';
++import { parseJson, projectNode, upsertById } from '../mesh/node-list-projection';
++import { pumpLink } from '../mesh/stream-pump';
+ import { patchNode } from './node-persistence';
+ import type { NodeRegistry } from './node-registry';
+ import {
+@@ -1285,15 +1287,18 @@ export class UplinkServer {
+       .filter((n) => n.userId === userId && n.status === 'enrolled')
+       .map((n) => {
+         const live = online.get(n.id);
+-        return {
+-          id: n.id,
+-          name: n.name,
+-          online: Boolean(live),
+-          endpoints: live?.meta.endpoints ?? parseJson(n.endpointsJson, []),
+-          inventory: live?.meta.inventory ?? parseJson(n.inventoryJson, {}),
+-          direct_capable: live?.meta.directCapable ?? n.directCapable,
+-          version: live?.meta.version ?? n.version ?? '',
+-        };
++        return projectNode(
++          n.id,
++          n.name,
++          Boolean(live),
++          {
++            endpoints: parseJson(n.endpointsJson, []),
++            inventory: parseJson(n.inventoryJson, {}),
++            directCapable: n.directCapable,
++            version: n.version ?? '',
++          },
++          live?.meta
++        );
+       });
+     const hubNodeId = this.config.nodeId ?? this.userStore.getHubMeta()?.nodeId;
+     const hubName = hubNodeId ? this.nodeDisplayName(hubNodeId) : null;
+@@ -1304,57 +1309,45 @@ export class UplinkServer {
+         now: this.now(),
+         listVersion: this.listVersion,
+       });
+-      const live = online.get(hubNodeId);
+       const existing = nodes.find((n) => n.id === hubNodeId);
+-      const hubEntry = {
+-        id: hubNodeId,
+-        name: hubName ?? hubNodeId,
+-        online: true,
+-        endpoints: live?.meta.endpoints ?? existing?.endpoints ?? [],
+-        inventory: live?.meta.inventory ?? existing?.inventory ?? {},
+-        direct_capable: live?.meta.directCapable ?? existing?.direct_capable ?? false,
+-        version: live?.meta.version ?? existing?.version ?? '',
+-      };
+-      if (existing) {
+-        existing.name = hubEntry.name;
+-        existing.online = true;
+-        existing.endpoints = hubEntry.endpoints;
+-        existing.inventory = hubEntry.inventory;
+-        existing.direct_capable = hubEntry.direct_capable;
+-        existing.version = hubEntry.version;
+-      } else {
+-        nodes.push(hubEntry);
+-      }
++      upsertById(
++        nodes,
++        projectNode(
++          hubNodeId,
++          hubName ?? hubNodeId,
++          true,
++          {
++            endpoints: existing?.endpoints ?? [],
++            inventory: existing?.inventory ?? {},
++            directCapable: existing?.direct_capable ?? false,
++            version: existing?.version ?? '',
++          },
++          online.get(hubNodeId)?.meta
++        )
++      );
+     }
+-    const msg: NodeListMessage = {
++    return {
+       t: 'node.list',
+       version: this.listVersion,
+       key_log_head: { seq: seqToWire(head.seq), hash: bytesToB64url(head.hash) },
+-      rtc: {
+-        stun: this.config.stun,
+-        turn: this.config.turn ?? null,
+-      },
++      rtc: { stun: this.config.stun, turn: this.config.turn ?? null },
+       nodes,
++      ...(hubNodeId
++        ? {
++            hub: {
++              nodeId: hubNodeId,
++              publicUrl: this.config.publicUrl,
++              ...(hubName ? { name: hubName } : {}),
++            },
++          }
++        : {}),
+     };
+-    if (hubNodeId) {
+-      msg.hub = {
+-        nodeId: hubNodeId,
+-        publicUrl: this.config.publicUrl,
+-        ...(hubName ? { name: hubName } : {}),
+-      };
+-    }
+-    return msg;
+   }
+ 
+   private nodeDisplayName(nodeId: string): string {
+-    const row = this.userStore.getNode(nodeId);
+-    const registry = row?.name?.trim();
++    const registry = this.userStore.getNode(nodeId)?.name?.trim();
+     if (registry && registry !== nodeId) return registry;
+-    const site = this.config.siteName?.trim();
+-    if (site) return site;
+-    const host = os.hostname().trim();
+-    if (host) return host;
+-    return nodeId;
++    return this.config.siteName?.trim() || os.hostname().trim() || nodeId;
+   }
+ }
+ 
+@@ -1374,14 +1367,6 @@ function stringifyJson(value: unknown): string {
+   }
+ }
+ 
+-function parseJson(raw: string, fallback: unknown): unknown {
+-  try {
+-    return JSON.parse(raw);
+-  } catch {
+-    return fallback;
+-  }
+-}
+-
+ function parseRelayOpen(payload: Uint8Array): { to: string; raw: Record<string, unknown> } | null {
+   try {
+     const parsed: unknown = JSON.parse(textDecoder.decode(payload));
+@@ -1413,8 +1398,8 @@ function pumpRelay(a: LinkStream, b: LinkStream): void {
+   };
+   a.onAbort(abortBoth);
+   b.onAbort(abortBoth);
+-  void copyDirection(a, b, abortBoth);
+-  void copyDirection(b, a, abortBoth);
++  void pumpLink(a, b, abortBoth);
++  void pumpLink(b, a, abortBoth);
+ }
+ 
+ function parseDcPeerSession(rtcSession: string): { a: string; b: string } | null {
+@@ -1429,19 +1414,3 @@ function parseDcPeerSession(rtcSession: string): { a: string; b: string } | null
+   const b = first < second ? second : first;
+   return { a, b };
+ }
+-
+-async function copyDirection(src: LinkStream, dst: LinkStream, onError: () => void): Promise<void> {
+-  const reader = src.readable.getReader();
+-  try {
+-    while (true) {
+-      const { done, value } = await reader.read();
+-      if (done) break;
+-      if (value) {
+-        await dst.write(value.bytes, { head: value.head });
+-      }
+-    }
+-    dst.end();
+-  } catch {
+-    onError();
+-  }
+-}
+diff --git a/apps/gateway/src/mesh/mesh-routes.ts b/apps/gateway/src/mesh/mesh-routes.ts
+index e04f51fb..58eaf647 100644
+--- a/apps/gateway/src/mesh/mesh-routes.ts
++++ b/apps/gateway/src/mesh/mesh-routes.ts
+@@ -22,6 +22,12 @@ import {
+   X_TMEX_CONNECTION,
+   getMeshRequestContext,
+ } from './mesh-deps';
++import {
++  parseJson,
++  pickMeshNodeName,
++  projectNode,
++  versionFromInventory,
++} from './node-list-projection';
+ import {
+   type AuthenticateOk,
+   type SessionMiddlewareDeps,
+@@ -213,26 +219,19 @@ export class MeshRoutes {
+     const reach = this.deps.peers.listReach();
+     const hubOnline = this.deps.peers.listHubOnline?.() ?? new Set<string>();
+     const certs = this.deps.userStore.listCerts().filter((c) => c.revokedLogSeq == null);
+-    const peers = this.deps.userStore.listPeers();
+-    const peerById = new Map(peers.map((p) => [p.nodeId, p]));
+-    const listedById = new Map(
+-      (this.deps.listedNames?.() ?? []).map((row) => [row.id, row.name] as const)
+-    );
+-    const registryById = new Map(
+-      this.deps.userStore.listNodes().map((row) => [row.id, row.name] as const)
+-    );
++    const certById = new Map(certs.map((c) => [c.nodeId, c]));
++    const peerById = new Map(this.deps.userStore.listPeers().map((p) => [p.nodeId, p]));
++    const listedById = new Map((this.deps.listedNames?.() ?? []).map((row) => [row.id, row.name]));
++    const registryById = new Map(this.deps.userStore.listNodes().map((row) => [row.id, row.name]));
+     const selfName = this.deps.selfName?.() ?? null;
+-    const ids = new Set<string>([this.deps.nodeId]);
+-    for (const cert of certs) ids.add(cert.nodeId);
++    const self = this.deps.selfStatus?.();
+     const hubNodeId = this.deps.roles.hub
+       ? this.deps.nodeId
+       : (this.deps.userStore.getHubMeta()?.nodeId ?? null);
+-
+     const nodes: MeshNodeDto[] = [];
+-    for (const id of ids) {
+-      const cert = certs.find((c) => c.nodeId === id);
++    for (const id of new Set([this.deps.nodeId, ...certs.map((c) => c.nodeId)])) {
++      const cert = certById.get(id);
+       if (id !== this.deps.nodeId && !cert) continue;
+-      const peer = peerById.get(id);
+       let publicKey = this.deps.nodePk;
+       if (id !== this.deps.nodeId && cert) {
+         try {
+@@ -243,47 +242,42 @@ export class MeshRoutes {
+       }
+       const isSelf = id === this.deps.nodeId;
+       const r = reach.get(id) ?? null;
+-      const online = isSelf ? true : hubOnline.has(id) || r === 'lan' || r === 'relay';
+-      const loggedIn = isSelf
+-        ? cookies.has(nodeSessionCookieName(MESH_VIA_SELF))
+-        : cookies.has(nodeSessionCookieName(id));
+-      const listedName = listedById.get(id);
+-      const registryName = registryById.get(id);
+-      let inventory: unknown = null;
+-      if (peer?.inventoryJson) {
+-        try {
+-          inventory = JSON.parse(peer.inventoryJson);
+-        } catch {
+-          inventory = peer.inventoryJson;
+-        }
+-      }
+-      let version = versionFromInventory(inventory);
+-      let directCapable = peer?.directCapable ?? false;
+-      if (isSelf) {
+-        const self = this.deps.selfStatus?.();
+-        if (self) {
+-          inventory = self.inventory ?? inventory;
+-          version = self.version || versionFromInventory(inventory);
+-          directCapable = self.direct_capable;
+-        }
+-      }
+-      nodes.push({
++      const peer = peerById.get(id);
++      const inv = parseJson(peer?.inventoryJson, peer?.inventoryJson ?? null);
++      const core = projectNode(
+         id,
+-        name: pickMeshNodeName({
++        pickMeshNodeName({
+           id,
+           isSelf,
+-          listedName,
+-          registryName,
++          listedName: listedById.get(id),
++          registryName: registryById.get(id),
+           selfName: isSelf ? selfName : null,
+         }),
++        isSelf || hubOnline.has(id) || r === 'lan' || r === 'relay',
++        {
++          inventory: inv,
++          directCapable: peer?.directCapable ?? false,
++          version: versionFromInventory(inv),
++        },
++        isSelf && self
++          ? {
++              inventory: self.inventory,
++              directCapable: self.direct_capable,
++              version: self.version || undefined,
++            }
++          : null
++      );
++      nodes.push({
++        id,
++        name: core.name,
+         publicKey: encodeBase64url(publicKey),
+-        online,
++        online: core.online,
+         reach: r,
+         transport: isSelf ? null : (this.deps.peers.transportOf?.(id) ?? null),
+-        version,
+-        direct_capable: directCapable,
+-        inventory,
+-        loggedIn,
++        version: core.version || versionFromInventory(core.inventory),
++        direct_capable: core.direct_capable,
++        inventory: core.inventory,
++        loggedIn: cookies.has(nodeSessionCookieName(isSelf ? MESH_VIA_SELF : id)),
+         isHub: hubNodeId != null && id === hubNodeId,
+       });
+     }
+@@ -296,25 +290,18 @@ export class MeshRoutes {
+   }
+ 
+   private handleConnection(req: Request, auth: AuthenticateOk): Response {
+-    if (!auth.sid) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
++    if (!auth.sid) return jsonError('UNAUTHORIZED', 401);
+     const via = getMeshRequestContext(req).via || MESH_VIA_SELF;
+-    const url = new URL(req.url);
+-    const cid = url.searchParams.get('cid')?.trim() || null;
+-    const header = req.headers.get(X_TMEX_CONNECTION)?.trim() || null;
++    const cid = new URL(req.url).searchParams.get('cid')?.trim() || null;
+     const resolved = this.deps.connectionLookup?.({
+       sid: auth.sid,
+       via,
+       cid,
+-      connectionId: cid ? null : header,
++      connectionId: cid ? null : req.headers.get(X_TMEX_CONNECTION)?.trim() || null,
+     });
+-    if (!resolved) {
+-      return jsonError('NO_CONNECTION', 404);
+-    }
++    if (!resolved) return jsonError('NO_CONNECTION', 404);
+     if (!resolved.ok) {
+-      const status = resolved.code === 'MULTIPLE_CONNECTIONS' ? 409 : 404;
+-      return jsonError(resolved.code, status, {
++      return jsonError(resolved.code, resolved.code === 'MULTIPLE_CONNECTIONS' ? 409 : 404, {
+         hint: 'open Gateway WS with ?cid=<tab-nonce> then GET /api/mesh/connection?cid=',
+       });
+     }
+@@ -322,37 +309,33 @@ export class MeshRoutes {
+   }
+ 
+   private async handleRtcAuthorize(req: Request, auth: AuthenticateOk): Promise<Response> {
+-    if (!auth.userId) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
+-    if (!this.deps.rtcFingerprint) {
+-      return jsonError('DIRECT_UNAVAILABLE', 503);
+-    }
++    if (!auth.userId) return jsonError('UNAUTHORIZED', 401);
++    if (!this.deps.rtcFingerprint) return jsonError('DIRECT_UNAVAILABLE', 503);
+     const body = await readJsonObjectBody(req);
+     const rtcSession = typeof body?.rtcSession === 'string' ? body.rtcSession : '';
+-    const fp = body?.fp_browser;
+-    if (!rtcSession || typeof fp !== 'object' || fp === null) {
+-      return jsonError('MALFORMED', 400);
+-    }
+-    const fpBrowser = fp as { algorithm?: unknown; value?: unknown };
+-    if (typeof fpBrowser.algorithm !== 'string' || typeof fpBrowser.value !== 'string') {
++    const fp = body?.fp_browser as { algorithm?: unknown; value?: unknown } | null | undefined;
++    if (
++      !rtcSession ||
++      typeof fp !== 'object' ||
++      fp === null ||
++      typeof fp.algorithm !== 'string' ||
++      typeof fp.value !== 'string'
++    ) {
+       return jsonError('MALFORMED', 400);
+     }
++    if (!auth.sid) return jsonError('UNAUTHORIZED', 401);
+     const via = getMeshRequestContext(req).via || MESH_VIA_SELF;
+-    if (!auth.sid) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
+-    const bodyConnectionId = typeof body?.connectionId === 'string' ? body.connectionId.trim() : '';
+-    const headerConnectionId = req.headers.get(X_TMEX_CONNECTION)?.trim() || '';
+-    const requestedConnectionId = bodyConnectionId || headerConnectionId || null;
++    const requestedConnectionId =
++      (typeof body?.connectionId === 'string' ? body.connectionId.trim() : '') ||
++      req.headers.get(X_TMEX_CONNECTION)?.trim() ||
++      null;
+     const resolved = this.deps.connectionLookup?.({
+       sid: auth.sid,
+       via,
+       connectionId: requestedConnectionId,
+     });
+     if (resolved && !resolved.ok) {
+-      const status = resolved.code === 'MULTIPLE_CONNECTIONS' ? 409 : 404;
+-      return jsonError(resolved.code, status, {
++      return jsonError(resolved.code, resolved.code === 'MULTIPLE_CONNECTIONS' ? 409 : 404, {
+         hint: 'send connectionId from GET /api/mesh/connection or x-tmex-connection',
+       });
+     }
+@@ -362,15 +345,10 @@ export class MeshRoutes {
+       via,
+       sid: auth.sid,
+       ...(resolved?.ok ? { connectionId: resolved.connectionId } : {}),
+-      fpBrowser: { algorithm: fpBrowser.algorithm, value: fpBrowser.value },
+-    });
+-    if (!granted) {
+-      return jsonError('DIRECT_UNAVAILABLE', 503);
+-    }
+-    return jsonBody({
+-      nonce: encodeBase64url(granted.nonce),
+-      fp_node: granted.fpNode,
++      fpBrowser: { algorithm: fp.algorithm, value: fp.value },
+     });
++    if (!granted) return jsonError('DIRECT_UNAVAILABLE', 503);
++    return jsonBody({ nonce: encodeBase64url(granted.nonce), fp_node: granted.fpNode });
+   }
+ 
+   private handleMeshWsUpgrade(req: Request, server: MeshUpgradeServer): Response | undefined {
+@@ -451,33 +429,3 @@ function toBytes(message: unknown): Uint8Array | null {
+   }
+   return null;
+ }
+-
+-function usableMeshName(name: string | null | undefined, nodeId: string): string | null {
+-  const trimmed = name?.trim() ?? '';
+-  if (!trimmed || trimmed === nodeId || trimmed === 'self') return null;
+-  return trimmed;
+-}
+-
+-function pickMeshNodeName(input: {
+-  id: string;
+-  isSelf: boolean;
+-  listedName?: string | null;
+-  registryName?: string | null;
+-  selfName?: string | null;
+-}): string {
+-  return (
+-    usableMeshName(input.listedName, input.id) ??
+-    usableMeshName(input.registryName, input.id) ??
+-    (input.isSelf ? usableMeshName(input.selfName, input.id) : null) ??
+-    (input.isSelf ? input.selfName?.trim() || 'self' : input.id)
+-  );
+-}
+-
+-function versionFromInventory(inventory: unknown): string | null {
+-  if (inventory && typeof inventory === 'object' && inventory !== null && 'version' in inventory) {
+-    const value = (inventory as { version: unknown }).version;
+-    if (value == null) return null;
+-    return String(value);
+-  }
+-  return null;
+-}
+diff --git a/apps/gateway/src/mesh/mesh-runtime.test.ts b/apps/gateway/src/mesh/mesh-runtime.test.ts
+index 2ed1d457..b582fc4e 100644
+--- a/apps/gateway/src/mesh/mesh-runtime.test.ts
++++ b/apps/gateway/src/mesh/mesh-runtime.test.ts
+@@ -24,7 +24,7 @@ import type { GatewayRuntime } from '../runtime';
+ import type { WebSocketServer } from '../ws';
+ import { GatewaySession } from '../ws/gateway-session';
+ import { createFakeCarrier } from '../ws/test-helpers';
+-import { SessionRegistry, createMeshRuntime } from './mesh-runtime';
++import { SessionRegistry, createMeshRuntime, isAdvertisablePeerAddress } from './mesh-runtime';
+ import {
+   ImmediateScheduler,
+   fakeSocketPair,
+@@ -261,9 +261,14 @@ describe('createMeshRuntime', () => {
+       order.push('uplink');
+       await origUplink();
+     };
++    const origRtc = mesh.rtc.close.bind(mesh.rtc);
++    mesh.rtc.close = () => {
++      order.push('rtc');
++      origRtc();
++    };
+ 
+     await mesh.stop();
+-    expect(order).toEqual(['peer', 'uplink']);
++    expect(order).toEqual(['peer', 'uplink', 'rtc']);
+   });
+ 
+   test('exposes gateway WS guard and inbound mesh handleRequest for peer via', async () => {
+@@ -1124,3 +1129,66 @@ describe('SessionRegistry', () => {
+     expect(registry.getByConnectionId(first.entry.connectionId)?.session).toBe(a);
+   });
+ });
++
++describe('isAdvertisablePeerAddress', () => {
++  const ni = (address: string, family: string | number, internal = false) =>
++    ({
++      address,
++      netmask: family === 'IPv6' || family === 6 ? 'ffff:ffff:ffff:ffff::' : '255.255.255.0',
++      family,
++      mac: '',
++      internal,
++      cidr: null,
++      scopeid: 0,
++    }) as Parameters<typeof isAdvertisablePeerAddress>[0];
++
++  test('pins current accept and reject cases', () => {
++    const accept: Array<[string, string | number]> = [
++      ['10.0.0.12', 'IPv4'],
++      ['192.0.2.10', 4],
++      ['192.168.1.1', 'IPv4'],
++      ['223.255.255.255', 'IPv4'],
++      ['240.0.0.1', 'IPv4'],
++      ['255.255.255.255', 'IPv4'],
++      ['2001:db8::8', 'IPv6'],
++      ['2001:db8::8', 6],
++      ['2600::1', 'IPv6'],
++      ['fe7f::1', 'IPv6'],
++      ['fec0::1', 'IPv6'],
++      ['::2', 'IPv6'],
++    ];
++    const reject: Array<[string, string | number, boolean?]> = [
++      ['10.0.0.12', 'IPv4', true],
++      ['127.0.0.1', 'IPv4'],
++      ['127.1.2.3', 'IPv4'],
++      ['169.254.10.20', 'IPv4'],
++      ['0.0.0.0', 'IPv4'],
++      ['224.0.0.1', 'IPv4'],
++      ['239.255.255.255', 'IPv4'],
++      ['256.0.0.1', 'IPv4'],
++      ['10.0.0', 'IPv4'],
++      ['1.2.3.4.5', 'IPv4'],
++      ['not-an-ip', 'IPv4'],
++      ['2001:db8::8', 'IPX'],
++      ['fe80::1', 'IPv6'],
++      ['fe80::1%en0', 'IPv6'],
++      ['febf::1', 'IPv6'],
++      ['ff02::1', 'IPv6'],
++      ['ff00::1', 'IPv6'],
++      ['::', 'IPv6'],
++      ['::1', 'IPv6'],
++      ['::1', 6],
++      [':::1', 'IPv6'],
++      ['2001:db8::1.2.3.4', 'IPv6'],
++    ];
++    for (const [address, family] of accept) {
++      expect(isAdvertisablePeerAddress(ni(address, family)), `${family} ${address}`).toBe(true);
++    }
++    for (const [address, family, internal] of reject) {
++      expect(
++        isAdvertisablePeerAddress(ni(address, family, Boolean(internal))),
++        `${family} ${address}${internal ? ' internal' : ''}`
++      ).toBe(false);
++    }
++  });
++});
+diff --git a/apps/gateway/src/mesh/mesh-runtime.ts b/apps/gateway/src/mesh/mesh-runtime.ts
+index 138025e8..ea4b9b9f 100644
+--- a/apps/gateway/src/mesh/mesh-runtime.ts
++++ b/apps/gateway/src/mesh/mesh-runtime.ts
+@@ -59,8 +59,6 @@ import type { DispatchContext, KeyLogApplier, MeshScheduler, PeerBindHost } from
+ import { UplinkClient, type UplinkWsFactory } from './uplink-client';
+ import type { UplinkNodeList, UplinkRtcSignal } from './uplink-protocol';
+ 
+-const ZERO_HASH = new Uint8Array(32);
+-
+ export type MeshRuntimeConfig = {
+   roles: TmexRoles;
+   hubUrl: string | null;
+@@ -141,24 +139,14 @@ export class SessionRegistry {
+ 
+   register(entry: RegisterGatewaySessionInput): RegisterGatewaySessionResult {
+     const cid = normalizeCid(entry.cid);
+-    const providedId =
+-      typeof entry.connectionId === 'string' && entry.connectionId.trim()
+-        ? entry.connectionId.trim()
+-        : '';
+-    if (providedId) {
+-      const prev = this.byConnection.get(providedId);
+-      if (prev && prev.session !== entry.session && !prev.session.closed) {
+-        return { ok: false, code: 'DUPLICATE_CONNECTION' };
+-      }
+-    }
+-    if (cid) {
+-      const existingId = this.byCid.get(cidIndexKey(entry.sid, entry.via, cid));
+-      if (existingId) {
+-        const existing = this.byConnection.get(existingId);
+-        if (existing && existing.session !== entry.session && !existing.session.closed) {
+-          return { ok: false, code: 'DUPLICATE_CID' };
+-        }
+-      }
++    const providedId = typeof entry.connectionId === 'string' ? entry.connectionId.trim() : '';
++    const taken = (id: string | undefined) => {
++      const e = id ? this.byConnection.get(id) : undefined;
++      return Boolean(e && e.session !== entry.session && !e.session.closed);
++    };
++    if (providedId && taken(providedId)) return { ok: false, code: 'DUPLICATE_CONNECTION' };
++    if (cid && taken(this.byCid.get(cidIndexKey(entry.sid, entry.via, cid)))) {
++      return { ok: false, code: 'DUPLICATE_CID' };
+     }
+     let connectionId = providedId;
+     if (!connectionId) {
+@@ -167,9 +155,7 @@ export class SessionRegistry {
+       } while (this.byConnection.has(connectionId));
+     }
+     const prevSame = this.byConnection.get(connectionId);
+-    if (prevSame && prevSame.session === entry.session) {
+-      this.drop(prevSame);
+-    }
++    if (prevSame?.session === entry.session) this.drop(prevSame);
+     const stored: RegisteredGatewaySession = {
+       connectionId,
+       sid: entry.sid,
+@@ -197,9 +183,7 @@ export class SessionRegistry {
+       this.unregisterSession(session);
+       return;
+     }
+-    for (const entry of this.listBySid(sid)) {
+-      this.drop(entry);
+-    }
++    for (const entry of this.listBySid(sid)) this.drop(entry);
+   }
+ 
+   unregisterSession(session: GatewaySession): void {
+@@ -251,21 +235,12 @@ export class SessionRegistry {
+     cid?: string | null
+   ): ConnectionLookupResult {
+     const nonce = normalizeCid(cid);
+-    if (nonce) {
+-      const id = this.byCid.get(cidIndexKey(sid, via, nonce));
+-      if (!id) return { ok: false, code: 'NO_CONNECTION' };
+-      const entry = this.getByConnectionId(id);
+-      if (entry && entry.sid === sid && entry.via === via) {
+-        return { ok: true, connectionId: entry.connectionId };
+-      }
+-      return { ok: false, code: 'NO_CONNECTION' };
+-    }
+-    if (connectionId) {
+-      const entry = this.getByConnectionId(connectionId);
+-      if (entry && entry.sid === sid && entry.via === via) {
+-        return { ok: true, connectionId: entry.connectionId };
+-      }
+-      return { ok: false, code: 'NO_CONNECTION' };
++    if (nonce || connectionId) {
++      const id = nonce ? this.byCid.get(cidIndexKey(sid, via, nonce)) : connectionId;
++      const entry = id ? this.getByConnectionId(id) : null;
++      return entry && entry.sid === sid && entry.via === via
++        ? { ok: true, connectionId: entry.connectionId }
++        : { ok: false, code: 'NO_CONNECTION' };
+     }
+     const matches = this.listBySid(sid).filter((entry) => entry.via === via);
+     if (matches.length === 0) return { ok: false, code: 'NO_CONNECTION' };
+@@ -331,7 +306,7 @@ function parseIpv4Octets(address: string): number[] | null {
+   for (const part of parts) {
+     if (!/^\d{1,3}$/.test(part)) return null;
+     const n = Number(part);
+-    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
++    if (n > 255) return null;
+     octets.push(n);
+   }
+   return octets;
+@@ -367,28 +342,27 @@ function parseIpv6Words(address: string): number[] | null {
+ export function isAdvertisablePeerAddress(addr: os.NetworkInterfaceInfo): boolean {
+   if (addr.internal) return false;
+   const family = addr.family as string | number;
+-  const isV4 = family === 'IPv4' || family === 4;
+-  const isV6 = family === 'IPv6' || family === 6;
+-  if (isV4) {
+-    const octets = parseIpv4Octets(stripZoneId(addr.address));
+-    if (!octets) return false;
+-    const a = octets[0] ?? 0;
+-    const b = octets[1] ?? 0;
+-    if (a === 0 && b === 0 && (octets[2] ?? 0) === 0 && (octets[3] ?? 0) === 0) return false;
+-    if (a === 127) return false;
+-    if (a === 169 && b === 254) return false;
+-    if (a >= 224 && a <= 239) return false;
+-    return true;
++  if (family === 'IPv4' || family === 4) {
++    const o = parseIpv4Octets(stripZoneId(addr.address));
++    if (!o) return false;
++    const a = o[0] ?? 0;
++    const b = o[1] ?? 0;
++    return !(
++      o.every((n) => n === 0) ||
++      a === 127 ||
++      (a === 169 && b === 254) ||
++      (a >= 224 && a <= 239)
++    );
+   }
+-  if (isV6) {
+-    const words = parseIpv6Words(addr.address);
+-    if (!words) return false;
+-    if (words.every((w) => w === 0)) return false;
+-    if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return false;
+-    const w0 = words[0] ?? 0;
+-    if ((w0 & 0xffc0) === 0xfe80) return false;
+-    if ((w0 & 0xff00) === 0xff00) return false;
+-    return true;
++  if (family === 'IPv6' || family === 6) {
++    const w = parseIpv6Words(addr.address);
++    if (!w) return false;
++    const w0 = w[0] ?? 0;
++    return !(
++      (w.slice(0, 7).every((x) => x === 0) && (w[7] ?? 0) <= 1) ||
++      (w0 & 0xffc0) === 0xfe80 ||
++      (w0 & 0xff00) === 0xff00
++    );
+   }
+   return false;
+ }
+@@ -404,8 +378,8 @@ export function enumeratePeerEndpoints(
+     for (const addr of addrs) {
+       if (!isAdvertisablePeerAddress(addr)) continue;
+       const family = addr.family as string | number;
+-      const isV6 = family === 'IPv6' || family === 6;
+-      const host = isV6 ? `[${stripZoneId(addr.address)}]` : stripZoneId(addr.address);
++      const v6 = family === 'IPv6' || family === 6;
++      const host = v6 ? `[${stripZoneId(addr.address)}]` : stripZoneId(addr.address);
+       const url = `ws://${host}:${port}/peer`;
+       if (seen.has(url)) continue;
+       seen.add(url);
+@@ -428,19 +402,13 @@ function peerFromDcSession(selfNodeId: string, rtcSession: string): string | nul
+   return null;
+ }
+ 
+-function splitPeerBindHosts(value: string | string[]): string[] {
+-  const parts = Array.isArray(value) ? value : value.split(',');
+-  const hosts = parts.map((item) => item.trim()).filter((item) => item.length > 0);
+-  return hosts.length > 0 ? hosts : [...gatewayConfig.peerBindHost];
+-}
+-
+ function resolvePeerBindHost(
+   explicit?: string | string[],
+   fromConfig?: string | string[]
+ ): string[] {
+-  if (explicit !== undefined) return splitPeerBindHosts(explicit);
+-  if (fromConfig !== undefined) return splitPeerBindHosts(fromConfig);
+-  return [...gatewayConfig.peerBindHost];
++  const raw = explicit ?? fromConfig ?? gatewayConfig.peerBindHost;
++  const parts = (Array.isArray(raw) ? raw : raw.split(',')).map((s) => s.trim()).filter(Boolean);
++  return parts.length ? parts : [...gatewayConfig.peerBindHost];
+ }
+ 
+ function turnConfig(config: MeshRuntimeConfig): CachedRtcConfig['turn'] {
+@@ -454,20 +422,15 @@ function turnConfig(config: MeshRuntimeConfig): CachedRtcConfig['turn'] {
+   return null;
+ }
+ 
+-function createKeyLogApplier(_keyLogStore: KeyLogStore, keys: UserKeyService): KeyLogApplier {
++function createKeyLogApplier(keys: UserKeyService): KeyLogApplier {
+   return {
+-    async head(userId, signal) {
+-      return keys.head(userId, signal);
+-    },
++    head: (userId, signal) => keys.head(userId, signal),
++    list: (userId, fromSeq, signal, limit) => keys.list(userId, fromSeq, signal, limit),
+     async applyMany(userId, records, signal) {
+       const result = await keys.applyMany(userId, records, signal);
+-      if (!result.ok) {
+-        return { applied: result.applied, error: result.error };
+-      }
+-      return { applied: result.applied };
+-    },
+-    async list(userId, fromSeq, signal, limit) {
+-      return keys.list(userId, fromSeq, signal, limit);
++      return result.ok
++        ? { applied: result.applied }
++        : { applied: result.applied, error: result.error };
+     },
+   };
+ }
+@@ -487,9 +450,7 @@ async function openAdaptedWsStream(
+     for (const cb of closeCbs) {
+       try {
+         cb(info);
+-      } catch {
+-        // listener errors must not break the pump
+-      }
++      } catch {}
+     }
+   };
+   const reader = opened.readable.getReader();
+@@ -498,18 +459,14 @@ async function openAdaptedWsStream(
+       while (true) {
+         const { done, value } = await reader.read();
+         if (done) break;
+-        if (value) {
+-          for (const cb of messageCbs) cb(value);
+-        }
++        if (value) for (const cb of messageCbs) cb(value);
+       }
+       notifyClose({});
+     } catch {
+       notifyClose({ code: 1011, reason: 'stream-error' });
+     }
+   })();
+-  opened.stream.onAbort(() => {
+-    notifyClose({ code: 1011, reason: 'reset' });
+-  });
++  opened.stream.onAbort(() => notifyClose({ code: 1011, reason: 'reset' }));
+   return {
+     send(bytes) {
+       void opened.send(bytes);
+@@ -523,9 +480,7 @@ async function openAdaptedWsStream(
+     close(_code, reason) {
+       try {
+         opened.close();
+-      } catch {
+-        // already closed
+-      }
++      } catch {}
+       notifyClose({ reason });
+     },
+   };
+@@ -552,20 +507,59 @@ export function resolveUserId(
+ }
+ 
+ function hubEndpointUrl(config: MeshRuntimeConfig): string {
+-  if (config.roles.hub) {
+-    return config.hubPublicUrl ?? config.hubUrl ?? 'http://127.0.0.1';
++  return (
++    (config.roles.hub ? (config.hubPublicUrl ?? config.hubUrl) : config.hubUrl) ??
++    'http://127.0.0.1'
++  );
++}
++
++function rtcSignalCtl(msg: RtcSignalMessage) {
++  return {
++    t: 'rtc.signal' as const,
++    rtcSession: msg.rtcSession,
++    from: msg.from,
++    to: msg.to,
++    ...(msg.sdp ? { sdp: msg.sdp } : {}),
++    ...(msg.candidate ? { candidate: msg.candidate } : {}),
++  };
++}
++
++function sendControl(
++  gateway: GatewayRuntime,
++  session: GatewaySession,
++  kind: number,
++  payload: Uint8Array
++): ControlSendStatus {
++  try {
++    const ws = gateway.wsServer as {
++      sendControl?: (s: GatewaySession, k: number, p: Uint8Array) => ControlSendStatus;
++      sendEnvelope?: (s: GatewaySession, k: number, p: Uint8Array) => void;
++    };
++    if (typeof ws.sendControl === 'function') return ws.sendControl(session, kind, payload);
++    ws.sendEnvelope?.(session, kind, payload);
++    return 'sent';
++  } catch {
++    return 'closed';
+   }
+-  return config.hubUrl ?? 'http://127.0.0.1';
+ }
+ 
+-export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise<MeshRuntime> {
++async function stopQuietly(parts: Array<[string, () => void | Promise<void>]>): Promise<void> {
++  for (const [label, fn] of parts) {
++    try {
++      await fn();
++    } catch (err) {
++      console.error(`[tmex] ${label} stop failed`, err);
++    }
++  }
++}
++
++async function constructMeshDeps(opts: CreateMeshRuntimeOptions) {
+   const { db, gateway, config } = opts;
+   const userStore = new UserStore(db);
+   const keyLogStore = new KeyLogStore(db);
+   const nodeSessionStore = new NodeSessionStore(db);
+   const challengeStore = new ChallengeStore();
+-  const identityStore = new NodeIdentityStore(db);
+-  const identity = await ensureNodeIdentity(identityStore, {
++  const identity = await ensureNodeIdentity(new NodeIdentityStore(db), {
+     hubUrl: config.hubUrl ?? undefined,
+   });
+   const keyLogService = new UserKeyService({
+@@ -575,18 +569,23 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     nodeSessionStore,
+     verifyPasskeyAssertion: makeVerifyPasskeyAssertion(userStore),
+   });
+-  const applier = createKeyLogApplier(keyLogStore, keyLogService);
++  const applier = createKeyLogApplier(keyLogService);
+   const userIdOf = () => resolveUserId(userStore, identity.nodeIdHex, opts.userId) ?? '';
+   const nodeEvents = new Set<(event: NodeEventPayload) => void>();
+   const nodeEventDedupe = new NodeEventDedupe();
+-  let hubGeneration = 0;
++  const state = {
++    lastRtc: (config.stunServers.length
++      ? { stun: config.stunServers, turn: turnConfig(config) }
++      : null) as CachedRtcConfig | null,
++    lastNodeList: null as UplinkNodeList | null,
++    hubPresenceLive: false,
++    hubGeneration: 0,
++  };
+   const emitNodeEvent = (event: NodeEventPayload) => {
+     for (const cb of nodeEvents) {
+       try {
+         cb(event);
+-      } catch {
+-        // listener errors must not break broadcast
+-      }
++      } catch {}
+     }
+   };
+   const emitListNodeEvent = (event: NodeEventProjection) => {
+@@ -594,7 +593,7 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     emitNodeEvent(event);
+   };
+   const emitSyntheticOffline = (nodeId: string) => {
+-    if (!nodeEventDedupe.shouldEmitSyntheticOffline(nodeId, hubGeneration)) return;
++    if (!nodeEventDedupe.shouldEmitSyntheticOffline(nodeId, state.hubGeneration)) return;
+     emitNodeEvent({ nodeId, status: 'offline' });
+   };
+   const emitRevoked = (nodeId: string) => {
+@@ -602,11 +601,6 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     emitNodeEvent({ nodeId, status: 'revoked' });
+   };
+   const signalListeners = new Set<(signal: RtcSignalMessage) => void>();
+-  let lastNodeList: UplinkNodeList | null = null;
+-  let lastRtc: CachedRtcConfig | null = config.stunServers.length
+-    ? { stun: config.stunServers, turn: turnConfig(config) }
+-    : null;
+-
+   const hub = config.roles.hub
+     ? (opts.hub ??
+       new HubRuntime({
+@@ -621,10 +615,7 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+           siteName: gatewayConfig.siteNameDefault,
+         },
+         authenticate: (req) => {
+-          const result = authenticateRequest(req, {
+-            roles: config.roles,
+-            nodeSessionStore,
+-          });
++          const result = authenticateRequest(req, { roles: config.roles, nodeSessionStore });
+           if (!result.ok || !result.userId) return null;
+           const via = getMeshRequestContext(req).via ?? MESH_VIA_SELF;
+           return {
+@@ -640,48 +631,26 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+   const peerHolder: { manager: PeerManager | null } = { manager: null };
+   const innerSignalsHolder: { router: MeshRtcSignalRouter | null } = { router: null };
+   const startBrowserAcceptHolder: { fn: (rtcSession: string) => void } = { fn() {} };
++  const httpHolder: { runtime: MeshHttpRuntime | null } = { runtime: null };
+   const interfacesFn = opts.networkInterfaces ?? os.networkInterfaces;
+   const loadNative: LoadNative = opts.loadNative ?? (async () => null);
+-
+   const sessions = new SessionRegistry();
+   const bulk = new BulkTransferService({ files: filesBulkHooks });
+   const acceptingBrowser = new Set<string>();
+-
+-  const sendControl = (
+-    session: GatewaySession,
+-    kind: number,
+-    payload: Uint8Array
+-  ): ControlSendStatus => {
+-    try {
+-      const ws = gateway.wsServer as {
+-        sendControl?: (s: GatewaySession, k: number, p: Uint8Array) => ControlSendStatus;
+-        sendEnvelope?: (s: GatewaySession, k: number, p: Uint8Array) => void;
+-      };
+-      if (typeof ws.sendControl === 'function') {
+-        return ws.sendControl(session, kind, payload);
+-      }
+-      ws.sendEnvelope?.(session, kind, payload);
+-      return 'sent';
+-    } catch {
+-      return 'closed';
+-    }
+-  };
+-
+   const rtc = new RtcPeerManager({
+     loadNative,
+-    iceConfigProvider: () => lastRtc ?? { stun: config.stunServers, turn: turnConfig(config) },
++    iceConfigProvider: () =>
++      state.lastRtc ?? { stun: config.stunServers, turn: turnConfig(config) },
+     identity: { nodeId: identity.nodeIdHex, edSecretKey: identity.edPrivateKey },
+     userStore,
+     handshakeTimeoutMs: opts.rtcHandshakeTimeoutMs,
+-    sendControl,
++    sendControl: (session, kind, payload) => sendControl(gateway, session, kind, payload),
+     deliverInbound: (session, bytes) => {
+       const entry = sessions.getBySession(session);
+       if (!entry || !verifyBoundSession(entry)) return;
+       try {
+         gateway.wsServer.handleMessage(session, Buffer.from(bytes));
+-      } catch {
+-        // fake / partial wsServer in tests
+-      }
++      } catch {}
+     },
+     verifyInbound: (session) => {
+       const entry = sessions.getBySession(session);
+@@ -704,19 +673,14 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       else rtc.notifySessionClosed(session);
+     });
+   }
+-
+   const tearingDown = new WeakSet<GatewaySession>();
+-
+   function verifyBoundSession(entry: RegisteredGatewaySession): boolean {
+     if (entry.session.closed) {
+       teardownBinding(entry);
+       return false;
+     }
+     const now = Date.now();
+-    const verified = nodeSessionStore.verify(entry.sid, {
+-      viaNodeId: entry.via,
+-      now,
+-    });
++    const verified = nodeSessionStore.verify(entry.sid, { viaNodeId: entry.via, now });
+     if (!verified.ok) {
+       teardownBinding(entry);
+       return false;
+@@ -724,7 +688,6 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     entry.lastVerifyAt = now;
+     return true;
+   }
+-
+   function teardownBinding(entry: RegisteredGatewaySession): void {
+     if (tearingDown.has(entry.session)) return;
+     tearingDown.add(entry.session);
+@@ -732,19 +695,14 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     rtc.notifySessionClosed(entry.session);
+     try {
+       entry.pc?.close();
+-    } catch {
+-      // already closed
+-    }
++    } catch {}
+     bulk.abortByOwner(entry.connectionId);
+     if (!entry.session.closed && typeof wsServer.closeSession === 'function') {
+       try {
+         wsServer.closeSession(entry.session, WS_CLOSE_LOGIN_REQUIRED, 'NODE_LOGIN_REQUIRED');
+-      } catch {
+-        // already closed
+-      }
++      } catch {}
+     }
+   }
+-
+   const scheduler = opts.scheduler ?? defaultScheduler();
+   const statusProvider = () => {
+     const version = getDisplayVersion();
+@@ -759,33 +717,82 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       ),
+     };
+   };
++  return {
++    opts,
++    db,
++    gateway,
++    config,
++    userStore,
++    nodeSessionStore,
++    challengeStore,
++    identity,
++    keyLogService,
++    applier,
++    userIdOf,
++    nodeEvents,
++    nodeEventDedupe,
++    state,
++    emitListNodeEvent,
++    emitSyntheticOffline,
++    emitRevoked,
++    signalListeners,
++    hub,
++    peerHolder,
++    innerSignalsHolder,
++    startBrowserAcceptHolder,
++    httpHolder,
++    sessions,
++    bulk,
++    acceptingBrowser,
++    rtc,
++    verifyBoundSession,
++    teardownBinding,
++    scheduler,
++    statusProvider,
++  };
++}
+ 
+-  const httpHolder: { runtime: MeshHttpRuntime | null } = { runtime: null };
+-  let hubPresenceLive = false;
+-
+-  const hubTrust = config.hubUrl ? new HubTrustStore(db).get(config.hubUrl) : null;
++function wireMeshEventsAndSessions(d: Awaited<ReturnType<typeof constructMeshDeps>>) {
++  const { opts, config, identity, userStore, state, rtc, sessions, hub, bulk } = d;
++  const hubTrust = config.hubUrl ? new HubTrustStore(d.db).get(config.hubUrl) : null;
+   if (config.hubUrl && !hubTrust?.caPem) {
+     let label = config.hubUrl;
+     try {
+       label = canonicalHubUrl(config.hubUrl);
+-    } catch {
+-      // keep the stored value when it cannot be canonicalized
+-    }
++    } catch {}
+     console.warn(`[uplink] no pinned CA for hub=${label}; using system trust`);
+   }
++  const rejectPeer = (nodeId: string, alwaysDelete: boolean) => {
++    const cert = userStore.getCert(nodeId);
++    const uid = d.userIdOf();
++    if (cert && uid && cert.userId === uid && cert.revokedLogSeq == null) return false;
++    if (cert?.revokedLogSeq != null) {
++      d.peerHolder.manager?.onRevoked(nodeId);
++      d.emitRevoked(nodeId);
++      if (alwaysDelete) userStore.deletePeer(nodeId);
++    } else {
++      userStore.deletePeer(nodeId);
++    }
++    return true;
++  };
++  const ensureDc = (peerNodeId: string, rtcSession: string) => {
++    if (rtcSession.startsWith('dc:')) {
++      hub?.uplink.ensureDcSession(d.userIdOf(), identity.nodeIdHex, peerNodeId);
++    }
++  };
+   const uplink = new UplinkClient({
+     hubUrl: hubEndpointUrl(config),
+     identity: { nodeId: identity.nodeIdHex, edSecretKey: identity.edPrivateKey },
+-    userId: userIdOf,
+-    keyLogApplier: applier,
++    userId: d.userIdOf,
++    keyLogApplier: d.applier,
+     userStore,
+-    statusProvider,
++    statusProvider: d.statusProvider,
+     wsFactory: opts.wsFactory,
+     tlsCa: hubTrust?.caPem ? [hubTrust.caPem] : null,
+-    scheduler,
++    scheduler: d.scheduler,
+     pingIntervalMs: opts.pingIntervalMs,
+     onEnrollRedeemed: (msg) => {
+-      httpHolder.runtime?.mesh.forwardEnrollRedeemed({
++      d.httpHolder.runtime?.mesh.forwardEnrollRedeemed({
+         enrollPk: msg.enroll_pk,
+         certificate: msg.certificate,
+         certSig: msg.cert_sig,
+@@ -794,28 +801,16 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       });
+     },
+     onNodeList: (list) => {
+-      lastNodeList = list;
+-      if (!hubPresenceLive) hubGeneration += 1;
+-      hubPresenceLive = true;
+-      lastRtc = {
+-        stun: list.rtc.stun,
+-        turn: list.rtc.turn ?? null,
+-      };
+-      const reach = peerHolder.manager?.listReach() ?? new Map();
++      state.lastNodeList = list;
++      if (!state.hubPresenceLive) state.hubGeneration += 1;
++      state.hubPresenceLive = true;
++      state.lastRtc = { stun: list.rtc.stun, turn: list.rtc.turn ?? null };
++      const reach = d.peerHolder.manager?.listReach() ?? new Map();
+       const hubId = list.hub?.nodeId ?? null;
+       for (const node of list.nodes) {
+         if (node.id === HUB_META_PEER_ID) continue;
+-        const cert = userStore.getCert(node.id);
+-        const uid = userIdOf();
+-        if (!cert || !uid || cert.userId !== uid || cert.revokedLogSeq != null) {
+-          userStore.deletePeer(node.id);
+-          if (cert?.revokedLogSeq != null) {
+-            peerHolder.manager?.onRevoked(node.id);
+-            emitRevoked(node.id);
+-          }
+-          continue;
+-        }
+-        emitListNodeEvent({
++        if (rejectPeer(node.id, true)) continue;
++        d.emitListNodeEvent({
+           nodeId: node.id,
+           status: node.online ? 'online' : 'offline',
+           reach: reach.get(node.id) ?? null,
+@@ -827,9 +822,8 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+           direct_capable: node.direct_capable,
+           name: node.name,
+         });
+-        if (node.id !== identity.nodeIdHex) {
+-          peerHolder.manager?.notifyPeerEndpointsChanged(node.id);
+-        }
++        if (node.id !== identity.nodeIdHex)
++          d.peerHolder.manager?.notifyPeerEndpointsChanged(node.id);
+       }
+       if (
+         hubId &&
+@@ -838,9 +832,9 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+         !list.nodes.some((node) => node.id === hubId)
+       ) {
+         const cert = userStore.getCert(hubId);
+-        const uid = userIdOf();
++        const uid = d.userIdOf();
+         if (cert && uid && cert.userId === uid && cert.revokedLogSeq == null) {
+-          emitListNodeEvent({
++          d.emitListNodeEvent({
+             nodeId: hubId,
+             status: 'online',
+             reach: reach.get(hubId) ?? null,
+@@ -856,16 +850,7 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+         ) {
+           continue;
+         }
+-        const cert = userStore.getCert(peer.nodeId);
+-        const uid = userIdOf();
+-        if (!cert || !uid || cert.userId !== uid || cert.revokedLogSeq != null) {
+-          if (cert?.revokedLogSeq != null) {
+-            peerHolder.manager?.onRevoked(peer.nodeId);
+-            emitRevoked(peer.nodeId);
+-          } else {
+-            userStore.deletePeer(peer.nodeId);
+-          }
+-        }
++        rejectPeer(peer.nodeId, false);
+       }
+     },
+     onRtcSignal: (msg: UplinkRtcSignal) => {
+@@ -877,42 +862,28 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+         candidate: msg.candidate,
+       };
+       const dcPeer = peerFromDcSession(identity.nodeIdHex, msg.rtcSession);
+-      if (dcPeer) {
+-        peerHolder.manager?.receiveRtcSignal(dcPeer, signal);
+-      }
++      if (dcPeer) d.peerHolder.manager?.receiveRtcSignal(dcPeer, signal);
+       if (signal.from === 'browser') {
+-        innerSignalsHolder.router?.deliverLocal(signal);
+-        startBrowserAcceptHolder.fn(signal.rtcSession);
++        d.innerSignalsHolder.router?.deliverLocal(signal);
++        d.startBrowserAcceptHolder.fn(signal.rtcSession);
+       }
+-      for (const cb of signalListeners) {
++      for (const cb of d.signalListeners) {
+         try {
+           cb(signal);
+-        } catch {
+-          // ignore
+-        }
++        } catch {}
+       }
+     },
+   });
+-
+   const noopUpgrade: MeshUpgradeServer = { upgrade: () => false };
+-
+   const dispatchInboundHttp = async (request: Request, ctx: DispatchContext): Promise<Response> => {
+     const trusted = requestDispatchContext.get(request);
+     const via = trusted?.viaNodeId ?? ctx.viaNodeId;
+     const uid = trusted?.uid ?? ctx.uid;
+     const renewedExpiresAt = trusted?.renewedExpiresAt ?? ctx.renewedExpiresAt;
+-    setMeshRequestContext(request, {
+-      via,
+-      uid,
+-      clientIp: `peer:${via}`,
+-      ...(renewedExpiresAt !== undefined ? { renewedExpiresAt } : {}),
+-    });
+-    requestDispatchContext.set(request, {
+-      uid,
+-      viaNodeId: via,
+-      ...(renewedExpiresAt !== undefined ? { renewedExpiresAt } : {}),
+-    });
+-    const meshHttp = httpHolder.runtime;
++    const extra = renewedExpiresAt !== undefined ? { renewedExpiresAt } : {};
++    setMeshRequestContext(request, { via, uid, clientIp: `peer:${via}`, ...extra });
++    requestDispatchContext.set(request, { uid, viaNodeId: via, ...extra });
++    const meshHttp = d.httpHolder.runtime;
+     if (meshHttp) {
+       const meshRes = await meshHttp.handleRequest(request, noopUpgrade);
+       if (meshRes instanceof Response) return meshRes;
+@@ -921,115 +892,49 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       const hubRes = await hub.handleRequest(request, noopUpgrade);
+       if (hubRes instanceof Response) return hubRes;
+     }
+-    return gateway.dispatchHttp(request, {
+-      uid,
+-      viaNodeId: via,
+-      ...(renewedExpiresAt !== undefined ? { renewedExpiresAt } : {}),
+-    });
++    return d.gateway.dispatchHttp(request, { uid, viaNodeId: via, ...extra });
+   };
+-
+   const peerManager = new PeerManager({
+     identity: { nodeId: identity.nodeIdHex, edSecretKey: identity.edPrivateKey },
+     userStore,
+     uplink,
+     peerPort: config.peerPort,
+-    keyLogApplier: applier,
+-    statusProvider,
+-    sessionStore: nodeSessionStore,
++    keyLogApplier: d.applier,
++    statusProvider: d.statusProvider,
++    sessionStore: d.nodeSessionStore,
+     dispatchHttp: dispatchInboundHttp,
+-    wsServer: gateway.wsServer,
++    wsServer: d.gateway.wsServer,
+     hostname: resolvePeerBindHost(opts.peerHostname, config.peerBindHost),
+     startServer: opts.startPeerServer,
+-    scheduler,
++    scheduler: d.scheduler,
+     rtc,
+     linkFactory: opts.linkFactory,
+     onGatewaySession: (session, auth) => sessions.register({ ...auth, session }).ok,
+     onGatewaySessionClose: (session) => {
+       const entry = sessions.getBySession(session);
+-      if (entry) teardownBinding(entry);
++      if (entry) d.teardownBinding(entry);
+       else sessions.unregisterSession(session);
+     },
+     onBrowserSignal: (signal, fromNodeId) => {
+-      innerSignalsHolder.router?.deliverLocal(signal, fromNodeId);
+-      startBrowserAcceptHolder.fn(signal.rtcSession);
+-    },
+-    ensureDcSession: (peerNodeId, rtcSession) => {
+-      if (!rtcSession.startsWith('dc:')) return;
+-      hub?.uplink.ensureDcSession(userIdOf(), identity.nodeIdHex, peerNodeId);
++      d.innerSignalsHolder.router?.deliverLocal(signal, fromNodeId);
++      d.startBrowserAcceptHolder.fn(signal.rtcSession);
+     },
++    ensureDcSession: ensureDc,
+   });
+-  peerHolder.manager = peerManager;
+-
+-  uplink.onStateChange((state) => {
+-    const live = state === 'online';
+-    if (hubPresenceLive && !live && lastNodeList) {
++  d.peerHolder.manager = peerManager;
++  uplink.onStateChange((liveState) => {
++    const live = liveState === 'online';
++    if (state.hubPresenceLive && !live && state.lastNodeList) {
+       const reach = peerManager.listReach();
+-      for (const node of lastNodeList.nodes) {
++      for (const node of state.lastNodeList.nodes) {
+         if (node.id === identity.nodeIdHex || !node.online) continue;
+         const r = reach.get(node.id);
+         if (r === 'lan' || r === 'relay') continue;
+-        emitSyntheticOffline(node.id);
++        d.emitSyntheticOffline(node.id);
+       }
+     }
+-    if (!live) hubPresenceLive = false;
++    if (!live) state.hubPresenceLive = false;
+   });
+-
+-  const peers: PeerLinkProvider = {
+-    getLink: (nodeId) => peerManager.getLink(nodeId),
+-    listReach: () => peerManager.listReach(),
+-    transportOf: (nodeId) => peerManager.transportOf(nodeId),
+-    listHubOnline: () => {
+-      const ids = new Set<string>();
+-      if (!hubPresenceLive || uplink.state !== 'online' || !lastNodeList) return ids;
+-      for (const node of lastNodeList.nodes) {
+-        if (node.online) ids.add(node.id);
+-      }
+-      return ids;
+-    },
+-    onNodeEvent: (cb) => {
+-      nodeEvents.add(cb);
+-      return () => {
+-        nodeEvents.delete(cb);
+-      };
+-    },
+-  };
+-
+-  const streams: StreamOpener = {
+-    openHttpStream: (link, open, body, signal) =>
+-      openHttpStream(
+-        link,
+-        {
+-          type: 'http',
+-          method: open.method,
+-          path: open.path,
+-          query: open.query,
+-          headers: open.headers,
+-          origin: open.origin,
+-          auth: open.auth,
+-        },
+-        body,
+-        signal
+-      ),
+-    openWsStream: (link, auth, cid) => openAdaptedWsStream(link, auth, cid),
+-  };
+-
+-  const publisher: KeyLogPublisher = {
+-    publish(record) {
+-      try {
+-        uplink.sendCtl({ t: 'key.log.append', bytes: record.bytes, sig: record.sig });
+-      } catch {
+-        // uplink offline
+-      }
+-    },
+-    async publishAndAck(record) {
+-      const ack = await uplink.appendAndAck(record);
+-      if (ack.ok) return { ok: true, seq: ack.seq ?? 0n };
+-      return { ok: false, error: ack.error ?? 'hub_error' };
+-    },
+-    queryHubHead: () => uplink.queryHubHead(),
+-    queryKeyLogAt: (seq) => uplink.queryKeyLogAt(seq),
+-  };
+-
+   const innerSignals = new MeshRtcSignalRouter({
+     selfNodeId: identity.nodeIdHex,
+     shouldCacheLocal(signal, sourceNodeId) {
+@@ -1046,44 +951,23 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       return true;
+     },
+     sendCtl(nodeId, msg) {
+-      if (msg.rtcSession.startsWith('dc:')) {
+-        hub?.uplink.ensureDcSession(userIdOf(), identity.nodeIdHex, nodeId);
+-      }
++      ensureDc(nodeId, msg.rtcSession);
+       const live = peerManager.getLive(nodeId);
+       if (live) {
+-        live.ctl.send(
+-          encodeJsonBytes({
+-            t: 'rtc.signal',
+-            rtcSession: msg.rtcSession,
+-            from: msg.from,
+-            to: msg.to,
+-            ...(msg.sdp ? { sdp: msg.sdp } : {}),
+-            ...(msg.candidate ? { candidate: msg.candidate } : {}),
+-          })
+-        );
++        live.ctl.send(encodeJsonBytes(rtcSignalCtl(msg)));
+         return;
+       }
+       try {
+-        uplink.sendCtl({
+-          t: 'rtc.signal',
+-          rtcSession: msg.rtcSession,
+-          from: msg.from,
+-          to: msg.to,
+-          ...(msg.sdp ? { sdp: msg.sdp } : {}),
+-          ...(msg.candidate ? { candidate: msg.candidate } : {}),
+-        });
+-      } catch {
+-        // uplink offline
+-      }
++        uplink.sendCtl(rtcSignalCtl(msg));
++      } catch {}
+     },
+   });
+-  innerSignalsHolder.router = innerSignals;
+-
++  d.innerSignalsHolder.router = innerSignals;
+   const startBrowserAccept = (rtcSession: string) => {
+-    if (!rtcSession || acceptingBrowser.has(rtcSession)) return;
++    if (!rtcSession || d.acceptingBrowser.has(rtcSession)) return;
+     const auth = rtc.authorizationOf(rtcSession);
+     if (!auth) return;
+-    acceptingBrowser.add(rtcSession);
++    d.acceptingBrowser.add(rtcSession);
+     if (!innerSignals.ownerOf(rtcSession)) {
+       innerSignals.register(rtcSession, {
+         browserSessionId: auth.sid,
+@@ -1108,7 +992,7 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+           binding.uid === result.uid &&
+           binding.via === result.via &&
+           binding.sid === result.sid &&
+-          verifyBoundSession(binding)
++          d.verifyBoundSession(binding)
+         ) {
+           binding.pc = result.pc;
+           rtc.attachDirect(binding.session, result.carrier, { rtcSession: result.rtcSession });
+@@ -1117,33 +1001,26 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+               bulk.attachChannel(dc, {
+                 uid: result.uid,
+                 ownerKey: binding.connectionId,
+-                verify: () => verifyBoundSession(binding),
++                verify: () => d.verifyBoundSession(binding),
+               });
+             }
+           });
+         } else {
+           try {
+             result.carrier.close(1000, 'session-mismatch');
+-          } catch {
+-            // ignore
+-          }
++          } catch {}
+           try {
+             result.pc.close();
+-          } catch {
+-            // ignore
+-          }
++          } catch {}
+         }
+       })
+-      .catch(() => {
+-        // handshake failed
+-      })
++      .catch(() => {})
+       .finally(() => {
+-        acceptingBrowser.delete(rtcSession);
++        d.acceptingBrowser.delete(rtcSession);
+         innerSignals.unregister(rtcSession);
+       });
+   };
+-  startBrowserAcceptHolder.fn = startBrowserAccept;
+-
++  d.startBrowserAcceptHolder.fn = startBrowserAccept;
+   const fingerprint: RtcFingerprintProvider = rtc;
+   const signals = {
+     send(signal: RtcSignalMessage, owner?: { uid: string; sid: string }) {
+@@ -1163,46 +1040,88 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     },
+     subscribe(cb: (signal: RtcSignalMessage) => void) {
+       const offRouter = innerSignals.subscribe(cb);
+-      signalListeners.add(cb);
++      d.signalListeners.add(cb);
+       return () => {
+         offRouter();
+-        signalListeners.delete(cb);
++        d.signalListeners.delete(cb);
+       };
+     },
+   };
++  return { uplink, peerManager, fingerprint, signals };
++}
+ 
++function wireMeshHttp(
++  d: Awaited<ReturnType<typeof constructMeshDeps>>,
++  w: ReturnType<typeof wireMeshEventsAndSessions>
++): MeshHttpRuntime {
++  const { config, identity, userStore, state } = d;
++  const { uplink, peerManager, fingerprint, signals } = w;
++  const peers: PeerLinkProvider = {
++    getLink: (nodeId) => peerManager.getLink(nodeId),
++    listReach: () => peerManager.listReach(),
++    transportOf: (nodeId) => peerManager.transportOf(nodeId),
++    listHubOnline: () => {
++      const ids = new Set<string>();
++      if (!state.hubPresenceLive || uplink.state !== 'online' || !state.lastNodeList) return ids;
++      for (const node of state.lastNodeList.nodes) {
++        if (node.online) ids.add(node.id);
++      }
++      return ids;
++    },
++    onNodeEvent: (cb) => {
++      d.nodeEvents.add(cb);
++      return () => {
++        d.nodeEvents.delete(cb);
++      };
++    },
++  };
++  const streams: StreamOpener = {
++    openHttpStream: (link, open, body, signal) =>
++      openHttpStream(link, { type: 'http', ...open }, body, signal),
++    openWsStream: (link, auth, cid) => openAdaptedWsStream(link, auth, cid),
++  };
++  const publisher: KeyLogPublisher = {
++    publish(record) {
++      try {
++        uplink.sendCtl({ t: 'key.log.append', bytes: record.bytes, sig: record.sig });
++      } catch {}
++    },
++    async publishAndAck(record) {
++      const ack = await uplink.appendAndAck(record);
++      if (ack.ok) return { ok: true, seq: ack.seq ?? 0n };
++      return { ok: false, error: ack.error ?? 'hub_error' };
++    },
++    queryHubHead: () => uplink.queryHubHead(),
++    queryKeyLogAt: (seq) => uplink.queryKeyLogAt(seq),
++  };
+   const http = new MeshHttpRuntime({
+     roles: config.roles,
+     nodeId: identity.nodeIdHex,
+     nodePk: identity.edPublicKey,
+     userStore,
+-    keyLogService,
+-    challengeStore,
+-    nodeSessionStore,
++    keyLogService: d.keyLogService,
++    challengeStore: d.challengeStore,
++    nodeSessionStore: d.nodeSessionStore,
+     peers,
+     streams,
+     publisher,
+     rtc: {
+       fingerprint,
+       signals,
+-      config: {
+-        getRtcConfig: () => lastRtc,
+-      },
++      config: { getRtcConfig: () => state.lastRtc },
+     },
+-    selfStatus: statusProvider,
++    selfStatus: d.statusProvider,
+     listedNames: () => {
+       const rows: Array<{ id: string; name: string }> = [];
+-      if (!lastNodeList) return rows;
+-      for (const node of lastNodeList.nodes) {
+-        rows.push({ id: node.id, name: node.name });
+-      }
+-      if (lastNodeList.hub?.name) {
+-        rows.push({ id: lastNodeList.hub.nodeId, name: lastNodeList.hub.name });
++      if (!state.lastNodeList) return rows;
++      for (const node of state.lastNodeList.nodes) rows.push({ id: node.id, name: node.name });
++      if (state.lastNodeList.hub?.name) {
++        rows.push({ id: state.lastNodeList.hub.nodeId, name: state.lastNodeList.hub.name });
+       }
+       return rows;
+     },
+     selfName: () => {
+-      const listed = lastNodeList?.nodes.find((node) => node.id === identity.nodeIdHex)?.name;
++      const listed = state.lastNodeList?.nodes.find((node) => node.id === identity.nodeIdHex)?.name;
+       if (listed && listed !== identity.nodeIdHex && listed !== 'self') return listed;
+       const row = userStore.getNode(identity.nodeIdHex);
+       if (row?.name && row.name !== identity.nodeIdHex) return row.name;
+@@ -1212,19 +1131,27 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       }
+       return listed && listed !== 'self' ? listed : null;
+     },
+-    primaryUserId: userIdOf() || undefined,
++    primaryUserId: d.userIdOf() || undefined,
+     hubPublicUrl: hubEndpointUrl(config),
+     trustProxy: gatewayConfig.trustProxy,
+     connectionLookup: (input) =>
+-      sessions.lookup(input.sid, input.via, input.connectionId, input.cid),
++      d.sessions.lookup(input.sid, input.via, input.connectionId, input.cid),
+   });
+-  http.auth.setTlsInfo(opts.tlsInfo);
+-  httpHolder.runtime = http;
++  http.auth.setTlsInfo(d.opts.tlsInfo);
++  d.httpHolder.runtime = http;
++  return http;
++}
+ 
++function assembleMeshRuntime(
++  d: Awaited<ReturnType<typeof constructMeshDeps>>,
++  w: ReturnType<typeof wireMeshEventsAndSessions>,
++  http: MeshHttpRuntime
++): MeshRuntime {
++  const { opts, config, identity, hub, sessions, userStore, rtc, bulk, state } = d;
++  const { uplink, peerManager } = w;
+   const uplinkHub = hub ?? opts.uplinkHub ?? null;
+   let stopPromise: Promise<void> | null = null;
+-
+-  const runtime: MeshRuntime = {
++  return {
+     nodeId: identity.nodeIdHex,
+     identity,
+     hub,
+@@ -1233,33 +1160,31 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     rtc,
+     sessions,
+     userStore,
+-    userKeyService: keyLogService,
+-    registerGatewaySession(entry) {
+-      return sessions.register(entry);
+-    },
++    userKeyService: d.keyLogService,
++    registerGatewaySession: (entry) => sessions.register(entry),
+     unregisterGatewaySession(sidOrSession) {
+       if (typeof sidOrSession === 'string') sessions.unregister(sidOrSession);
+       else sessions.unregisterSession(sidOrSession);
+     },
+     get lastNodeList() {
+-      return lastNodeList;
++      return state.lastNodeList;
+     },
+     set lastNodeList(value) {
+-      lastNodeList = value;
++      state.lastNodeList = value;
+     },
+-    handleRequest: (req, server) => http.handleRequest(req, server),
+-    localUiGuard: (req) => http.localUiGuard(req),
+-    guardGatewayWebSocket: (req, server) => http.guardGatewayWebSocket(req, server),
+-    rewriteSelf: (req) => http.rewriteSelf(req),
++    handleRequest: http.handleRequest.bind(http),
++    localUiGuard: http.localUiGuard.bind(http),
++    guardGatewayWebSocket: http.guardGatewayWebSocket.bind(http),
++    rewriteSelf: http.rewriteSelf.bind(http),
+     closeSocketsForUser: (uid) => {
+       http.closeSocketsForUser(uid);
+-      for (const entry of sessions.listByUid(uid)) teardownBinding(entry);
++      for (const entry of sessions.listByUid(uid)) d.teardownBinding(entry);
+     },
+     closeSocketsForSid: (sid) => {
+       http.closeSocketsForSid(sid);
+-      for (const entry of sessions.listBySid(sid)) teardownBinding(entry);
++      for (const entry of sessions.listBySid(sid)) d.teardownBinding(entry);
+     },
+-    touchSocket: (ws) => http.touchSocket(ws),
++    touchSocket: http.touchSocket.bind(http),
+     websocket: {
+       open: (ws) => http.handleWebSocket.open(ws),
+       message: (ws, message) => http.handleWebSocket.message(ws, message),
+@@ -1267,14 +1192,14 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+       close: (ws, code, reason) => http.handleWebSocket.close(ws, code, reason),
+     },
+     onNodeEvent(cb) {
+-      nodeEvents.add(cb);
++      d.nodeEvents.add(cb);
+       return () => {
+-        nodeEvents.delete(cb);
++        d.nodeEvents.delete(cb);
+       };
+     },
+     async start() {
+       await rtc.ready();
+-      if (!userIdOf()) {
++      if (!d.userIdOf()) {
+         const empty = userStore.listUsers().length === 0 && userStore.listCerts().length === 0;
+         if (config.roles.hub && empty) {
+           console.warn(
+@@ -1303,35 +1228,23 @@ export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise
+     async stop() {
+       if (stopPromise) return stopPromise;
+       stopPromise = (async () => {
+-        nodeEventDedupe.clear();
+-        try {
+-          await peerManager.stop();
+-        } catch (err) {
+-          console.error('[tmex] peer stop failed', err);
+-        }
+-        try {
+-          await uplink.stop();
+-        } catch (err) {
+-          console.error('[tmex] uplink stop failed', err);
+-        }
+-        try {
+-          http.stop();
+-        } catch (err) {
+-          console.error('[tmex] mesh http stop failed', err);
+-        }
+-        try {
+-          rtc.close();
+-        } catch (err) {
+-          console.error('[tmex] rtc stop failed', err);
+-        }
+-        try {
+-          bulk.close();
+-        } catch (err) {
+-          console.error('[tmex] bulk stop failed', err);
+-        }
++        d.nodeEventDedupe.clear();
++        await stopQuietly([
++          ['peer', () => peerManager.stop()],
++          ['uplink', () => uplink.stop()],
++          ['mesh http', () => http.stop()],
++          ['rtc', () => rtc.close()],
++          ['bulk', () => bulk.close()],
++        ]);
+       })();
+       return stopPromise;
+     },
+   };
+-  return runtime;
++}
++
++export async function createMeshRuntime(opts: CreateMeshRuntimeOptions): Promise<MeshRuntime> {
++  const deps = await constructMeshDeps(opts);
++  const wired = wireMeshEventsAndSessions(deps);
++  const http = wireMeshHttp(deps, wired);
++  return assembleMeshRuntime(deps, wired, http);
+ }
+diff --git a/apps/gateway/src/mesh/node-list-projection.test.ts b/apps/gateway/src/mesh/node-list-projection.test.ts
+new file mode 100644
+index 00000000..460542af
+--- /dev/null
++++ b/apps/gateway/src/mesh/node-list-projection.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, test } from 'bun:test';
++import {
++  parseJson,
++  pickMeshNodeName,
++  projectNode,
++  upsertById,
++  versionFromInventory,
++} from './node-list-projection';
++
++describe('node-list-projection', () => {
++  test('projectNode prefers live inventory, capability, and version', () => {
++    expect(
++      projectNode(
++        'n1',
++        'box',
++        true,
++        {
++          endpoints: ['old'],
++          inventory: { version: '1' },
++          directCapable: false,
++          version: '1',
++        },
++        {
++          endpoints: ['new'],
++          inventory: { version: '2' },
++          directCapable: true,
++          version: '2',
++        }
++      )
++    ).toEqual({
++      id: 'n1',
++      name: 'box',
++      online: true,
++      endpoints: ['new'],
++      inventory: { version: '2' },
++      direct_capable: true,
++      version: '2',
++    });
++  });
++
++  test('upsertById overwrites an existing hub row in place', () => {
++    const nodes = [{ id: 'hub', name: 'old', online: false }];
++    upsertById(nodes, { id: 'hub', name: 'site', online: true });
++    upsertById(nodes, { id: 'peer', name: 'p', online: true });
++    expect(nodes).toEqual([
++      { id: 'hub', name: 'site', online: true },
++      { id: 'peer', name: 'p', online: true },
++    ]);
++  });
++
++  test('parseJson and versionFromInventory fall back cleanly', () => {
++    expect(parseJson('{"a":1}', null)).toEqual({ a: 1 });
++    expect(parseJson('nope', { x: 1 })).toEqual({ x: 1 });
++    expect(parseJson(null, [])).toEqual([]);
++    expect(versionFromInventory({ version: '9' })).toBe('9');
++    expect(versionFromInventory({})).toBeNull();
++  });
++
++  test('pickMeshNodeName prefers listed then registry then self fallback', () => {
++    expect(
++      pickMeshNodeName({
++        id: 'aa',
++        isSelf: true,
++        listedName: 'self',
++        registryName: 'aa',
++        selfName: 'home',
++      })
++    ).toBe('home');
++    expect(pickMeshNodeName({ id: 'bb', isSelf: false, listedName: 'studio' })).toBe('studio');
++  });
++});
+diff --git a/apps/gateway/src/mesh/node-list-projection.ts b/apps/gateway/src/mesh/node-list-projection.ts
+new file mode 100644
+index 00000000..ba0d24da
+--- /dev/null
++++ b/apps/gateway/src/mesh/node-list-projection.ts
+@@ -0,0 +1,64 @@
++type Meta = {
++  endpoints?: unknown;
++  inventory?: unknown;
++  directCapable?: boolean;
++  version?: string | null;
++};
++
++export function parseJson(raw: string | null | undefined, fallback: unknown): unknown {
++  if (raw == null) return fallback;
++  try {
++    return JSON.parse(raw);
++  } catch {
++    return fallback;
++  }
++}
++
++export function versionFromInventory(inventory: unknown): string | null {
++  if (!inventory || typeof inventory !== 'object' || !('version' in inventory)) return null;
++  const value = (inventory as { version: unknown }).version;
++  return value == null ? null : String(value);
++}
++
++export function projectNode(
++  id: string,
++  name: string,
++  online: boolean,
++  stored: Meta,
++  live?: Meta | null
++) {
++  return {
++    id,
++    name,
++    online,
++    endpoints: live?.endpoints ?? stored.endpoints ?? [],
++    inventory: live?.inventory ?? stored.inventory ?? null,
++    direct_capable: live?.directCapable ?? stored.directCapable ?? false,
++    version: live?.version ?? stored.version ?? null,
++  };
++}
++
++export function upsertById<T extends { id: string }>(nodes: T[], entry: T): void {
++  const existing = nodes.find((n) => n.id === entry.id);
++  if (existing) Object.assign(existing, entry);
++  else nodes.push(entry);
++}
++
++export function pickMeshNodeName(input: {
++  id: string;
++  isSelf: boolean;
++  listedName?: string | null;
++  registryName?: string | null;
++  selfName?: string | null;
++}): string {
++  const usable = (name: string | null | undefined) => {
++    const t = name?.trim() ?? '';
++    return !t || t === input.id || t === 'self' ? null : t;
++  };
++  return (
++    usable(input.listedName) ??
++    usable(input.registryName) ??
++    (input.isSelf ? usable(input.selfName) : null) ??
++    (input.isSelf ? input.selfName?.trim() || 'self' : input.id)
++  );
++}
+diff --git a/apps/gateway/src/mesh/peer-manager.test.ts b/apps/gateway/src/mesh/peer-manager.test.ts
+index 0aed0ae2..8f584804 100644
+--- a/apps/gateway/src/mesh/peer-manager.test.ts
++++ b/apps/gateway/src/mesh/peer-manager.test.ts
+@@ -1801,6 +1801,89 @@ describe('PeerManager', () => {
+     expect(cached?.inventoryJson).toContain('9.9.9');
+   });
+ 
++  test('peer ctl async handlers log errors instead of unhandled rejection', async () => {
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new UserStore(db);
++    seedUser(store);
++    const self = seedNodeIdentity(store, 'user-1');
++    const peer = seedNodeIdentity(store, 'user-1');
++    store.upsertPeer({
++      nodeId: peer.nodeId,
++      name: 'studio',
++      endpointsJson: '[]',
++      inventoryJson: '{}',
++      directCapable: false,
++      lastSeenAt: Date.now(),
++      listVersion: 1,
++    });
++    store.upsertPeer = () => {
++      throw new Error('upsert-fail');
++    };
++    const manager = new PeerManager({
++      identity: self,
++      userStore: store,
++      uplink: dummyUplink(self, store),
++      peerPort: 0,
++      startServer: false,
++      keyLogApplier: {
++        async head() {
++          return { seq: 0n, hash: new Uint8Array(32) };
++        },
++        async applyMany() {
++          throw new Error('apply-fail');
++        },
++      },
++    });
++    fixtures.push({ close, stop: () => manager.stop() });
++    const [local, remote] = createInMemoryLinkPair();
++    echoQuiesceCaps(remote);
++    expect(manager.adoptLink(peer.nodeId, local, 'ws-secure', self.nodeId)).toBe(local);
++    await waitUntil(() => manager.quiesceCapableOf(peer.nodeId));
++
++    const unhandled: unknown[] = [];
++    const onUnhandled = (reason: unknown) => {
++      unhandled.push(reason);
++    };
++    const events = process as unknown as {
++      on(event: string, listener: (reason: unknown) => void): void;
++      off(event: string, listener: (reason: unknown) => void): void;
++    };
++    const logs: string[] = [];
++    const origLog = console.log;
++    console.log = (...args: unknown[]) => {
++      logs.push(args.map(String).join(' '));
++    };
++    events.on('unhandledRejection', onUnhandled);
++    try {
++      remote.ctl.send(
++        encodeJsonBytes({
++          t: 'node.status',
++          endpoints: [],
++          inventory: {},
++          direct_capable: true,
++        })
++      );
++      remote.ctl.send(
++        encodeJsonBytes({
++          t: 'key.log.res',
++          records: [{ seq: 1, bytes: 'AAAA', sig: 'AAAA' }],
++        })
++      );
++      await Bun.sleep(50);
++    } finally {
++      events.off('unhandledRejection', onUnhandled);
++      console.log = origLog;
++    }
++    expect(unhandled).toEqual([]);
++    expect(logs.some((line) => line.includes('ctl failed') && line.includes('upsert-fail'))).toBe(
++      true
++    );
++    expect(logs.some((line) => line.includes('ctl failed') && line.includes('apply-fail'))).toBe(
++      true
++    );
++  });
++
+   test('failed DC upgrade retry does not produce an unhandled rejection', async () => {
+     const { db, close } = createMigratedAuthDb();
+     fixtures.push({ close });
+diff --git a/apps/gateway/src/mesh/peer-manager.ts b/apps/gateway/src/mesh/peer-manager.ts
+index 4c201cf0..87f19d49 100644
+--- a/apps/gateway/src/mesh/peer-manager.ts
++++ b/apps/gateway/src/mesh/peer-manager.ts
+@@ -194,6 +194,14 @@ function isServerSocketAdapter(value: WebSocketTransportInput): value is ServerS
+   );
+ }
+ 
++function quiet(fn: () => void): void {
++  try {
++    fn();
++  } catch {
++    // ignore
++  }
++}
++
+ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+   if (signal.aborted) {
+     return Promise.reject(signal.reason ?? new Error('aborted'));
+@@ -235,19 +243,11 @@ function waitSocketOpen(
+       else resolve();
+     };
+     const onAbort = () => {
+-      try {
+-        socket.close(1000, 'stopped');
+-      } catch {
+-        // ignore
+-      }
++      quiet(() => socket.close(1000, 'stopped'));
+       finish(new Error('aborted'));
+     };
+     const timer = setTimeout(() => {
+-      try {
+-        socket.close(1000, 'connect-timeout');
+-      } catch {
+-        // ignore
+-      }
++      quiet(() => socket.close(1000, 'connect-timeout'));
+       finish(new Error('connect-timeout'));
+     }, timeoutMs);
+     if (signal?.aborted) {
+@@ -600,16 +600,32 @@ export class PeerManager {
+     live.recvKey = recvKey;
+   }
+ 
+-  private currentGeneration(): number {
+-    return this.generation;
++  private stale(gen: number): boolean {
++    return this.stopped || gen !== this.generation;
++  }
++
++  private throwIfStopped(nodeId: string, gen: number, err?: unknown): void {
++    if (!this.stale(gen)) return;
++    throw err instanceof NodeUnreachableError
++      ? err
++      : new NodeUnreachableError(nodeId, 'peer manager stopped');
++  }
++
++  private runCtlAsync(kind: string, peer: string, work: () => Promise<void>): void {
++    void work().catch((err) => {
++      rtcLog('ctl failed', {
++        peer,
++        kind,
++        reason: err instanceof Error ? err.message : String(err),
++      });
++    });
+   }
+ 
+   private isTrusted(nodeId: string): boolean {
+     const cert = this.userStore.getCert(nodeId);
+     if (!cert || cert.revokedLogSeq != null) return false;
+     const uid = this.uplink.userId;
+-    if (!uid || cert.userId !== uid) return false;
+-    return true;
++    return !!uid && cert.userId === uid;
+   }
+ 
+   private requireTrusted(nodeId: string): void {
+@@ -626,8 +642,10 @@ export class PeerManager {
+   private wantsUpgrade(live: LivePeer): boolean {
+     if (live.retiring) return false;
+     if (live.transport === 'dc') return false;
+-    if (live.transport === 'ws-secure') return this.shouldTryDc(live.peerNodeId);
+-    return this.shouldTryDc(live.peerNodeId) || this.hasWsSecureCandidate(live.peerNodeId);
++    return (
++      this.shouldTryDc(live.peerNodeId) ||
++      (live.transport === 'relay' && this.hasWsSecureCandidate(live.peerNodeId))
++    );
+   }
+ 
+   private ensureGate(nodeId: string): UpgradeGate {
+@@ -777,45 +795,34 @@ export class PeerManager {
+     if (this.stopped) return;
+     const now = this.scheduler.now();
+     const gate = this.ensureIncomingWakeGate(fromNodeId);
+-    if (now < gate.nextEligibleAt) {
+-      rtcLogRateLimited(`wake:rate:${fromNodeId}`, 'signal recv', {
++    const drop = (tag: string, dropped: string) =>
++      rtcLogRateLimited(`wake:${tag}:${fromNodeId}`, 'signal recv', {
+         peer: fromNodeId,
+         kind: 'wake',
+-        dropped: 'rate',
++        dropped,
+       });
++    if (now < gate.nextEligibleAt) {
++      drop('rate', 'rate');
+       return;
+     }
+     if (!this.consumeWakeVerifyToken(gate, now)) {
+-      rtcLogRateLimited(`wake:rate:${fromNodeId}`, 'signal recv', {
+-        peer: fromNodeId,
+-        kind: 'wake',
+-        dropped: 'rate',
+-      });
++      drop('rate', 'rate');
+       return;
+     }
+     const wake = parseRtcWakeSdp(msg.sdp);
+     if (!wake || !this.acceptSignedRtcWake(fromNodeId, msg, wake)) {
+-      rtcLogRateLimited(`wake:auth:${fromNodeId}`, 'signal recv', {
+-        peer: fromNodeId,
+-        kind: 'wake',
+-        dropped: 'auth',
+-      });
++      drop('auth', 'auth');
+       return;
+     }
+     gate.nextEligibleAt = now + PEER_RTC_WAKE_COOLDOWN_MS;
+     if (this.identity.nodeId.toLowerCase() >= fromNodeId.toLowerCase()) {
+-      rtcLogRateLimited(`wake:role:${fromNodeId}`, 'signal recv', {
+-        peer: fromNodeId,
+-        kind: 'wake',
+-        dropped: 'not-offerer',
+-      });
++      drop('role', 'not-offerer');
+       return;
+     }
+     rtcLog('signal recv', { peer: fromNodeId, kind: 'wake' });
+-    if (this.live.get(fromNodeId)?.transport === 'dc') return;
+-    if (!this.shouldTryDc(fromNodeId)) return;
+-    if (this.pending.has(fromNodeId) || this.upgrading.has(fromNodeId)) return;
+     const live = this.live.get(fromNodeId);
++    if (live?.transport === 'dc' || !this.shouldTryDc(fromNodeId)) return;
++    if (this.pending.has(fromNodeId) || this.upgrading.has(fromNodeId)) return;
+     if (live && !this.wantsUpgrade(live)) return;
+     void this.getLink(fromNodeId).catch(() => undefined);
+   }
+@@ -834,7 +841,7 @@ export class PeerManager {
+     if (Math.abs(this.scheduler.now() - wake.issued_at) > RTC_WAKE_MAX_SKEW_MS) return false;
+     if (!this.isTrusted(wake.from)) return false;
+     const cert = this.userStore.getCert(wake.from);
+-    if (!cert || cert.revokedLogSeq != null) return false;
++    if (!cert) return false;
+     let edPk: Uint8Array;
+     try {
+       edPk = decodeCertificate(cert.certificateBytes).ed_pk;
+@@ -920,13 +927,12 @@ export class PeerManager {
+       return;
+     }
+     const live = this.live.get(nodeId);
+-    if (!live || live.transport === 'dc') {
+-      if (live?.transport === 'dc') {
+-        this.lostDirect.delete(nodeId);
+-        this.cancelDcUpgradeRetry(nodeId);
+-      }
++    if (live?.transport === 'dc') {
++      this.lostDirect.delete(nodeId);
++      this.cancelDcUpgradeRetry(nodeId);
+       return;
+     }
++    if (!live) return;
+     if (!live.quiesceCapable) return;
+     let rec = this.dcUpgradeRetry.get(nodeId);
+     if (!rec) {
+@@ -1026,10 +1032,6 @@ export class PeerManager {
+     this.disarmDeferredRtcWake(gate);
+   }
+ 
+-  private maybeSendRtcWake(peerNodeId: string): void {
+-    this.dispatchRtcWake(peerNodeId);
+-  }
+-
+   private dispatchRtcWake(peerNodeId: string): void {
+     if (this.identity.nodeId.toLowerCase() < peerNodeId.toLowerCase()) return;
+     if (this.live.get(peerNodeId)?.transport === 'dc') {
+@@ -1202,17 +1204,13 @@ export class PeerManager {
+       },
+     };
+     const connectP = this.rtc.connectToPeer(nodeId, wrapped);
+-    this.maybeSendRtcWake(nodeId);
++    this.dispatchRtcWake(nodeId);
+     try {
+       const result = await abortable(connectP, signal);
+-      if (this.stopped || gen !== this.generation) {
++      if (this.stale(gen)) {
+         this.releaseRtcAttempt(nodeId, unsub);
+         unsub = null;
+-        try {
+-          result.pc.close();
+-        } catch {
+-          // ignore
+-        }
++        quiet(() => result.pc.close());
+         throw new Error('stopped');
+       }
+       const session = new LinkMux(result.link, { role: result.role });
+@@ -1237,62 +1235,54 @@ export class PeerManager {
+ 
+   private async dial(nodeId: string): Promise<LinkSession> {
+     await Promise.resolve();
+-    const gen = this.currentGeneration();
++    const gen = this.generation;
+     const signal = this.stopAbort.signal;
+     const existingLive = this.live.get(nodeId);
+     const floor = existingLive ? PEER_TRANSPORT_RANK[existingLive.transport] : 0;
+-
+-    const stopped = () => this.stopped || gen !== this.generation;
+-    const throwIfStopped = (err?: unknown) => {
+-      if (!stopped()) return;
+-      throw err instanceof NodeUnreachableError
+-        ? err
+-        : new NodeUnreachableError(nodeId, 'peer manager stopped');
+-    };
+-
++    const skipDcFirst = !existingLive && this.lostDirect.has(nodeId);
+     let dcError: unknown = null;
+-    const skipForegroundDc = !existingLive && this.lostDirect.has(nodeId);
+-    if (PEER_TRANSPORT_RANK.dc > floor && this.shouldTryDc(nodeId) && !skipForegroundDc) {
++    const above = (kind: PeerTransportKind) => PEER_TRANSPORT_RANK[kind] > floor;
++    const tryDc = async (): Promise<LinkSession | null> => {
++      if (!above('dc') || !this.shouldTryDc(nodeId)) return null;
+       try {
+-        const dc = await this.dialDc(nodeId, gen, signal);
+-        if (dc) return dc;
++        return await this.dialDc(nodeId, gen, signal);
+       } catch (err) {
+         dcError = err;
+-        throwIfStopped(err);
++        this.throwIfStopped(nodeId, gen, err);
++        return null;
+       }
++    };
++    const liveOf = async () => this.live.get(nodeId)?.session ?? null;
++    const attempts: Array<{
++      run: () => Promise<LinkSession | null>;
++      fallback?: 'ws-secure';
++      skipStop?: boolean;
++    }> = [];
++    if (!skipDcFirst) attempts.push({ run: tryDc });
++    if (above('ws-secure')) {
++      attempts.push({
++        run: () => this.dialWsSecure(nodeId, gen, signal),
++        fallback: 'ws-secure',
++      });
+     }
+-
+-    if (PEER_TRANSPORT_RANK['ws-secure'] > floor) {
+-      if (dcError) {
++    attempts.push({ run: liveOf });
++    if (skipDcFirst) {
++      attempts.push({ run: tryDc, skipStop: true });
++      attempts.push({ run: liveOf });
++    }
++    for (const step of attempts) {
++      if (step.fallback && dcError) {
+         rtcLog('dial failed', {
+           peer: nodeId,
+           reason: dcError instanceof Error ? dcError.message : String(dcError),
+-          fallback: 'ws-secure',
++          fallback: step.fallback,
+         });
+       }
+-      const ws = await this.dialWsSecure(nodeId, gen, signal);
+-      if (ws) return ws;
+-      throwIfStopped();
++      const got = await step.run();
++      if (got) return got;
++      if (!step.skipStop) this.throwIfStopped(nodeId, gen);
+     }
+-
+-    const already = this.live.get(nodeId);
+-    if (already) return already.session;
+-    throwIfStopped();
+-
+-    if (skipForegroundDc && PEER_TRANSPORT_RANK.dc > floor && this.shouldTryDc(nodeId)) {
+-      try {
+-        const dc = await this.dialDc(nodeId, gen, signal);
+-        if (dc) return dc;
+-      } catch (err) {
+-        dcError = err;
+-        throwIfStopped(err);
+-      }
+-      const afterDc = this.live.get(nodeId);
+-      if (afterDc) return afterDc.session;
+-      throwIfStopped();
+-    }
+-
+-    if (dcError != null || (PEER_TRANSPORT_RANK.dc > floor && this.shouldTryDc(nodeId))) {
++    if (dcError != null || (above('dc') && this.shouldTryDc(nodeId))) {
+       rtcLog('dial failed', {
+         peer: nodeId,
+         reason:
+@@ -1304,7 +1294,6 @@ export class PeerManager {
+         fallback: 'relay',
+       });
+     }
+-
+     try {
+       const stream = await this.uplink.openRelay(nodeId);
+       const result = await handshakeRelay({
+@@ -1324,9 +1313,7 @@ export class PeerManager {
+         this.identity.nodeId,
+         gen
+       );
+-      if (!kept) {
+-        throw new NodeUnreachableError(nodeId, 'simultaneous-dial');
+-      }
++      if (!kept) throw new NodeUnreachableError(nodeId, 'simultaneous-dial');
+       this.rememberKeys(result.peerNodeId, result.sendKey, result.recvKey);
+       return kept;
+     } catch (err) {
+@@ -1344,35 +1331,25 @@ export class PeerManager {
+       try {
+         const session = await abortable(Promise.resolve(this.linkFactory(nodeId, signal)), signal);
+         if (session) {
+-          if (this.stopped || gen !== this.generation) {
+-            try {
+-              session.close('stopped');
+-            } catch {
+-              // ignore
+-            }
++          if (this.stale(gen)) {
++            quiet(() => session.close('stopped'));
+             throw new NodeUnreachableError(nodeId, 'peer manager stopped');
+           }
+           const kept = this.track(session, nodeId, 'ws-secure', this.identity.nodeId, gen);
+           if (kept) return kept;
+         }
+       } catch (err) {
+-        if (this.stopped || gen !== this.generation) {
+-          throw err instanceof NodeUnreachableError
+-            ? err
+-            : new NodeUnreachableError(nodeId, 'peer manager stopped');
+-        }
++        this.throwIfStopped(nodeId, gen, err);
+       }
+     }
+     const cached = this.userStore.listPeers().find((row) => row.nodeId === nodeId);
+     const endpoints = cached ? parseEndpoints(cached.endpointsJson, this.server?.port) : [];
+     for (const url of endpoints) {
+-      if (this.stopped || gen !== this.generation) {
+-        throw new NodeUnreachableError(nodeId, 'peer manager stopped');
+-      }
++      this.throwIfStopped(nodeId, gen);
+       try {
+         return await this.dialDirect(url, nodeId, gen, signal);
+       } catch (err) {
+-        if (this.stopped || gen !== this.generation) throw err;
++        if (this.stale(gen)) throw err;
+       }
+     }
+     return null;
+@@ -1386,13 +1363,11 @@ export class PeerManager {
+   ): Promise<LinkSession> {
+     const ws = await abortable(Promise.resolve(this.wsFactory(url)), signal);
+     await waitSocketOpen(ws, this.connectTimeoutMs, signal);
+-    if (this.stopped || gen !== this.generation) {
+-      try {
++    if (this.stale(gen)) {
++      quiet(() => {
+         if (isServerSocketAdapter(ws)) ws.close(1000, 'stopped');
+         else (ws as WebSocket).close(1000, 'stopped');
+-      } catch {
+-        // ignore
+-      }
++      });
+       throw new Error('stopped');
+     }
+     const result = await handshakeWsDirect({
+@@ -1405,7 +1380,7 @@ export class PeerManager {
+       result.session.close('peer-id-mismatch');
+       throw new Error('peer-id-mismatch');
+     }
+-    if (this.stopped || gen !== this.generation) {
++    if (this.stale(gen)) {
+       result.session.close('stopped');
+       throw new Error('stopped');
+     }
+@@ -1422,7 +1397,7 @@ export class PeerManager {
+   }
+ 
+   private async acceptDirect(socket: ServerSocketAdapter): Promise<void> {
+-    const gen = this.currentGeneration();
++    const gen = this.generation;
+     try {
+       const result = await handshakeWsDirect({
+         socket,
+@@ -1430,23 +1405,19 @@ export class PeerManager {
+         identity: this.identity,
+         userStore: this.userStore,
+       });
+-      if (this.stopped || gen !== this.generation) {
+-        result.session.close('stopped');
++      if (this.stale(gen)) {
++        quiet(() => result.session.close('stopped'));
+         return;
+       }
+       this.track(result.session, result.peerNodeId, 'ws-secure', result.peerNodeId, gen);
+       this.rememberKeys(result.peerNodeId, result.sendKey, result.recvKey);
+     } catch {
+-      try {
+-        socket.close(1000, 'handshake-failed');
+-      } catch {
+-        // already closed
+-      }
++      quiet(() => socket.close(1000, 'handshake-failed'));
+     }
+   }
+ 
+   private async acceptRelay(stream: LinkStream, from: string): Promise<void> {
+-    const gen = this.currentGeneration();
++    const gen = this.generation;
+     try {
+       const result = await handshakeRelay({
+         stream,
+@@ -1454,25 +1425,17 @@ export class PeerManager {
+         identity: this.identity,
+         userStore: this.userStore,
+       });
+-      if (this.stopped || gen !== this.generation) {
+-        result.session.close('stopped');
++      if (this.stale(gen)) {
++        quiet(() => result.session.close('stopped'));
+         return;
+       }
+       this.track(result.session, result.peerNodeId, 'relay', from || result.peerNodeId, gen);
+       this.rememberKeys(result.peerNodeId, result.sendKey, result.recvKey);
+     } catch {
+-      try {
+-        stream.reset('handshake-failed');
+-      } catch {
+-        // already closed
+-      }
++      quiet(() => stream.reset('handshake-failed'));
+     }
+   }
+ 
+-  private preferredInitiator(peerNodeId: string): string {
+-    return winningDialInitiator(this.identity.nodeId, peerNodeId);
+-  }
+-
+   private track(
+     session: LinkSession,
+     peerNodeId: string,
+@@ -1481,42 +1444,20 @@ export class PeerManager {
+     gen: number,
+     quiesceCapable = false
+   ): LinkSession | null {
+-    if (this.stopped || gen !== this.generation) {
+-      try {
+-        session.close('stale');
+-      } catch {
+-        // already closed
+-      }
+-      return null;
+-    }
+-    if (!this.isTrusted(peerNodeId)) {
+-      try {
+-        session.close('not-trusted');
+-      } catch {
+-        // already closed
+-      }
+-      return null;
+-    }
++    const reject = (reason: string, keep: LinkSession | null = null) => {
++      quiet(() => session.close(reason));
++      return keep;
++    };
++    if (this.stale(gen)) return reject('stale');
++    if (!this.isTrusted(peerNodeId)) return reject('not-trusted');
+     const prev = this.live.get(peerNodeId);
+     if (prev && prev.session !== session) {
+       const rank = comparePeerTransport(transport, prev.transport);
+-      if (rank < 0) {
+-        try {
+-          session.close('lower-priority');
+-        } catch {
+-          // already closed
+-        }
+-        return prev.session;
+-      }
++      if (rank < 0) return reject('lower-priority', prev.session);
+       if (rank === 0) {
+-        const winner = this.preferredInitiator(peerNodeId);
++        const winner = winningDialInitiator(this.identity.nodeId, peerNodeId);
+         if (initiatedBy !== winner && prev.initiatedBy === winner) {
+-          try {
+-            session.close('simultaneous-dial');
+-          } catch {
+-            // already closed
+-          }
+-          return prev.session;
++          return reject('simultaneous-dial', prev.session);
+         }
+       }
+       if (!prev.quiesceCapable) {
+@@ -1526,6 +1467,17 @@ export class PeerManager {
+       }
+       this.retirePeer(prev, 'replaced');
+     }
++    return this.installLive(session, peerNodeId, transport, initiatedBy, gen, quiesceCapable);
++  }
++
++  private installLive(
++    session: LinkSession,
++    peerNodeId: string,
++    transport: PeerTransportKind,
++    initiatedBy: string,
++    gen: number,
++    quiesceCapable: boolean
++  ): LinkSession {
+     const live: LivePeer = {
+       session,
+       peerNodeId,
+@@ -1571,12 +1523,8 @@ export class PeerManager {
+     const { session, peerNodeId } = live;
+     const origOpen = session.openStream.bind(session);
+     session.openStream = async (openPayload: Uint8Array) => {
+-      if (live.finishRetired) {
+-        throw new Error('peer link replaced');
+-      }
+-      if (live.streams >= this.maxConcurrentStreams) {
+-        throw new Error('too-many-streams');
+-      }
++      if (live.finishRetired) throw new Error('peer link replaced');
++      if (live.streams >= this.maxConcurrentStreams) throw new Error('too-many-streams');
+       const stream = await origOpen(openPayload);
+       this.onLocalStream(live, stream);
+       return stream;
+@@ -1669,66 +1617,45 @@ export class PeerManager {
+   private handlePeerCtl(live: LivePeer, bytes: Uint8Array): void {
+     const msg = parseOpenPayload(bytes);
+     if (!msg || typeof msg.t !== 'string') return;
+-    switch (msg.t) {
+-      case 'ping':
+-        this.sendPeerCtl(live, { t: 'pong' });
+-        return;
+-      case 'pong':
+-        live.missedPongs = 0;
+-        return;
+-      case 'link.hello': {
+-        const caps = Array.isArray(msg.caps) ? msg.caps : [];
+-        if (caps.includes('quiesce')) this.markQuiesceCapable(live);
+-        if (!live.helloReplied) {
+-          live.helloReplied = true;
+-          this.sendLinkHello(live);
+-        }
+-        return;
+-      }
+-      case 'link.quiesce.probe':
++    const t = msg.t;
++    const asyncCtl = {
++      'node.status': () => this.applyPeerStatus(live, msg),
++      'key.log.req': () => this.serveKeyLog(live, msg),
++      'key.log.res': () => this.applyKeyLogRes(msg),
++    } as const;
++    const work = asyncCtl[t as keyof typeof asyncCtl];
++    if (work) this.runCtlAsync(t, live.peerNodeId, work);
++    else if (t === 'ping') this.sendPeerCtl(live, { t: 'pong' });
++    else if (t === 'pong') live.missedPongs = 0;
++    else if (t === 'link.hello') {
++      if ((Array.isArray(msg.caps) ? msg.caps : []).includes('quiesce')) {
+         this.markQuiesceCapable(live);
+-        this.sendPeerCtl(live, { t: 'link.quiesce.probe.ack' });
+-        return;
+-      case 'link.quiesce.probe.ack':
+-        this.markQuiesceCapable(live);
+-        return;
+-      case 'link.quiesce':
++      }
++      if (!live.helloReplied) {
++        live.helloReplied = true;
++        this.sendLinkHello(live);
++      }
++    } else if (t === 'link.quiesce.probe') {
++      this.markQuiesceCapable(live);
++      this.sendPeerCtl(live, { t: 'link.quiesce.probe.ack' });
++    } else if (t === 'link.quiesce.probe.ack') this.markQuiesceCapable(live);
++    else if (t === 'link.quiesce' || t === 'link.quiesce.ack') {
++      if (t === 'link.quiesce') {
+         live.gotPeerQuiesce = true;
+-        this.markQuiesceCapable(live);
+         this.sendPeerCtl(live, { t: 'link.quiesce.ack' });
+-        if (live.retiring) this.maybeFinishRetire(live);
+-        return;
+-      case 'link.quiesce.ack':
+-        live.gotQuiesceAck = true;
+-        this.markQuiesceCapable(live);
+-        if (live.retiring) this.maybeFinishRetire(live);
+-        return;
+-      case 'node.status':
+-        void this.applyPeerStatus(live, msg);
+-        return;
+-      case 'key.log.req':
+-        void this.serveKeyLog(live, msg);
+-        return;
+-      case 'key.log.res':
+-        void this.applyKeyLogRes(msg);
+-        return;
+-      case 'rtc.signal': {
+-        const signal: RtcSignalMessage = {
+-          rtcSession: typeof msg.rtcSession === 'string' ? msg.rtcSession : '',
+-          from: msg.from === 'browser' ? 'browser' : 'node',
+-          to: typeof msg.to === 'string' ? msg.to : '',
+-          sdp: typeof msg.sdp === 'string' ? msg.sdp : null,
+-          candidate: typeof msg.candidate === 'string' ? msg.candidate : null,
+-        };
+-        if (signal.from === 'browser') {
+-          this.onBrowserSignal?.(signal, live.peerNodeId);
+-          return;
+-        }
+-        this.receiveRtcSignal(live.peerNodeId, signal);
+-        return;
+-      }
+-      default:
+-        return;
++      } else live.gotQuiesceAck = true;
++      this.markQuiesceCapable(live);
++      if (live.retiring) this.maybeFinishRetire(live);
++    } else if (t === 'rtc.signal') {
++      const signal: RtcSignalMessage = {
++        rtcSession: typeof msg.rtcSession === 'string' ? msg.rtcSession : '',
++        from: msg.from === 'browser' ? 'browser' : 'node',
++        to: typeof msg.to === 'string' ? msg.to : '',
++        sdp: typeof msg.sdp === 'string' ? msg.sdp : null,
++        candidate: typeof msg.candidate === 'string' ? msg.candidate : null,
++      };
++      if (signal.from === 'browser') this.onBrowserSignal?.(signal, live.peerNodeId);
++      else this.receiveRtcSignal(live.peerNodeId, signal);
+     }
+   }
+ 
+@@ -1766,30 +1693,26 @@ export class PeerManager {
+ 
+   private async serveKeyLog(live: LivePeer, msg: Record<string, unknown>): Promise<void> {
+     if (!this.keyLogApplier?.list) return;
+-    try {
+-      const fromSeq = parseSeq(msg.from_seq, 'from_seq');
+-      const requested = typeof msg.limit === 'number' ? msg.limit : 256;
+-      const limit = Math.min(256, Math.max(1, requested));
+-      const fetched = await this.keyLogApplier.list(
+-        this.uplink.userId,
+-        fromSeq,
+-        undefined,
+-        limit + 1
+-      );
+-      const hasMore = fetched.length > limit;
+-      const records = hasMore ? fetched.slice(0, limit) : fetched;
+-      this.sendPeerCtl(live, {
+-        t: 'key.log.res',
+-        records: records.map((row) => ({
+-          seq: Number(row.seq),
+-          bytes: encodeBase64url(row.bytes),
+-          sig: encodeBase64url(row.sig),
+-        })),
+-        has_more: hasMore,
+-      });
+-    } catch {
+-      // ignore
+-    }
++    const fromSeq = parseSeq(msg.from_seq, 'from_seq');
++    const requested = typeof msg.limit === 'number' ? msg.limit : 256;
++    const limit = Math.min(256, Math.max(1, requested));
++    const fetched = await this.keyLogApplier.list(
++      this.uplink.userId,
++      fromSeq,
++      undefined,
++      limit + 1
++    );
++    const hasMore = fetched.length > limit;
++    const records = hasMore ? fetched.slice(0, limit) : fetched;
++    this.sendPeerCtl(live, {
++      t: 'key.log.res',
++      records: records.map((row) => ({
++        seq: Number(row.seq),
++        bytes: encodeBase64url(row.bytes),
++        sig: encodeBase64url(row.sig),
++      })),
++      has_more: hasMore,
++    });
+   }
+ 
+   private async applyKeyLogRes(msg: Record<string, unknown>): Promise<void> {
+@@ -1946,11 +1869,7 @@ export class PeerManager {
+       this.parked.delete(peerNodeId);
+       existing.timer?.clear();
+       this.parkedSessions.delete(existing.session);
+-      try {
+-        existing.session.close('replaced-park');
+-      } catch {
+-        // already closed
+-      }
++      quiet(() => existing.session.close('replaced-park'));
+     }
+     this.armParkedDrain(session);
+     this.parkedSessions.add(session);
+@@ -1982,11 +1901,7 @@ export class PeerManager {
+   private armParkedDrain(session: LinkSession): void {
+     session.onStream((stream) => {
+       if (!this.parkedSessions.has(session)) return;
+-      try {
+-        stream.reset('parked');
+-      } catch {
+-        // already closed
+-      }
++      quiet(() => stream.reset('parked'));
+     });
+     session.ctl.onMessage(() => {
+       // drain ctl while parked so the inbox cannot grow
+@@ -1999,11 +1914,7 @@ export class PeerManager {
+     this.parked.delete(nodeId);
+     parked.timer?.clear();
+     this.parkedSessions.delete(parked.session);
+-    try {
+-      parked.session.close(reason);
+-    } catch {
+-      // already closed
+-    }
++    quiet(() => parked.session.close(reason));
+   }
+ 
+   private activateParked(nodeId: string): void {
+@@ -2054,26 +1965,20 @@ export class PeerManager {
+     if (live.streams > 0) return;
+     const now = this.scheduler.now();
+     const elapsed = now - live.retiredAt;
+-    if (live.gotQuiesceAck && live.gotPeerQuiesce) {
+-      this.finishRetire(live, reason);
+-      return;
+-    }
+-    if (elapsed >= PEER_RETIRE_MAX_MS) {
+-      this.finishRetire(live, reason);
+-      return;
+-    }
+     const quietFor = live.zeroStreamsSince > 0 ? now - live.zeroStreamsSince : 0;
+-    if (elapsed >= PEER_RETIRE_MIN_MS && quietFor >= PEER_RETIRE_QUIET_MS) {
++    if (
++      (live.gotQuiesceAck && live.gotPeerQuiesce) ||
++      elapsed >= PEER_RETIRE_MAX_MS ||
++      (elapsed >= PEER_RETIRE_MIN_MS && quietFor >= PEER_RETIRE_QUIET_MS)
++    ) {
+       this.finishRetire(live, reason);
+     }
+   }
+ 
+   private sendPeerCtl(live: LivePeer, msg: Record<string, unknown>): void {
+-    try {
++    quiet(() => {
+       void Promise.resolve(live.session.ctl.send(encodeJsonBytes(msg))).catch(() => undefined);
+-    } catch {
+-      // link may already be closing
+-    }
++    });
+   }
+ 
+   private sendLinkHello(live: LivePeer): void {
+@@ -2101,11 +2006,7 @@ export class PeerManager {
+ 
+   private finishRetire(live: LivePeer, reason = 'replaced'): void {
+     if (live.finishRetired) {
+-      try {
+-        live.session.close(reason);
+-      } catch {
+-        // already closed
+-      }
++      quiet(() => live.session.close(reason));
+       return;
+     }
+     live.finishRetired = true;
+@@ -2125,11 +2026,7 @@ export class PeerManager {
+     this.clearIdle(live);
+     live.pingTimer?.clear();
+     live.pingTimer = null;
+-    try {
+-      live.session.close(reason);
+-    } catch {
+-      // already closed
+-    }
++    quiet(() => live.session.close(reason));
+   }
+ 
+   private forceCloseRetiring(nodeId: string, reason: string): void {
+@@ -2180,8 +2077,7 @@ function parseEndpoints(endpointsJson: string, fallbackPort?: number): string[]
+       return;
+     }
+     if (raw.includes('://')) return;
+-    const host = raw.includes('/') ? raw : raw;
+-    const withPath = host.includes('/peer') ? host : `${host}/peer`;
++    const withPath = raw.includes('/peer') ? raw : `${raw}/peer`;
+     const url = withPath.startsWith('ws') ? withPath : `ws://${withPath}`;
+     if (url.length > PEER_MAX_ENDPOINT_LENGTH) return;
+     urls.push(url);
+diff --git a/apps/gateway/src/mesh/rtc/fragmenter.ts b/apps/gateway/src/mesh/rtc/fragmenter.ts
+index 11190a8f..7519bcd5 100644
+--- a/apps/gateway/src/mesh/rtc/fragmenter.ts
++++ b/apps/gateway/src/mesh/rtc/fragmenter.ts
+@@ -1,11 +1,25 @@
+-import { FRAME_HEADER_SIZE, MAX_FRAME_PAYLOAD } from '@tmex/shared/link';
++import {
++  DC_MAX_MESSAGE_BYTES,
++  DEFAULT_FRAME_TIMEOUT_MS,
++  DEFAULT_MAX_IN_FLIGHT,
++  FRAGMENT_HEADER_SIZE,
++  FRAGMENT_PAYLOAD_SIZE,
++  FRAME_HEADER_SIZE,
++  FragmentAssembler,
++  type FragmentFail,
++  MAX_FRAME_PAYLOAD,
++  fragmentBytes,
++} from '@tmex/shared/link';
++
++export {
++  DC_MAX_MESSAGE_BYTES,
++  DEFAULT_FRAME_TIMEOUT_MS,
++  DEFAULT_MAX_IN_FLIGHT,
++  FRAGMENT_HEADER_SIZE,
++  FRAGMENT_PAYLOAD_SIZE,
++};
+ 
+-export const FRAGMENT_HEADER_SIZE = 8;
+-export const DC_MAX_MESSAGE_BYTES = 64 * 1024;
+-export const FRAGMENT_PAYLOAD_SIZE = DC_MAX_MESSAGE_BYTES - FRAGMENT_HEADER_SIZE;
+ export const MAX_REASSEMBLED_FRAME_BYTES = MAX_FRAME_PAYLOAD + FRAME_HEADER_SIZE;
+-export const DEFAULT_FRAME_TIMEOUT_MS = 15_000;
+-export const DEFAULT_MAX_IN_FLIGHT = 32;
+ 
+ export class FragmentProtocolError extends Error {
+   constructor(message: string) {
+@@ -31,211 +45,44 @@ export function fragmentPayloadSize(maxMessageSize: number): number {
+   return Math.min(FRAGMENT_PAYLOAD_SIZE, maxMessageSize - FRAGMENT_HEADER_SIZE);
+ }
+ 
+-function readU16LE(buf: Uint8Array, offset: number): number {
+-  const lo = buf[offset];
+-  const hi = buf[offset + 1];
+-  if (lo === undefined || hi === undefined) return 0;
+-  return lo | (hi << 8);
+-}
+-
+-function writeU16LE(buf: Uint8Array, offset: number, value: number): void {
+-  buf[offset] = value & 0xff;
+-  buf[offset + 1] = (value >>> 8) & 0xff;
+-}
+-
+-function readU32LE(buf: Uint8Array, offset: number): number {
+-  const b0 = buf[offset];
+-  const b1 = buf[offset + 1];
+-  const b2 = buf[offset + 2];
+-  const b3 = buf[offset + 3];
+-  if (b0 === undefined || b1 === undefined || b2 === undefined || b3 === undefined) return 0;
+-  return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0;
+-}
+-
+-function writeU32LE(buf: Uint8Array, offset: number, value: number): void {
+-  buf[offset] = value & 0xff;
+-  buf[offset + 1] = (value >>> 8) & 0xff;
+-  buf[offset + 2] = (value >>> 16) & 0xff;
+-  buf[offset + 3] = (value >>> 24) & 0xff;
+-}
+-
+ export function fragmentFrame(
+   frameId: number,
+   payload: Uint8Array,
+   payloadSize = FRAGMENT_PAYLOAD_SIZE
+ ): Uint8Array[] {
+-  const size = Math.max(1, payloadSize);
+-  const total = Math.max(1, Math.ceil(payload.byteLength / size));
+-  const parts: Uint8Array[] = [];
+-  for (let idx = 0; idx < total; idx++) {
+-    const start = idx * size;
+-    const end = Math.min(payload.byteLength, start + size);
+-    const chunk = new Uint8Array(FRAGMENT_HEADER_SIZE + (end - start));
+-    writeU32LE(chunk, 0, frameId >>> 0);
+-    writeU16LE(chunk, 4, idx);
+-    writeU16LE(chunk, 6, total);
+-    if (end > start) {
+-      chunk.set(payload.subarray(start, end), FRAGMENT_HEADER_SIZE);
+-    }
+-    parts.push(chunk);
+-  }
+-  return parts;
++  return fragmentBytes(frameId, payload, payloadSize);
+ }
+ 
+-type PendingFrame = {
+-  frameId: number;
+-  total: number;
+-  received: number;
+-  bytes: number;
+-  chunks: Array<Uint8Array | undefined>;
+-  deadline: number;
+-};
+-
+ export class FrameReassembler {
+-  private readonly timeoutMs: number;
+-  private readonly maxInFlight: number;
+-  private readonly now: () => number;
+-  private readonly maxFrameBytes: number;
+-  private readonly payloadMax: number;
+-  private readonly maxTotal: number;
+-  private readonly setTimeoutFn: (fn: () => void, ms: number) => unknown;
+-  private readonly clearTimeoutFn: (handle: unknown) => void;
+-  private readonly pending = new Map<number, PendingFrame>();
+-  private readonly order: number[] = [];
+-  private timer: unknown = null;
+-  private disposed = false;
++  private readonly core: FragmentAssembler;
+ 
+   constructor(opts: ReassemblerOptions = {}) {
+-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_FRAME_TIMEOUT_MS;
+-    this.maxInFlight = opts.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+-    this.now = opts.now ?? Date.now;
+-    this.maxFrameBytes = opts.maxFrameBytes ?? MAX_REASSEMBLED_FRAME_BYTES;
+-    this.payloadMax = opts.payloadMax ?? FRAGMENT_PAYLOAD_SIZE;
+-    this.maxTotal = Math.max(1, Math.ceil(this.maxFrameBytes / this.payloadMax));
+-    this.setTimeoutFn = opts.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms));
+-    this.clearTimeoutFn =
+-      opts.clearTimeoutFn ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
++    const maxFrameBytes = opts.maxFrameBytes ?? MAX_REASSEMBLED_FRAME_BYTES;
++    const payloadMax = opts.payloadMax ?? FRAGMENT_PAYLOAD_SIZE;
++    this.core = new FragmentAssembler({
++      ...opts,
++      maxFrameBytes,
++      payloadMax,
++      maxTotal: Math.max(1, Math.ceil(maxFrameBytes / payloadMax)),
++      refreshDeadline: true,
++      setTimeoutFn: opts.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms)),
++      clearTimeoutFn:
++        opts.clearTimeoutFn ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>)),
++    });
+   }
+ 
+   push(chunk: Uint8Array): Uint8Array | null {
+-    if (this.disposed) return null;
+-    if (chunk.byteLength < FRAGMENT_HEADER_SIZE) return null;
+-    const frameId = readU32LE(chunk, 0);
+-    const idx = readU16LE(chunk, 4);
+-    const total = readU16LE(chunk, 6);
+-    if (total === 0 || idx >= total) return null;
+-    if (total > this.maxTotal) {
+-      this.protocolError(`fragment total ${total} exceeds ${this.maxTotal}`);
+-    }
+-    const payloadLen = chunk.byteLength - FRAGMENT_HEADER_SIZE;
+-    if (payloadLen > this.payloadMax) {
+-      this.protocolError(`fragment payload ${payloadLen} exceeds ${this.payloadMax}`);
+-    }
+-    this.sweep();
+-
+-    let frame = this.pending.get(frameId);
+-    if (frame && frame.total !== total) {
+-      this.drop(frameId);
+-      frame = undefined;
+-    }
+-    if (!frame) {
+-      if (this.pending.size >= this.maxInFlight) {
+-        this.evictOldest();
+-      }
+-      frame = {
+-        frameId,
+-        total,
+-        received: 0,
+-        bytes: 0,
+-        chunks: new Array(total),
+-        deadline: this.now() + this.timeoutMs,
+-      };
+-      this.pending.set(frameId, frame);
+-      this.order.push(frameId);
+-      this.armTimer();
+-    }
+-
+-    if (frame.chunks[idx]) return null;
+-    frame.deadline = this.now() + this.timeoutMs;
+-    this.armTimer();
+-    const piece = chunk.subarray(FRAGMENT_HEADER_SIZE).slice();
+-    if (frame.bytes + piece.byteLength > this.maxFrameBytes) {
+-      this.protocolError(`reassembled frame exceeds ${this.maxFrameBytes} bytes`);
+-    }
+-    frame.chunks[idx] = piece;
+-    frame.bytes += piece.byteLength;
+-    frame.received += 1;
+-    if (frame.received < frame.total) return null;
+-
+-    const out = new Uint8Array(frame.bytes);
+-    let offset = 0;
+-    for (const part of frame.chunks) {
+-      if (!part) return null;
+-      out.set(part, offset);
+-      offset += part.byteLength;
+-    }
+-    this.drop(frameId);
+-    this.armTimer();
+-    return out;
++    return this.core.push(chunk, (kind, message) => this.onFail(kind, message));
+   }
+ 
+-  sweep(): void {
+-    if (this.disposed) return;
+-    const now = this.now();
+-    let dropped = false;
+-    for (const [id, frame] of this.pending) {
+-      if (frame.deadline <= now) {
+-        this.drop(id);
+-        dropped = true;
+-      }
+-    }
+-    if (dropped) this.armTimer();
+-  }
+-
+-  dispose(): void {
+-    this.disposed = true;
+-    this.clearTimer();
+-    this.pending.clear();
+-    this.order.length = 0;
+-  }
++  sweep = (): void => this.core.sweep();
++  dispose = (): void => this.core.dispose();
+ 
+-  private protocolError(message: string): never {
+-    this.dispose();
+-    throw new FragmentProtocolError(message);
+-  }
+-
+-  private evictOldest(): void {
+-    while (this.order.length > 0 && this.pending.size >= this.maxInFlight) {
+-      const id = this.order.shift();
+-      if (id === undefined) return;
+-      if (this.pending.has(id)) this.drop(id);
+-    }
+-  }
+-
+-  private drop(frameId: number): void {
+-    this.pending.delete(frameId);
+-    const at = this.order.indexOf(frameId);
+-    if (at >= 0) this.order.splice(at, 1);
+-  }
+-
+-  private armTimer(): void {
+-    this.clearTimer();
+-    if (this.disposed || this.pending.size === 0) return;
+-    let earliest = Number.POSITIVE_INFINITY;
+-    for (const frame of this.pending.values()) {
+-      if (frame.deadline < earliest) earliest = frame.deadline;
++  private onFail(kind: FragmentFail, message: string): null {
++    if (kind === 'total-exceeds' || kind === 'payload-exceeds' || kind === 'frame-too-large') {
++      this.dispose();
++      throw new FragmentProtocolError(message);
+     }
+-    if (earliest === Number.POSITIVE_INFINITY) return;
+-    const delay = Math.max(0, earliest - this.now());
+-    this.timer = this.setTimeoutFn(() => {
+-      this.timer = null;
+-      this.sweep();
+-    }, delay);
+-  }
+-
+-  private clearTimer(): void {
+-    if (this.timer == null) return;
+-    this.clearTimeoutFn(this.timer);
+-    this.timer = null;
++    return null;
+   }
+ }
+diff --git a/apps/gateway/src/mesh/stream-pump.test.ts b/apps/gateway/src/mesh/stream-pump.test.ts
+new file mode 100644
+index 00000000..71e3cfde
+--- /dev/null
++++ b/apps/gateway/src/mesh/stream-pump.test.ts
+@@ -0,0 +1,64 @@
++import { describe, expect, test } from 'bun:test';
++import type { LinkStream } from '@tmex/shared/link';
++import { pumpLink, pumpToLink } from './stream-pump';
++
++describe('pumpToLink', () => {
++  test('awaits end and reports rejection via onError', async () => {
++    const src = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new Uint8Array([1, 2]));
++        controller.close();
++      },
++    });
++    const written: Uint8Array[] = [];
++    let ended = false;
++    let errors = 0;
++    await pumpToLink(
++      src.getReader(),
++      {
++        write: async (bytes) => {
++          written.push(bytes);
++        },
++        end: async () => {
++          ended = true;
++          throw new Error('end-fail');
++        },
++      },
++      () => {
++        errors += 1;
++      }
++    );
++    expect(written).toEqual([new Uint8Array([1, 2])]);
++    expect(ended).toBe(true);
++    expect(errors).toBe(1);
++  });
++});
++
++describe('pumpLink', () => {
++  test('awaits dst.end rejection and releases the source reader', async () => {
++    const readable = new ReadableStream<{ bytes: Uint8Array; head: boolean }>({
++      start(controller) {
++        controller.enqueue({ bytes: new Uint8Array([1]), head: false });
++        controller.close();
++      },
++    });
++    let errors = 0;
++    let ended = false;
++    await pumpLink(
++      { readable } as LinkStream,
++      {
++        write: async () => {},
++        end: async () => {
++          ended = true;
++          throw new Error('end-fail');
++        },
++      } as unknown as LinkStream,
++      () => {
++        errors += 1;
++      }
++    );
++    expect(ended).toBe(true);
++    expect(errors).toBe(1);
++    expect(() => readable.getReader()).not.toThrow();
++  });
++});
+diff --git a/apps/gateway/src/mesh/stream-pump.ts b/apps/gateway/src/mesh/stream-pump.ts
+new file mode 100644
+index 00000000..34cb8c5c
+--- /dev/null
++++ b/apps/gateway/src/mesh/stream-pump.ts
+@@ -0,0 +1,45 @@
++import type { LinkStream } from '@tmex/shared/link';
++
++type Chunk = Uint8Array | { bytes: Uint8Array; head?: boolean };
++
++export async function pumpToLink(
++  src: ReadableStreamDefaultReader<Chunk> | Uint8Array | null | undefined,
++  dst: Pick<LinkStream, 'write' | 'end'>,
++  onError?: () => void,
++  stopped?: () => boolean
++): Promise<boolean> {
++  const reader = src instanceof Uint8Array || !src ? null : src;
++  try {
++    if (src instanceof Uint8Array && src.byteLength && !stopped?.()) await dst.write(src);
++    while (reader && !stopped?.()) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      if (!value) continue;
++      const bytes = value instanceof Uint8Array ? value : value.bytes;
++      const head = !(value instanceof Uint8Array) && value.head;
++      if (bytes.byteLength) await dst.write(bytes, head ? { head: true } : undefined);
++    }
++    if (!stopped?.()) await dst.end();
++    return true;
++  } catch {
++    onError?.();
++    return false;
++  }
++}
++
++export async function pumpLink(
++  src: LinkStream,
++  dst: LinkStream,
++  onError: () => void
++): Promise<void> {
++  const reader = src.readable.getReader();
++  try {
++    await pumpToLink(reader, dst, onError);
++  } finally {
++    try {
++      reader.releaseLock();
++    } catch {
++      // already released
++    }
++  }
++}
+diff --git a/apps/gateway/src/mesh/stream-targets.test.ts b/apps/gateway/src/mesh/stream-targets.test.ts
+index 8678e3a3..b56d22e3 100644
+--- a/apps/gateway/src/mesh/stream-targets.test.ts
++++ b/apps/gateway/src/mesh/stream-targets.test.ts
+@@ -614,8 +614,169 @@ describe('http/ws stream targets', () => {
+     const opened = await openWsStream(a, issued.sid);
+     await expect(opened.stream.closed).resolves.toMatchObject({ reason: 'rst' });
+   });
++
++  test('HTTP abort cancel() rejection is not unhandled', async () => {
++    const [a, b] = createInMemoryLinkPair();
++    b.onStream((stream) => {
++      void acceptHttpStream(stream, {
++        peerNodeId: 'entry-1',
++        sessionStore: {
++          verify: () => ({ ok: true, session: { userId: 'user-1' } }),
++        } as unknown as NodeSessionStore,
++        async dispatchHttp() {
++          return new Response(
++            new ReadableStream({
++              start() {},
++              cancel() {
++                return Promise.reject(new Error('cancel-fail'));
++              },
++            })
++          );
++        },
++      });
++    });
++    const unhandled = await collectUnhandled(async () => {
++      const res = await openHttpStream(a, {
++        method: 'GET',
++        path: '/api/hang',
++        origin: 'http://localhost',
++        auth: 'sid',
++      });
++      await res.body?.cancel();
++      await Bun.sleep(30);
++    });
++    expect(unhandled).toEqual([]);
++  });
++
++  test('failed response head cancels the upload and does not unhandle writeBody', async () => {
++    const [a, b] = createInMemoryLinkPair();
++    b.onStream(async (stream) => {
++      await stream.end();
++    });
++    let cancelled = false;
++    const body = new ReadableStream<Uint8Array>({
++      pull(controller) {
++        controller.enqueue(new Uint8Array([1]));
++      },
++      cancel() {
++        cancelled = true;
++      },
++    });
++    const unhandled = await collectUnhandled(async () => {
++      await expect(
++        openHttpStream(
++          a,
++          { method: 'POST', path: '/api/echo', origin: 'http://localhost', auth: 'sid' },
++          body
++        )
++      ).rejects.toBeDefined();
++      await Bun.sleep(20);
++    });
++    expect(cancelled).toBe(true);
++    expect(unhandled).toEqual([]);
++  });
++
++  test('GET without body does not unhandle end() when the peer RSTs before head', async () => {
++    const [a, b] = createInMemoryLinkPair();
++    b.onStream((stream) => {
++      stream.reset('link-down');
++    });
++    const unhandled = await collectUnhandled(async () => {
++      await expect(
++        openHttpStream(a, {
++          type: 'http',
++          method: 'GET',
++          path: '/api/devices',
++          origin: 'http://entry',
++          auth: null,
++        })
++      ).rejects.toThrow();
++    });
++    expect(unhandled).toEqual([]);
++  });
++
++  test('openWsStream.close end() rejection is not unhandled', async () => {
++    const server = new WebSocketServer();
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new NodeSessionStore(db);
++    const userStore = new UserStore(db);
++    seedUser(userStore);
++    const sid = store.issue({
++      userId: 'user-1',
++      viaNodeId: 'entry-1',
++      sessPublicKey: new Uint8Array(32),
++      delegationMethod: 'root',
++      now: Date.now(),
++    });
++    const [a, b] = createInMemoryLinkPair();
++    b.onStream((stream) => {
++      void acceptWsStream(stream, {
++        peerNodeId: 'entry-1',
++        sessionStore: store,
++        wsServer: server,
++      });
++    });
++    const opened = await openWsStream(a, sid.sid);
++    opened.stream.end = () => Promise.reject(new Error('end-fail'));
++    const unhandled = await collectUnhandled(async () => {
++      opened.close();
++      await Bun.sleep(20);
++    });
++    expect(unhandled).toEqual([]);
++  });
++
++  test('WS teardown end() rejection is not unhandled', async () => {
++    const server = new WebSocketServer();
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new NodeSessionStore(db);
++    const userStore = new UserStore(db);
++    seedUser(userStore);
++    const issued = store.issue({
++      userId: 'user-1',
++      viaNodeId: 'entry-1',
++      sessPublicKey: new Uint8Array(32),
++      delegationMethod: 'root',
++      now: Date.now(),
++    });
++    const [a, b] = createInMemoryLinkPair();
++    b.onStream((stream) => {
++      stream.end = () => Promise.reject(new Error('teardown-end-fail'));
++      void acceptWsStream(stream, {
++        peerNodeId: 'entry-1',
++        sessionStore: store,
++        wsServer: server,
++      });
++    });
++    const opened = await openWsStream(a, issued.sid);
++    const unhandled = await collectUnhandled(async () => {
++      opened.close();
++      await Bun.sleep(40);
++    });
++    expect(unhandled).toEqual([]);
++  });
+ });
+ 
++async function collectUnhandled(run: () => Promise<void>): Promise<unknown[]> {
++  const unhandled: unknown[] = [];
++  const onUnhandled = (reason: unknown) => {
++    unhandled.push(reason);
++  };
++  const events = process as unknown as {
++    on(event: string, listener: (reason: unknown) => void): void;
++    off(event: string, listener: (reason: unknown) => void): void;
++  };
++  events.on('unhandledRejection', onUnhandled);
++  try {
++    await run();
++    await Bun.sleep(20);
++  } finally {
++    events.off('unhandledRejection', onUnhandled);
++  }
++  return unhandled;
++}
++
+ describe('LinkStreamCarrier with attachStreamSession', () => {
+   test('attachStreamSession routes HELLO without a Bun socket', async () => {
+     const server = new WebSocketServer();
+diff --git a/apps/gateway/src/mesh/stream-targets.ts b/apps/gateway/src/mesh/stream-targets.ts
+index 91c1c59f..251a627c 100644
+--- a/apps/gateway/src/mesh/stream-targets.ts
++++ b/apps/gateway/src/mesh/stream-targets.ts
+@@ -7,6 +7,7 @@ import { encodeJsonBytes, isRecord } from './ctl';
+ import { LinkStreamCarrier } from './link-stream-carrier';
+ import { X_TMEX_SESSION_RENEWED } from './mesh-deps';
+ import { parseOpenPayload } from './peer-protocol';
++import { pumpToLink } from './stream-pump';
+ import type { DispatchHttp, HttpStreamOpenPayload, WsStreamOpenPayload } from './types';
+ 
+ const AUTH_SKIP_PATHS = new Set(['/api/auth/challenge', '/api/auth/login']);
+@@ -28,12 +29,6 @@ export type StreamAuthContext = {
+   now?: () => number;
+ };
+ 
+-export type StreamAuthOk = {
+-  ok: true;
+-  uid: string | null;
+-  renewedExpiresAt?: number;
+-};
+-
+ export function isAuthSkippedPath(path: string): boolean {
+   const bare = path.split('?')[0] ?? path;
+   return AUTH_SKIP_PATHS.has(bare);
+@@ -42,23 +37,24 @@ export function isAuthSkippedPath(path: string): boolean {
+ export function stripForwardedRequestHeaders(
+   headers?: Record<string, string> | null
+ ): Record<string, string> {
+-  const out: Record<string, string> = {};
+-  if (!headers) return out;
+-  for (const [key, value] of Object.entries(headers)) {
+-    const lower = key.toLowerCase();
+-    if (BLOCKED_REQUEST_HEADERS.has(lower)) continue;
+-    if (lower.startsWith('proxy-')) continue;
+-    if (lower.startsWith('x-forwarded-')) continue;
+-    out[key] = value;
+-  }
+-  return out;
++  return copyHeaders(
++    headers,
++    (k) => BLOCKED_REQUEST_HEADERS.has(k) || k.startsWith('proxy-') || k.startsWith('x-forwarded-')
++  );
+ }
+ 
+ export function stripSetCookieHeaders(headers: Record<string, string>): Record<string, string> {
++  return copyHeaders(headers, (k) => k === 'set-cookie');
++}
++
++function copyHeaders(
++  headers: Record<string, string> | null | undefined,
++  drop: (lower: string) => boolean
++): Record<string, string> {
+   const out: Record<string, string> = {};
++  if (!headers) return out;
+   for (const [key, value] of Object.entries(headers)) {
+-    if (key.toLowerCase() === 'set-cookie') continue;
+-    out[key] = value;
++    if (!drop(key.toLowerCase())) out[key] = value;
+   }
+   return out;
+ }
+@@ -82,39 +78,83 @@ function logHttpForwardAborted(fields: {
+   const now = Date.now();
+   if (now - lastHttpForwardAbortLogAt < HTTP_FORWARD_ABORT_LOG_INTERVAL_MS) return;
+   lastHttpForwardAbortLogAt = now;
+-  const expected = fields.expected === null ? '-' : String(fields.expected);
+   console.warn(
+-    `[mesh][http] forward aborted status=${fields.status} sent=${fields.sent} expected=${expected} reason=${fields.reason}`
++    `[mesh][http] forward aborted status=${fields.status} sent=${fields.sent} expected=${fields.expected ?? '-'} reason=${fields.reason}`
+   );
+ }
+ 
+ function headerRecord(headers: Headers): Record<string, string> {
+   const out: Record<string, string> = {};
+   headers.forEach((value, key) => {
+-    if (key.toLowerCase() === 'set-cookie') return;
+     out[key] = value;
+   });
++  return stripSetCookieHeaders(out);
++}
++
++function stringHeaders(value: unknown): Record<string, string> {
++  const out: Record<string, string> = {};
++  if (!isRecord(value)) return out;
++  for (const [key, val] of Object.entries(value)) {
++    if (typeof val === 'string') out[key] = val;
++  }
+   return out;
+ }
+ 
++function str(value: unknown, fallback = ''): string {
++  return typeof value === 'string' ? value : fallback;
++}
++
++function requestBodyFromLink(
++  reader: ReadableStreamDefaultReader<{ bytes: Uint8Array; head: boolean }>,
++  stream: LinkStream,
++  abort: AbortController,
++  complete: () => boolean
++): ReadableStream<Uint8Array> {
++  return new ReadableStream({
++    async pull(controller) {
++      for (;;) {
++        let chunk: Awaited<ReturnType<typeof reader.read>>;
++        try {
++          chunk = await reader.read();
++        } catch (err) {
++          controller.error(err);
++          return;
++        }
++        if (chunk.done) {
++          controller.close();
++          return;
++        }
++        if (chunk.value?.head) continue;
++        if (chunk.value?.bytes.byteLength) {
++          controller.enqueue(chunk.value.bytes);
++          return;
++        }
++      }
++    },
++    cancel() {
++      if (!abort.signal.aborted) abort.abort();
++      if (!complete())
++        try {
++          stream.reset('request-cancelled');
++        } catch {
++          // already reset
++        }
++    },
++  });
++}
++
+ function verifyAuth(
+   auth: string | null | undefined,
+   path: string,
+   ctx: StreamAuthContext
+-): StreamAuthOk | { ok: false; reason: string } {
+-  if (isAuthSkippedPath(path)) {
+-    return { ok: true, uid: null };
+-  }
+-  if (!auth) {
+-    return { ok: false, reason: 'missing auth' };
+-  }
++): { ok: true; uid: string | null; renewedExpiresAt?: number } | { ok: false; reason: string } {
++  if (isAuthSkippedPath(path)) return { ok: true, uid: null };
++  if (!auth) return { ok: false, reason: 'missing auth' };
+   const result = ctx.sessionStore.verify(auth, {
+     viaNodeId: ctx.peerNodeId,
+     now: ctx.now?.() ?? Date.now(),
+   });
+-  if (!result.ok) {
+-    return { ok: false, reason: result.reason };
+-  }
++  if (!result.ok) return { ok: false, reason: result.reason };
+   return {
+     ok: true,
+     uid: result.session.userId,
+@@ -127,20 +167,12 @@ export async function acceptHttpStream(
+   opts: StreamAuthContext & { dispatchHttp: DispatchHttp }
+ ): Promise<void> {
+   const open = parseOpenPayload(stream.openPayload) ?? {};
+-  const method = typeof open.method === 'string' ? open.method : 'GET';
+-  const path = typeof open.path === 'string' ? open.path : '/';
+-  const query = typeof open.query === 'string' ? open.query : '';
+-  const origin = typeof open.origin === 'string' ? open.origin : 'http://localhost';
+-  const headers = stripForwardedRequestHeaders(
+-    isRecord(open.headers)
+-      ? Object.fromEntries(
+-          Object.entries(open.headers).filter(
+-            (entry): entry is [string, string] => typeof entry[1] === 'string'
+-          )
+-        )
+-      : {}
+-  );
+-  const auth = typeof open.auth === 'string' ? open.auth : null;
++  const method = str(open.method, 'GET');
++  const path = str(open.path, '/');
++  const query = str(open.query);
++  const origin = str(open.origin, 'http://localhost');
++  const headers = stripForwardedRequestHeaders(stringHeaders(open.headers));
++  const auth = str(open.auth) || null;
+   const verified = verifyAuth(auth, path, opts);
+   if (!verified.ok) {
+     await writeHttpResponse(
+@@ -158,69 +190,18 @@ export async function acceptHttpStream(
+     null;
+   let responseReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+   let responseComplete = false;
+-
+   const cancelReaders = () => {
+-    try {
+-      void requestReader?.cancel();
+-    } catch {
+-      // already cancelled
+-    }
+-    try {
+-      void responseReader?.cancel();
+-    } catch {
+-      // already cancelled
+-    }
++    void requestReader?.cancel().catch(() => {});
++    void responseReader?.cancel().catch(() => {});
+   };
+-
+   stream.onAbort(() => {
+     if (!abort.signal.aborted) abort.abort();
+     cancelReaders();
+   });
+-
+-  if (hasBody) {
+-    requestReader = stream.readable.getReader();
+-  }
+-
+-  const requestBody = hasBody
+-    ? new ReadableStream<Uint8Array>({
+-        async pull(controller) {
+-          const reader = requestReader;
+-          if (!reader) {
+-            controller.close();
+-            return;
+-          }
+-          while (true) {
+-            let chunk: Awaited<ReturnType<typeof reader.read>>;
+-            try {
+-              chunk = await reader.read();
+-            } catch (err) {
+-              controller.error(err);
+-              return;
+-            }
+-            if (chunk.done) {
+-              controller.close();
+-              return;
+-            }
+-            if (chunk.value?.head) continue;
+-            if (chunk.value && chunk.value.bytes.byteLength > 0) {
+-              controller.enqueue(chunk.value.bytes);
+-              return;
+-            }
+-          }
+-        },
+-        cancel() {
+-          if (!abort.signal.aborted) abort.abort();
+-          if (!responseComplete) {
+-            try {
+-              stream.reset('request-cancelled');
+-            } catch {
+-              // already reset
+-            }
+-          }
+-        },
+-      })
++  if (hasBody) requestReader = stream.readable.getReader();
++  const requestBody = requestReader
++    ? requestBodyFromLink(requestReader, stream, abort, () => responseComplete)
+     : null;
+-
+   const url = new URL(path + query, origin.endsWith('/') ? origin : `${origin}/`);
+   const request = new Request(url, {
+     method,
+@@ -244,7 +225,7 @@ export async function acceptHttpStream(
+     return;
+   }
+ 
+-  const responseHeaders = stripSetCookieHeaders(headerRecord(response.headers));
++  const responseHeaders = headerRecord(response.headers);
+   if (verified.renewedExpiresAt !== undefined) {
+     responseHeaders[X_TMEX_SESSION_RENEWED] = String(verified.renewedExpiresAt);
+   }
+@@ -253,25 +234,14 @@ export async function acceptHttpStream(
+     await stream.write(encodeJsonBytes({ status: response.status, headers: responseHeaders }), {
+       head: true,
+     });
+-    if (response.body) {
+-      responseReader = response.body.getReader();
+-      try {
+-        while (true) {
+-          if (abort.signal.aborted) break;
+-          const { done, value } = await responseReader.read();
+-          if (done) break;
+-          if (value && value.byteLength > 0) {
+-            await stream.write(value);
+-          }
+-        }
+-      } catch {
+-        if (!abort.signal.aborted && !responseComplete) {
+-          stream.reset('response-cancelled');
+-        }
+-        return;
+-      }
++    responseReader = response.body?.getReader() ?? null;
++    if (
++      !(await pumpToLink(responseReader, stream, () => {
++        if (!abort.signal.aborted && !responseComplete) stream.reset('response-cancelled');
++      }))
++    ) {
++      return;
+     }
+-    await stream.end();
+     responseComplete = true;
+   } catch {
+     if (!responseComplete) {
+@@ -292,9 +262,7 @@ async function writeHttpResponse(
+ ): Promise<void> {
+   try {
+     await stream.write(encodeJsonBytes({ status, headers }), { head: true });
+-    if (body) {
+-      await stream.write(new TextEncoder().encode(body));
+-    }
++    if (body) await stream.write(new TextEncoder().encode(body));
+     await stream.end();
+   } catch {
+     try {
+@@ -340,30 +308,15 @@ export async function openHttpStream(
+   });
+ 
+   const upload = { reader: null as ReadableStreamDefaultReader<Uint8Array> | null };
+-  const writeBody = (async () => {
+-    if (!body) {
+-      await stream.end();
+-      return;
+-    }
+-    if (body instanceof Uint8Array) {
+-      if (body.byteLength > 0 && !stopUpload.signal.aborted) await stream.write(body);
+-      if (!stopUpload.signal.aborted) await stream.end();
+-      return;
+-    }
+-    upload.reader = body.getReader();
+-    try {
+-      while (!stopUpload.signal.aborted) {
+-        const { done, value } = await upload.reader.read();
+-        if (done) break;
+-        if (value && value.byteLength > 0) {
+-          await stream.write(value);
+-        }
+-      }
+-      if (!stopUpload.signal.aborted) await stream.end();
+-    } catch {
++  if (body && !(body instanceof Uint8Array)) upload.reader = body.getReader();
++  void pumpToLink(
++    upload.reader ?? (body instanceof Uint8Array ? body : null),
++    stream,
++    () => {
+       if (!gotHead && !stopUpload.signal.aborted) rst();
+-    }
+-  })();
++    },
++    () => stopUpload.signal.aborted
++  );
+ 
+   try {
+     const head = await readHttpHead(stream);
+@@ -391,9 +344,8 @@ export async function openHttpStream(
+           reason: error.message,
+         });
+       }
+-      if (!bodyController) return;
+       try {
+-        bodyController.error(error);
++        bodyController?.error(error);
+       } catch {
+         // already closed/errored
+       }
+@@ -432,13 +384,11 @@ export async function openHttpStream(
+               controller.enqueue(value.bytes);
+             }
+           }
+-          if (abortedAfterHead) {
+-            failBody(new Error('http stream aborted'));
+-            return;
+-          }
++          if (abortedAfterHead) return failBody(new Error('http stream aborted'));
+           if (expectedLength !== null && sent < expectedLength) {
+-            failBody(new Error(`http body truncated: sent=${sent} expected=${expectedLength}`));
+-            return;
++            return failBody(
++              new Error(`http body truncated: sent=${sent} expected=${expectedLength}`)
++            );
+           }
+           controller.close();
+         } catch (err) {
+@@ -452,7 +402,12 @@ export async function openHttpStream(
+     return new Response(responseBody, { status: head.status, headers: head.headers });
+   } finally {
+     signal?.removeEventListener('abort', onOuterAbort);
+-    void writeBody;
++    if (!stopUpload.signal.aborted) stopUpload.abort();
++    try {
++      void upload.reader?.cancel().catch(() => {});
++    } catch {
++      // already released
++    }
+   }
+ }
+ 
+@@ -471,17 +426,11 @@ async function readHttpHead(stream: LinkStream): Promise<{
+       }
+       if (value.head) {
+         const parsed = parseOpenPayload(value.bytes) ?? {};
+-        const status = typeof parsed.status === 'number' ? parsed.status : 200;
+-        const headers = stripSetCookieHeaders(
+-          isRecord(parsed.headers)
+-            ? Object.fromEntries(
+-                Object.entries(parsed.headers).filter(
+-                  (entry): entry is [string, string] => typeof entry[1] === 'string'
+-                )
+-              )
+-            : {}
+-        );
+-        return { status, headers, rest };
++        return {
++          status: typeof parsed.status === 'number' ? parsed.status : 200,
++          headers: stripSetCookieHeaders(stringHeaders(parsed.headers)),
++          rest,
++        };
+       }
+       rest.push(value.bytes);
+     }
+@@ -508,7 +457,7 @@ export async function acceptWsStream(
+   opts: AcceptWsStreamOptions
+ ): Promise<void> {
+   const open = parseOpenPayload(stream.openPayload) ?? {};
+-  const auth = typeof open.auth === 'string' ? open.auth : '';
++  const auth = str(open.auth);
+   const verified = verifyAuth(auth, '/ws', opts);
+   if (!verified.ok) {
+     stream.reset(verified.reason);
+@@ -517,11 +466,7 @@ export async function acceptWsStream(
+   const sid = auth;
+   const via = opts.peerNodeId;
+   const uid = verified.uid;
+-  const cidRaw =
+-    (typeof open.cid === 'string' && open.cid) ||
+-    (typeof open.connectionId === 'string' && open.connectionId) ||
+-    '';
+-  const cid = cidRaw.trim();
++  const cid = (str(open.cid) || str(open.connectionId)).trim();
+   const carrier = new LinkStreamCarrier(stream);
+   const attached = opts.wsServer.attachStreamSession(carrier);
+   let tornDown = false;
+@@ -540,7 +485,7 @@ export async function acceptWsStream(
+     }
+     try {
+       if (mode === 'rst') stream.reset(reason ?? 'session-invalid');
+-      else void stream.end();
++      else void stream.end().catch(() => {});
+     } catch {
+       // already closed
+     }
+@@ -579,7 +524,6 @@ export async function acceptWsStream(
+         teardown('rst', check.reason);
+         return;
+       }
+-      void uid;
+       attached.onMessage(value.bytes);
+     }
+   } catch {
+@@ -614,7 +558,7 @@ export async function openWsStream(
+       })
+     ),
+     close: () => {
+-      void stream.end();
++      void stream.end().catch(() => {});
+     },
+   };
+ }
+diff --git a/packages/app/src/runtime/assemble.ts b/packages/app/src/runtime/assemble.ts
+index 4ae44bbc..2b47a71a 100644
+--- a/packages/app/src/runtime/assemble.ts
++++ b/packages/app/src/runtime/assemble.ts
+@@ -13,6 +13,7 @@ import {
+   MESH_REJECT_4401_KIND,
+   MESH_VIA_SELF,
+   MESH_WS_KIND,
++  type MeshRewritten,
+   WS_CLOSE_LOGIN_REQUIRED,
+   getMeshRequestContext,
+   isMeshRewritten,
+@@ -44,8 +45,7 @@ import { HttpsListener } from '../tls/https-listener';
+ import { TlsService } from '../tls/tls-service';
+ import { createTmexGatewayRuntime } from './gateway';
+ import { jsonErr } from './http';
+-import { handleLocalRequest } from './local-routes';
+-import type { LocalRouteDeps } from './local-routes';
++import { type LocalRouteDeps, handleLocalRequest } from './local-routes';
+ import { serveFrontend as defaultServeFrontend } from './serve-frontend';
+ import { handleSetupRequest } from './setup-routes';
+ import { SETUP_RESTART_DELAY_MS, resolveSetupEnvPath } from './setup-service';
+@@ -57,7 +57,7 @@ export function meshShutdownNeeded(roles: TmexRoles): boolean {
+   return roles.hub || roles.node;
+ }
+ 
+-export type AssembleTmexOptions = {
++type AssembleTmexOptions = {
+   roles?: TmexRoles;
+   staticRoot?: string;
+   createGatewayRuntime?: () => Promise<GatewayRuntime>;
+@@ -68,7 +68,7 @@ export type AssembleTmexOptions = {
+   nativeDir?: string;
+ };
+ 
+-export type AssembledTmex = {
++type AssembledTmex = {
+   roles: TmexRoles;
+   gateway: GatewayRuntime;
+   mesh: MeshRuntime | null;
+@@ -86,20 +86,18 @@ export type AssembledTmex = {
+   isRestartRequested: () => boolean;
+ };
+ 
++type HttpResult = Response | null | undefined | MeshRewritten;
++type HttpHandler = (req: Request, server: Bun.Server<unknown>) => HttpResult | Promise<HttpResult>;
++
+ function defaultStaticRoot(): string {
+-  if (process.env.TMEX_FE_DIST_DIR) {
+-    return resolve(process.env.TMEX_FE_DIST_DIR);
+-  }
+-  return resolve(import.meta.dir, '../../resources/fe-dist');
++  return process.env.TMEX_FE_DIST_DIR
++    ? resolve(process.env.TMEX_FE_DIST_DIR)
++    : resolve(import.meta.dir, '../../resources/fe-dist');
+ }
+ 
+ function socketKind(ws: { data?: unknown }): string | undefined {
+-  const data = ws.data;
+-  if (typeof data === 'object' && data !== null && 'kind' in data) {
+-    const kind = (data as { kind?: unknown }).kind;
+-    if (typeof kind === 'string') return kind;
+-  }
+-  return undefined;
++  const kind = (ws.data as { kind?: unknown } | null)?.kind;
++  return typeof kind === 'string' ? kind : undefined;
+ }
+ 
+ function isMeshKind(kind: string | undefined): boolean {
+@@ -111,66 +109,232 @@ function isMeshKind(kind: string | undefined): boolean {
+   );
+ }
+ 
+-function clientIpFromServer(server: Bun.Server<unknown>, req: Request): string | undefined {
+-  try {
+-    const info = server.requestIP(req);
+-    if (info?.address) return info.address;
+-  } catch {
+-    // requestIP is unavailable in some test fakes
+-  }
+-  return undefined;
+-}
+-
+ function seedLocalContext(req: Request, bunServer: Bun.Server<unknown>): void {
+   const existing = getMeshRequestContext(req);
++  let clientIp = existing.clientIp;
++  try {
++    clientIp ??= bunServer.requestIP(req)?.address || undefined;
++  } catch {}
+   setMeshRequestContext(req, {
+     ...existing,
+     via: existing.via || MESH_VIA_SELF,
+-    clientIp: existing.clientIp ?? clientIpFromServer(bunServer, req),
++    clientIp,
+     trustProxy: gatewayConfig.trustProxy,
+   });
+ }
+ 
+ async function attachStartedAt(resp: Response): Promise<Response> {
+   const text = await resp.text();
++  const passthrough = () => new Response(text, { status: resp.status, headers: resp.headers });
+   try {
+     const body = JSON.parse(text) as unknown;
+-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+-      return new Response(text, { status: resp.status, headers: resp.headers });
+-    }
++    if (!body || typeof body !== 'object' || Array.isArray(body)) return passthrough();
+     const next = body as Record<string, unknown>;
+-    if (typeof next.startedAt !== 'number') {
+-      next.startedAt = PROCESS_STARTED_AT;
+-    }
++    if (typeof next.startedAt !== 'number') next.startedAt = PROCESS_STARTED_AT;
+     const headers = new Headers(resp.headers);
+     headers.set('content-type', 'application/json');
+     return new Response(JSON.stringify(next), { status: resp.status, headers });
+   } catch {
+-    return new Response(text, { status: resp.status, headers: resp.headers });
++    return passthrough();
+   }
+ }
+ 
++async function tryStop(run: () => unknown, label?: string): Promise<void> {
++  try {
++    await run();
++  } catch (err) {
++    if (label) console.error(`[tmex] ${label} stop failed`, err);
++  }
++}
++
++async function meshHttp(
++  mesh: MeshRuntime | null,
++  req: Request,
++  server: Bun.Server<unknown>
++): Promise<HttpResult> {
++  const path = new URL(req.url).pathname;
++  if (!mesh) {
++    return path === '/api/auth/mode' && req.method === 'GET'
++      ? Response.json({ mode: 'none' })
++      : null;
++  }
++  if (path.startsWith('/api/')) {
++    const blocked = mesh.localUiGuard(req);
++    if (blocked) return blocked;
++  }
++  if (path === '/ws' || path === '/n/self/ws' || path === `/n/${mesh.nodeId}/ws`) {
++    const wsGuard = mesh.guardGatewayWebSocket(req, server);
++    if (wsGuard !== null) return wsGuard ?? undefined;
++  }
++  const meshResp = await mesh.handleRequest(req, server);
++  if (isMeshRewritten(meshResp) || meshResp == null) return meshResp;
++  const next =
++    path === '/healthz' && req.method === 'GET' ? await attachStartedAt(meshResp) : meshResp;
++  return applyLocalRenewal(req, next);
++}
++
++async function gatewayHttp(
++  gateway: GatewayRuntime,
++  mesh: MeshRuntime | null,
++  req: Request,
++  server: Bun.Server<unknown>
++): Promise<HttpResult> {
++  const gatewayResp = await gateway.handleRequest(req, server);
++  if (gatewayResp instanceof Response)
++    return mesh ? applyLocalRenewal(req, gatewayResp) : gatewayResp;
++  if (gatewayResp === undefined && new URL(req.url).pathname === '/ws') return undefined;
++  return null;
++}
++
++function createHttpDispatch(handlers: HttpHandler[]): AssembledTmex['fetch'] {
++  const dispatch = async (
++    req: Request,
++    bunServer: Bun.Server<unknown>,
++    rewritten: boolean
++  ): Promise<Response | undefined> => {
++    seedLocalContext(req, bunServer);
++    for (const handler of handlers) {
++      const out = await handler(req, bunServer);
++      if (isMeshRewritten(out)) {
++        if (!rewritten) return dispatch(out.rewritten, bunServer, true);
++        continue;
++      }
++      if (out !== null) return out ?? undefined;
++    }
++  };
++  return (req, bunServer) => dispatch(req, bunServer, false);
++}
++
++function routeWebsocket(
++  gateway: GatewayRuntime,
++  mesh: MeshRuntime | null,
++  hub: HubRuntime | null
++): GatewayRuntime['websocket'] {
++  const gw = gateway.websocket;
++  return {
++    backpressureLimit: gw.backpressureLimit,
++    closeOnBackpressureLimit: gw.closeOnBackpressureLimit,
++    open(ws) {
++      if (hub?.isUplinkSocket(ws)) {
++        hub.handleUplinkOpen(ws as HubServerWebSocket);
++        return;
++      }
++      const kind = socketKind(ws);
++      if (!(mesh && isMeshKind(kind))) {
++        gw.open(ws);
++        return;
++      }
++      const data = ws.data as { sid?: string; uid?: string; via?: string; cid?: string };
++      mesh.websocket.open(ws as never);
++      if (kind !== MESH_GATEWAY_WS_KIND) return;
++      gw.open(ws);
++      const session = (ws.data as { session?: GatewaySession }).session;
++      if (!data.sid || !data.uid || !session) return;
++      const cid = typeof data.cid === 'string' && data.cid.trim() ? data.cid.trim() : '';
++      const registered = mesh.registerGatewaySession?.({
++        sid: data.sid,
++        uid: data.uid,
++        via: data.via ?? MESH_VIA_SELF,
++        session,
++        ...(cid ? { cid } : {}),
++      });
++      if (registered && !registered.ok) {
++        gw.closeSession(session, WS_CLOSE_LOGIN_REQUIRED, registered.code);
++      }
++    },
++    message(ws, message) {
++      if (hub?.isUplinkSocket(ws)) {
++        hub.handleUplinkMessage(ws as HubServerWebSocket, message);
++        return;
++      }
++      const kind = socketKind(ws);
++      if (mesh && isMeshKind(kind)) {
++        if (kind === MESH_GATEWAY_WS_KIND) {
++          if (!mesh.touchSocket(ws as never)) return;
++          gw.message(ws, message);
++          return;
++        }
++        mesh.websocket.message(ws as never, message);
++        return;
++      }
++      if (mesh && !mesh.touchSocket(ws as never)) return;
++      gw.message(ws, message);
++    },
++    drain(ws) {
++      if (hub?.isUplinkSocket(ws)) {
++        hub.handleUplinkDrain(ws as HubServerWebSocket);
++        return;
++      }
++      if (mesh && isMeshKind(socketKind(ws)) && socketKind(ws) !== MESH_GATEWAY_WS_KIND) {
++        mesh.websocket.drain(ws as never);
++        return;
++      }
++      gw.drain(ws);
++    },
++    close(ws, code, reason) {
++      if (hub?.isUplinkSocket(ws)) {
++        hub.handleUplinkClose(ws as HubServerWebSocket, code, reason);
++        return;
++      }
++      if (mesh) {
++        const session = (ws.data as { session?: GatewaySession }).session;
++        if (session) mesh.unregisterGatewaySession?.(session);
++        mesh.websocket.close(ws as never, code, reason);
++        if (isMeshKind(socketKind(ws)) && socketKind(ws) !== MESH_GATEWAY_WS_KIND) return;
++      }
++      gw.close(ws, code, reason);
++    },
++    closeSession(session, code, reason) {
++      gw.closeSession(session, code, reason);
++    },
++  };
++}
++
++function buildTlsLifecycle(
++  fetch: AssembledTmex['fetch'],
++  websocket: GatewayRuntime['websocket'],
++  db: GatewayRuntime['db'],
++  routeDeps: LocalRouteDeps,
++  tlsSlot: { service?: TlsService }
++) {
++  const httpsListener = new HttpsListener({
++    fetch,
++    websocket,
++    log: (message) => console.log(`[tmex] ${message}`),
++  });
++  const tls = new TlsService({
++    store: new TlsConfigStore(db),
++    listener: httpsListener,
++    challenge: new AcmeHttp01Challenge(),
++    envPath: resolveSetupEnvPath(),
++    trustProxy: gatewayConfig.trustProxy,
++  });
++  tlsSlot.service = tls;
++  return {
++    tls,
++    httpsListener,
++    tlsHandler: createTlsRoutes({
++      service: tls,
++      authorize: async (req) =>
++        isStandaloneRoles(routeDeps.roles) || routeDeps.authenticate(req).ok
++          ? null
++          : jsonErr('UNAUTHORIZED', 'login required', 401),
++    }),
++  };
++}
++
+ export async function assembleTmex(opts: AssembleTmexOptions = {}): Promise<AssembledTmex> {
+   const roles = opts.roles ?? parseTmexRoles(process.env.TMEX_ROLES);
+   const staticRoot = opts.staticRoot ?? defaultStaticRoot();
+   const createGateway = opts.createGatewayRuntime ?? createTmexGatewayRuntime;
+   const createMesh = opts.createMeshRuntime ?? createMeshRuntime;
+   const serveFrontend = opts.serveFrontend ?? defaultServeFrontend;
+-
+   const gateway = await createGateway();
+   const tlsSlot: { service?: TlsService } = {};
+ 
+   let mesh: MeshRuntime | null = null;
+   if (roles.node) {
+     const nativeDir = opts.nativeDir ?? process.env.TMEX_NATIVE_DIR ?? '';
+-    const loadNative: LoadNative =
+-      opts.loadNative ??
+-      (async () => {
+-        if (process.env.TMEX_DIRECT_ENABLED === 'false') return null;
+-        if (!nativeDir) return null;
+-        return loadNodeDatachannel({ nativeDir });
+-      });
+-    const identityUserId = (await new NodeIdentityStore(gateway.db).load())?.userId ?? undefined;
+     mesh = await createMesh({
+       db: gateway.db,
+       gateway,
+@@ -187,21 +351,21 @@ export async function assembleTmex(opts: AssembleTmexOptions = {}): Promise<Asse
+         peerBindHost: gatewayConfig.peerBindHost,
+       },
+       hub: opts.hub,
+-      loadNative,
+-      userId: identityUserId,
+-      tlsInfo: async () => {
+-        const service = tlsSlot.service;
+-        if (!service) return { caFingerprint: null, caPem: null };
+-        return {
+-          caFingerprint: (await service.status()).caFingerprint,
+-          caPem: await service.caPem(),
+-        };
+-      },
++      loadNative:
++        opts.loadNative ??
++        (async () =>
++          process.env.TMEX_DIRECT_ENABLED === 'false' || !nativeDir
++            ? null
++            : loadNodeDatachannel({ nativeDir })),
++      userId: (await new NodeIdentityStore(gateway.db).load())?.userId ?? undefined,
++      tlsInfo: async () => ({
++        caFingerprint: tlsSlot.service ? (await tlsSlot.service.status()).caFingerprint : null,
++        caPem: (await tlsSlot.service?.caPem()) ?? null,
++      }),
+     });
+   }
+ 
+   const hub = mesh?.hub ?? opts.hub ?? null;
+-
+   const auth = await createAuthContextFromDb(gateway.db, {
+     installDir: resolveGatewayInstallDir(),
+     envPath: resolveSetupEnvPath(),
+@@ -216,13 +380,10 @@ export async function assembleTmex(opts: AssembleTmexOptions = {}): Promise<Asse
+   let restartRequested = false;
+   const scheduleRestart = (): void => {
+     restartRequested = true;
+-    setTimeout(() => {
+-      if (processShutdown) {
+-        void processShutdown();
+-        return;
+-      }
+-      process.exit(0);
+-    }, SETUP_RESTART_DELAY_MS);
++    setTimeout(
++      () => void (processShutdown ? processShutdown() : process.exit(0)),
++      SETUP_RESTART_DELAY_MS
++    );
+   };
+ 
+   const routeDeps: LocalRouteDeps = {
+@@ -244,34 +405,20 @@ export async function assembleTmex(opts: AssembleTmexOptions = {}): Promise<Asse
+     performHubJoin,
+     scheduleRestart,
+     quiesceMesh: async () => {
+-      try {
+-        await mesh?.stop();
+-      } catch {
+-        // best-effort
+-      }
+-      try {
+-        await hub?.stop();
+-      } catch {
+-        // best-effort
+-      }
++      await tryStop(() => mesh?.stop());
++      await tryStop(() => hub?.stop());
+     },
+     startedAt: PROCESS_STARTED_AT,
+     authenticate: (req) => {
+       try {
+-        return authenticateRequest(req, {
+-          roles,
+-          nodeSessionStore: auth.nodeSessionStore,
+-        });
++        return authenticateRequest(req, { roles, nodeSessionStore: auth.nodeSessionStore });
+       } catch {
+         return { ok: false };
+       }
+     },
+     tlsStatus: async () => {
+-      const service = tlsSlot.service;
+-      if (!service) {
+-        throw new Error('tls service is not initialized');
+-      }
+-      const status = await service.status();
++      if (!tlsSlot.service) throw new Error('tls service is not initialized');
++      const status = await tlsSlot.service.status();
+       return {
+         mode: status.mode,
+         listenerRunning: status.listener.running,
+@@ -281,229 +428,38 @@ export async function assembleTmex(opts: AssembleTmexOptions = {}): Promise<Asse
+   };
+ 
+   let tlsHandler: (req: Request) => Promise<Response | null> = async () => null;
+-
+-  const dispatch = async (
+-    req: Request,
+-    bunServer: Bun.Server<unknown>,
+-    rewritten: boolean
+-  ): Promise<Response | undefined> => {
+-    seedLocalContext(req, bunServer);
+-
+-    const tlsResp = await tlsHandler(req);
+-    if (tlsResp) return tlsResp;
+-
+-    const localResp = await handleLocalRequest(req, routeDeps);
+-    if (localResp) return localResp;
+-    const setupResp = await handleSetupRequest(req, routeDeps);
+-    if (setupResp) return setupResp;
+-
+-    if (hub) {
+-      const hubResp = await hub.handleRequest(req, bunServer);
+-      if (hubResp instanceof Response) return hubResp;
+-    }
+-
+-    if (mesh) {
+-      const path = new URL(req.url).pathname;
+-      if (path.startsWith('/api/')) {
+-        const blocked = mesh.localUiGuard(req);
+-        if (blocked) return blocked;
+-      }
+-      if (path === '/ws' || path === '/n/self/ws' || path === `/n/${mesh.nodeId}/ws`) {
+-        const wsGuard = mesh.guardGatewayWebSocket(req, bunServer);
+-        if (wsGuard !== null) return wsGuard ?? undefined;
+-      }
+-      const meshResp = await mesh.handleRequest(req, bunServer);
+-      if (isMeshRewritten(meshResp) && !rewritten) {
+-        return dispatch(meshResp.rewritten, bunServer, true);
+-      }
+-      if (meshResp instanceof Response) {
+-        const path = new URL(req.url).pathname;
+-        const next =
+-          path === '/healthz' && req.method === 'GET' ? await attachStartedAt(meshResp) : meshResp;
+-        return applyLocalRenewal(req, next);
+-      }
+-      if (meshResp === undefined) return undefined;
+-    } else {
+-      const path = new URL(req.url).pathname;
+-      if (path === '/api/auth/mode' && req.method === 'GET') {
+-        return new Response(JSON.stringify({ mode: 'none' }), {
+-          status: 200,
+-          headers: { 'content-type': 'application/json' },
+-        });
+-      }
+-    }
+-
+-    const gatewayResp = await gateway.handleRequest(req, bunServer);
+-    if (gatewayResp instanceof Response) {
+-      return mesh ? applyLocalRenewal(req, gatewayResp) : gatewayResp;
+-    }
+-    if (gatewayResp === undefined && new URL(req.url).pathname === '/ws') {
+-      return undefined;
+-    }
+-    return serveFrontend(req, staticRoot);
+-  };
+-
+-  const fetch: AssembledTmex['fetch'] = async (req, bunServer) => {
+-    return dispatch(req, bunServer, false);
+-  };
+-
+-  const websocket: GatewayRuntime['websocket'] = {
+-    backpressureLimit: gateway.websocket.backpressureLimit,
+-    closeOnBackpressureLimit: gateway.websocket.closeOnBackpressureLimit,
+-    open(ws) {
+-      if (hub?.isUplinkSocket(ws)) {
+-        hub.handleUplinkOpen(ws as HubServerWebSocket);
+-        return;
+-      }
+-      const kind = socketKind(ws);
+-      if (mesh && isMeshKind(kind)) {
+-        const data = ws.data as {
+-          sid?: string;
+-          uid?: string;
+-          via?: string;
+-          cid?: string;
+-        };
+-        const sid = data.sid;
+-        const uid = data.uid;
+-        const via = data.via ?? MESH_VIA_SELF;
+-        mesh.websocket.open(ws as never);
+-        if (kind === MESH_GATEWAY_WS_KIND) {
+-          gateway.websocket.open(ws);
+-          const session = (ws.data as { session?: GatewaySession }).session;
+-          if (sid && uid && session) {
+-            const cid = typeof data.cid === 'string' && data.cid.trim() ? data.cid.trim() : '';
+-            const registered = mesh.registerGatewaySession?.({
+-              sid,
+-              uid,
+-              via,
+-              session,
+-              ...(cid ? { cid } : {}),
+-            });
+-            if (registered && !registered.ok) {
+-              gateway.websocket.closeSession(session, WS_CLOSE_LOGIN_REQUIRED, registered.code);
+-            }
+-          }
+-        }
+-        return;
+-      }
+-      gateway.websocket.open(ws);
+-    },
+-    message(ws, message) {
+-      if (hub?.isUplinkSocket(ws)) {
+-        hub.handleUplinkMessage(ws as HubServerWebSocket, message);
+-        return;
+-      }
+-      const kind = socketKind(ws);
+-      if (mesh && isMeshKind(kind)) {
+-        if (kind === MESH_GATEWAY_WS_KIND) {
+-          if (!mesh.touchSocket(ws as never)) return;
+-          gateway.websocket.message(ws, message);
+-          return;
+-        }
+-        mesh.websocket.message(ws as never, message);
+-        return;
+-      }
+-      if (mesh && !mesh.touchSocket(ws as never)) {
+-        return;
+-      }
+-      gateway.websocket.message(ws, message);
+-    },
+-    drain(ws) {
+-      if (hub?.isUplinkSocket(ws)) {
+-        hub.handleUplinkDrain(ws as HubServerWebSocket);
+-        return;
+-      }
+-      const kind = socketKind(ws);
+-      if (mesh && isMeshKind(kind) && kind !== MESH_GATEWAY_WS_KIND) {
+-        mesh.websocket.drain(ws as never);
+-        return;
+-      }
+-      gateway.websocket.drain(ws);
+-    },
+-    close(ws, code, reason) {
+-      if (hub?.isUplinkSocket(ws)) {
+-        hub.handleUplinkClose(ws as HubServerWebSocket, code, reason);
+-        return;
+-      }
+-      const kind = socketKind(ws);
+-      if (mesh) {
+-        const session = (ws.data as { session?: GatewaySession }).session;
+-        if (session) mesh.unregisterGatewaySession?.(session);
+-        mesh.websocket.close(ws as never, code, reason);
+-        if (
+-          kind === MESH_WS_KIND ||
+-          kind === MESH_FORWARD_WS_KIND ||
+-          kind === MESH_REJECT_4401_KIND
+-        ) {
+-          return;
+-        }
+-      }
+-      gateway.websocket.close(ws, code, reason);
+-    },
+-    closeSession(session, code, reason) {
+-      gateway.websocket.closeSession(session, code, reason);
+-    },
+-  };
+-
+-  const challenge = new AcmeHttp01Challenge();
+-  const store = new TlsConfigStore(gateway.db);
+-  const httpsListener = new HttpsListener({
+-    fetch,
+-    websocket,
+-    log: (message) => console.log(`[tmex] ${message}`),
+-  });
+-  const tlsService = new TlsService({
+-    store,
+-    listener: httpsListener,
+-    challenge,
+-    envPath: resolveSetupEnvPath(),
+-    trustProxy: gatewayConfig.trustProxy,
+-  });
+-  tlsSlot.service = tlsService;
+-  tlsHandler = createTlsRoutes({
+-    service: tlsService,
+-    authorize: async (req) => {
+-      if (isStandaloneRoles(roles)) return null;
+-      const result = routeDeps.authenticate(req);
+-      if (!result.ok) {
+-        return jsonErr('UNAUTHORIZED', 'login required', 401);
+-      }
+-      return null;
+-    },
+-  });
++  const fetch = createHttpDispatch([
++    (req) => tlsHandler(req),
++    (req) => handleLocalRequest(req, routeDeps),
++    (req) => handleSetupRequest(req, routeDeps),
++    (req, server) =>
++      hub ? hub.handleRequest(req, server).then((r) => (r instanceof Response ? r : null)) : null,
++    (req, server) => meshHttp(mesh, req, server),
++    (req, server) => gatewayHttp(gateway, mesh, req, server),
++    (req) => serveFrontend(req, staticRoot),
++  ]);
++  const websocket = routeWebsocket(gateway, mesh, hub);
++  const tlsLife = buildTlsLifecycle(fetch, websocket, gateway.db, routeDeps, tlsSlot);
++  tlsHandler = tlsLife.tlsHandler;
+ 
+   let stopPromise: Promise<void> | null = null;
+-
+   return {
+     roles,
+     gateway,
+     mesh,
+     hub,
+-    tls: tlsService,
+-    httpsListener,
++    tls: tlsLife.tls,
++    httpsListener: tlsLife.httpsListener,
+     fetch,
+     websocket,
+     async start() {
+       await mesh?.start();
+     },
+     async stop() {
+-      if (stopPromise) return stopPromise;
+-      stopPromise = (async () => {
+-        try {
+-          await mesh?.stop();
+-        } catch (err) {
+-          console.error('[tmex] mesh stop failed', err);
+-        }
+-        try {
+-          await hub?.stop();
+-        } catch (err) {
+-          console.error('[tmex] hub stop failed', err);
+-        }
+-        try {
+-          await gateway.stop();
+-        } catch (err) {
+-          console.error('[tmex] gateway stop failed', err);
+-        }
++      stopPromise ??= (async () => {
++        await tryStop(() => mesh?.stop(), 'mesh');
++        await tryStop(() => hub?.stop(), 'hub');
++        await tryStop(() => gateway.stop(), 'gateway');
+       })();
+       return stopPromise;
+     },
+@@ -516,7 +472,7 @@ export async function assembleTmex(opts: AssembleTmexOptions = {}): Promise<Asse
+   };
+ }
+ 
+-export type ShutdownHooks = {
++type ShutdownHooks = {
+   on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+   exit?: (code: number) => void;
+   timeoutMs?: number;
+@@ -533,29 +489,19 @@ export function createProcessShutdown(
+     if (promise) return promise;
+     promise = new Promise<void>((resolve) => {
+       let finished = false;
+-      const timer = setTimeout(() => {
++      const timer = setTimeout(() => done(1), timeoutMs);
++      function done(code: number) {
+         if (finished) return;
+         finished = true;
+-        exit(1);
++        clearTimeout(timer);
++        exit(code);
+         resolve();
+-      }, timeoutMs);
++      }
+       void Promise.resolve()
+         .then(stop)
+         .then(
+-          () => {
+-            if (finished) return;
+-            finished = true;
+-            clearTimeout(timer);
+-            exit(0);
+-            resolve();
+-          },
+-          () => {
+-            if (finished) return;
+-            finished = true;
+-            clearTimeout(timer);
+-            exit(1);
+-            resolve();
+-          }
++          () => done(0),
++          () => done(1)
+         );
+     });
+     return promise;
+@@ -572,9 +518,7 @@ export function installShutdownHandlers(
+       process.on(event as NodeJS.Signals, listener as NodeJS.SignalsListener);
+     });
+   const run = createProcessShutdown(stop, hooks);
+-  const handler = () => {
+-    void run();
+-  };
++  const handler = () => void run();
+   on('SIGINT', handler);
+   on('SIGTERM', handler);
+   return run;
+diff --git a/packages/shared/src/link/fragment-core.test.ts b/packages/shared/src/link/fragment-core.test.ts
+new file mode 100644
+index 00000000..ae0c081f
+--- /dev/null
++++ b/packages/shared/src/link/fragment-core.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, test } from 'bun:test';
++import {
++  DC_MAX_MESSAGE_BYTES,
++  FRAGMENT_HEADER_SIZE,
++  FRAGMENT_PAYLOAD_SIZE,
++  fragmentBytes,
++} from './fragment-core';
++
++describe('fragmentBytes wire format', () => {
++  test('header is [frameId u32 LE][idx u16 LE][total u16 LE] then payload', () => {
++    const parts = fragmentBytes(0x01020304, new Uint8Array([0xaa, 0xbb]), FRAGMENT_PAYLOAD_SIZE);
++    expect(parts).toHaveLength(1);
++    const head = parts[0] as Uint8Array;
++    expect(Array.from(head.subarray(0, 8))).toEqual([0x04, 0x03, 0x02, 0x01, 0, 0, 1, 0]);
++    expect(Array.from(head.subarray(8))).toEqual([0xaa, 0xbb]);
++  });
++
++  test('empty payload is one header-only fragment; oversized payload splits', () => {
++    expect(fragmentBytes(7, new Uint8Array(0), FRAGMENT_PAYLOAD_SIZE)[0]?.byteLength).toBe(
++      FRAGMENT_HEADER_SIZE
++    );
++    const over = fragmentBytes(
++      2,
++      new Uint8Array(FRAGMENT_PAYLOAD_SIZE + 1).fill(2),
++      FRAGMENT_PAYLOAD_SIZE
++    );
++    expect(over).toHaveLength(2);
++    expect(over[0]?.byteLength).toBe(DC_MAX_MESSAGE_BYTES);
++    expect(Array.from((over[0] as Uint8Array).subarray(4, 8))).toEqual([0, 0, 2, 0]);
++    expect(Array.from((over[1] as Uint8Array).subarray(4, 8))).toEqual([1, 0, 2, 0]);
++  });
++});
+diff --git a/packages/shared/src/link/fragment-core.ts b/packages/shared/src/link/fragment-core.ts
+new file mode 100644
+index 00000000..88099e4d
+--- /dev/null
++++ b/packages/shared/src/link/fragment-core.ts
+@@ -0,0 +1,211 @@
++export const FRAGMENT_HEADER_SIZE = 8;
++export const DC_MAX_MESSAGE_BYTES = 64 * 1024;
++export const FRAGMENT_PAYLOAD_SIZE = DC_MAX_MESSAGE_BYTES - FRAGMENT_HEADER_SIZE;
++export const DEFAULT_FRAME_TIMEOUT_MS = 15_000;
++export const DEFAULT_MAX_IN_FLIGHT = 32;
++
++export type FragmentFail =
++  | 'short'
++  | 'chunk-too-large'
++  | 'total-zero'
++  | 'total-exceeds'
++  | 'bad-index'
++  | 'payload-exceeds'
++  | 'frame-too-large'
++  | 'pending-exceeded';
++
++type Pending = {
++  total: number;
++  received: number;
++  bytes: number;
++  chunks: Array<Uint8Array | undefined>;
++  deadline: number;
++};
++
++type Opts = {
++  timeoutMs: number;
++  maxInFlight: number;
++  now: () => number;
++  maxFrameBytes: number;
++  maxTotal: number;
++  payloadMax: number;
++  maxMessageBytes: number;
++  maxPendingBytes: number;
++  refreshDeadline: boolean;
++  setTimeoutFn?: (fn: () => void, ms: number) => unknown;
++  clearTimeoutFn?: (handle: unknown) => void;
++};
++
++export function fragmentBytes(
++  frameId: number,
++  payload: Uint8Array,
++  payloadSize: number
++): Uint8Array[] {
++  const size = Math.max(1, payloadSize);
++  const total = Math.max(1, Math.ceil(payload.byteLength / size));
++  const parts: Uint8Array[] = [];
++  for (let idx = 0; idx < total; idx++) {
++    const start = idx * size;
++    const end = Math.min(payload.byteLength, start + size);
++    const chunk = new Uint8Array(FRAGMENT_HEADER_SIZE + (end - start));
++    const dv = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
++    dv.setUint32(0, frameId >>> 0, true);
++    dv.setUint16(4, idx, true);
++    dv.setUint16(6, total, true);
++    if (end > start) chunk.set(payload.subarray(start, end), FRAGMENT_HEADER_SIZE);
++    parts.push(chunk);
++  }
++  return parts;
++}
++
++export class FragmentAssembler {
++  pendingBytes = 0;
++  disposed = false;
++  private timer: unknown = null;
++  private readonly pending = new Map<number, Pending>();
++  private readonly order: number[] = [];
++  private readonly o: Opts;
++
++  constructor(o: Partial<Opts> & Pick<Opts, 'maxFrameBytes' | 'maxTotal' | 'refreshDeadline'>) {
++    this.o = {
++      timeoutMs: o.timeoutMs ?? DEFAULT_FRAME_TIMEOUT_MS,
++      maxInFlight: o.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT,
++      now: o.now ?? Date.now,
++      maxFrameBytes: o.maxFrameBytes,
++      maxTotal: o.maxTotal,
++      payloadMax: o.payloadMax ?? Number.POSITIVE_INFINITY,
++      maxMessageBytes: o.maxMessageBytes ?? Number.POSITIVE_INFINITY,
++      maxPendingBytes: o.maxPendingBytes ?? Number.POSITIVE_INFINITY,
++      refreshDeadline: o.refreshDeadline,
++      setTimeoutFn: o.setTimeoutFn,
++      clearTimeoutFn: o.clearTimeoutFn,
++    };
++  }
++
++  clear(): void {
++    this.pending.clear();
++    this.order.length = 0;
++    this.pendingBytes = 0;
++  }
++
++  dispose(): void {
++    this.disposed = true;
++    this.clearTimer();
++    this.clear();
++  }
++
++  sweep(): void {
++    if (this.disposed) return;
++    const now = this.o.now();
++    for (const [id, frame] of this.pending) {
++      if (frame.deadline <= now) this.drop(id);
++    }
++    this.armTimer();
++  }
++
++  push(chunk: Uint8Array, fail: (kind: FragmentFail, message: string) => null): Uint8Array | null {
++    const o = this.o;
++    try {
++      if (this.disposed) return null;
++      if (chunk.byteLength < FRAGMENT_HEADER_SIZE) return fail('short', 'chunk-too-short');
++      if (chunk.byteLength > o.maxMessageBytes) return fail('chunk-too-large', 'chunk-too-large');
++      const dv = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
++      const frameId = dv.getUint32(0, true);
++      const idx = dv.getUint16(4, true);
++      const total = dv.getUint16(6, true);
++      if (total === 0) return fail('total-zero', 'bad-total');
++      if (total > o.maxTotal) {
++        return fail('total-exceeds', `fragment total ${total} exceeds ${o.maxTotal}`);
++      }
++      if (idx >= total) return fail('bad-index', 'bad-index');
++      const payloadLen = chunk.byteLength - FRAGMENT_HEADER_SIZE;
++      if (payloadLen > o.payloadMax) {
++        return fail('payload-exceeds', `fragment payload ${payloadLen} exceeds ${o.payloadMax}`);
++      }
++      const now = o.now();
++      for (const [id, f] of this.pending) {
++        if (f.deadline <= now) this.drop(id);
++      }
++      let frame = this.pending.get(frameId);
++      if (frame && frame.total !== total) {
++        this.drop(frameId);
++        frame = undefined;
++      }
++      if (!frame) {
++        while (this.order.length > 0 && this.pending.size >= o.maxInFlight) {
++          const id = this.order.shift();
++          if (id !== undefined && this.pending.has(id)) this.drop(id);
++        }
++        frame = {
++          total,
++          received: 0,
++          bytes: 0,
++          chunks: new Array(total),
++          deadline: now + o.timeoutMs,
++        };
++        this.pending.set(frameId, frame);
++        this.order.push(frameId);
++      }
++      if (frame.chunks[idx]) return null;
++      if (o.refreshDeadline) frame.deadline = o.now() + o.timeoutMs;
++      const piece = chunk.subarray(FRAGMENT_HEADER_SIZE).slice();
++      if (frame.bytes + piece.byteLength > o.maxFrameBytes) {
++        this.drop(frameId);
++        return fail('frame-too-large', `reassembled frame exceeds ${o.maxFrameBytes} bytes`);
++      }
++      if (this.pendingBytes + piece.byteLength > o.maxPendingBytes) {
++        this.drop(frameId);
++        return fail('pending-exceeded', 'pending-bytes-exceeded');
++      }
++      frame.chunks[idx] = piece;
++      frame.bytes += piece.byteLength;
++      frame.received += 1;
++      this.pendingBytes += piece.byteLength;
++      if (frame.received < frame.total) return null;
++      const out = new Uint8Array(frame.bytes);
++      let offset = 0;
++      for (const part of frame.chunks) {
++        if (!part) return null;
++        out.set(part, offset);
++        offset += part.byteLength;
++      }
++      this.drop(frameId);
++      return out;
++    } finally {
++      this.armTimer();
++    }
++  }
++
++  private drop(frameId: number): void {
++    const frame = this.pending.get(frameId);
++    if (frame) this.pendingBytes -= frame.bytes;
++    this.pending.delete(frameId);
++    const at = this.order.indexOf(frameId);
++    if (at >= 0) this.order.splice(at, 1);
++  }
++
++  private armTimer(): void {
++    const { setTimeoutFn, clearTimeoutFn } = this.o;
++    if (!setTimeoutFn || !clearTimeoutFn) return;
++    this.clearTimer();
++    if (this.disposed || this.pending.size === 0) return;
++    let earliest = Number.POSITIVE_INFINITY;
++    for (const frame of this.pending.values()) {
++      if (frame.deadline < earliest) earliest = frame.deadline;
++    }
++    if (earliest === Number.POSITIVE_INFINITY) return;
++    this.timer = setTimeoutFn(
++      () => {
++        this.timer = null;
++        this.sweep();
++      },
++      Math.max(0, earliest - this.o.now())
++    );
++  }
++
++  private clearTimer(): void {
++    if (this.timer == null) return;
++    this.o.clearTimeoutFn?.(this.timer);
++    this.timer = null;
++  }
++}
+diff --git a/packages/shared/src/link/index.ts b/packages/shared/src/link/index.ts
+index a3e8a1c6..eaed6621 100644
+--- a/packages/shared/src/link/index.ts
++++ b/packages/shared/src/link/index.ts
+@@ -37,6 +37,16 @@ export {
+   type SecureChannelOptions,
+   type SecureChannelDirections,
+ } from './secure-channel-link';
++export {
++  DC_MAX_MESSAGE_BYTES,
++  DEFAULT_FRAME_TIMEOUT_MS,
++  DEFAULT_MAX_IN_FLIGHT,
++  FRAGMENT_HEADER_SIZE,
++  FRAGMENT_PAYLOAD_SIZE,
++  FragmentAssembler,
++  fragmentBytes,
++  type FragmentFail,
++} from './fragment-core';
+ export {
+   FRAME_HEADER_SIZE,
+   MAX_FRAME_PAYLOAD,
+diff --git a/packages/shared/src/link/websocket-link.ts b/packages/shared/src/link/websocket-link.ts
+index 237c9ab8..4223d8fe 100644
+--- a/packages/shared/src/link/websocket-link.ts
++++ b/packages/shared/src/link/websocket-link.ts
+@@ -8,10 +8,6 @@ import {
+   type LinkStream,
+ } from './types';
+ 
+-/**
+- * Adapter for wrapping a Bun `ServerWebSocket` outside this package.
+- * `send` matches Bun: `>0` accepted, `-1` queued with backpressure, `0` discarded.
+- */
+ export interface ServerSocketAdapter {
+   send(bytes: Uint8Array): number;
+   close(code?: number, reason?: string): void;
+@@ -195,7 +191,6 @@ function createQueuedTransport(hooks: QueuedTransportHooks): ByteTransport {
+   };
+ }
+ 
+-/** Standard DOM/Bun client `WebSocket` (`send(): void`, event listeners). */
+ export function createClientWebSocketTransport(ws: WebSocket): ByteTransport {
+   if (ws.binaryType !== undefined) {
+     ws.binaryType = 'arraybuffer';
+@@ -254,10 +249,6 @@ export type WebSocketLinkOptions = {
+   maxLinkUnacked?: number;
+ };
+ 
+-/**
+- * LinkSession over a client `WebSocket` or a `ServerSocketAdapter`
+- * wrapping a Bun `ServerWebSocket`.
+- */
+ export class WebSocketLink implements LinkSession {
+   private readonly mux: LinkMux;
+ 
+diff --git a/apps/gateway/src/hub/hub-runtime.ts b/apps/gateway/src/hub/hub-runtime.ts
+index 8ea6e771..68cd53e9 100644
+--- a/apps/gateway/src/hub/hub-runtime.ts
++++ b/apps/gateway/src/hub/hub-runtime.ts
+@@ -454,11 +454,17 @@ export class HubRuntime {
+   private async handleRedeem(req: Request): Promise<Response> {
+     const body = await readJsonObjectBody(req);
+     if (!body) return json({ error: 'invalid_body' }, 400);
++    let parsed: ReturnType<typeof parseRedeemRequest>;
++    try {
++      parsed = parseRedeemRequest(body, this.userStore);
++    } catch (err) {
++      if (err instanceof RedeemAbort) return json({ error: err.error }, err.status);
++      return validationError(err);
++    }
++    const { hexId, token, stored, providedName, version, certBytes, certSig, certificate } =
++      parsed;
++    const now = this.now();
+     try {
+-      const parsed = parseRedeemRequest(body, this.userStore);
+-      const { hexId, token, stored, providedName, version, certBytes, certSig, certificate } =
+-        parsed;
+-      const now = this.now();
+       let replayUserId: string | null = null;
+       let replacedExisting = false;
+       let alreadyAdmitted = false;
+@@ -503,7 +509,7 @@ export class HubRuntime {
+       return this.redeemSuccessPayload(replayUserId ?? token.userId, alreadyAdmitted);
+     } catch (err) {
+       if (err instanceof RedeemAbort) return json({ error: err.error }, err.status);
+-      return validationError(err);
++      throw err;
+     }
+   }
+ 
+diff --git a/apps/gateway/src/mesh/auth-routes.ts b/apps/gateway/src/mesh/auth-routes.ts
+index 0e93dd60..7d9df59e 100644
+--- a/apps/gateway/src/mesh/auth-routes.ts
++++ b/apps/gateway/src/mesh/auth-routes.ts
+@@ -647,18 +647,19 @@ export class AuthRoutes {
+       stored = null;
+     }
+     if (!stored || stored.userId !== user.id) return bad;
++    let assertion: ReturnType<typeof decodePasskeyAssertionSig>;
+     try {
+-      const assertion = decodePasskeyAssertionSig(delegationSig);
+-      const ok = await this.verifyPasskey({
+-        challenge: delegationChallenge(delegation),
+-        delegation,
+-        assertion,
+-        credentialId: delegation.credential_id,
+-      });
+-      return ok ? { ok: true } : bad;
++      assertion = decodePasskeyAssertionSig(delegationSig);
+     } catch {
+       return bad;
+     }
++    const ok = await this.verifyPasskey({
++      challenge: delegationChallenge(delegation),
++      delegation,
++      assertion,
++      credentialId: delegation.credential_id,
++    });
++    return ok ? { ok: true } : bad;
+   }
+ 
+   private async checkTotp(

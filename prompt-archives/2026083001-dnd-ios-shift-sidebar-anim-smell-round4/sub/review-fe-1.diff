@@ -1,0 +1,3406 @@
+diff --git a/apps/fe/src/auth/session-key-store.test.ts b/apps/fe/src/auth/session-key-store.test.ts
+index 1f9c96a6..37409d62 100644
+--- a/apps/fe/src/auth/session-key-store.test.ts
++++ b/apps/fe/src/auth/session-key-store.test.ts
+@@ -63,11 +63,14 @@ function mockApi(options: {
+   meshListStatus?: number;
+   /** entry 自身在 mesh 列表里的公钥（默认与 challenge 返回的一致）。 */
+   entryPkInList?: Uint8Array;
++  /** 让匹配的请求直接网络失败。 */
++  offline?: (url: string) => boolean;
+ }): { api: AuthApi; captured: Captured } {
+   const nodes = options.nodes ?? [{ id: NODE_A, publicKey: NODE_A_PK }];
+   const captured: Captured = { loginCalls: [], challengeCalls: [], meshListCalls: 0 };
+ 
+   const client = new ApiClient('', (url, init) => {
++    if (options.offline?.(url)) return Promise.reject(new Error('offline'));
+     if (url === '/api/mesh/nodes') {
+       captured.meshListCalls += 1;
+       if (options.meshListStatus && options.meshListStatus !== 200) {
+@@ -232,6 +235,18 @@ describe('loginToNode', () => {
+     expect(await loginToNode(NODE_UNKNOWN, { api })).toEqual({ ok: false, code: 'UNKNOWN_NODE' });
+   });
+ 
++  test('列表 / challenge / login 任一网络失败都映射成 NETWORK_ERROR', async () => {
++    establishRoot();
++    const offline = { ok: false, code: 'NETWORK_ERROR' };
++    for (const match of [
++      (url: string) => url === '/api/mesh/nodes',
++      (url: string) => url.endsWith('/challenge'),
++      (url: string) => url.endsWith('/login'),
++    ]) {
++      expect(await loginToNode(NODE_A, { api: mockApi({ offline: match }).api })).toEqual(offline);
++    }
++  });
++
+   test('后端返回的 code 原样透出', async () => {
+     establishRoot();
+     const { api } = mockApi({ loginStatus: () => 401 });
+diff --git a/apps/fe/src/auth/session-key-store.ts b/apps/fe/src/auth/session-key-store.ts
+index 1d48bf83..7fb17f26 100644
+--- a/apps/fe/src/auth/session-key-store.ts
++++ b/apps/fe/src/auth/session-key-store.ts
+@@ -34,7 +34,7 @@ import {
+   signLogin,
+ } from '@tmex/shared/auth';
+ 
+-export type SessionKeyMethod = 'root' | 'passkey';
++type SessionKeyMethod = 'root' | 'passkey';
+ 
+ /** 对外可见的会话钥元数据（不含任何私钥字节）。 */
+ export interface SessionKeyInfo {
+@@ -69,7 +69,7 @@ export type LoginFailureCode =
+   | 'NODE_LIST_FAILED'
+   | (string & {});
+ 
+-export type LoginNodeResult = { ok: true } | { ok: false; code: LoginFailureCode };
++type LoginNodeResult = { ok: true } | { ok: false; code: LoginFailureCode };
+ 
+ // ---------------------------------------------------------------------------
+ // 状态
+@@ -137,7 +137,7 @@ export function setTotpCode(code: string): void {
+ // 建立会话钥
+ // ---------------------------------------------------------------------------
+ 
+-export interface EstablishFromSeedOptions {
++interface EstablishFromSeedOptions {
+   uid: string;
+   entryNodeId: string;
+   rootEpoch: number;
+@@ -187,7 +187,7 @@ export function establishSessionFromSeed(
+   return current.info;
+ }
+ 
+-export interface EstablishFromPasswordOptions extends EstablishFromSeedOptions {
++interface EstablishFromPasswordOptions extends EstablishFromSeedOptions {
+   password: string;
+   kdfParams: { salt: string; memory_kib: number; iterations: number; parallelism: number };
+ }
+@@ -204,7 +204,7 @@ export async function establishSessionFromPassword(
+   return establishSessionFromSeed(seed, opts);
+ }
+ 
+-export interface EstablishFromPasskeyOptions {
++interface EstablishFromPasskeyOptions {
+   uid: string;
+   entryNodeId: string;
+   /** 指定用哪一把；不给则按当前 origin / RP 过滤后再选。 */
+@@ -219,7 +219,7 @@ export interface EstablishFromPasskeyOptions {
+   generateSessionKeyPair?: () => { publicKey: Uint8Array; secretKey: Uint8Array };
+ }
+ 
+-export class PasskeyCredentialUnknownError extends Error {
++class PasskeyCredentialUnknownError extends Error {
+   readonly code = 'PASSKEY_CREDENTIAL_UNKNOWN';
+   constructor() {
+     super('no passkey credential available for this entry');
+@@ -239,7 +239,7 @@ function currentOrigin(override?: string): string {
+  * - `browser`：**不由前端挑**，把这份列表原样交给 WebAuthn，让浏览器 / 认证器选；
+  * - `none`：当前 origin 一把可用的都没有。
+  */
+-export type PasskeySelection =
++type PasskeySelection =
+   | { kind: 'bind'; credentialId: string }
+   | { kind: 'browser'; allowCredentials: PublicKeyCredentialDescriptorJSON[] }
+   | { kind: 'none' };
+@@ -396,7 +396,7 @@ export async function establishSessionFromPasskey(
+ // 登录
+ // ---------------------------------------------------------------------------
+ 
+-export interface LoginToNodeOptions {
++interface LoginToNodeOptions {
+   api?: AuthApi;
+   /** 已知的 node 行（避免 fan-out 时每个 node 各拉一次列表）。 */
+   node?: MeshNode;
+@@ -422,38 +422,32 @@ export async function loginToNode(
+   const session = getSessionKey();
+   if (!current || !session) return { ok: false, code: 'NO_SESSION_KEY' };
+   const api = opts.api ?? defaultAuthApi;
+-  const bootstrap = opts.selfBootstrap === true && nodeId === SELF_NODE_ID;
+ 
+   let node = opts.node;
+-  if (!node && !bootstrap) {
+-    try {
+-      node = (await api.listNodes()).find((item) => item.id === nodeId);
+-    } catch {
+-      return { ok: false, code: 'NETWORK_ERROR' };
+-    }
++  if (!node && !(opts.selfBootstrap && nodeId === SELF_NODE_ID)) {
++    const nodes = await api.listNodes().catch(() => null);
++    if (!nodes) return { ok: false, code: 'NETWORK_ERROR' };
++    node = nodes.find((item) => item.id === nodeId);
++    if (!node) return { ok: false, code: 'UNKNOWN_NODE' };
+   }
+-  if (!node && !bootstrap) return { ok: false, code: 'UNKNOWN_NODE' };
+ 
+-  const needsTotp = session.method === 'root' && session.hasTotp;
+-  if (needsTotp && !(current.kTotp && current.totpCode)) {
+-    return { ok: false, code: 'TOTP_REQUIRED' };
+-  }
++  // 需要 TOTP 但码不在内存里 → null（回 TOTP_REQUIRED，一个请求都不发）；不需要 TOTP → undefined。
++  const totp =
++    session.method === 'root' && session.hasTotp
++      ? current.kTotp && current.totpCode
++        ? { code: current.totpCode, k_totp: encodeBase64url(current.kTotp) }
++        : null
++      : undefined;
++  if (totp === null) return { ok: false, code: 'TOTP_REQUIRED' };
+ 
+-  let challenge: Awaited<ReturnType<AuthApi['challenge']>>;
+-  try {
+-    challenge = await api.challenge(nodeId, session.uid);
+-  } catch {
+-    return { ok: false, code: 'NETWORK_ERROR' };
+-  }
++  const challenge = await api.challenge(nodeId, session.uid).catch(() => null);
++  if (!challenge) return { ok: false, code: 'NETWORK_ERROR' };
+ 
+   const targetPk = decodeBase64url(challenge.nodePk);
+-  if (node) {
+-    if (!bytesEqual(targetPk, decodeBase64url(node.publicKey))) {
+-      return { ok: false, code: 'NODE_PK_MISMATCH' };
+-    }
+-  } else {
+-    selfChallengePk = targetPk;
++  if (node && !bytesEqual(targetPk, decodeBase64url(node.publicKey))) {
++    return { ok: false, code: 'NODE_PK_MISMATCH' };
+   }
++  if (!node) selfChallengePk = targetPk;
+ 
+   const login = buildLogin({
+     challengeId: challenge.challenge_id,
+@@ -463,29 +457,24 @@ export async function loginToNode(
+     uid: session.uid,
+     entry: session.entryNodeId,
+   });
+-  const sig = signLogin(current.sessSk, login);
+-
+-  try {
+-    const result = await api.login(nodeId, {
++  const result = await api
++    .login(nodeId, {
+       login: encodeBase64url(encodeLogin(login)),
+-      sig: encodeBase64url(sig),
++      sig: encodeBase64url(signLogin(current.sessSk, login)),
+       delegation: encodeBase64url(current.delegationBytes),
+       delegation_sig: encodeBase64url(current.delegationSig),
+-      ...(needsTotp && current.kTotp && current.totpCode
+-        ? { totp: { code: current.totpCode, k_totp: encodeBase64url(current.kTotp) } }
+-        : {}),
+-    });
+-    return result.ok ? { ok: true } : { ok: false, code: result.code };
+-  } catch {
+-    return { ok: false, code: 'NETWORK_ERROR' };
+-  }
++      ...(totp ? { totp } : {}),
++    })
++    .catch(() => null);
++  if (!result) return { ok: false, code: 'NETWORK_ERROR' };
++  return result.ok ? { ok: true } : { ok: false, code: result.code };
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // entry 自身登录 + 按需的单 node 登录
+ // ---------------------------------------------------------------------------
+ 
+-export interface LoginSelfOptions {
++interface LoginSelfOptions {
+   api?: AuthApi;
+ }
+ 
+@@ -506,36 +495,25 @@ export async function loginSelf(opts: LoginSelfOptions = {}): Promise<LoginNodeR
+     return selfResult;
+   }
+ 
+-  let nodes: MeshNode[];
+-  try {
+-    nodes = await api.listNodes();
+-  } catch {
+-    clearTotpCode();
+-    return { ok: false, code: 'NODE_LIST_FAILED' };
+-  }
++  const nodes = await api.listNodes().catch(() => null);
++  // 一次性 TOTP 码用完即弃：它只在 ±30s 内有效，留着也救不了后面的懒登录，
++  // 而 k_totp（服务端 TOTP 密文的解密钥）保留在内存里，用户下次输入新码时直接可用。
++  clearTotpCode();
++  if (!nodes) return { ok: false, code: 'NODE_LIST_FAILED' };
+ 
+-  const entryNodeId = current?.info.entryNodeId ?? null;
+-  const selfRow = entryNodeId ? nodes.find((node) => node.id === entryNodeId) : undefined;
+-  if (
+-    selfRow &&
+-    selfChallengePk &&
+-    !bytesEqual(selfChallengePk, decodeBase64url(selfRow.publicKey))
+-  ) {
+-    selfChallengePk = null;
++  const selfRow = nodes.find((node) => node.id === current?.info.entryNodeId);
++  const pinnedPk = selfChallengePk;
++  selfChallengePk = null;
++  if (selfRow && pinnedPk && !bytesEqual(pinnedPk, decodeBase64url(selfRow.publicKey))) {
+     clearSessionKey();
+-    clearTotpCode();
+     return { ok: false, code: 'NODE_PK_MISMATCH' };
+   }
+-  selfChallengePk = null;
+ 
+-  // 一次性 TOTP 码用完即弃：它只在 ±30s 内有效，留着也救不了后面的懒登录，
+-  // 而 k_totp（服务端 TOTP 密文的解密钥）保留在内存里，用户下次输入新码时直接可用。
+-  clearTotpCode();
+   markLoggedIn(SELF_NODE_ID);
+   return { ok: true };
+ }
+ 
+-export interface EnsureNodeLoginOptions {
++interface EnsureNodeLoginOptions {
+   api?: AuthApi;
+   /** 已知的 node 行，省掉 `loginToNode` 内部再拉一次 `/api/mesh/nodes`。 */
+   node?: MeshNode;
+@@ -578,18 +556,3 @@ export function ensureNodeLogin(
+ export function resetNodeLoginsForTest(): void {
+   nodeLoginsInFlight.clear();
+ }
+-
+-/** 全部登出：对每台 node fan-out `POST /n/:T/api/auth/logout`，随后丢弃会话钥。 */
+-export async function logoutEverywhere(opts: { api?: AuthApi } = {}): Promise<void> {
+-  const api = opts.api ?? defaultAuthApi;
+-  let nodes: MeshNode[] = [];
+-  try {
+-    nodes = await api.listNodes();
+-  } catch {
+-    nodes = [];
+-  }
+-  await Promise.all(
+-    nodes.filter((node) => node.loggedIn).map((node) => api.logout(node.id).catch(() => undefined))
+-  );
+-  clearSessionKey();
+-}
+diff --git a/apps/fe/src/auth/use-node-login.ts b/apps/fe/src/auth/use-node-login.ts
+index e78f14dd..ac4b9994 100644
+--- a/apps/fe/src/auth/use-node-login.ts
++++ b/apps/fe/src/auth/use-node-login.ts
+@@ -5,7 +5,6 @@
+ // 「登录此节点」按钮 → `/login?node=`。
+ 
+ import {
+-  type MeshNodesState,
+   ensureAuthMode,
+   getMeshNodesState,
+   refreshMeshNodes,
+@@ -16,7 +15,7 @@ import type { MeshNode } from '@tmex/api-client/auth/index';
+ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+ import { type LoginFailureCode, ensureNodeLogin } from './session-key-store';
+ 
+-export type NodeLoginGateStatus =
++type NodeLoginGateStatus =
+   /** 可以直接渲染该 node 的内容：本机、standalone、已登录，或确定判断不了。 */
+   | 'ready'
+   /** 正在确认状态或正在静默登录。 */
+@@ -32,13 +31,38 @@ export interface NodeLoginGate {
+   retry: () => void;
+ }
+ 
+-export interface UseNodeLoginGateOptions {
++interface UseNodeLoginGateOptions {
+   /** false 时门闸恒为 `ready` 且不发任何请求（侧边栏折叠态）。 */
+   enabled?: boolean;
+ }
+ 
+-function selectState(): MeshNodesState {
+-  return getMeshNodesState();
++/**
++ * 静默登录：`needsLogin` 起来就登一次，失败后停下等 `retry()`。
++ * 失败记录带上 nodeId：切到另一台 node 时旧的失败自动不再匹配，不必额外重置。
++ */
++function useSilentLogin(
++  nodeId: string,
++  row: MeshNode | null,
++  needsLogin: boolean
++): { code: LoginFailureCode | null; retry: () => void } {
++  const [failure, setFailure] = useState<{ nodeId: string; code: LoginFailureCode } | null>(null);
++  const rowRef = useRef<MeshNode | null>(row);
++  rowRef.current = row;
++  const code = failure?.nodeId === nodeId ? failure.code : null;
++
++  useEffect(() => {
++    if (!needsLogin || code !== null) return;
++    let cancelled = false;
++    void ensureNodeLogin(nodeId, { node: rowRef.current ?? undefined }).then((result) => {
++      if (!cancelled && !result.ok) setFailure({ nodeId, code: result.code });
++    });
++    return () => {
++      cancelled = true;
++    };
++  }, [needsLogin, code, nodeId]);
++
++  // 清掉失败记录即重新触发上面的静默登录。
++  return { code, retry: useCallback(() => setFailure(null), []) };
+ }
+ 
+ /**
+@@ -53,61 +77,31 @@ export function useNodeLoginGate(
+   runtimeNodeId: string,
+   options: UseNodeLoginGateOptions = {}
+ ): NodeLoginGate {
+-  const enabled = options.enabled ?? true;
+-  const snapshot = useSyncExternalStore(subscribeMeshNodes, selectState, selectState);
+-  // 失败记录带上 nodeId：切到另一台 node 时旧的失败自动不再匹配，不必额外重置。
+-  const [failure, setFailure] = useState<{ nodeId: string; code: LoginFailureCode } | null>(null);
+-
+-  const meshEnabled = snapshot.mode?.mode === 'mesh';
+-  const isSelf =
+-    runtimeNodeId === SELF_NODE_ID ||
+-    (snapshot.entryNodeId != null && runtimeNodeId === snapshot.entryNodeId);
+-  const active = enabled && !isSelf;
+-
+-  const row: MeshNode | null =
+-    active && meshEnabled
+-      ? (snapshot.nodes.find((node) => node.id === runtimeNodeId) ?? null)
+-      : null;
+-  const rowRef = useRef<MeshNode | null>(row);
+-  rowRef.current = row;
+-
++  const snapshot = useSyncExternalStore(subscribeMeshNodes, getMeshNodesState, getMeshNodesState);
++  const active =
++    (options.enabled ?? true) &&
++    runtimeNodeId !== SELF_NODE_ID &&
++    runtimeNodeId !== snapshot.entryNodeId;
++  const meshEnabled = active && snapshot.mode?.mode === 'mesh';
++  const row = meshEnabled
++    ? (snapshot.nodes.find((node) => node.id === runtimeNodeId) ?? null)
++    : null;
+   const modeUnknown = active && !snapshot.modeLoaded;
+-  const listUnknown =
+-    active && meshEnabled && snapshot.loadedAt === null && snapshot.error === null;
++  const listUnknown = meshEnabled && snapshot.loadedAt === null && snapshot.error === null;
+ 
+   useEffect(() => {
+-    if (!active) return;
+-    void ensureAuthMode();
++    if (active) void ensureAuthMode();
+   }, [active]);
+   useEffect(() => {
+-    if (!listUnknown) return;
+-    void refreshMeshNodes();
++    if (listUnknown) void refreshMeshNodes();
+   }, [listUnknown]);
+ 
+   const needsLogin = row?.online === true && !row.loggedIn;
+-  const failedHere = failure?.nodeId === runtimeNodeId ? failure : null;
+-
+-  useEffect(() => {
+-    if (!needsLogin || failedHere) return;
+-    let cancelled = false;
+-    void ensureNodeLogin(runtimeNodeId, { node: rowRef.current ?? undefined }).then((result) => {
+-      if (cancelled || result.ok) return;
+-      setFailure({ nodeId: runtimeNodeId, code: result.code });
+-    });
+-    return () => {
+-      cancelled = true;
+-    };
+-  }, [needsLogin, failedHere, runtimeNodeId]);
+-
+-  // 清掉失败记录即重新触发上面的静默登录。
+-  const retry = useCallback(() => setFailure(null), []);
++  const { code, retry } = useSilentLogin(runtimeNodeId, row, needsLogin);
+ 
+   let status: NodeLoginGateStatus = 'ready';
+-  if (modeUnknown || listUnknown) {
+-    status = 'pending';
+-  } else if (needsLogin) {
+-    status = failedHere ? 'blocked' : 'pending';
+-  }
++  if (modeUnknown || listUnknown) status = 'pending';
++  else if (needsLogin) status = code === null ? 'pending' : 'blocked';
+ 
+-  return { status, code: failedHere?.code ?? null, retry };
++  return { status, code, retry };
+ }
+diff --git a/apps/fe/src/components/page-layouts/components/app-sidebar.tsx b/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
+index fc88b3dc..8ce16700 100644
+--- a/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
++++ b/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
+@@ -73,17 +73,23 @@ export function AppSidebar({ ...props }: ComponentProps<typeof Sidebar>) {
+       </SidebarHeader>
+       <SidebarContent className="flex min-h-0 flex-col overflow-hidden">
+         {/* 换 tab 时只让新内容淡入；壳的 flex 链（min-h-0 / flex-1）必须原样透下去，
+-            否则设备树与文件树会失去可滚动高度。 */}
+-        <Reveal key={sidebarTab} className="flex min-h-0 flex-1 flex-col">
+-          {sidebarTab === 'panes' && <SideBarDeviceList />}
+-          {sidebarTab !== 'panes' && (
++            否则设备树与文件树会失去可滚动高度。
++            设备树的 key 只能是 tab 本身：切 node 时它不重挂（展开态/滚动位置都得留着）。
++            智能体 / 文件两块本来就随 routeNodeId 重挂，key 带上 node 让重挂淡入而不是直接弹出。 */}
++        {sidebarTab === 'panes' && (
++          <Reveal key="panes" className="flex min-h-0 flex-1 flex-col">
++            <SideBarDeviceList />
++          </Reveal>
++        )}
++        {sidebarTab !== 'panes' && (
++          <Reveal key={`${sidebarTab}:${routeNodeId}`} className="flex min-h-0 flex-1 flex-col">
+             <NodeRuntimeScope nodeId={routeNodeId}>
+               <Suspense fallback={null}>
+                 {sidebarTab === 'agent' ? <AgentTab /> : <FilesTab />}
+               </Suspense>
+             </NodeRuntimeScope>
+-          )}
+-        </Reveal>
++          </Reveal>
++        )}
+       </SidebarContent>
+       <SidebarFooter>
+         <NavMain items={navMainItems} />
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+index 2ab5592e..9e1d8274 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+@@ -11,6 +11,7 @@ import { useRuntime } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import type { CSSProperties, ReactNode } from 'react';
+ import { SidebarAgentSessionsProvider, useSidebarAgentAdapter } from './sidebar-agent-sessions';
++import { useSectionPresence } from './use-section-presence';
+ 
+ /** 聚合视图的分节外壳：分节头与设备树同生共死，没有可显示的设备时整节都不渲染。 */
+ export interface SidebarNodeSectionShell {
+@@ -68,7 +69,11 @@ function NodeSection({
+   ...rest
+ }: SideBarDeviceListForRuntimeProps & { section: SidebarNodeSectionShell }) {
+   const stats = useSidebarDeviceStats();
+-  if (!stats.failed && shouldHideSidebarNodeSection(stats, section.keepWhenNoDevices ?? false)) {
++  const visible =
++    stats.failed || !shouldHideSidebarNodeSection(stats, section.keepWhenNoDevices ?? false);
++  // 切 node 会让「选中的那台无条件保留」失效，整节可能就此隐藏：淡出后再卸载，别硬切
++  const presence = useSectionPresence(visible, null);
++  if (!presence.rendered) {
+     return null;
+   }
+ 
+@@ -77,7 +82,7 @@ function NodeSection({
+       ref={section.containerRef}
+       style={section.containerStyle}
+       data-testid={section.testId}
+-      className={cn('space-y-0.5', section.containerClassName)}
++      className={cn('space-y-0.5', presence.className, section.containerClassName)}
+     >
+       {section.header}
+       <DeviceTree {...rest} />
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
+index 18aae55f..2bfd6b1e 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list.test.tsx
+@@ -260,6 +260,16 @@ describe('SidebarNodeSection', () => {
+     expect(html).not.toContain('data-testid="device-item-');
+   });
+ 
++  test('可见的离线分节首屏就在且不透明：presence 外壳既不推迟渲染也不淡入一遍', () => {
++    const html = render(<SidebarNodeSection node={offlineNode()} />, {
++      [sidebarDeviceVisibilityKey(OFFLINE_NODE, 'd1')]: true,
++    });
++
++    expect(html).toContain(`data-testid="sidebar-node-offline-${OFFLINE_NODE}"`);
++    const section = html.slice(html.indexOf(`data-testid="sidebar-node-offline-${OFFLINE_NODE}"`));
++    expect(section.slice(0, section.indexOf('>'))).toContain('opacity-100');
++  });
++
+   test('离线 node：当前选中的那台设备无条件保留（与在线选择器同一条例外）', () => {
+     const html = render(
+       <SidebarNodeSection node={offlineNode()} />,
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+index cde02c60..47dd572a 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-node-section.tsx
+@@ -25,6 +25,7 @@ import { useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link, matchPath, useLocation } from 'react-router';
+ import { SideBarDeviceListForRuntime } from './sidebar-device-list-runtime';
++import { useSectionPresence } from './use-section-presence';
+ 
+ /** 分节整体的拖拽接线；未传即不可拖（standalone / 单元测试直接渲染分节时）。 */
+ export interface SidebarNodeSortable {
+@@ -177,7 +178,12 @@ function SidebarNodeSignIn({ node, drag }: { node: SidebarNodeEntry; drag?: Side
+   );
+ }
+ 
+-export function SidebarNodeSection({
++/**
++ * 离线分节：灰显最近一次已知 inventory 里的设备。已知设备被取消显示（或切到别的 node
++ * 让「选中的那台无条件保留」失效）时整节隐藏——过 `useSectionPresence` 淡出后再卸载，
++ * 退场期间沿用锁住的设备列表，不会先掉内容再消失。
++ */
++function SidebarNodeOffline({
+   node,
+   drag,
+ }: { node: SidebarNodeEntry; drag?: SidebarNodeSortable }) {
+@@ -186,50 +192,57 @@ export function SidebarNodeSection({
+   const visibility = useUIStore((state) => state.sidebarDeviceVisibility);
+   const selectedDeviceId = selectedDeviceIdForNode(useLocation().pathname, node.runtimeNodeId);
+ 
+-  if (!node.online) {
+-    const knownDevices = inventoryDevices(node.inventory);
+-    const devices = knownDevices.filter(
+-      (device) =>
+-        device.id === selectedDeviceId ||
+-        isSidebarDeviceVisible(visibility, node.runtimeNodeId, device.id)
+-    );
+-    // 已知设备全被取消显示时整节隐藏（与在线分节同一条规则）；零已知设备只给 self 留空态。
+-    if (
+-      shouldHideSidebarNodeSection(
+-        { total: knownDevices.length, visible: devices.length },
+-        node.isSelf
+-      )
+-    ) {
+-      return null;
+-    }
++  const knownDevices = inventoryDevices(node.inventory);
++  const devices = knownDevices.filter(
++    (device) =>
++      device.id === selectedDeviceId ||
++      isSidebarDeviceVisible(visibility, node.runtimeNodeId, device.id)
++  );
++  // 已知设备全被取消显示时整节隐藏（与在线分节同一条规则）；零已知设备只给 self 留空态。
++  const hidden = shouldHideSidebarNodeSection(
++    { total: knownDevices.length, visible: devices.length },
++    node.isSelf
++  );
++  const presence = useSectionPresence(!hidden, devices);
++  if (!presence.rendered) return null;
+ 
+-    return (
+-      <div
+-        ref={drag?.sortable.setNodeRef}
+-        style={drag?.sortable.style}
+-        data-testid={`sidebar-node-offline-${node.runtimeNodeId}`}
+-        className={cn('space-y-0.5', drag?.sortable.isDragging && 'opacity-60')}
+-      >
+-        <SectionHeader node={node} hint={t('sidebar.node.offline')} drag={drag} />
+-        {knownDevices.length === 0 ? (
+-          <div className="tmex-fade px-2 py-1 text-[11px] text-muted-foreground/60">
+-            {t('sidebar.node.noKnownDevices')}
+-          </div>
+-        ) : (
+-          devices.map((device) => (
+-            <Link
+-              key={device.id}
+-              to={nodeAppPath(node.runtimeNodeId, `/devices/${encodeURIComponent(device.id)}`)}
+-              data-testid={`sidebar-node-offline-device-${device.id}`}
+-              className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground/60"
+-            >
+-              <Monitor className="h-3.5 w-3.5 shrink-0" />
+-              <span className="truncate">{device.name}</span>
+-            </Link>
+-          ))
+-        )}
+-      </div>
+-    );
++  return (
++    <div
++      ref={drag?.sortable.setNodeRef}
++      style={drag?.sortable.style}
++      data-testid={`sidebar-node-offline-${node.runtimeNodeId}`}
++      className={cn('space-y-0.5', presence.className, drag?.sortable.isDragging && 'opacity-60')}
++    >
++      <SectionHeader node={node} hint={t('sidebar.node.offline')} drag={drag} />
++      {knownDevices.length === 0 ? (
++        <div className="px-2 py-1 text-[11px] text-muted-foreground/60">
++          {t('sidebar.node.noKnownDevices')}
++        </div>
++      ) : (
++        presence.value.map((device) => (
++          <Link
++            key={device.id}
++            to={nodeAppPath(node.runtimeNodeId, `/devices/${encodeURIComponent(device.id)}`)}
++            data-testid={`sidebar-node-offline-device-${device.id}`}
++            className="flex items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground/60"
++          >
++            <Monitor className="h-3.5 w-3.5 shrink-0" />
++            <span className="truncate">{device.name}</span>
++          </Link>
++        ))
++      )}
++    </div>
++  );
++}
++
++export function SidebarNodeSection({
++  node,
++  drag,
++}: { node: SidebarNodeEntry; drag?: SidebarNodeSortable }) {
++  const { t } = useTranslation();
++
++  if (!node.online) {
++    return <SidebarNodeOffline node={node} drag={drag} />;
+   }
+ 
+   if (!node.loggedIn) {
+diff --git a/apps/fe/src/components/page-layouts/components/use-section-presence.ts b/apps/fe/src/components/page-layouts/components/use-section-presence.ts
+new file mode 100644
+index 00000000..72a1cf2d
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/use-section-presence.ts
+@@ -0,0 +1,69 @@
++// 侧边栏分节的出入场：分节按可见性/在线状态整节 return null，切 node 时会直接「啪」地消失。
++// 这里给一层最轻的 presence 外壳——入场淡入、退场淡出后再卸载，reduced motion 下直接落到终态
++// （与 connection-indicator 同一套做法：没有过渡就不能等 transitionend）。
++//
++// 只用 transition 不用 tmex-fade：动画的 fill-mode 是 both，播完会把 opacity 永久钉在 1，
++// 分节根上拖拽用的 opacity-60 就再也压不住了；纯 class 才能让 tailwind-merge 正常收敛。
++
++import { motionDurations, useReducedMotion } from '@tmex/ui/motion';
++import { useEffect, useRef, useState } from 'react';
++
++type Phase = 'hidden' | 'entering' | 'visible' | 'exiting';
++
++const TRANSITION =
++  'transition-opacity duration-(--tmex-motion-standard) motion-reduce:transition-none';
++
++const CLASS_BY_PHASE: Record<Phase, string> = {
++  hidden: `${TRANSITION} ease-out opacity-0`,
++  entering: `${TRANSITION} ease-out opacity-0`,
++  visible: `${TRANSITION} ease-out opacity-100`,
++  exiting: `${TRANSITION} ease-in opacity-0 pointer-events-none`,
++};
++
++export interface SectionPresence<T> {
++  /** 是否还要渲染：退场过渡期间仍为 true */
++  rendered: boolean;
++  /** 退场期间锁住最后一份内容，避免一边淡出一边掉内容 */
++  value: T;
++  /** 挂在分节根元素上的入场 / 退场类名；调用方的拖拽半透明要排在它后面 */
++  className: string;
++}
++
++export function useSectionPresence<T>(present: boolean, value: T): SectionPresence<T> {
++  const reducedMotion = useReducedMotion();
++  // 首次渲染就在场的分节直接落 visible：整棵侧边栏刚挂上时不该集体淡入一遍
++  const [phase, setPhase] = useState<Phase>(present ? 'visible' : 'hidden');
++  const phaseRef = useRef(phase);
++  phaseRef.current = phase;
++  const latched = useRef(value);
++  if (present) latched.current = value;
++
++  useEffect(() => {
++    if (reducedMotion) {
++      setPhase(present ? 'visible' : 'hidden');
++      return;
++    }
++    if (present) {
++      if (phaseRef.current === 'visible') return;
++      setPhase('entering');
++      let inner = 0;
++      const outer = requestAnimationFrame(() => {
++        inner = requestAnimationFrame(() => setPhase('visible'));
++      });
++      return () => {
++        cancelAnimationFrame(outer);
++        cancelAnimationFrame(inner);
++      };
++    }
++    if (phaseRef.current === 'hidden') return;
++    setPhase('exiting');
++    const timer = setTimeout(() => setPhase('hidden'), motionDurations.standard);
++    return () => clearTimeout(timer);
++  }, [present, reducedMotion]);
++
++  return {
++    rendered: present || phase !== 'hidden',
++    value: present ? value : latched.current,
++    className: CLASS_BY_PHASE[phase],
++  };
++}
+diff --git a/apps/fe/src/pages/settings/nodes/copy-feedback.tsx b/apps/fe/src/pages/settings/nodes/copy-feedback.tsx
+index bf449322..9b319b7b 100644
+--- a/apps/fe/src/pages/settings/nodes/copy-feedback.tsx
++++ b/apps/fe/src/pages/settings/nodes/copy-feedback.tsx
+@@ -1,20 +1,27 @@
+-// 「复制」按钮的共享部件：复制状态 + 可访问的反馈。
++// 节点设置里的共享小部件：标签行、复制状态与可访问的复制反馈。
+ //
+ // 播报区里**只能**放「已复制」：把可见标签整段塞进 live region 的话，2 秒后复位会让
+ // 「复制」变成一条新内容再播一次，读屏用户听到的是一句莫名其妙的第二次提示。
+ // 可见标签因此留在 live region 外面。
+ 
++import { Button } from '@tmex/ui/button';
++import { Check, Copy } from 'lucide-react';
+ import { useCallback, useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-export const COPIED_RESET_MS = 2000;
+-
+-export interface CopyToClipboard {
+-  copied: boolean;
+-  copy: () => void;
++/** 「标签 + 内容」的一行：本机区块里所有条目共用这个左侧固定宽度。 */
++export function Row({ label, children }: { label: string; children: React.ReactNode }) {
++  return (
++    <div className="flex flex-wrap items-center gap-2">
++      <span className="w-32 shrink-0 text-xs text-muted-foreground">{label}</span>
++      {children}
++    </div>
++  );
+ }
+ 
+-export function useCopyToClipboard(value: string): CopyToClipboard {
++export const COPIED_RESET_MS = 2000;
++
++export function useCopyToClipboard(value: string) {
+   const [copied, setCopied] = useState(false);
+   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+ 
+@@ -48,3 +55,63 @@ export function CopyLabel({ copied }: { copied: boolean }) {
+     </>
+   );
+ }
++
++/** 复制按钮：图标随复制状态切换，标签自带播报节点。 */
++export function CopyButton({
++  value,
++  testId,
++  variant = 'ghost',
++}: {
++  value: string;
++  testId: string;
++  variant?: 'ghost' | 'outline';
++}) {
++  const { copied, copy } = useCopyToClipboard(value);
++  return (
++    <Button type="button" size="xs" variant={variant} onClick={copy} data-testid={`${testId}-copy`}>
++      {copied ? <Check className="tmex-scale-in" /> : <Copy className="tmex-scale-in" />}
++      <CopyLabel copied={copied} />
++    </Button>
++  );
++}
++
++/** 只读的地址 / 标识：行内等宽展示 + 一键复制。 */
++export function CopyableValue({ value, testId }: { value: string; testId: string }) {
++  return (
++    <span className="flex min-w-0 items-center gap-1">
++      <code
++        className="min-w-0 break-all rounded bg-muted/50 px-1.5 py-0.5 text-[11px]"
++        data-testid={testId}
++      >
++        {value}
++      </code>
++      <CopyButton value={value} testId={testId} />
++    </span>
++  );
++}
++
++/** 带标题的整块内容（join 命令 / 加入码）：上下两行排版 + 一键复制。 */
++export function CopyableCode({
++  label,
++  value,
++  testId,
++}: {
++  label: string;
++  value: string;
++  testId: string;
++}) {
++  return (
++    <div className="flex flex-col gap-1">
++      <span className="text-[11px] text-muted-foreground">{label}</span>
++      <div className="flex items-start gap-1">
++        <code
++          className="min-w-0 flex-1 break-all rounded bg-background p-2 text-[11px]"
++          data-testid={testId}
++        >
++          {value}
++        </code>
++        <CopyButton value={value} testId={testId} variant="outline" />
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/nodes/direct-section.tsx b/apps/fe/src/pages/settings/nodes/direct-section.tsx
+new file mode 100644
+index 00000000..edd08488
+--- /dev/null
++++ b/apps/fe/src/pages/settings/nodes/direct-section.tsx
+@@ -0,0 +1,284 @@
++// 直连插件区：安装（下载 `native/`）和启用（`TMEX_DIRECT_ENABLED`）是两件独立的事——装好的插件
++// 可以先关着，关掉也不必删文件，两者只在「未安装时开关不可用」上耦合，所以按钮管安装 / 删除，
++// 开关管启用 / 停用。四个动作都要重启网关才生效，横幅与重启入口由调用方给出。
++
++import { LocalApiError } from '@tmex/api-client/local/local-api';
++import type {
++  LocalDirectAction,
++  LocalDirectResponse,
++  LocalDirectStatus,
++} from '@tmex/api-client/local/types';
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogTitle,
++} from '@tmex/ui/alert-dialog';
++import { Badge } from '@tmex/ui/badge';
++import { Button } from '@tmex/ui/button';
++import { Switch } from '@tmex/ui/switch';
++import { Download, Loader2, Trash2 } from 'lucide-react';
++import { useMemo, useRef, useSyncExternalStore } from 'react';
++import { useTranslation } from 'react-i18next';
++import { Row } from './copy-feedback';
++
++/** 只取 `LocalApi` 的直连那一面，测试注入假实现时不必凑出整个客户端。 */
++export interface DirectApi {
++  setDirect(action: LocalDirectAction): Promise<LocalDirectResponse>;
++}
++
++/** 这些错误码的 `message` 才是诊断信息（下载失败的原因、加载失败的 dlopen 报错）。 */
++const DIRECT_ERROR_KEY: Record<string, string> = {
++  direct_unsupported: 'nodes.machine.directErrorUnsupported',
++  direct_download_failed: 'nodes.machine.directErrorDownloadFailed',
++  direct_not_installed: 'nodes.machine.directErrorNotInstalled',
++};
++
++type Translate = (key: string, options?: Record<string, unknown>) => string;
++
++export function describeDirectError(t: Translate, error: unknown): string {
++  const base = t(
++    (error instanceof LocalApiError && DIRECT_ERROR_KEY[error.code]) || 'nodes.machine.directFailed'
++  );
++  const detail = (error instanceof Error ? error.message : String(error)).trim();
++  const code = error instanceof LocalApiError ? error.code : '';
++  if (!detail || detail === code) return base;
++  return t('nodes.machine.directErrorDetail', { base, detail });
++}
++
++export interface DirectMutationState {
++  pending: LocalDirectAction | null;
++  /** 删除插件前的二次确认。 */
++  confirmingRemove: boolean;
++}
++
++export interface DirectMutationCallbacks {
++  onResult: (result: LocalDirectResponse) => void;
++  onError: (error: unknown) => void;
++  onRefresh: () => void;
++}
++
++/**
++ * 四个动作共用一把锁：安装要下载最多 60 s，期间再点删除 / 拨开关只会让 `native/` 和 env
++ * 互相打架。状态放在可订阅的控制器里而不是组件 state，锁与确认流程才能脱离 DOM 直接测。
++ */
++export class DirectMutationController {
++  private state: DirectMutationState = { pending: null, confirmingRemove: false };
++  private readonly listeners = new Set<() => void>();
++
++  constructor(
++    private readonly api: DirectApi,
++    private readonly readCallbacks: () => DirectMutationCallbacks
++  ) {}
++
++  snapshot = (): DirectMutationState => this.state;
++
++  subscribe = (listener: () => void): (() => void) => {
++    this.listeners.add(listener);
++    return () => {
++      this.listeners.delete(listener);
++    };
++  };
++
++  get busy(): boolean {
++    return this.state.pending !== null;
++  }
++
++  run = async (action: LocalDirectAction): Promise<void> => {
++    if (this.busy || this.state.confirmingRemove) return;
++    await this.perform(action);
++  };
++
++  requestRemove = (): void => {
++    if (this.busy || this.state.confirmingRemove) return;
++    this.update({ confirmingRemove: true });
++  };
++
++  confirmRemove = async (): Promise<void> => {
++    if (!this.state.confirmingRemove) return;
++    this.update({ confirmingRemove: false });
++    if (this.busy) return;
++    await this.perform('remove');
++  };
++
++  cancelRemove = (): void => {
++    if (this.state.confirmingRemove) this.update({ confirmingRemove: false });
++  };
++
++  private async perform(action: LocalDirectAction): Promise<void> {
++    this.update({ pending: action });
++    try {
++      const result = await this.api.setDirect(action);
++      this.readCallbacks().onResult(result);
++    } catch (error) {
++      this.readCallbacks().onError(error);
++    } finally {
++      this.update({ pending: null });
++      // 成功要拿到权威状态，失败也要——下载失败时 `native/` 可能已被清干净。
++      this.readCallbacks().onRefresh();
++    }
++  }
++
++  private update(patch: Partial<DirectMutationState>): void {
++    this.state = { ...this.state, ...patch };
++    for (const listener of this.listeners) listener();
++  }
++}
++
++export function useDirectMutations(api: DirectApi, callbacks: DirectMutationCallbacks) {
++  const callbacksRef = useRef(callbacks);
++  callbacksRef.current = callbacks;
++
++  const controller = useMemo(
++    () => new DirectMutationController(api, () => callbacksRef.current),
++    [api]
++  );
++  const state = useSyncExternalStore(
++    controller.subscribe,
++    controller.snapshot,
++    controller.snapshot
++  );
++
++  return {
++    ...state,
++    busy: state.pending !== null,
++    /** `remove` 先走二次确认，其余动作直接发。 */
++    dispatch: (action: LocalDirectAction) => {
++      if (action === 'remove') controller.requestRemove();
++      else void controller.run(action);
++    },
++    confirmRemove: () => void controller.confirmRemove(),
++    cancelRemove: controller.cancelRemove,
++  };
++}
++
++export function DirectSection({
++  direct,
++  busy,
++  pending,
++  error,
++  onAction,
++}: {
++  direct: LocalDirectStatus;
++  busy: boolean;
++  pending: LocalDirectAction | null;
++  error: string | null;
++  onAction: (action: LocalDirectAction) => void;
++}) {
++  const { t } = useTranslation();
++  const { supported, installed, enabled, capable, version } = direct;
++  const primary = installed ? 'remove' : 'install';
++  const PrimaryIcon = installed ? Trash2 : Download;
++  const installedLabel = installed
++    ? version
++      ? t('nodes.machine.directInstalledVersion', { version })
++      : t('nodes.machine.directInstalled')
++    : t('nodes.machine.directNotInstalled');
++  return (
++    <>
++      <Row label={t('nodes.machine.direct')}>
++        <div className="flex flex-wrap items-center gap-2">
++          {supported ? (
++            <>
++              <DirectBadge id="supported">{t('nodes.machine.directSupported')}</DirectBadge>
++              <DirectBadge id="installed">{installedLabel}</DirectBadge>
++              {installed && capable && (
++                <DirectBadge id="active">{t('nodes.machine.directActive')}</DirectBadge>
++              )}
++              {installed && !enabled && (
++                <DirectBadge id="disabled">{t('nodes.machine.directDisabled')}</DirectBadge>
++              )}
++            </>
++          ) : (
++            <DirectBadge id="unsupported">{t('nodes.machine.directUnsupported')}</DirectBadge>
++          )}
++          <Button
++            type="button"
++            size="xs"
++            variant={installed ? 'destructive' : 'outline'}
++            disabled={!supported || busy}
++            onClick={() => onAction(primary)}
++            data-testid={`local-machine-direct-${primary}`}
++          >
++            {pending === primary ? <Loader2 className="animate-spin" /> : <PrimaryIcon />}
++            {t(installed ? 'nodes.machine.directRemove' : 'nodes.machine.directInstall')}
++          </Button>
++        </div>
++      </Row>
++
++      <Row label={t('nodes.machine.directSwitch')}>
++        <div className="flex flex-wrap items-center gap-2">
++          <Switch
++            checked={installed && enabled}
++            disabled={!supported || !installed || busy}
++            onCheckedChange={(checked) => onAction(checked ? 'enable' : 'disable')}
++            data-testid="local-machine-direct-switch"
++          />
++          {supported && !installed && (
++            <span className="text-xs text-muted-foreground" data-testid="local-machine-direct-hint">
++              {t('nodes.machine.directSwitchHint')}
++            </span>
++          )}
++        </div>
++      </Row>
++
++      {error && (
++        <p className="text-xs text-destructive" data-testid="local-machine-direct-error">
++          {error}
++        </p>
++      )}
++    </>
++  );
++}
++
++function DirectBadge({ id, children }: { id: string; children: React.ReactNode }) {
++  return (
++    <Badge variant="outline" data-testid={`local-machine-direct-${id}`}>
++      {children}
++    </Badge>
++  );
++}
++
++export function RemoveConfirm({
++  open,
++  onConfirm,
++  onCancel,
++}: {
++  open: boolean;
++  onConfirm: () => void;
++  onCancel: () => void;
++}) {
++  const { t } = useTranslation();
++  if (!open) return null;
++  return (
++    <AlertDialog open onOpenChange={(next) => !next && onCancel()}>
++      <AlertDialogContent data-testid="local-machine-direct-remove-confirm">
++        <AlertDialogHeader>
++          <AlertDialogTitle>{t('nodes.machine.directRemoveConfirm.title')}</AlertDialogTitle>
++          <AlertDialogDescription>
++            {t('nodes.machine.directRemoveConfirm.description')}
++          </AlertDialogDescription>
++        </AlertDialogHeader>
++        <AlertDialogFooter>
++          <AlertDialogCancel
++            onClick={onCancel}
++            data-testid="local-machine-direct-remove-confirm-cancel"
++          >
++            {t('nodes.machine.directRemoveConfirm.cancel')}
++          </AlertDialogCancel>
++          <AlertDialogAction
++            variant="destructive"
++            onClick={onConfirm}
++            data-testid="local-machine-direct-remove-confirm-ok"
++          >
++            {t('nodes.machine.directRemoveConfirm.confirm')}
++          </AlertDialogAction>
++        </AlertDialogFooter>
++      </AlertDialogContent>
++    </AlertDialog>
++  );
++}
+diff --git a/apps/fe/src/pages/settings/nodes/local-machine-card.test.tsx b/apps/fe/src/pages/settings/nodes/local-machine-card.test.tsx
+index 40e6da4e..1892e3c6 100644
+--- a/apps/fe/src/pages/settings/nodes/local-machine-card.test.tsx
++++ b/apps/fe/src/pages/settings/nodes/local-machine-card.test.tsx
+@@ -18,9 +18,9 @@ import {
+   type DirectApi,
+   type DirectMutationCallbacks,
+   DirectMutationController,
+-  LocalMachineCard,
+   describeDirectError,
+-} from './local-machine-card';
++} from './direct-section';
++import { LocalMachineCard } from './local-machine-card';
+ 
+ const MESH_MODE: AuthModeResponse = {
+   mode: 'mesh',
+diff --git a/apps/fe/src/pages/settings/nodes/local-machine-card.tsx b/apps/fe/src/pages/settings/nodes/local-machine-card.tsx
+index f2ca6bb6..5ac594d2 100644
+--- a/apps/fe/src/pages/settings/nodes/local-machine-card.tsx
++++ b/apps/fe/src/pages/settings/nodes/local-machine-card.tsx
+@@ -1,52 +1,40 @@
+-// 本机区块：角色、hub 地址、直连插件的安装与开关。
+-//
+-// 安装（下载 `native/`）和启用（`TMEX_DIRECT_ENABLED`）是两件独立的事：装好的插件可以先关着，
+-// 关掉也不必删文件——所以按钮管安装/删除，开关管启用/停用，两者只在「未安装时开关不可用」上耦合。
+-//
+-// 四个动作都只动磁盘与 env，运行中的 RTC 管理器无法热加载，后端恒返回 `restartRequired: true`
+-// ——这里必须给出「立即重启」并等服务回来，否则用户会以为操作没生效。
++// 本机区块：角色、hub 地址、直连插件的安装与开关。直连的四个动作都只动磁盘与 env，运行中的
++// RTC 管理器无法热加载，后端恒返回 `restartRequired: true`——这里必须给出「立即重启」并等服务
++// 回来，否则用户会以为操作没生效。
+ 
+ import { SIDE_PANEL_LINK_STATE, useSidePanel } from '@/components/side-panels/use-side-panel';
+ import { type ApiClient, defaultApiClient } from '@tmex/api-client';
+ import type { AuthModeResponse } from '@tmex/api-client/auth/index';
+-import { LocalApiError, defaultLocalApi } from '@tmex/api-client/local/local-api';
++import { defaultLocalApi } from '@tmex/api-client/local/local-api';
+ import type {
+-  LocalDirectAction,
+-  LocalDirectResponse,
+   LocalDirectStatus,
+   LocalRole,
+   LocalStatusResponse,
+ } from '@tmex/api-client/local/types';
+-import {
+-  AlertDialog,
+-  AlertDialogAction,
+-  AlertDialogCancel,
+-  AlertDialogContent,
+-  AlertDialogDescription,
+-  AlertDialogFooter,
+-  AlertDialogHeader,
+-  AlertDialogTitle,
+-} from '@tmex/ui/alert-dialog';
+-import { Badge } from '@tmex/ui/badge';
+ import { Button } from '@tmex/ui/button';
+ import { Card, CardContent, CardHeader, CardTitle } from '@tmex/ui/card';
+ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@tmex/ui/select';
+-import { Switch } from '@tmex/ui/switch';
+-import { Check, Copy, Download, Loader2, Repeat, RotateCcw, Trash2 } from 'lucide-react';
+-import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react';
++import { Loader2, Repeat, RotateCcw } from 'lucide-react';
++import { useCallback, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+-import { CopyLabel, useCopyToClipboard } from './copy-feedback';
++import { CopyableValue, Row } from './copy-feedback';
++import {
++  type DirectApi,
++  DirectSection,
++  RemoveConfirm,
++  describeDirectError,
++  useDirectMutations,
++} from './direct-section';
+ import type { SetupIntent } from './membership/intent';
+ import { LeaveDialog, type LeaveDialogRequest } from './membership/leave-dialog';
+ import { classifyRoleChange } from './membership/role-transition';
+ import { useLeaveMesh } from './membership/use-leave-mesh';
+-import { useRestartGateway } from './restart/use-restart-now';
+-
+-/** 只取 `LocalApi` 的直连那一面，测试注入假实现时不必凑出整个客户端。 */
+-export interface DirectApi {
+-  setDirect(action: LocalDirectAction): Promise<LocalDirectResponse>;
+-}
++import {
++  type RestartGateway,
++  type RestartState,
++  useRestartGateway,
++} from './restart/use-restart-now';
+ 
+ export interface LocalMachineCardProps {
+   mode: AuthModeResponse | null;
+@@ -68,139 +56,44 @@ const ROLE_LABEL_KEY: Record<LocalRole, string> = {
+ };
+ 
+ /** 后端只认这三个角色串（`packages/app/src/lib/roles.ts`）。 */
+-export const SELECTABLE_ROLES: LocalRole[] = ['standalone', 'node', 'hub,node'];
+-
+-/** 这些错误码的 `message` 才是诊断信息（下载失败的原因、加载失败的 dlopen 报错）。 */
+-const DIRECT_ERROR_KEY: Record<string, string> = {
+-  direct_unsupported: 'nodes.machine.directErrorUnsupported',
+-  direct_download_failed: 'nodes.machine.directErrorDownloadFailed',
+-  direct_not_installed: 'nodes.machine.directErrorNotInstalled',
++const SELECTABLE_ROLES: LocalRole[] = ['standalone', 'node', 'hub,node'];
++
++/** 「更换 Hub」：角色不变，退出后直接展开加入向导。 */
++const CHANGE_HUB_REQUEST: LeaveDialogRequest = {
++  kind: 'change-hub',
++  from: 'node',
++  target: 'node',
++  intent: 'join-hub',
+ };
+ 
+-type Translate = (key: string, options?: Record<string, unknown>) => string;
+-
+-export function describeDirectError(t: Translate, error: unknown): string {
+-  const base = t(
+-    (error instanceof LocalApiError && DIRECT_ERROR_KEY[error.code]) || 'nodes.machine.directFailed'
+-  );
+-  const detail = (error instanceof Error ? error.message : String(error)).trim();
+-  const code = error instanceof LocalApiError ? error.code : '';
+-  if (!detail || detail === code) return base;
+-  return t('nodes.machine.directErrorDetail', { base, detail });
+-}
+-
+-export interface DirectMutationState {
+-  pending: LocalDirectAction | null;
+-  /** 删除插件前的二次确认。 */
+-  confirmingRemove: boolean;
+-}
+-
+-export interface DirectMutationCallbacks {
+-  onResult: (result: LocalDirectResponse) => void;
+-  onError: (error: unknown) => void;
+-  onRefresh: () => void;
+-}
+-
+ /**
+- * 四个动作共用一把锁：安装要下载最多 60 s，期间再点删除 / 拨开关只会让 `native/` 和 env
+- * 互相打架。状态放在可订阅的控制器里而不是组件 state，锁与确认流程才能脱离 DOM 直接测。
++ * 角色切换：standalone → mesh 只展开向导；mesh 侧的两种目标都要先退出当前 mesh，
++ * 因此统一落到一份「待确认的退出请求」上，由 `LeaveDialog` 接手。
+  */
+-export class DirectMutationController {
+-  private state: DirectMutationState = { pending: null, confirmingRemove: false };
+-  private readonly listeners = new Set<() => void>();
+-
+-  constructor(
+-    private readonly api: DirectApi,
+-    private readonly readCallbacks: () => DirectMutationCallbacks
+-  ) {}
+-
+-  snapshot = (): DirectMutationState => this.state;
+-
+-  subscribe = (listener: () => void): (() => void) => {
+-    this.listeners.add(listener);
+-    return () => {
+-      this.listeners.delete(listener);
+-    };
+-  };
+-
+-  get busy(): boolean {
+-    return this.state.pending !== null;
+-  }
+-
+-  run = async (action: LocalDirectAction): Promise<void> => {
+-    if (this.busy || this.state.confirmingRemove) return;
+-    await this.perform(action);
+-  };
+-
+-  requestRemove = (): void => {
+-    if (this.busy || this.state.confirmingRemove) return;
+-    this.update({ confirmingRemove: true });
+-  };
+-
+-  confirmRemove = async (): Promise<void> => {
+-    if (!this.state.confirmingRemove) return;
+-    this.update({ confirmingRemove: false });
+-    if (this.busy) return;
+-    await this.perform('remove');
+-  };
+-
+-  cancelRemove = (): void => {
+-    if (this.state.confirmingRemove) this.update({ confirmingRemove: false });
+-  };
+-
+-  private async perform(action: LocalDirectAction): Promise<void> {
+-    this.update({ pending: action });
+-    try {
+-      const result = await this.api.setDirect(action);
+-      this.readCallbacks().onResult(result);
+-    } catch (error) {
+-      this.readCallbacks().onError(error);
+-    } finally {
+-      this.update({ pending: null });
+-      // 成功要拿到权威状态，失败也要——下载失败时 `native/` 可能已被清干净。
+-      this.readCallbacks().onRefresh();
+-    }
+-  }
+-
+-  private update(patch: Partial<DirectMutationState>): void {
+-    this.state = { ...this.state, ...patch };
+-    for (const listener of this.listeners) listener();
+-  }
+-}
+-
+-export interface DirectMutations extends DirectMutationState {
+-  busy: boolean;
+-  run: (action: LocalDirectAction) => void;
+-  requestRemove: () => void;
+-  confirmRemove: () => void;
+-  cancelRemove: () => void;
+-}
+-
+-export function useDirectMutations(
+-  api: DirectApi,
+-  callbacks: DirectMutationCallbacks
+-): DirectMutations {
+-  const callbacksRef = useRef(callbacks);
+-  callbacksRef.current = callbacks;
+-
+-  const controller = useMemo(
+-    () => new DirectMutationController(api, () => callbacksRef.current),
+-    [api]
+-  );
+-  const state = useSyncExternalStore(
+-    controller.subscribe,
+-    controller.snapshot,
+-    controller.snapshot
++function useRoleSwitch(
++  status: LocalStatusResponse | null,
++  busy: boolean,
++  onSelectSetupPath?: (path: SetupIntent) => void
++) {
++  const [request, setRequest] = useState<LeaveDialogRequest | null>(null);
++  const select = useCallback(
++    (next: LocalRole) => {
++      if (!status || busy) return;
++      const transition = classifyRoleChange(status.role, next);
++      if (transition.kind === 'none') return;
++      if (transition.kind === 'setup') {
++        onSelectSetupPath?.(transition.path);
++        return;
++      }
++      setRequest(
++        transition.kind === 'leave'
++          ? { kind: 'leave', from: transition.from, target: next, intent: null }
++          : { kind: 'switch', from: transition.from, target: next, intent: transition.path }
++      );
++    },
++    [busy, onSelectSetupPath, status]
+   );
+-
+-  return {
+-    ...state,
+-    busy: state.pending !== null,
+-    run: (action) => void controller.run(action),
+-    requestRemove: controller.requestRemove,
+-    confirmRemove: () => void controller.confirmRemove(),
+-    cancelRemove: controller.cancelRemove,
+-  };
++  return { request, setRequest, select };
+ }
+ 
+ export function LocalMachineCard({
+@@ -219,8 +112,8 @@ export function LocalMachineCard({
+   const { hrefFor: panelHref } = useSidePanel();
+   const [restartRequired, setRestartRequired] = useState(false);
+   const [directError, setDirectError] = useState<string | null>(null);
+-  const [leaveRequest, setLeaveRequest] = useState<LeaveDialogRequest | null>(null);
+   const leave = useLeaveMesh({ mode, client });
++  const role = useRoleSwitch(status, leave.busy, onSelectSetupPath);
+ 
+   // 动作的返回体就是权威结果，先盖在拉到的状态上：重新拉 `local-status` 是异步的，
+   // 不盖的话开关会在这段时间里停在旧值。下一份状态到达（引用变了）即撤销。
+@@ -256,25 +149,6 @@ export function LocalMachineCard({
+ 
+   const busy = mutations.busy || restart.waiting;
+ 
+-  // 角色切换：standalone → mesh 只展开向导；mesh 侧的两种目标都要先退出当前 mesh。
+-  const changeRole = useCallback(
+-    (next: LocalRole) => {
+-      if (!status || leave.busy) return;
+-      const transition = classifyRoleChange(status.role, next);
+-      if (transition.kind === 'none') return;
+-      if (transition.kind === 'setup') {
+-        onSelectSetupPath?.(transition.path);
+-        return;
+-      }
+-      setLeaveRequest(
+-        transition.kind === 'leave'
+-          ? { kind: 'leave', from: transition.from, target: next, intent: null }
+-          : { kind: 'switch', from: transition.from, target: next, intent: transition.path }
+-      );
+-    },
+-    [leave.busy, onSelectSetupPath, status]
+-  );
+-
+   return (
+     <Card data-testid="local-machine-card">
+       <CardHeader>
+@@ -292,9 +166,7 @@ export function LocalMachineCard({
+             <Row label={t('nodes.machine.role')}>
+               <Select
+                 value={status.role}
+-                onValueChange={(next) => {
+-                  if (next) changeRole(next as LocalRole);
+-                }}
++                onValueChange={(next) => next && role.select(next as LocalRole)}
+               >
+                 <SelectTrigger
+                   size="sm"
+@@ -305,9 +177,9 @@ export function LocalMachineCard({
+                   <SelectValue>{t(ROLE_LABEL_KEY[status.role])}</SelectValue>
+                 </SelectTrigger>
+                 <SelectContent>
+-                  {SELECTABLE_ROLES.map((role) => (
+-                    <SelectItem key={role} value={role} data-testid={`local-machine-role-${role}`}>
+-                      {t(ROLE_LABEL_KEY[role])}
++                  {SELECTABLE_ROLES.map((item) => (
++                    <SelectItem key={item} value={item} data-testid={`local-machine-role-${item}`}>
++                      {t(ROLE_LABEL_KEY[item])}
+                     </SelectItem>
+                   ))}
+                 </SelectContent>
+@@ -323,14 +195,7 @@ export function LocalMachineCard({
+                     size="xs"
+                     variant="outline"
+                     disabled={leave.busy}
+-                    onClick={() =>
+-                      setLeaveRequest({
+-                        kind: 'change-hub',
+-                        from: 'node',
+-                        target: 'node',
+-                        intent: 'join-hub',
+-                      })
+-                    }
++                    onClick={() => role.setRequest(CHANGE_HUB_REQUEST)}
+                     data-testid="local-machine-change-hub"
+                   >
+                     <Repeat />
+@@ -350,42 +215,13 @@ export function LocalMachineCard({
+               busy={busy}
+               pending={mutations.pending}
+               error={directError}
+-              onInstall={() => {
+-                setDirectError(null);
+-                mutations.run('install');
+-              }}
+-              onRemove={mutations.requestRemove}
+-              onToggle={(next) => {
+-                setDirectError(null);
+-                mutations.run(next ? 'enable' : 'disable');
++              onAction={(action) => {
++                if (action !== 'remove') setDirectError(null);
++                mutations.dispatch(action);
+               }}
+             />
+ 
+-            {restartRequired && (
+-              <div
+-                className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/50 p-2 text-xs"
+-                data-testid="local-machine-restart-required"
+-              >
+-                <span className="text-muted-foreground">
+-                  {restart.state === 'waiting'
+-                    ? t('nodes.machine.restarting')
+-                    : restart.state === 'timeout'
+-                      ? t('nodes.machine.restartTimeout')
+-                      : t('nodes.machine.directRestartRequired')}
+-                </span>
+-                <Button
+-                  type="button"
+-                  size="xs"
+-                  variant="outline"
+-                  disabled={busy}
+-                  onClick={() => void restart.run()}
+-                  data-testid="local-machine-restart-now"
+-                >
+-                  {restart.waiting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+-                  {t('nodes.machine.restartNow')}
+-                </Button>
+-              </div>
+-            )}
++            {restartRequired && <RestartBanner restart={restart} busy={busy} />}
+           </>
+         ) : null}
+ 
+@@ -410,13 +246,13 @@ export function LocalMachineCard({
+       />
+ 
+       <LeaveDialog
+-        request={leaveRequest}
++        request={role.request}
+         leave={leave}
+         onConfirm={() => {
+-          if (leaveRequest) leave.run({ from: leaveRequest.from, intent: leaveRequest.intent });
++          if (role.request) leave.run({ from: role.request.from, intent: role.request.intent });
+         }}
+         onCancel={() => {
+-          setLeaveRequest(null);
++          role.setRequest(null);
+           leave.reset();
+         }}
+       />
+@@ -425,178 +261,32 @@ export function LocalMachineCard({
+   );
+ }
+ 
+-function DirectSection({
+-  direct,
+-  busy,
+-  pending,
+-  error,
+-  onInstall,
+-  onRemove,
+-  onToggle,
+-}: {
+-  direct: LocalDirectStatus;
+-  busy: boolean;
+-  pending: LocalDirectAction | null;
+-  error: string | null;
+-  onInstall: () => void;
+-  onRemove: () => void;
+-  onToggle: (next: boolean) => void;
+-}) {
+-  const { t } = useTranslation();
+-  const { supported, installed, enabled, capable, version } = direct;
+-  return (
+-    <>
+-      <Row label={t('nodes.machine.direct')}>
+-        <div className="flex flex-wrap items-center gap-2">
+-          {supported ? (
+-            <>
+-              <Badge variant="outline" data-testid="local-machine-direct-supported">
+-                {t('nodes.machine.directSupported')}
+-              </Badge>
+-              <Badge variant="outline" data-testid="local-machine-direct-installed">
+-                {installed
+-                  ? version
+-                    ? t('nodes.machine.directInstalledVersion', { version })
+-                    : t('nodes.machine.directInstalled')
+-                  : t('nodes.machine.directNotInstalled')}
+-              </Badge>
+-              {installed && capable && (
+-                <Badge variant="outline" data-testid="local-machine-direct-active">
+-                  {t('nodes.machine.directActive')}
+-                </Badge>
+-              )}
+-              {installed && !enabled && (
+-                <Badge variant="outline" data-testid="local-machine-direct-disabled">
+-                  {t('nodes.machine.directDisabled')}
+-                </Badge>
+-              )}
+-            </>
+-          ) : (
+-            <Badge variant="outline" data-testid="local-machine-direct-unsupported">
+-              {t('nodes.machine.directUnsupported')}
+-            </Badge>
+-          )}
+-          {installed ? (
+-            <Button
+-              type="button"
+-              size="xs"
+-              variant="destructive"
+-              disabled={!supported || busy}
+-              onClick={onRemove}
+-              data-testid="local-machine-direct-remove"
+-            >
+-              {pending === 'remove' ? <Loader2 className="animate-spin" /> : <Trash2 />}
+-              {t('nodes.machine.directRemove')}
+-            </Button>
+-          ) : (
+-            <Button
+-              type="button"
+-              size="xs"
+-              variant="outline"
+-              disabled={!supported || busy}
+-              onClick={onInstall}
+-              data-testid="local-machine-direct-install"
+-            >
+-              {pending === 'install' ? <Loader2 className="animate-spin" /> : <Download />}
+-              {t('nodes.machine.directInstall')}
+-            </Button>
+-          )}
+-        </div>
+-      </Row>
+-
+-      <Row label={t('nodes.machine.directSwitch')}>
+-        <div className="flex flex-wrap items-center gap-2">
+-          <Switch
+-            checked={installed && enabled}
+-            disabled={!supported || !installed || busy}
+-            onCheckedChange={(checked) => onToggle(Boolean(checked))}
+-            data-testid="local-machine-direct-switch"
+-          />
+-          {supported && !installed && (
+-            <span className="text-xs text-muted-foreground" data-testid="local-machine-direct-hint">
+-              {t('nodes.machine.directSwitchHint')}
+-            </span>
+-          )}
+-        </div>
+-      </Row>
+-
+-      {error && (
+-        <p className="text-xs text-destructive" data-testid="local-machine-direct-error">
+-          {error}
+-        </p>
+-      )}
+-    </>
+-  );
+-}
++const RESTART_TEXT_KEY: Partial<Record<RestartState, string>> = {
++  waiting: 'nodes.machine.restarting',
++  timeout: 'nodes.machine.restartTimeout',
++};
+ 
+-function RemoveConfirm({
+-  open,
+-  onConfirm,
+-  onCancel,
+-}: {
+-  open: boolean;
+-  onConfirm: () => void;
+-  onCancel: () => void;
+-}) {
++function RestartBanner({ restart, busy }: { restart: RestartGateway; busy: boolean }) {
+   const { t } = useTranslation();
+-  if (!open) return null;
+   return (
+-    <AlertDialog
+-      open
+-      onOpenChange={(next) => {
+-        if (!next) onCancel();
+-      }}
++    <div
++      className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/50 p-2 text-xs"
++      data-testid="local-machine-restart-required"
+     >
+-      <AlertDialogContent data-testid="local-machine-direct-remove-confirm">
+-        <AlertDialogHeader>
+-          <AlertDialogTitle>{t('nodes.machine.directRemoveConfirm.title')}</AlertDialogTitle>
+-          <AlertDialogDescription>
+-            {t('nodes.machine.directRemoveConfirm.description')}
+-          </AlertDialogDescription>
+-        </AlertDialogHeader>
+-        <AlertDialogFooter>
+-          <AlertDialogCancel
+-            onClick={onCancel}
+-            data-testid="local-machine-direct-remove-confirm-cancel"
+-          >
+-            {t('nodes.machine.directRemoveConfirm.cancel')}
+-          </AlertDialogCancel>
+-          <AlertDialogAction
+-            variant="destructive"
+-            onClick={onConfirm}
+-            data-testid="local-machine-direct-remove-confirm-ok"
+-          >
+-            {t('nodes.machine.directRemoveConfirm.confirm')}
+-          </AlertDialogAction>
+-        </AlertDialogFooter>
+-      </AlertDialogContent>
+-    </AlertDialog>
+-  );
+-}
+-
+-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+-  return (
+-    <div className="flex flex-wrap items-center gap-2">
+-      <span className="w-32 shrink-0 text-xs text-muted-foreground">{label}</span>
+-      {children}
+-    </div>
+-  );
+-}
+-
+-function CopyableValue({ value, testId }: { value: string; testId: string }) {
+-  const { copied, copy } = useCopyToClipboard(value);
+-  return (
+-    <span className="flex min-w-0 items-center gap-1">
+-      <code
+-        className="min-w-0 break-all rounded bg-muted/50 px-1.5 py-0.5 text-[11px]"
+-        data-testid={testId}
++      <span className="text-muted-foreground">
++        {t(RESTART_TEXT_KEY[restart.state] ?? 'nodes.machine.directRestartRequired')}
++      </span>
++      <Button
++        type="button"
++        size="xs"
++        variant="outline"
++        disabled={busy}
++        onClick={() => void restart.run()}
++        data-testid="local-machine-restart-now"
+       >
+-        {value}
+-      </code>
+-      <Button type="button" size="xs" variant="ghost" onClick={copy} data-testid={`${testId}-copy`}>
+-        {copied ? <Check className="tmex-scale-in" /> : <Copy className="tmex-scale-in" />}
+-        <CopyLabel copied={copied} />
++        {restart.waiting ? <Loader2 className="animate-spin" /> : <RotateCcw />}
++        {t('nodes.machine.restartNow')}
+       </Button>
+-    </span>
++    </div>
+   );
+ }
+diff --git a/apps/fe/src/pages/settings/nodes/management/enrollment-section.tsx b/apps/fe/src/pages/settings/nodes/management/enrollment-section.tsx
+index e38574ee..e71ed239 100644
+--- a/apps/fe/src/pages/settings/nodes/management/enrollment-section.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/enrollment-section.tsx
+@@ -19,10 +19,11 @@ import type { AuthApi } from '@tmex/api-client/auth/index';
+ import { requireRootEpoch } from '@tmex/api-client/auth/index';
+ import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+-import { Check, Copy, Loader2, ShieldCheck } from 'lucide-react';
++import { Check, Loader2, ShieldCheck } from 'lucide-react';
+ import { useCallback, useEffect, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { CopyLabel, useCopyToClipboard } from '../copy-feedback';
++import { CopyableCode } from '../copy-feedback';
++import { actionErrorText } from './errors';
+ import type { ResolvedMode } from './types';
+ 
+ export function EnrollmentSection({
+@@ -95,14 +96,7 @@ export function EnrollmentSection({
+       // 走到这里说明 enrollment 没建成（多半是 hub 请求失败）：复用窗口里的根钥没有任何
+       // 后续动作会用到，立刻清零，不要等 5 分钟定时器（见 F4-fix 评审 Major「所有权式清零」）。
+       prompt.forget();
+-      const code = (err as { code?: string })?.code;
+-      setError(
+-        code
+-          ? t(`auth.errors.${code}`, { defaultValue: code })
+-          : err instanceof Error
+-            ? err.message
+-            : String(err)
+-      );
++      setError(actionErrorText(t, err));
+     } finally {
+       setBusy(false);
+     }
+@@ -214,38 +208,3 @@ export function resolveHubPublicUrl(
+   const url = created?.hubPublicUrl ?? mode.hubPublicUrl ?? null;
+   return isTrustedHubUrl(url) ? url : null;
+ }
+-
+-export function CopyableCode({
+-  label,
+-  value,
+-  testId,
+-}: {
+-  label: string;
+-  value: string;
+-  testId: string;
+-}) {
+-  const { copied, copy } = useCopyToClipboard(value);
+-  return (
+-    <div className="flex flex-col gap-1">
+-      <span className="text-[11px] text-muted-foreground">{label}</span>
+-      <div className="flex items-start gap-1">
+-        <code
+-          className="min-w-0 flex-1 break-all rounded bg-background p-2 text-[11px]"
+-          data-testid={testId}
+-        >
+-          {value}
+-        </code>
+-        <Button
+-          type="button"
+-          size="xs"
+-          variant="outline"
+-          onClick={copy}
+-          data-testid={`${testId}-copy`}
+-        >
+-          {copied ? <Check className="tmex-scale-in" /> : <Copy className="tmex-scale-in" />}
+-          <CopyLabel copied={copied} />
+-        </Button>
+-      </div>
+-    </div>
+-  );
+-}
+diff --git a/apps/fe/src/pages/settings/nodes/management/errors.ts b/apps/fe/src/pages/settings/nodes/management/errors.ts
+new file mode 100644
+index 00000000..4adc92f5
+--- /dev/null
++++ b/apps/fe/src/pages/settings/nodes/management/errors.ts
+@@ -0,0 +1,9 @@
++/** 管理动作失败的文案：带 `code` 的错误走 i18n 错误表，其余原样用异常信息。 */
++export function actionErrorText(
++  t: (key: string, options?: Record<string, unknown>) => string,
++  err: unknown
++): string {
++  const code = (err as { code?: string })?.code;
++  if (code) return t(`auth.errors.${code}`, { defaultValue: code });
++  return err instanceof Error ? err.message : String(err);
++}
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+index bc0108ce..c68b3be2 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+@@ -3,39 +3,15 @@
+ // 表格本体铺在「节点管理」卡片里，只留一层浅边框做横向滚动容器。
+ 
+ import { NodeLoginButton } from '@/auth/NodeLoginButton';
+-import type { CredentialPromptHandle } from '@/auth/credential-prompt';
+-import { headFromResponse } from '@/auth/key-log-actions';
+-import { buildRevokeNodeRecord, classifyKeyLogFailure } from '@/node/enrollment';
+-import type { HubApi } from '@/node/hub-api';
+ import type { NodeRow } from '@/node/mesh-nodes';
+-import type { AuthApi } from '@tmex/api-client/auth/index';
+-import { requireRootEpoch } from '@tmex/api-client/auth/index';
+-import { encodeBase64url } from '@tmex/shared/auth';
+ import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+ import { Pencil, ShieldAlert } from 'lucide-react';
+-import { useCallback, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { toast } from 'sonner';
+-import type { ResolvedMode } from './types';
++import type { NodeActionDeps } from './types';
++import { useNodeRowActions } from './use-node-row-actions';
+ 
+-export function NodesTable({
+-  rows,
+-  hubApi,
+-  hubOnline,
+-  mode,
+-  api,
+-  prompt,
+-  onChanged,
+-}: {
+-  rows: NodeRow[];
+-  hubApi: HubApi | null;
+-  hubOnline: boolean;
+-  mode: ResolvedMode;
+-  api: AuthApi;
+-  prompt: CredentialPromptHandle;
+-  onChanged: () => void;
+-}) {
++export function NodesTable({ rows, ...deps }: { rows: NodeRow[] } & NodeActionDeps) {
+   const { t } = useTranslation();
+   return (
+     <section className="overflow-x-auto rounded-lg border border-border/60">
+@@ -55,16 +31,7 @@ export function NodesTable({
+         </thead>
+         <tbody>
+           {rows.map((row) => (
+-            <NodeRowView
+-              key={row.id}
+-              row={row}
+-              hubApi={hubApi}
+-              hubOnline={hubOnline}
+-              mode={mode}
+-              api={api}
+-              prompt={prompt}
+-              onChanged={onChanged}
+-            />
++            <NodeRowView key={row.id} row={row} {...deps} />
+           ))}
+           {rows.length === 0 && (
+             <tr>
+@@ -79,127 +46,11 @@ export function NodesTable({
+   );
+ }
+ 
+-function Th({ children }: { children: React.ReactNode }) {
+-  return <th className="whitespace-nowrap px-3 py-2 text-left font-medium">{children}</th>;
+-}
+-
+-function Td({ children }: { children: React.ReactNode }) {
+-  return <td className="whitespace-nowrap px-3 py-2 align-middle">{children}</td>;
+-}
+-
+-export function formatLastSeen(value: number | null): string {
+-  if (!value) return '—';
+-  return new Date(value).toLocaleString();
+-}
+-
+-function NodeRowView({
+-  row,
+-  hubApi,
+-  hubOnline,
+-  mode,
+-  api,
+-  prompt,
+-  onChanged,
+-}: {
+-  row: NodeRow;
+-  hubApi: HubApi | null;
+-  hubOnline: boolean;
+-  mode: ResolvedMode;
+-  api: AuthApi;
+-  prompt: CredentialPromptHandle;
+-  onChanged: () => void;
+-}) {
++function NodeRowView({ row, ...deps }: { row: NodeRow } & NodeActionDeps) {
+   const { t } = useTranslation();
+-  const [renaming, setRenaming] = useState(false);
+-  const [nameDraft, setNameDraft] = useState(row.name);
+-  const [busy, setBusy] = useState(false);
+-
+-  const rename = useCallback(async () => {
+-    if (!hubApi) return;
+-    setBusy(true);
+-    try {
+-      await hubApi.rename(row.id, nameDraft);
+-      setRenaming(false);
+-      toast.success(t('nodes.rename.done'));
+-      onChanged();
+-    } catch (err) {
+-      toast.error(err instanceof Error ? err.message : String(err));
+-    } finally {
+-      setBusy(false);
+-    }
+-  }, [hubApi, nameDraft, onChanged, row.id, t]);
+-
+-  /**
+-   * 吊销：**只有一条路径**——`POST /api/auth/keylog?hub=sync`。
+-   * entry 先把签好的记录送 hub 等 ack，再本地 append。
+-   * 老实现「本地 append + 再调 hub revoke」是两条独立通道，先到的那条会让另一条报 `seq_gap`，
+-   * UI 误报 hub 失败；两条都失败时本地却已经把节点从列表里摘掉（见 F4-3 评审 Major）。
+-   *
+-   * 凭据走 `withSigner`（**不**进 5 分钟复用窗口）：吊销是破坏性动作，每次都要用户当场确认；
+-   * 根钥路径签完立刻清零 seed。
+-   */
+-  const revoke = useCallback(async () => {
+-    const confirmed = globalThis.confirm?.(t('nodes.revoke.confirmText', { name: row.name }));
+-    if (!confirmed) return;
+-    const reason = globalThis.prompt?.(t('nodes.revoke.reasonPrompt')) ?? '';
+-    setBusy(true);
+-    try {
+-      const rootEpoch = requireRootEpoch(mode);
+-      const head = headFromResponse(await api.keyLogHead());
+-      const result = await prompt.withSigner(
+-        async (signer) => {
+-          const record = await buildRevokeNodeRecord({
+-            head,
+-            rootEpoch,
+-            uid: mode.uid,
+-            nodeIdHex: row.id,
+-            reason,
+-            signer,
+-          });
+-          return api.appendKeyLog(
+-            { bytes: encodeBase64url(record.bytes), sig: encodeBase64url(record.sig) },
+-            { hubSync: true }
+-          );
+-        },
+-        { purpose: 'revoke' }
+-      );
+-      if (!result) return;
+-      if (!result.ok) {
+-        // B2-6：hub 未确认时服务端一条都没落库（409 / 504），撤销**没有生效**——
+-        // 文案必须这么说，否则用户会以为节点已经吊销掉了。
+-        const failure = classifyKeyLogFailure(result.code);
+-        if (failure === 'unconfirmed') {
+-          toast.warning(t('nodes.revoke.hubFailed', { error: result.code }));
+-          return;
+-        }
+-        toast.error(
+-          failure === 'stale'
+-            ? t('nodes.enrollment.staleRecord')
+-            : t(`auth.errors.${result.code}`, { defaultValue: result.code })
+-        );
+-        return;
+-      }
+-      if (result.hubAck !== true) {
+-        toast.warning(t('nodes.revoke.hubFailed', { error: result.hubError ?? '' }));
+-        return;
+-      }
+-      toast.success(t('nodes.revoke.done'));
+-      onChanged();
+-    } catch (err) {
+-      const code = (err as { code?: string })?.code;
+-      toast.error(
+-        code
+-          ? t(`auth.errors.${code}`, { defaultValue: code })
+-          : err instanceof Error
+-            ? err.message
+-            : String(err)
+-      );
+-    } finally {
+-      setBusy(false);
+-    }
+-  }, [api, mode, onChanged, prompt, row.id, row.name, t]);
+-
+-  const disabledHint = hubOnline ? undefined : t('nodes.hubOffline');
++  const { renaming, setRenaming, nameDraft, setNameDraft, busy, rename, revoke } =
++    useNodeRowActions(row, deps);
++  const disabledHint = deps.hubOnline ? undefined : t('nodes.hubOffline');
+ 
+   return (
+     <tr className="border-b border-border/60 last:border-0" data-testid={`nodes-row-${row.id}`}>
+@@ -242,7 +93,7 @@ function NodeRowView({
+         </span>
+       </Td>
+       <Td>{row.version ?? '—'}</Td>
+-      <Td>{formatLastSeen(row.lastSeenAt)}</Td>
++      <Td>{row.lastSeenAt ? new Date(row.lastSeenAt).toLocaleString() : '—'}</Td>
+       <Td>{row.directCapable ? t('common.yes') : t('common.no')}</Td>
+       <Td>
+         {row.loggedIn || row.isSelf ? (
+@@ -260,7 +111,7 @@ function NodeRowView({
+             type="button"
+             size="xs"
+             variant="outline"
+-            disabled={!hubOnline || busy}
++            disabled={!deps.hubOnline || busy}
+             title={disabledHint}
+             onClick={() => setRenaming((value) => !value)}
+             data-testid={`nodes-rename-${row.id}`}
+@@ -272,7 +123,7 @@ function NodeRowView({
+             type="button"
+             size="xs"
+             variant="destructive"
+-            disabled={!hubOnline || busy || row.isSelf}
++            disabled={!deps.hubOnline || busy || row.isSelf}
+             title={row.isSelf ? t('nodes.revoke.selfBlocked') : disabledHint}
+             onClick={() => void revoke()}
+             data-testid={`nodes-revoke-${row.id}`}
+@@ -286,6 +137,14 @@ function NodeRowView({
+   );
+ }
+ 
++function Th({ children }: { children: React.ReactNode }) {
++  return <th className="whitespace-nowrap px-3 py-2 text-left font-medium">{children}</th>;
++}
++
++function Td({ children }: { children: React.ReactNode }) {
++  return <td className="whitespace-nowrap px-3 py-2 align-middle">{children}</td>;
++}
++
+ function Tag({ children }: { children: React.ReactNode }) {
+   return (
+     <span className="rounded border border-border px-1 py-px text-[10px] text-muted-foreground">
+diff --git a/apps/fe/src/pages/settings/nodes/management/types.ts b/apps/fe/src/pages/settings/nodes/management/types.ts
+index c730ce98..e284f766 100644
+--- a/apps/fe/src/pages/settings/nodes/management/types.ts
++++ b/apps/fe/src/pages/settings/nodes/management/types.ts
+@@ -1,8 +1,20 @@
+-import type { AuthKdfParamsJson, AuthModeResponse } from '@tmex/api-client/auth/index';
++import type { CredentialPromptHandle } from '@/auth/credential-prompt';
++import type { HubApi } from '@/node/hub-api';
++import type { AuthApi, AuthKdfParamsJson, AuthModeResponse } from '@tmex/api-client/auth/index';
+ 
+ /** 已确认带 uid / kdf 参数的 mesh 模式：管理动作都要签名，缺一不可。 */
+ export type ResolvedMode = AuthModeResponse & { uid: string; kdfParams: AuthKdfParamsJson };
+ 
++/** 节点表与行内动作共用的依赖：hub 通道、签名凭据与刷新回调。 */
++export interface NodeActionDeps {
++  hubApi: HubApi | null;
++  hubOnline: boolean;
++  mode: ResolvedMode;
++  api: AuthApi;
++  prompt: CredentialPromptHandle;
++  onChanged: () => void;
++}
++
+ /** 没有 uid / kdf 参数时不渲染管理动作；hook 不能条件调用，故给个不会被用到的占位。 */
+ export const PLACEHOLDER_KDF: AuthKdfParamsJson = {
+   salt: '',
+diff --git a/apps/fe/src/pages/settings/nodes/management/use-node-row-actions.ts b/apps/fe/src/pages/settings/nodes/management/use-node-row-actions.ts
+new file mode 100644
+index 00000000..c9db70bb
+--- /dev/null
++++ b/apps/fe/src/pages/settings/nodes/management/use-node-row-actions.ts
+@@ -0,0 +1,102 @@
++// 节点行的两个异步动作：重命名与吊销。行组件只管渲染，动作的锁与错误处理都留在这里。
++
++import { headFromResponse } from '@/auth/key-log-actions';
++import { buildRevokeNodeRecord, classifyKeyLogFailure } from '@/node/enrollment';
++import type { NodeRow } from '@/node/mesh-nodes';
++import { requireRootEpoch } from '@tmex/api-client/auth/index';
++import { encodeBase64url } from '@tmex/shared/auth';
++import { useCallback, useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { toast } from 'sonner';
++import { actionErrorText } from './errors';
++import type { NodeActionDeps } from './types';
++
++export function useNodeRowActions(
++  row: NodeRow,
++  { hubApi, mode, api, prompt, onChanged }: NodeActionDeps
++) {
++  const { t } = useTranslation();
++  const [renaming, setRenaming] = useState(false);
++  const [nameDraft, setNameDraft] = useState(row.name);
++  const [busy, setBusy] = useState(false);
++
++  const rename = useCallback(async () => {
++    if (!hubApi) return;
++    setBusy(true);
++    try {
++      await hubApi.rename(row.id, nameDraft);
++      setRenaming(false);
++      toast.success(t('nodes.rename.done'));
++      onChanged();
++    } catch (err) {
++      toast.error(err instanceof Error ? err.message : String(err));
++    } finally {
++      setBusy(false);
++    }
++  }, [hubApi, nameDraft, onChanged, row.id, t]);
++
++  /**
++   * 吊销：**只有一条路径**——`POST /api/auth/keylog?hub=sync`。
++   * entry 先把签好的记录送 hub 等 ack，再本地 append。
++   * 老实现「本地 append + 再调 hub revoke」是两条独立通道，先到的那条会让另一条报 `seq_gap`，
++   * UI 误报 hub 失败；两条都失败时本地却已经把节点从列表里摘掉（见 F4-3 评审 Major）。
++   *
++   * 凭据走 `withSigner`（**不**进 5 分钟复用窗口）：吊销是破坏性动作，每次都要用户当场确认；
++   * 根钥路径签完立刻清零 seed。
++   */
++  const revoke = useCallback(async () => {
++    const confirmed = globalThis.confirm?.(t('nodes.revoke.confirmText', { name: row.name }));
++    if (!confirmed) return;
++    const reason = globalThis.prompt?.(t('nodes.revoke.reasonPrompt')) ?? '';
++    setBusy(true);
++    try {
++      const rootEpoch = requireRootEpoch(mode);
++      const head = headFromResponse(await api.keyLogHead());
++      const result = await prompt.withSigner(
++        async (signer) => {
++          const record = await buildRevokeNodeRecord({
++            head,
++            rootEpoch,
++            uid: mode.uid,
++            nodeIdHex: row.id,
++            reason,
++            signer,
++          });
++          return api.appendKeyLog(
++            { bytes: encodeBase64url(record.bytes), sig: encodeBase64url(record.sig) },
++            { hubSync: true }
++          );
++        },
++        { purpose: 'revoke' }
++      );
++      if (!result) return;
++      if (!result.ok) {
++        // B2-6：hub 未确认时服务端一条都没落库（409 / 504），撤销**没有生效**——
++        // 文案必须这么说，否则用户会以为节点已经吊销掉了。
++        const failure = classifyKeyLogFailure(result.code);
++        if (failure === 'unconfirmed') {
++          toast.warning(t('nodes.revoke.hubFailed', { error: result.code }));
++          return;
++        }
++        toast.error(
++          failure === 'stale'
++            ? t('nodes.enrollment.staleRecord')
++            : t(`auth.errors.${result.code}`, { defaultValue: result.code })
++        );
++        return;
++      }
++      if (result.hubAck !== true) {
++        toast.warning(t('nodes.revoke.hubFailed', { error: result.hubError ?? '' }));
++        return;
++      }
++      toast.success(t('nodes.revoke.done'));
++      onChanged();
++    } catch (err) {
++      toast.error(actionErrorText(t, err));
++    } finally {
++      setBusy(false);
++    }
++  }, [api, mode, onChanged, prompt, row.id, row.name, t]);
++
++  return { renaming, setRenaming, nameDraft, setNameDraft, busy, rename, revoke };
++}
+diff --git a/packages/panels/src/device-folders/collision.test.ts b/packages/panels/src/device-folders/collision.test.ts
+index eef55bfa..bc52ef21 100644
+--- a/packages/panels/src/device-folders/collision.test.ts
++++ b/packages/panels/src/device-folders/collision.test.ts
+@@ -139,8 +139,10 @@ describe('落点分档：条目之间的空隙归给相邻的兄弟', () => {
+   });
+ 
+   test('分组重排：停在两个分组之间的空隙 → 插到空隙处，而不是甩到末尾', () => {
+-    // 260 落在分组 a（250 结束）与分组 b（270 开始）之间
+-    expect(overId('folder:b', 260)).toBe('folder:a');
++    // 260 落在分组 a（250 结束）与分组 b（270 开始）之间：离 b 自己的中心更近 = 还在原位
++    expect(overId('folder:b', 260)).toBe('folder:b');
++    // 越过中点就归给 a，不会掉到整棵树上被甩到末尾
++    expect(overId('folder:b', 200)).toBe('folder:a');
+     const drop = resolveDrop('folder:b', 'folder:a', LAYOUT);
+     expect(drop).toEqual({ kind: 'folder', folderId: 'b', index: 0 });
+   });
+@@ -155,6 +157,18 @@ describe('落点分档：条目之间的空隙归给相邻的兄弟', () => {
+   });
+ });
+ 
++describe('拖回原位：被拖元素自己也是候选', () => {
++  test('n2 拖到 n3 再拖回自己原来的位置 → 选中自己，退避的兄弟归位', () => {
++    expect(overId('node:n2', 205)).toBe('node:n3');
++    expect(overId('node:n2', 135)).toBe('node:n2');
++    expect(resolveDrop('node:n2', 'node:n2', LAYOUT)).toBeNull();
++  });
++
++  test('跨容器时原容器里的自己不会被别的容器当成兄弟', () => {
++    expect(overId('node:n2', 385)).toBe('node:r1');
++  });
++});
++
+ describe('落点分档：容器与放置区', () => {
+   test('分组头最先判，不会被里面的条目抢走', () => {
+     expect(overId('node:r1', 15)).toBe(dropZoneId('folder:a'));
+diff --git a/packages/panels/src/device-folders/collision.ts b/packages/panels/src/device-folders/collision.ts
+index d5d0c0cb..a02b0ed1 100644
+--- a/packages/panels/src/device-folders/collision.ts
++++ b/packages/panels/src/device-folders/collision.ts
+@@ -45,7 +45,7 @@ export const deviceFolderCollisionDetection: CollisionDetection = (args) => {
+ 
+   // 键盘拖拽没有指针坐标（`pointerWithin` 恒为空），只能退回最近中心。
+   if (!args.pointerCoordinates) {
+-    const candidates = pick([...groups.zones, ...groups.items]);
++    const candidates = pick([...groups.zones, ...groups.items, String(args.active.id)]);
+     const activeContainerId = containerIdOf(args.active);
+     const rootRect = args.droppableRects.get(rootZone);
+     // 节点在分组里时把根落点区也放进候选：根层没有兄弟节点的话，候选里根本没有任何指向根
+@@ -83,7 +83,9 @@ export const deviceFolderCollisionDetection: CollisionDetection = (args) => {
+   // 指针在整棵树之外：over 为空 = 取消
+   if (containerId === null) return [];
+ 
+-  const siblings = pick(groups.items).filter(
++  // 被拖元素自己（原位变暗的那个）也要参与（键盘分支同理）：指针回到原来的位置时选中自己，
++  // sortable 才会把已经退避的兄弟归位——否则最近的永远是邻居，邻居一直占着原位不回来。
++  const siblings = pick([...groups.items, String(args.active.id)]).filter(
+     (container) => containerIdOf(container) === containerId
+   );
+   if (siblings.length > 0) return closestCenter({ ...args, droppableContainers: siblings });
+diff --git a/packages/panels/src/device-management/device-card-connect-toggle.tsx b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+index 05edcc5f..adb71d2f 100644
+--- a/packages/panels/src/device-management/device-card-connect-toggle.tsx
++++ b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+@@ -13,7 +13,7 @@ import { useTranslation } from 'react-i18next';
+ import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
+ import { deviceStatusDotClass } from '../device-tree/device-connection-control';
+ 
+-export type DeviceConnectAction = 'connect' | 'disconnect' | 'pending';
++type DeviceConnectAction = 'connect' | 'disconnect' | 'pending';
+ 
+ export function deviceConnectAction(status: DeviceConnectionStatus): DeviceConnectAction {
+   switch (status) {
+@@ -42,7 +42,7 @@ export function displayedConnectionStatus(
+   return status === 'connected' ? 'disconnected' : status;
+ }
+ 
+-export interface DeviceCardConnectToggleProps {
++interface DeviceCardConnectToggleProps {
+   deviceId: string;
+   connection: DeviceConnectionAdapter;
+   offline?: boolean;
+diff --git a/packages/panels/src/device-management/device-grid.tsx b/packages/panels/src/device-management/device-grid.tsx
+new file mode 100644
+index 00000000..8e35f2ed
+--- /dev/null
++++ b/packages/panels/src/device-management/device-grid.tsx
+@@ -0,0 +1,127 @@
++// 设备卡片网格：dnd-kit 排序容器 + 每张卡片的拖动把手；首屏逐项入场的样式由 state 给。
++
++import {
++  DndContext,
++  KeyboardSensor,
++  MouseSensor,
++  TouchSensor,
++  closestCenter,
++  useSensor,
++  useSensors,
++} from '@dnd-kit/core';
++import {
++  SortableContext,
++  rectSortingStrategy,
++  sortableKeyboardCoordinates,
++  useSortable,
++} from '@dnd-kit/sortable';
++import { CSS } from '@dnd-kit/utilities';
++import type { Device } from '@tmex/shared';
++import { cn } from '@tmex/ui';
++import { GripVertical } from 'lucide-react';
++import type { CSSProperties } from 'react';
++import { useTranslation } from 'react-i18next';
++import { DeviceCardHost, type DeviceCardHostProps } from './device-card-host';
++import type { useDeviceManagementState } from './use-device-management-state';
++
++const HANDLE_CLASS =
++  'inline-flex size-6 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-muted-foreground/60 transition-colors duration-(--tmex-motion-fast) ease-out hover:bg-accent hover:text-foreground active:cursor-grabbing motion-reduce:transition-none';
++
++type CardProps = Omit<DeviceCardHostProps, 'device' | 'dragHandle' | 'style' | 'className'>;
++
++function SortableDeviceCard({
++  device,
++  disabled,
++  style,
++  card,
++}: {
++  device: Device;
++  disabled: boolean;
++  style?: CSSProperties;
++  card: CardProps;
++}) {
++  const { t } = useTranslation();
++  const sortable = useSortable({ id: device.id, disabled });
++
++  const dragHandle = disabled ? null : (
++    <button
++      type="button"
++      ref={sortable.setActivatorNodeRef}
++      data-testid={`device-card-handle-${device.id}`}
++      aria-label={t('device.dragHandle')}
++      title={t('device.dragHandle')}
++      className={HANDLE_CLASS}
++      {...sortable.attributes}
++      {...sortable.listeners}
++    >
++      <GripVertical className="size-3.5" />
++    </button>
++  );
++
++  // 拖起来的卡片要有「被拎起」的观感：抬高层级 + 放大一点 + 更重的投影。
++  // 缩放只能拼进内联 transform——tailwind 的 scale-* 会被这里的内联 transform 盖掉。
++  const translate = CSS.Translate.toString(sortable.transform);
++  const dragging = sortable.isDragging;
++  return (
++    <div
++      ref={sortable.setNodeRef}
++      data-testid={`device-card-slot-${device.id}`}
++      data-dragging={dragging ? 'true' : undefined}
++      className={cn(
++        'min-w-0 rounded-xl',
++        dragging && 'z-10 shadow-2xl ring-2 ring-ring/30 motion-reduce:shadow-lg'
++      )}
++      style={{
++        ...style,
++        transform:
++          dragging && !disabled
++            ? `${translate ?? ''} scale(1.03)`.trim()
++            : (translate ?? undefined),
++        transition: sortable.transition,
++      }}
++    >
++      <DeviceCardHost device={device} dragHandle={dragHandle} {...card} />
++    </div>
++  );
++}
++
++export function DeviceGrid({
++  state,
++  card,
++}: {
++  state: ReturnType<typeof useDeviceManagementState>;
++  card: CardProps;
++}) {
++  const sensors = useSensors(
++    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
++    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
++    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
++  );
++  const { devices, deviceIds, reorderDisabled } = state;
++
++  return (
++    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={state.onDragEnd}>
++      <SortableContext items={deviceIds} strategy={rectSortingStrategy} disabled={reorderDisabled}>
++        <div
++          data-testid="devices-grid"
++          // 自适应列数：每列至少 24rem，设备名与 SSH 目标才有地方放（窄屏退回单列）
++          className={cn(
++            'grid grid-cols-[repeat(auto-fill,minmax(min(24rem,100%),1fr))] gap-3',
++            state.staggering && 'tmex-stagger'
++          )}
++          onAnimationEnd={state.onAnimationEnd}
++        >
++          {devices.map((device, index) => (
++            <SortableDeviceCard
++              key={device.id}
++              device={device}
++              disabled={reorderDisabled}
++              style={state.staggerStyle(device.id, index)}
++              card={card}
++            />
++          ))}
++        </div>
++      </SortableContext>
++    </DndContext>
++  );
++}
+diff --git a/packages/panels/src/device-management/device-management-panel.test.tsx b/packages/panels/src/device-management/device-management-panel.test.tsx
+new file mode 100644
+index 00000000..1b3dbeda
+--- /dev/null
++++ b/packages/panels/src/device-management/device-management-panel.test.tsx
+@@ -0,0 +1,100 @@
++// 面板的三条渲染分支：加载中 / 空态 / 卡片网格。bun test 无 DOM，用 react-dom/server 静态渲染，
++// 列表数据直接塞进 query 缓存（静态渲染跑不了 effect，也就发不出请求）。
++
++import { describe, expect, test } from 'bun:test';
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
++import { devicesQueryKey } from '@tmex/api-client';
++import type { Device } from '@tmex/shared';
++import { I18N_RESOURCES } from '@tmex/shared';
++import { createAppRuntime } from '@tmex/stores';
++import { RuntimeProvider } from '@tmex/stores/react';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++import i18next from 'i18next';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
++import { MemoryRouter } from 'react-router';
++import { DeviceManagementPanel } from './device-management-panel';
++
++installWindowStorage();
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++const DEVICE: Device = {
++  id: 'dev-1',
++  name: '书房',
++  type: 'local',
++  authMode: 'auto',
++  sortOrder: 1,
++  createdAt: '2026-01-01T00:00:00.000Z',
++  updatedAt: '2026-01-01T00:00:00.000Z',
++};
++const OTHER_DEVICE: Device = { ...DEVICE, id: 'dev-2', name: '客厅', sortOrder: 0 };
++
++let storageSeq = 0;
++
++function renderPanel(options: { devices?: Device[]; offline?: boolean } = {}): string {
++  const queryClient = new QueryClient();
++  if (options.devices) queryClient.setQueryData(devicesQueryKey, { devices: options.devices });
++  const runtime = createAppRuntime({
++    nodeId: 'self',
++    storagePrefix: `device-panel-test-${storageSeq++}:`,
++  });
++  const html = renderToStaticMarkup(
++    <MemoryRouter>
++      <I18nextProvider i18n={i18n}>
++        <QueryClientProvider client={queryClient}>
++          <RuntimeProvider runtime={runtime}>
++            <DeviceManagementPanel offline={options.offline} />
++          </RuntimeProvider>
++        </QueryClientProvider>
++      </I18nextProvider>
++    </MemoryRouter>
++  );
++  runtime.dispose();
++  return html;
++}
++
++describe('DeviceManagementPanel 的渲染分支', () => {
++  test('缓存里还没有列表时是加载态，不渲染网格', () => {
++    const html = renderPanel();
++    expect(html).toContain('加载中');
++    expect(html).not.toContain('data-testid="devices-grid"');
++    expect(html).not.toContain('data-testid="devices-add-empty"');
++  });
++
++  test('空列表给出「添加设备」空态', () => {
++    const html = renderPanel({ devices: [] });
++    expect(html).toContain('data-testid="devices-add-empty"');
++    expect(html).not.toContain('data-testid="devices-grid"');
++  });
++
++  test('离线且没有任何已知设备时是离线空态，不给添加入口', () => {
++    const html = renderPanel({ offline: true });
++    expect(html).toContain('data-testid="devices-offline-empty"');
++    expect(html).not.toContain('data-testid="devices-add-empty"');
++  });
++
++  test('有设备时渲染网格，卡片按 sortOrder 排序并带拖动把手', () => {
++    const html = renderPanel({ devices: [DEVICE, OTHER_DEVICE] });
++    expect(html).toContain('data-testid="devices-grid"');
++    expect(html.indexOf('device-card-slot-dev-2')).toBeLessThan(
++      html.indexOf('device-card-slot-dev-1')
++    );
++    expect(html).toContain('data-testid="device-card-handle-dev-1"');
++    expect(html).not.toContain('data-testid="devices-offline-hint"');
++  });
++
++  test('离线时用缓存里的列表渲染，带离线提示且没有拖动把手', () => {
++    const html = renderPanel({ devices: [DEVICE, OTHER_DEVICE], offline: true });
++    expect(html).toContain('data-testid="devices-offline-hint"');
++    expect(html).toContain('data-testid="devices-grid"');
++    expect(html).not.toContain('data-testid="device-card-handle-dev-1"');
++  });
++});
+diff --git a/packages/panels/src/device-management/device-management-panel.tsx b/packages/panels/src/device-management/device-management-panel.tsx
+index ad0a6651..3296cee3 100644
+--- a/packages/panels/src/device-management/device-management-panel.tsx
++++ b/packages/panels/src/device-management/device-management-panel.tsx
+@@ -1,69 +1,26 @@
+-// 设备管理面板：设备卡片网格（节点内可拖拽排序）+ 新建对话框 + 空态/加载/错误态
+-// （每张卡片的编辑与删除由 DeviceCardHost 自己管）。数据自取（fetchDevices + 注入 queryKey），
+-// REST 一律经 runtime.apiClient；「添加设备」既可经全局事件（缺省监听，多面板宿主可关）也可经
+-// ref 命令式打开。
++// 设备管理面板：设备卡片网格（节点内可拖拽排序，见 device-grid）+ 新建对话框 + 空态/加载/错误态；
++// 每张卡片的编辑与删除由 DeviceCardHost 自己管，数据与拖拽状态在 useDeviceManagementState。
++// 「添加设备」既可经全局事件（缺省监听，多面板宿主可关）也可经 ref 命令式打开。
+ //
+ // `offline`：所属节点离线。不再拉列表，卡片来自 query 缓存里最近一次成功的列表，缓存也没有时
+ // 退回宿主给的 `fallbackDevices`（本地快照 / 节点 inventory）；卡片带 offline 标记、排序禁用。
+-//
+ // 宽度与内边距由页面级容器统一负责，本面板只是 `w-full`。
+ 
+-import {
+-  DndContext,
+-  type DragEndEvent,
+-  KeyboardSensor,
+-  MouseSensor,
+-  TouchSensor,
+-  closestCenter,
+-  useSensor,
+-  useSensors,
+-} from '@dnd-kit/core';
+-import {
+-  SortableContext,
+-  arrayMove,
+-  rectSortingStrategy,
+-  sortableKeyboardCoordinates,
+-  useSortable,
+-} from '@dnd-kit/sortable';
+-import { CSS } from '@dnd-kit/utilities';
+-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+-import {
+-  type DevicesResponse,
+-  devicesQueryKey as defaultDevicesQueryKey,
+-  fetchDevices,
+-  reorderDevices,
+-} from '@tmex/api-client';
+-import type { Device, LocaleCode } from '@tmex/shared';
+-import { toBCP47 } from '@tmex/shared';
+-import { useRuntime, useSiteStore, useTmuxStore } from '@tmex/stores/react';
++import { devicesQueryKey as defaultDevicesQueryKey } from '@tmex/api-client';
++import type { Device } from '@tmex/shared';
++import { useRuntime } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import { Button } from '@tmex/ui/button';
+ import { Card, CardContent } from '@tmex/ui/card';
+-import { staggerItemStyle } from '@tmex/ui/motion';
+-import { GripVertical, Monitor, Plus } from 'lucide-react';
+-import {
+-  type CSSProperties,
+-  type ReactNode,
+-  type Ref,
+-  useCallback,
+-  useEffect,
+-  useImperativeHandle,
+-  useMemo,
+-  useRef,
+-  useState,
+-} from 'react';
++import { Monitor, Plus } from 'lucide-react';
++import { type Ref, useEffect, useImperativeHandle, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { toast } from 'sonner';
+ import type { DeviceConnectionAdapter } from '../device-connection';
+-import { DeviceCardHost } from './device-card-host';
+ import { DeviceDialog } from './device-dialog';
++import { DeviceGrid } from './device-grid';
+ import type { DeviceNodeContext } from './device-node-context';
+ import { OPEN_ADD_DEVICE_EVENT } from './events';
+-
+-/** 首屏逐项入场的延迟档位上限（35ms/档），超出的卡片与最后一档同时进场 */
+-const STAGGER_MAX_INDEX = 11;
+-/** 入场动画兜底：animationend 没等到（隐藏标签页等）也在此之后摘掉 stagger 类 */
+-const STAGGER_FALLBACK_MS = 1500;
++import { useDeviceManagementState } from './use-device-management-state';
+ 
+ export interface DeviceManagementPanelHandle {
+   openAddDevice(): void;
+@@ -82,26 +39,6 @@ export function subscribeOpenAddDevice(
+   return () => window.removeEventListener(OPEN_ADD_DEVICE_EVENT, onOpen);
+ }
+ 
+-/**
+- * 卡片顺序与侧边栏 Panes Tab 一致：先 sortOrder，再按设备名 locale 感知排序。
+- * 顺带按 id 去重：同一个 id 出现两次会渲染出两张一模一样的卡片（React key 也会撞），
+- * 列表可能来自缓存 + 快照 + 节点 inventory 几处，这里统一兜住。
+- */
+-export function sortDevices<T extends Pick<Device, 'id' | 'name' | 'sortOrder'>>(
+-  devices: readonly T[],
+-  language: LocaleCode
+-): T[] {
+-  const byId = new Map<string, T>();
+-  for (const device of devices) {
+-    if (!byId.has(device.id)) byId.set(device.id, device);
+-  }
+-  return [...byId.values()].sort(
+-    (a, b) =>
+-      a.sortOrder - b.sortOrder ||
+-      a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
+-  );
+-}
+-
+ export interface DeviceManagementPanelProps {
+   /** 设备列表查询 key；多实例宿主按 gateway 区分，缺省与既有共享缓存一致 */
+   devicesQueryKey?: readonly unknown[];
+@@ -121,77 +58,39 @@ export interface DeviceManagementPanelProps {
+   ref?: Ref<DeviceManagementPanelHandle>;
+ }
+ 
+-function useDeviceGridSensors() {
+-  return useSensors(
+-    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
+-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
++function NoticeCard({ text, failed }: { text: string; failed: boolean }) {
++  return (
++    <Card size="sm" className="tmex-reveal">
++      <CardContent
++        className={cn(
++          'py-10 text-center text-sm',
++          failed ? 'text-destructive' : 'text-muted-foreground'
++        )}
++      >
++        {text}
++      </CardContent>
++    </Card>
+   );
+ }
+ 
+-const HANDLE_CLASS =
+-  'inline-flex size-6 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-muted-foreground/60 transition-colors duration-(--tmex-motion-fast) ease-out hover:bg-accent hover:text-foreground active:cursor-grabbing motion-reduce:transition-none';
+-
+-function SortableDeviceCard({
+-  device,
+-  disabled,
+-  style,
+-  children,
+-}: {
+-  device: Device;
+-  disabled: boolean;
+-  style?: CSSProperties;
+-  children: (dragHandle: ReactNode) => ReactNode;
+-}) {
++function EmptyState({ onAdd }: { onAdd: () => void }) {
+   const { t } = useTranslation();
+-  const {
+-    attributes,
+-    listeners,
+-    setNodeRef,
+-    setActivatorNodeRef,
+-    transform,
+-    transition,
+-    isDragging,
+-  } = useSortable({ id: device.id, disabled });
+-
+-  const dragHandle = disabled ? null : (
+-    <button
+-      type="button"
+-      ref={setActivatorNodeRef}
+-      data-testid={`device-card-handle-${device.id}`}
+-      aria-label={t('device.dragHandle')}
+-      title={t('device.dragHandle')}
+-      className={HANDLE_CLASS}
+-      {...attributes}
+-      {...listeners}
+-    >
+-      <GripVertical className="size-3.5" />
+-    </button>
+-  );
+-
+-  // 拖起来的卡片要有「被拎起」的观感：抬高层级 + 放大一点 + 更重的投影。
+-  // 缩放只能拼进内联 transform——tailwind 的 scale-* 会被这里的内联 transform 盖掉。
+-  const translate = CSS.Translate.toString(transform);
+   return (
+-    <div
+-      ref={setNodeRef}
+-      data-testid={`device-card-slot-${device.id}`}
+-      data-dragging={isDragging ? 'true' : undefined}
+-      className={cn(
+-        'min-w-0 rounded-xl',
+-        isDragging && 'z-10 shadow-2xl ring-2 ring-ring/30 motion-reduce:shadow-lg'
+-      )}
+-      style={{
+-        ...style,
+-        transform:
+-          isDragging && !disabled
+-            ? `${translate ?? ''} scale(1.03)`.trim()
+-            : (translate ?? undefined),
+-        transition,
+-      }}
+-    >
+-      {children(dragHandle)}
+-    </div>
++    <Card size="sm" className="tmex-reveal">
++      <CardContent className="space-y-3 py-8 text-center">
++        <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-muted">
++          <Monitor className="h-5 w-5 text-muted-foreground" />
++        </div>
++        <div className="space-y-0.5">
++          <h2 className="text-sm font-medium">{t('device.noDevices')}</h2>
++          <p className="text-xs text-muted-foreground">{t('device.addDevice')}</p>
++        </div>
++        <Button variant="default" size="sm" data-testid="devices-add-empty" onClick={onAdd}>
++          <Plus className="h-4 w-4" />
++          {t('device.addDevice')}
++        </Button>
++      </CardContent>
++    </Card>
+   );
+ }
+ 
+@@ -208,9 +107,7 @@ export function DeviceManagementPanel({
+ }: DeviceManagementPanelProps) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+-  const queryClient = useQueryClient();
+   const [showAddModal, setShowAddModal] = useState(false);
+-  const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
+ 
+   const resolvedNodeContext = useMemo<DeviceNodeContext>(
+     () => nodeContext ?? { runtimeNodeId: runtime.nodeId, name: '', isSelf: true },
+@@ -218,7 +115,6 @@ export function DeviceManagementPanel({
+   );
+ 
+   useImperativeHandle(ref, () => ({ openAddDevice: () => setShowAddModal(true) }), []);
+-
+   useEffect(
+     () => subscribeOpenAddDevice(listenOpenAddDeviceEvent, () => setShowAddModal(true)),
+     [listenOpenAddDeviceEvent]
+@@ -227,204 +123,47 @@ export function DeviceManagementPanel({
+     if (offline) setShowAddModal(false);
+   }, [offline]);
+ 
+-  const { data, isLoading, isError } = useQuery({
+-    queryKey: devicesQueryKey,
+-    queryFn: () => fetchDevices(runtime.apiClient),
+-    throwOnError: false,
+-    enabled: !offline,
+-  });
+-
+-  const hydrateDeviceErrors = useTmuxStore((state) => state.hydrateDeviceErrors);
+-
+-  useEffect(() => {
+-    if (!data?.devices) return;
+-    hydrateDeviceErrors(
+-      data.devices.map((d) => ({
+-        deviceId: d.id,
+-        lastError: d.lastError ?? null,
+-        lastErrorType: d.lastErrorType ?? null,
+-      }))
+-    );
+-    onDevicesLoaded?.(data.devices);
+-  }, [data, hydrateDeviceErrors, onDevicesLoaded]);
+-
+-  const devices = useMemo(() => {
+-    const list = data?.devices ?? (offline ? fallbackDevices : undefined);
+-    return list ? sortDevices(list, language) : undefined;
+-  }, [data?.devices, offline, fallbackDevices, language]);
+-
+-  // 逐项入场只做首屏那一批，动画跑完就摘掉 stagger 类：之后 refetch / 重排 / 状态更新都不再
+-  // 重放（DOM 节点被移动时 CSS 动画会重新触发，摘掉类是唯一稳妥的办法）。
+-  const initialBatchRef = useRef<ReadonlySet<string> | null>(null);
+-  if (initialBatchRef.current === null && devices) {
+-    initialBatchRef.current = new Set(devices.map((device) => device.id));
+-  }
+-  const initialBatch = initialBatchRef.current;
+-  const [entered, setEntered] = useState(false);
+-  const enteredCountRef = useRef(0);
+-  useEffect(() => {
+-    if (!initialBatch || entered) return;
+-    if (initialBatch.size === 0) {
+-      setEntered(true);
+-      return;
+-    }
+-    const timer = window.setTimeout(() => setEntered(true), STAGGER_FALLBACK_MS);
+-    return () => window.clearTimeout(timer);
+-  }, [initialBatch, entered]);
+-  const handleAnimationEnd = useCallback(() => {
+-    if (!initialBatch || entered) return;
+-    enteredCountRef.current += 1;
+-    if (enteredCountRef.current >= initialBatch.size) setEntered(true);
+-  }, [initialBatch, entered]);
+-
+-  const reorderMutation = useMutation({
+-    mutationFn: (deviceIds: string[]) => reorderDevices(deviceIds, runtime.apiClient),
+-    onMutate: async (deviceIds: string[]) => {
+-      await queryClient.cancelQueries({ queryKey: devicesQueryKey });
+-      const previous = queryClient.getQueryData<DevicesResponse>(devicesQueryKey);
+-      if (previous) {
+-        const byId = new Map(previous.devices.map((device) => [device.id, device]));
+-        const reordered = deviceIds.flatMap((id, index) => {
+-          const device = byId.get(id);
+-          return device ? [{ ...device, sortOrder: index }] : [];
+-        });
+-        const rest = previous.devices.filter((device) => !deviceIds.includes(device.id));
+-        queryClient.setQueryData(devicesQueryKey, { devices: [...reordered, ...rest] });
+-      }
+-      return { previous };
+-    },
+-    onError: (_error, _ids, context) => {
+-      if (context?.previous) queryClient.setQueryData(devicesQueryKey, context.previous);
+-      toast.error(t('device.reorderFailed'));
+-    },
+-    onSuccess: (result) => {
+-      queryClient.setQueryData(devicesQueryKey, result);
+-    },
++  const state = useDeviceManagementState({
++    devicesQueryKey,
++    offline,
++    fallbackDevices,
++    onDevicesLoaded,
+   });
+-
+-  const deviceIds = useMemo(() => (devices ?? []).map((device) => device.id), [devices]);
+-  const reorderMutate = reorderMutation.mutate;
+-  const reorderPending = reorderMutation.isPending;
+-  const handleDragEnd = useCallback(
+-    (event: DragEndEvent) => {
+-      const { active, over } = event;
+-      if (offline || reorderPending || !over || active.id === over.id) return;
+-      const from = deviceIds.indexOf(String(active.id));
+-      const to = deviceIds.indexOf(String(over.id));
+-      if (from < 0 || to < 0) return;
+-      reorderMutate(arrayMove([...deviceIds], from, to));
+-    },
+-    [deviceIds, reorderMutate, offline, reorderPending]
+-  );
+-  const sensors = useDeviceGridSensors();
+-  const reorderDisabled = offline || reorderPending || deviceIds.length < 2;
+-
+-  const emptyState = (
+-    <Card size="sm" className="tmex-reveal">
+-      <CardContent className="space-y-3 py-8 text-center">
+-        <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-muted">
+-          <Monitor className="h-5 w-5 text-muted-foreground" />
+-        </div>
+-        <div className="space-y-0.5">
+-          <h2 className="text-sm font-medium">{t('device.noDevices')}</h2>
+-          <p className="text-xs text-muted-foreground">{t('device.addDevice')}</p>
+-        </div>
+-        <Button
+-          variant="default"
+-          size="sm"
+-          data-testid="devices-add-empty"
+-          onClick={() => setShowAddModal(true)}
+-        >
+-          <Plus className="h-4 w-4" />
+-          {t('device.addDevice')}
+-        </Button>
+-      </CardContent>
+-    </Card>
+-  );
+-
+-  const offlineEmptyState = (
+-    <div
+-      data-testid="devices-offline-empty"
+-      className="rounded-lg border border-dashed border-border/60 bg-muted/20 px-3 py-3 text-xs text-muted-foreground/70"
+-    >
+-      {t('devices.nodes.noKnownDevices')}
+-    </div>
+-  );
+-
+-  let body: ReactNode;
+-  if (!devices) {
+-    body =
+-      isLoading || (!isError && !offline) ? (
+-        <Card size="sm" className="tmex-reveal">
+-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
+-            {t('common.loading')}
+-          </CardContent>
+-        </Card>
+-      ) : offline ? (
+-        offlineEmptyState
+-      ) : (
+-        <Card size="sm" className="tmex-reveal">
+-          <CardContent className="py-10 text-center text-sm text-destructive">
+-            {t('device.loadFailed')}
+-          </CardContent>
+-        </Card>
+-      );
+-  } else if (devices.length === 0) {
+-    body = offline ? offlineEmptyState : emptyState;
+-  } else {
+-    body = (
+-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+-        <SortableContext
+-          items={deviceIds}
+-          strategy={rectSortingStrategy}
+-          disabled={reorderDisabled}
+-        >
+-          <div
+-            data-testid="devices-grid"
+-            className={cn(
+-              // 自适应列数：每列至少 18rem，设备名与 SSH 目标才有地方放（窄屏退回单列）
+-              'grid grid-cols-[repeat(auto-fill,minmax(min(24rem,100%),1fr))] gap-3',
+-              !entered && 'tmex-stagger'
+-            )}
+-            onAnimationEnd={handleAnimationEnd}
+-          >
+-            {devices.map((device, index) => (
+-              <SortableDeviceCard
+-                key={device.id}
+-                device={device}
+-                disabled={reorderDisabled}
+-                style={
+-                  !entered && initialBatch?.has(device.id)
+-                    ? staggerItemStyle(Math.min(index, STAGGER_MAX_INDEX))
+-                    : undefined
+-                }
+-              >
+-                {(dragHandle) => (
+-                  <DeviceCardHost
+-                    device={device}
+-                    queryKey={devicesQueryKey}
+-                    nodeContext={resolvedNodeContext}
+-                    connection={connection}
+-                    offline={offline}
+-                    dragHandle={dragHandle}
+-                  />
+-                )}
+-              </SortableDeviceCard>
+-            ))}
+-          </div>
+-        </SortableContext>
+-      </DndContext>
+-    );
+-  }
++  const empty = state.devices.length === 0;
+ 
+   return (
+     <div className={cn('flex w-full min-w-0 flex-col gap-3', className)} data-testid="devices-page">
+-      {offline && devices && devices.length > 0 && (
++      {offline && !empty && (
+         <p data-testid="devices-offline-hint" className="text-[11px] text-muted-foreground/70">
+           {t('devices.nodes.offlineSnapshot')}
+         </p>
+       )}
+-      {body}
++
++      {state.status !== 'ready' ? (
++        <NoticeCard
++          failed={state.status === 'error'}
++          text={state.status === 'error' ? t('device.loadFailed') : t('common.loading')}
++        />
++      ) : !empty ? (
++        <DeviceGrid
++          state={state}
++          card={{
++            queryKey: devicesQueryKey,
++            nodeContext: resolvedNodeContext,
++            connection,
++            offline,
++          }}
++        />
++      ) : offline ? (
++        <div
++          data-testid="devices-offline-empty"
++          className="rounded-lg border border-dashed border-border/60 bg-muted/20 px-3 py-3 text-xs text-muted-foreground/70"
++        >
++          {t('devices.nodes.noKnownDevices')}
++        </div>
++      ) : (
++        <EmptyState onAdd={() => setShowAddModal(true)} />
++      )}
+ 
+       {showAddModal && !offline && (
+         <DeviceDialog
+diff --git a/packages/panels/src/device-management/device-remote-info-fields.tsx b/packages/panels/src/device-management/device-remote-info-fields.tsx
+index 69fd09a5..43503642 100644
+--- a/packages/panels/src/device-management/device-remote-info-fields.tsx
++++ b/packages/panels/src/device-management/device-remote-info-fields.tsx
+@@ -20,7 +20,7 @@ function InfoRow({ label, value }: { label: string; value: string }) {
+   );
+ }
+ 
+-export interface DeviceRemoteInfoFieldsProps {
++interface DeviceRemoteInfoFieldsProps {
+   device: Device;
+   nodeContext: DeviceNodeContext;
+ }
+diff --git a/packages/panels/src/device-management/use-device-dialog-submit.ts b/packages/panels/src/device-management/use-device-dialog-submit.ts
+index 3ae16717..d7a2b7d6 100644
+--- a/packages/panels/src/device-management/use-device-dialog-submit.ts
++++ b/packages/panels/src/device-management/use-device-dialog-submit.ts
+@@ -16,7 +16,7 @@ import {
+ 
+ export type DeviceDialogMode = 'create' | 'edit';
+ 
+-export type DeviceMutationPayload =
++type DeviceMutationPayload =
+   | { mode: 'create'; payload: CreateDeviceRequest }
+   | { mode: 'edit'; payload: UpdateDeviceRequest };
+ 
+@@ -49,7 +49,7 @@ function useMutationCallbacks(queryKey: readonly unknown[], onClose: () => void)
+   };
+ }
+ 
+-export interface DeviceDialogSubmitParams {
++interface DeviceDialogSubmitParams {
+   mode: DeviceDialogMode;
+   device?: Device;
+   values: DeviceFormValues;
+@@ -59,7 +59,7 @@ export interface DeviceDialogSubmitParams {
+   offline?: boolean;
+ }
+ 
+-export interface DeviceDialogSubmitModel {
++interface DeviceDialogSubmitModel {
+   attempted: boolean;
+   isSubmitting: boolean;
+   handleSubmit: (event: FormEvent) => Promise<void>;
+diff --git a/packages/panels/src/device-management/use-device-management-state.ts b/packages/panels/src/device-management/use-device-management-state.ts
+new file mode 100644
+index 00000000..0b634718
+--- /dev/null
++++ b/packages/panels/src/device-management/use-device-management-state.ts
+@@ -0,0 +1,162 @@
++// 设备管理面板的数据与交互状态：列表拉取（离线时退回缓存 / 宿主快照）、错误水合、
++// 首屏逐项入场的收尾、拖拽重排的乐观更新。面板只负责渲染分支。
++
++import type { DragEndEvent } from '@dnd-kit/core';
++import { arrayMove } from '@dnd-kit/sortable';
++import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
++import { type DevicesResponse, fetchDevices, reorderDevices } from '@tmex/api-client';
++import type { Device, LocaleCode } from '@tmex/shared';
++import { toBCP47 } from '@tmex/shared';
++import { useRuntime, useSiteStore, useTmuxStore } from '@tmex/stores/react';
++import { staggerItemStyle } from '@tmex/ui/motion';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { toast } from 'sonner';
++
++/** 首屏逐项入场的延迟档位上限（35ms/档），超出的卡片与最后一档同时进场 */
++const STAGGER_MAX_INDEX = 11;
++/** 入场动画兜底：animationend 没等到（隐藏标签页等）也在此之后摘掉 stagger 类 */
++const STAGGER_FALLBACK_MS = 1500;
++
++const NO_DEVICES: Device[] = [];
++
++// 顺序与侧边栏 Panes Tab 一致：先 sortOrder 再按设备名 locale 感知排序；顺带按 id 去重
++// （列表可能来自缓存 + 快照 + 节点 inventory 几处，撞 id 会渲染出两张一样的卡片）。
++function sortDevices(devices: readonly Device[], language: LocaleCode): Device[] {
++  const byId = new Map<string, Device>();
++  for (const device of devices) {
++    if (!byId.has(device.id)) byId.set(device.id, device);
++  }
++  return [...byId.values()].sort(
++    (a, b) =>
++      a.sortOrder - b.sortOrder ||
++      a.name.localeCompare(b.name, toBCP47(language), { numeric: true, sensitivity: 'base' })
++  );
++}
++
++export function useDeviceManagementState({
++  devicesQueryKey,
++  offline,
++  fallbackDevices,
++  onDevicesLoaded,
++}: {
++  devicesQueryKey: readonly unknown[];
++  offline: boolean;
++  fallbackDevices?: readonly Device[];
++  onDevicesLoaded?: (devices: Device[]) => void;
++}) {
++  const { t } = useTranslation();
++  const runtime = useRuntime();
++  const queryClient = useQueryClient();
++  const language = useSiteStore((state) => state.settings?.language ?? 'en_US');
++  const hydrateDeviceErrors = useTmuxStore((state) => state.hydrateDeviceErrors);
++
++  const { data, isError } = useQuery({
++    queryKey: devicesQueryKey,
++    queryFn: () => fetchDevices(runtime.apiClient),
++    throwOnError: false,
++    enabled: !offline,
++  });
++
++  useEffect(() => {
++    if (!data?.devices) return;
++    hydrateDeviceErrors(
++      data.devices.map((d) => ({
++        deviceId: d.id,
++        lastError: d.lastError ?? null,
++        lastErrorType: d.lastErrorType ?? null,
++      }))
++    );
++    onDevicesLoaded?.(data.devices);
++  }, [data, hydrateDeviceErrors, onDevicesLoaded]);
++
++  const loaded = useMemo(() => {
++    const list = data?.devices ?? (offline ? fallbackDevices : undefined);
++    return list ? sortDevices(list, language) : undefined;
++  }, [data?.devices, offline, fallbackDevices, language]);
++
++  // 逐项入场只做首屏那一批，动画跑完就摘掉 stagger 类：之后 refetch / 重排 / 状态更新都不再
++  // 重放（DOM 节点被移动时 CSS 动画会重新触发，摘掉类是唯一稳妥的办法）。
++  const initialBatchRef = useRef<ReadonlySet<string> | null>(null);
++  if (initialBatchRef.current === null && loaded) {
++    initialBatchRef.current = new Set(loaded.map((device) => device.id));
++  }
++  const initialBatch = initialBatchRef.current;
++  const [entered, setEntered] = useState(false);
++  const enteredCountRef = useRef(0);
++  useEffect(() => {
++    if (!initialBatch || entered) return;
++    if (initialBatch.size === 0) {
++      setEntered(true);
++      return;
++    }
++    const timer = window.setTimeout(() => setEntered(true), STAGGER_FALLBACK_MS);
++    return () => window.clearTimeout(timer);
++  }, [initialBatch, entered]);
++  const onAnimationEnd = useCallback(() => {
++    if (!initialBatch || entered) return;
++    enteredCountRef.current += 1;
++    if (enteredCountRef.current >= initialBatch.size) setEntered(true);
++  }, [initialBatch, entered]);
++  const staggerStyle = useCallback(
++    (deviceId: string, index: number) =>
++      !entered && initialBatch?.has(deviceId)
++        ? staggerItemStyle(Math.min(index, STAGGER_MAX_INDEX))
++        : undefined,
++    [entered, initialBatch]
++  );
++
++  const reorderMutation = useMutation({
++    mutationFn: (deviceIds: string[]) => reorderDevices(deviceIds, runtime.apiClient),
++    onMutate: async (deviceIds: string[]) => {
++      await queryClient.cancelQueries({ queryKey: devicesQueryKey });
++      const previous = queryClient.getQueryData<DevicesResponse>(devicesQueryKey);
++      if (previous) {
++        const byId = new Map(previous.devices.map((device) => [device.id, device]));
++        const reordered = deviceIds.flatMap((id, index) => {
++          const device = byId.get(id);
++          return device ? [{ ...device, sortOrder: index }] : [];
++        });
++        const rest = previous.devices.filter((device) => !deviceIds.includes(device.id));
++        queryClient.setQueryData(devicesQueryKey, { devices: [...reordered, ...rest] });
++      }
++      return { previous };
++    },
++    onError: (_error, _ids, context) => {
++      if (context?.previous) queryClient.setQueryData(devicesQueryKey, context.previous);
++      toast.error(t('device.reorderFailed'));
++    },
++    onSuccess: (result) => {
++      queryClient.setQueryData(devicesQueryKey, result);
++    },
++  });
++
++  // 拿到列表（离线时的空列表也算）为 ready，否则是加载中 / 加载失败
++  const status: 'loading' | 'error' | 'ready' =
++    loaded || offline ? 'ready' : isError ? 'error' : 'loading';
++
++  const deviceIds = useMemo(() => (loaded ?? NO_DEVICES).map((device) => device.id), [loaded]);
++  const reorderMutate = reorderMutation.mutate;
++  const reorderDisabled = offline || reorderMutation.isPending || deviceIds.length < 2;
++  const onDragEnd = useCallback(
++    ({ active, over }: DragEndEvent) => {
++      if (reorderDisabled || !over || active.id === over.id) return;
++      const from = deviceIds.indexOf(String(active.id));
++      const to = deviceIds.indexOf(String(over.id));
++      if (from < 0 || to < 0) return;
++      reorderMutate(arrayMove([...deviceIds], from, to));
++    },
++    [deviceIds, reorderMutate, reorderDisabled]
++  );
++
++  return {
++    status,
++    devices: loaded ?? NO_DEVICES,
++    deviceIds,
++    reorderDisabled,
++    staggering: !entered,
++    staggerStyle,
++    onAnimationEnd,
++    onDragEnd,
++  };
++}
+diff --git a/packages/panels/src/device-tree/device-row-header.tsx b/packages/panels/src/device-tree/device-row-header.tsx
+index 461051fa..abc4879c 100644
+--- a/packages/panels/src/device-tree/device-row-header.tsx
++++ b/packages/panels/src/device-tree/device-row-header.tsx
+@@ -27,9 +27,12 @@ export function DeviceRowHeader({
+ 
+   return (
+     <div className="relative px-3 py-1.5">
+-      {isSelected && (
+-        <span className="absolute left-0 top-0 bottom-0 w-0.5 bg-muted-foreground/70" />
+-      )}
++      <span
++        className={cn(
++          'absolute left-0 top-0 bottom-0 w-0.5 bg-muted-foreground/70 transition-opacity duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
++          isSelected ? 'opacity-100' : 'opacity-0'
++        )}
++      />
+       <div className="flex items-center gap-2">
+         <button
+           type="button"
+@@ -56,7 +59,10 @@ export function DeviceRowHeader({
+           className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground [@media(any-pointer:coarse)]:h-9 [@media(any-pointer:coarse)]:w-9"
+         >
+           <ChevronRight
+-            className={cn('h-3.5 w-3.5 transition-transform', isExpanded && 'rotate-90')}
++            className={cn(
++              'h-3.5 w-3.5 transition-transform duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
++              isExpanded && 'rotate-90'
++            )}
+           />
+         </button>
+       </div>
+diff --git a/packages/panels/src/device-tree/device-row.test.tsx b/packages/panels/src/device-tree/device-row.test.tsx
+new file mode 100644
+index 00000000..d21503fe
+--- /dev/null
++++ b/packages/panels/src/device-tree/device-row.test.tsx
+@@ -0,0 +1,115 @@
++// 设备行的展开/收起外壳：子树改由受控 Collapsible 承载（收起播完退场再卸载）。
++// bun test 无 DOM，用 react-dom/server 静态渲染断言结构（与 device-card.test.tsx 同一套做法）。
++
++import { describe, expect, test } from 'bun:test';
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
++import type { Device } from '@tmex/shared';
++import { I18N_RESOURCES } from '@tmex/shared';
++import { createAppRuntime } from '@tmex/stores';
++import { RuntimeProvider } from '@tmex/stores/react';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++import i18next from 'i18next';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
++import { MemoryRouter } from 'react-router';
++import { DeviceRow } from './device-row';
++import { SortableVerticalList } from './device-tree-dnd';
++
++installWindowStorage();
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++const DEVICE: Device = {
++  id: 'dev-1',
++  name: '书房',
++  type: 'local',
++  authMode: 'auto',
++  sortOrder: 0,
++  createdAt: '2026-01-01T00:00:00.000Z',
++  updatedAt: '2026-01-01T00:00:00.000Z',
++};
++
++let storageSeq = 0;
++
++function renderRow(options: { isExpanded: boolean; isSelected?: boolean }): string {
++  const runtime = createAppRuntime({
++    nodeId: 'self',
++    storagePrefix: `device-row-test-${storageSeq++}:`,
++  });
++  const html = renderToStaticMarkup(
++    <MemoryRouter>
++      <I18nextProvider i18n={i18n}>
++        <QueryClientProvider client={new QueryClient()}>
++          <RuntimeProvider runtime={runtime}>
++            <SortableVerticalList ids={[DEVICE.id]} onReorder={() => undefined}>
++              <DeviceRow
++                device={DEVICE}
++                isExpanded={options.isExpanded}
++                isSelected={options.isSelected ?? false}
++                onExpandedChange={() => undefined}
++                onCreateWindow={() => undefined}
++                onCloseWindow={() => undefined}
++                onClosePane={() => undefined}
++                onRenameWindow={() => undefined}
++                onRenamePane={() => undefined}
++                onPaneClick={() => undefined}
++                onWindowClick={() => undefined}
++                onWatchPane={() => undefined}
++                nav={{ navigateToPane: () => undefined }}
++              />
++            </SortableVerticalList>
++          </RuntimeProvider>
++        </QueryClientProvider>
++      </I18nextProvider>
++    </MemoryRouter>
++  );
++  runtime.dispose();
++  return html;
++}
++
++/** 选中指示条那一段开标签（它没有 testid，只能按专属背景色找） */
++function indicatorTag(html: string): string {
++  const index = html.indexOf('bg-muted-foreground/70');
++  expect(index).toBeGreaterThan(-1);
++  return html.slice(html.lastIndexOf('<', index), html.indexOf('>', index) + 1);
++}
++
++describe('DeviceRow 子树的展开态', () => {
++  test('展开时子树挂在 collapsible 面板里，缩进与 testid 不变', () => {
++    const html = renderRow({ isExpanded: true });
++
++    expect(html).toContain('data-slot="collapsible-content"');
++    expect(html).toContain(`data-testid="device-tree-${DEVICE.id}"`);
++    // e2e 断言子树左内边距 >= 20px；缩进留在子树自身而不是动画面板上
++    expect(html).toContain('pl-6');
++  });
++
++  test('收起时面板整块不渲染（Base UI 默认 keepMounted=false），设备行本身还在', () => {
++    const html = renderRow({ isExpanded: false });
++
++    expect(html).toContain(`data-testid="device-item-${DEVICE.id}"`);
++    expect(html).not.toContain(`data-testid="device-tree-${DEVICE.id}"`);
++    expect(html).not.toContain('data-slot="collapsible-content"');
++  });
++
++  test('子树不再叠一层入场动画：tmex-reveal 由 collapsible 的高度过渡取代', () => {
++    expect(renderRow({ isExpanded: true })).not.toContain('tmex-reveal');
++  });
++
++  test('选中指示条常驻，只切透明度，未选中时也在 DOM 里', () => {
++    const selected = indicatorTag(renderRow({ isExpanded: false, isSelected: true }));
++    const idle = indicatorTag(renderRow({ isExpanded: false, isSelected: false }));
++
++    expect(selected).toContain('opacity-100');
++    expect(selected).toContain('transition-opacity');
++    expect(idle).toContain('opacity-0');
++    expect(idle).toContain('transition-opacity');
++  });
++});
+diff --git a/packages/panels/src/device-tree/device-row.tsx b/packages/panels/src/device-tree/device-row.tsx
+index d035c639..1660c6ca 100644
+--- a/packages/panels/src/device-tree/device-row.tsx
++++ b/packages/panels/src/device-tree/device-row.tsx
+@@ -1,4 +1,5 @@
+ import { cn } from '@tmex/ui';
++import { Collapsible, CollapsibleContent } from '@tmex/ui/collapsible';
+ import { memo } from 'react';
+ import { DeviceRowHeader } from './device-row-header';
+ import { useSortableRow } from './device-tree-dnd';
+@@ -27,13 +28,19 @@ export const DeviceRow = memo(function DeviceRow(props: DeviceRowProps) {
+       style={sortable.style}
+       data-testid={`device-item-${deviceId}`}
+       className={cn(
+-        'group/device rounded-xl border border-border/60 overflow-hidden',
++        'group/device rounded-xl border border-border/60 overflow-hidden transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none',
+         isSelected ? 'bg-chat-surface' : 'bg-muted/20',
+         sortable.isDragging && 'opacity-60 shadow-lg'
+       )}
+     >
+       <DeviceRowHeader {...props} sortable={sortable} status={status} />
+-      {showTree && <DeviceWindowList {...props} windows={windows} />}
++      {/* 受控 Collapsible：展开/收起都走高度+透明度过渡；首屏已展开的设备由 Base UI
++          自己取消入场过渡（不会从 0 高度弹一下），收起时面板走完过渡才卸载 */}
++      <Collapsible open={showTree}>
++        <CollapsibleContent>
++          <DeviceWindowList {...props} windows={windows} />
++        </CollapsibleContent>
++      </Collapsible>
+     </div>
+   );
+ });
+diff --git a/packages/panels/src/device-tree/device-window-list.tsx b/packages/panels/src/device-tree/device-window-list.tsx
+index 999afd3c..5b8e4c09 100644
+--- a/packages/panels/src/device-tree/device-window-list.tsx
++++ b/packages/panels/src/device-tree/device-window-list.tsx
+@@ -15,7 +15,7 @@ const stopPropagation = (event: { stopPropagation: () => void }) => event.stopPr
+ 
+ /**
+  * 展开态的设备子树：加载中 / 空窗口 / 窗口列表 + 新建窗口按钮。
+- * 根节点的 `tmex-reveal` 只在展开挂载时播一次；tmux 快照推送只是重渲染，不会重放。
++ * 出入场动画由外层 `DeviceRow` 的 Collapsible 统一负责，这里不再叠一层入场动画。
+  */
+ export function DeviceWindowList(props: DeviceWindowListProps) {
+   const { device, windows, onCreateWindow } = props;
+@@ -30,7 +30,7 @@ export function DeviceWindowList(props: DeviceWindowListProps) {
+   return (
+     <div
+       data-testid={`device-tree-${deviceId}`}
+-      className="tmex-reveal space-y-1.5 py-1.5 pr-1.5 pl-6 [@media(any-pointer:coarse)]:space-y-2"
++      className="space-y-1.5 py-1.5 pr-1.5 pl-6 [@media(any-pointer:coarse)]:space-y-2"
+     >
+       {!windows && <DeviceTreeHint text={t('common.loading')} />}
+       {windows?.length === 0 && <DeviceTreeHint text={t('window.noWindows')} />}
+diff --git a/packages/panels/src/device-tree/pane-row-content.tsx b/packages/panels/src/device-tree/pane-row-content.tsx
+index 53dbd058..f5764ffd 100644
+--- a/packages/panels/src/device-tree/pane-row-content.tsx
++++ b/packages/panels/src/device-tree/pane-row-content.tsx
+@@ -40,7 +40,7 @@ export const PaneRowContent = memo(function PaneRowContent({
+       data-testid={`pane-item-${pane.id}`}
+       data-active={isActive ? 'true' : undefined}
+       className={cn(
+-        'flex-1 min-w-0 flex items-center gap-2 px-2 py-1 rounded-lg text-left transition-colors pr-13 [@media(any-pointer:coarse)]:py-2 [@media(any-pointer:coarse)]:pr-21',
++        'flex-1 min-w-0 flex items-center gap-2 px-2 py-1 rounded-lg text-left transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none pr-13 [@media(any-pointer:coarse)]:py-2 [@media(any-pointer:coarse)]:pr-21',
+         isMobile && 'py-2.5 pr-24',
+         isActive ? 'bg-primary/10 text-primary' : 'hover:bg-accent/30 text-muted-foreground'
+       )}
+diff --git a/packages/panels/src/device-tree/window-row-header.tsx b/packages/panels/src/device-tree/window-row-header.tsx
+index a3848f5e..5d7f7055 100644
+--- a/packages/panels/src/device-tree/window-row-header.tsx
++++ b/packages/panels/src/device-tree/window-row-header.tsx
+@@ -46,7 +46,7 @@ export const WindowRowHeader = memo(function WindowRowHeader({
+       data-testid={`window-item-${tmuxWindow.id}`}
+       data-active={isPaneSelected ? 'true' : undefined}
+       className={cn(
+-        'flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded-lg text-left transition-colors pr-7 [@media(any-pointer:coarse)]:py-2.5 [@media(any-pointer:coarse)]:pr-12',
++        'flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded-lg text-left transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none pr-7 [@media(any-pointer:coarse)]:py-2.5 [@media(any-pointer:coarse)]:pr-12',
+         isMobile && 'py-2.5 pr-13',
+         isPaneSelected ? 'bg-primary/10 text-primary' : 'hover:bg-accent/50 text-foreground'
+       )}

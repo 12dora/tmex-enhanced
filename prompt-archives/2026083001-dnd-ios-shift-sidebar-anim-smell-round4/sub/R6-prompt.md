@@ -1,0 +1,23 @@
+You are a senior backend engineer working in the Bun + TypeScript monorepo at the current working directory (a git worktree of tmex, branch `chore/round4-dnd-sidebar-smell`). Read `AGENTS.md` at the repo root first and obey it (Bun only — `bun`, `bunx`, never node/npm; no unnecessary comments; any comment you do write is Simplified Chinese; never lint/format generated files such as `packages/shared/src/i18n/resources.ts`).
+
+HARD RULES
+- Other agents edit OTHER files in this worktree at the same time. You may only modify the files listed in YOUR SCOPE below (plus their `*.test.ts` siblings and brand-new files you are told to create). If you believe you need to touch anything else, stop and note it in your result instead.
+- Never run git commands that change state (no add/commit/stash/checkout/reset). `git diff` / `git status` / `git log` are fine.
+- This is a code-smell cleanup whose #1 metric is NET LINE COUNT REDUCTION. Every refactor must delete more than it adds. Do not introduce interfaces, classes, wrapper layers, option bags, or "helpers" that merely move code around. Prefer deleting duplicated logic, collapsing repeated branches into table-driven code only when the table is clearly smaller, removing dead exports (drop the `export` keyword or delete the symbol if unused), and simplifying control flow. Preserve every observable behaviour (wire formats, error codes/messages that tests or clients depend on, ordering, transaction boundaries, stop/cleanup order).
+- Do not touch the previous rounds' intentionally-retained hotspots even if they are in your file: `emitOsc`, `encodeMouseEvent`, `classifySshError`, control-mode `parse`, `dispatchPaneStreamByte`, `runInit`, `sanitizeBunPath`.
+- Do not change version numbers, CHANGELOG, build scripts or anything release-related.
+- Fix real bugs you are pointed at (and ones you find in scope), each with a regression test where feasible.
+- Test discipline: run the package's tests before you start to know the baseline, again when done. Commands: `cd apps/gateway && bun test` (baseline 2499 pass / 0 fail; `bunx tsc --noEmit -p .` has 21 pre-existing errors — do not increase them), `cd packages/app && bun test` (baseline 409 pass / 1 pre-existing fail (cpu-features stub plugin); tsc 1 pre-existing error), `cd packages/shared && bun test` (358 pass; tsc 0), `cd packages/ws-client && bun test` (261 pass; tsc 0). Run `bunx biome check <each changed file>` and fix findings (biome config is at repo root). macOS has no `timeout` command. bun test summary lines contain ANSI colours; strip with `sed 's/\x1b\[[0-9;]*m//g'`.
+- No file may end up with a hard-coded credential. No network access needed.
+- Never touch the production tmex service (port 9883, `~/Library/Application Support/tmex/`) or any tmux session named `tmex`.
+
+RESULT: when finished, write a markdown report to the path given in YOUR SCOPE (`RESULT FILE`) containing: files changed with one-line summaries, `git diff --stat` output, line delta (before/after per file, from `wc -l`), test/tsc/biome results before and after, bugs fixed, and anything you deliberately skipped and why. The report is how the commander learns you are done, so write it last, and write it even if you had to stop early.
+
+RESULT FILE: /Users/konata/code/tmex-enhanced/prompt-archives/2026083001-dnd-ios-shift-sidebar-anim-smell-round4/sub/R6-result.md
+
+YOUR SCOPE (R6 — forwarder response/failover seams):
+File: `apps/gateway/src/mesh/forwarder.ts` (1049 lines) + `forwarder.test.ts`. Nothing else. A previous agent already fixed the flushQueue double call and abort-listener leak and extracted `appendNodeCookie` — build on that (read `git log -p -1 -- apps/gateway/src/mesh/forwarder.ts` for context).
+- `failover` (~273, CC25/68), `handleRemoteHttp` (~427, CC18/54), `adaptResponse` (~540, CC17/65): reduce CC under 15 each. Concretely: `adaptResponse` — separate the 401/session-header rewrite policy from the header copy loop; `failover` — split retry/open from replay-completion; `handleRemoteHttp` — hoist the retry loop. ONLY do a split when it does not add lines overall (the previous agent found pure extractions grew the file — so look for duplication to delete alongside: repeated header-copy loops, duplicated try/finally, repeated `this.log(...)` shapes, identical error→Response mappings).
+- Also look for unused private fields/methods and dead branches across the whole file (it is 1049 lines; there is probably 40+ lines of dead weight). Verify with `rg` before deleting.
+Tests: `forwarder.test.ts` (44 pass) and `integration/stream-failover.integration.test.ts` must stay green.
+Target: net -40 lines or better with all three functions under CC15.

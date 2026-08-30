@@ -1,0 +1,5104 @@
+diff --git a/apps/gateway/src/api/route-input.test.ts b/apps/gateway/src/api/route-input.test.ts
+new file mode 100644
+index 00000000..0de7b52e
+--- /dev/null
++++ b/apps/gateway/src/api/route-input.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, test } from 'bun:test';
++import { encodeBase64url } from '@tmex/shared/auth';
++import {
++  decodeB64url,
++  requireB64url,
++  requireBodyString,
++  requiredStrings,
++  validationError,
++} from './route-input';
++
++describe('route-input', () => {
++  test('requiredStrings keeps empty strings and rejects missing/non-string fields', () => {
++    expect(requiredStrings({ a: 'x', b: '' }, ['a', 'b'])).toEqual({ a: 'x', b: '' });
++    expect(requiredStrings({ a: 'x' }, ['a', 'b'])).toBeNull();
++    expect(requiredStrings({ a: 1, b: 'y' }, ['a', 'b'])).toBeNull();
++  });
++
++  test('requireBodyString / b64url / validationError match hub messages', async () => {
++    const bytes = new Uint8Array([1, 2, 3, 4]);
++    const encoded = encodeBase64url(bytes);
++    expect(requireBodyString({ k: 'v' }, 'k')).toBe('v');
++    expect(() => requireBodyString({ k: '' }, 'k')).toThrow('missing k');
++    expect(decodeB64url(encoded)).toEqual(bytes);
++    expect(requireB64url({ f: encoded }, 'f', 4)).toEqual(bytes);
++    expect(() => decodeB64url('')).toThrow('invalid b64url');
++    expect(() => decodeB64url(encoded, 3)).toThrow('expected 3 bytes');
++    expect(await validationError(new Error('missing certificate')).json()).toEqual({
++      error: 'missing certificate',
++    });
++    expect(await validationError('nope').json()).toEqual({ error: 'invalid_fields' });
++  });
++});
+diff --git a/apps/gateway/src/api/route-input.ts b/apps/gateway/src/api/route-input.ts
+new file mode 100644
+index 00000000..17e747ed
+--- /dev/null
++++ b/apps/gateway/src/api/route-input.ts
+@@ -0,0 +1,49 @@
++import { decodeBase64url } from '@tmex/shared/auth';
++import { json } from './http';
++
++export function requiredStrings<K extends string>(
++  body: Record<string, unknown>,
++  keys: readonly K[]
++): Record<K, string> | null {
++  const out = {} as Record<K, string>;
++  for (const key of keys) {
++    const value = body[key];
++    if (typeof value !== 'string') return null;
++    out[key] = value;
++  }
++  return out;
++}
++
++export function requireBodyString(body: Record<string, unknown>, key: string): string {
++  const value = body[key];
++  if (typeof value !== 'string' || value.length === 0) {
++    throw new Error(`missing ${key}`);
++  }
++  return value;
++}
++
++export function decodeB64url(value: string, expectedLen?: number): Uint8Array {
++  if (value.length === 0) throw new Error('invalid b64url');
++  let bytes: Uint8Array;
++  try {
++    bytes = decodeBase64url(value);
++  } catch {
++    throw new Error('invalid b64url');
++  }
++  if (expectedLen !== undefined && bytes.byteLength !== expectedLen) {
++    throw new Error(`expected ${expectedLen} bytes`);
++  }
++  return bytes;
++}
++
++export function requireB64url(
++  body: Record<string, unknown>,
++  key: string,
++  expectedLen?: number
++): Uint8Array {
++  return decodeB64url(requireBodyString(body, key), expectedLen);
++}
++
++export function validationError(err: unknown): Response {
++  return json({ error: err instanceof Error ? err.message : 'invalid_fields' }, 400);
++}
+diff --git a/apps/gateway/src/hub/hub-runtime.ts b/apps/gateway/src/hub/hub-runtime.ts
+index c67fa32b..8ea6e771 100644
+--- a/apps/gateway/src/hub/hub-runtime.ts
++++ b/apps/gateway/src/hub/hub-runtime.ts
+@@ -13,9 +13,11 @@ import {
+ } from '@tmex/shared/auth';
+ import { type LinkSession, type ServerSocketAdapter, WebSocketLink } from '@tmex/shared/link';
+ import { json, readJsonObjectBody } from '../api/http';
++import { matchPath } from '../api/route';
++import { decodeB64url, requireB64url, validationError } from '../api/route-input';
+ import { makeVerifyPasskeyAssertion } from '../auth/passkey';
+ import type { AuthDb } from '../auth/types';
+-import { UserStore } from '../auth/user-store';
++import { type UserRecord, UserStore } from '../auth/user-store';
+ import { detachEnrollmentTokensFromNode, patchNode } from './node-persistence';
+ import { NodeRegistry } from './node-registry';
+ import { encodeRedeemPopMessage } from './redeem-pop';
+@@ -31,7 +33,6 @@ import {
+   type HubRuntimeConfig,
+   type HubUplinkSocketData,
+ } from './types';
+-import { b64urlToBytes } from './uplink-protocol';
+ import { type RegisterRtcSessionInput, UplinkServer } from './uplink-server';
+ 
+ export type HubUpgradeServer = {
+@@ -176,44 +177,33 @@ export class HubRuntime {
+       return ok ? undefined : json({ error: 'upgrade_failed' }, 500);
+     }
+     if (!path.startsWith('/api/hub/')) return undefined;
+-    if (path === '/api/hub/enrollments/redeem') {
+-      if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+-      return this.handleRedeem(req);
+-    }
+-    if (path === '/api/hub/enrollments') {
+-      if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+-      return this.withAuth(req, (auth) => this.handleCreateEnrollment(req, auth));
+-    }
+-    const enrollmentGet = path.match(/^\/api\/hub\/enrollments\/([^/]+)$/);
+-    if (enrollmentGet) {
+-      const enrollmentId = enrollmentGet[1];
+-      if (!enrollmentId || enrollmentId === 'redeem') {
+-        return json({ error: 'not_found' }, 404);
+-      }
+-      if (req.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+-      return this.withAuth(req, (auth) =>
+-        this.handleGetEnrollment(decodeURIComponent(enrollmentId), auth)
+-      );
+-    }
+-    if (path === '/api/hub/nodes') {
+-      if (req.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+-      return this.withAuth(req, (auth) => this.handleListNodes(auth));
+-    }
+-    const rename = path.match(/^\/api\/hub\/nodes\/([^/]+)\/rename$/);
+-    if (rename) {
+-      const nodeId = rename[1];
+-      if (!nodeId) return json({ error: 'not_found' }, 404);
+-      if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+-      return this.withAuth(req, (auth) => this.handleRename(req, decodeURIComponent(nodeId), auth));
+-    }
+-    const revoke = path.match(/^\/api\/hub\/nodes\/([^/]+)\/revoke$/);
+-    if (revoke) {
+-      const nodeId = revoke[1];
+-      if (!nodeId) return json({ error: 'not_found' }, 404);
+-      if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+-      return this.withAuth(req, (auth) => this.handleRevoke(req, decodeURIComponent(nodeId), auth));
+-    }
+-    return json({ error: 'not_found' }, 404);
++    const hit = (
++      pattern: string,
++      method: string,
++      fn: (p: Record<string, string>) => Response | Promise<Response>
++    ) => {
++      const params = matchPath(path, pattern);
++      if (!params) return;
++      if (req.method !== method) return json({ error: 'method_not_allowed' }, 405);
++      return fn(params);
++    };
++    return (
++      hit('/api/hub/enrollments/redeem', 'POST', () => this.handleRedeem(req)) ??
++      hit('/api/hub/enrollments', 'POST', () =>
++        this.withAuth(req, (a) => this.handleCreateEnrollment(req, a))
++      ) ??
++      hit('/api/hub/enrollments/:id', 'GET', (p) =>
++        this.withAuth(req, (a) => this.handleGetEnrollment(decodeURIComponent(p.id), a))
++      ) ??
++      hit('/api/hub/nodes', 'GET', () => this.withAuth(req, (a) => this.handleListNodes(a))) ??
++      hit('/api/hub/nodes/:id/rename', 'POST', (p) =>
++        this.withAuth(req, (a) => this.handleRename(req, decodeURIComponent(p.id), a))
++      ) ??
++      hit('/api/hub/nodes/:id/revoke', 'POST', (p) =>
++        this.withAuth(req, (a) => this.handleRevoke(req, decodeURIComponent(p.id), a))
++      ) ??
++      json({ error: 'not_found' }, 404)
++    );
+   }
+ 
+   handleUplinkOpen(ws: HubServerWebSocket): void {
+@@ -280,36 +270,26 @@ export class HubRuntime {
+ 
+   private handleGetEnrollment(id: string, auth: HubAuthResult): Response {
+     const token = this.userStore.getEnrollmentTokenById(id);
+-    if (!token || token.userId !== auth.userId) {
+-      return json({ error: 'not_found' }, 404);
+-    }
++    if (!token || token.userId !== auth.userId) return json({ error: 'not_found' }, 404);
+     const stored = parseStoredEnrollment(token.authorizationJson);
+     const redeemed = token.usedAt !== null;
+-    const body: {
+-      status: 'pending' | 'redeemed';
+-      enroll_pk: string;
+-      already_admitted: boolean;
+-      certificate?: string;
+-      cert_sig?: string;
+-      node_id?: string;
+-    } = {
++    const body: Record<string, unknown> = {
+       status: redeemed ? 'redeemed' : 'pending',
+       enroll_pk: encodeBase64url(token.enrollPublicKey),
+       already_admitted: false,
+     };
+-    if (redeemed) {
+-      const nodeId = stored?.node_id ?? token.nodeId;
+-      if (nodeId) body.node_id = nodeId;
+-      const admitted = nodeId ? this.userStore.getCert(nodeId) : null;
+-      const alreadyAdmitted = Boolean(admitted && admitted.revokedLogSeq === null);
+-      body.already_admitted = alreadyAdmitted;
+-      if (alreadyAdmitted && admitted) {
+-        body.certificate = encodeBase64url(admitted.certificateBytes);
+-        body.cert_sig = encodeBase64url(admitted.certSig);
+-      } else {
+-        if (stored?.certificate_b64) body.certificate = stored.certificate_b64;
+-        if (stored?.cert_sig_b64) body.cert_sig = stored.cert_sig_b64;
+-      }
++    if (!redeemed) return json(body);
++    const nodeId = stored?.node_id ?? token.nodeId;
++    if (nodeId) body.node_id = nodeId;
++    const admitted = nodeId ? this.userStore.getCert(nodeId) : null;
++    const alreadyAdmitted = Boolean(admitted && admitted.revokedLogSeq === null);
++    body.already_admitted = alreadyAdmitted;
++    if (alreadyAdmitted && admitted) {
++      body.certificate = encodeBase64url(admitted.certificateBytes);
++      body.cert_sig = encodeBase64url(admitted.certSig);
++    } else {
++      if (stored?.certificate_b64) body.certificate = stored.certificate_b64;
++      if (stored?.cert_sig_b64) body.cert_sig = stored.cert_sig_b64;
+     }
+     return json(body);
+   }
+@@ -317,17 +297,14 @@ export class HubRuntime {
+   private async handleRename(req: Request, nodeId: string, auth: HubAuthResult): Promise<Response> {
+     const body = await readJsonObjectBody(req);
+     const name = body?.name;
+-    if (typeof name !== 'string' || name.trim().length === 0) {
+-      return json({ error: 'invalid_name' }, 400);
+-    }
++    if (typeof name !== 'string' || !name.trim()) return json({ error: 'invalid_name' }, 400);
++    const next = name.trim();
+     const node = this.userStore.getNode(nodeId);
+-    if (!node || node.userId !== auth.userId) {
+-      return json({ error: 'not_found' }, 404);
+-    }
+-    patchNode(this.db, nodeId, { name: name.trim() });
+-    this.registry.updateMeta(nodeId, { name: name.trim() }, this.now());
++    if (!node || node.userId !== auth.userId) return json({ error: 'not_found' }, 404);
++    patchNode(this.db, nodeId, { name: next });
++    this.registry.updateMeta(nodeId, { name: next }, this.now());
+     await this.uplink.broadcastNodeList(auth.userId);
+-    return json({ ok: true, id: nodeId, name: name.trim() });
++    return json({ ok: true, id: nodeId, name: next });
+   }
+ 
+   private async handleRevoke(req: Request, nodeId: string, auth: HubAuthResult): Promise<Response> {
+@@ -340,10 +317,10 @@ export class HubRuntime {
+     let bytes: Uint8Array;
+     let sig: Uint8Array;
+     try {
+-      bytes = b64urlToBytes(requireBodyString(body, 'bytes'));
+-      sig = b64urlToBytes(requireBodyString(body, 'sig'), 64);
++      bytes = requireB64url(body, 'bytes');
++      sig = requireB64url(body, 'sig', 64);
+     } catch (err) {
+-      return json({ error: err instanceof Error ? err.message : 'invalid_fields' }, 400);
++      return validationError(err);
+     }
+     let record: ReturnType<typeof decodeKeyLogRecord>;
+     try {
+@@ -380,11 +357,11 @@ export class HubRuntime {
+     let authorizationBytes: Uint8Array;
+     let authorizationSig: Uint8Array;
+     try {
+-      enrollPk = b64urlToBytes(requireBodyString(body, 'enroll_pk'), 32);
+-      authorizationBytes = b64urlToBytes(requireBodyString(body, 'authorization'));
+-      authorizationSig = b64urlToBytes(requireBodyString(body, 'authorization_sig'));
++      enrollPk = requireB64url(body, 'enroll_pk', 32);
++      authorizationBytes = requireB64url(body, 'authorization');
++      authorizationSig = requireB64url(body, 'authorization_sig');
+     } catch (err) {
+-      return json({ error: err instanceof Error ? err.message : 'invalid_fields' }, 400);
++      return validationError(err);
+     }
+     let authorization: ReturnType<typeof decodeAuthorization>;
+     try {
+@@ -392,51 +369,14 @@ export class HubRuntime {
+     } catch {
+       return json({ error: 'bad_authorization' }, 400);
+     }
+-    if (authorization.uid !== user.id) {
+-      return json({ error: 'uid_mismatch' }, 400);
+-    }
+-    if (authorization.root_epoch !== user.rootEpoch) {
+-      return json({ error: 'epoch_mismatch' }, 400);
+-    }
+-    if (!bytesEqual(authorization.enroll_pk, enrollPk)) {
+-      return json({ error: 'enroll_pk_mismatch' }, 400);
+-    }
+-    if (authorization.signer === 'root') {
+-      if (
+-        authorizationSig.byteLength !== 64 ||
+-        !verifyEd25519(authorizationSig, authorizationBytes, user.rootPublicKey)
+-      ) {
+-        return json({ error: 'bad_authorization_sig' }, 400);
+-      }
+-    } else if (authorization.signer === 'passkey') {
+-      const credentialId = authorization.credential_id;
+-      if (!credentialId) {
+-        return json({ error: 'missing_credential_id' }, 400);
+-      }
+-      let credentialIdBytes: Uint8Array;
+-      try {
+-        credentialIdBytes = decodeBase64url(credentialId);
+-      } catch {
+-        return json({ error: 'bad_authorization' }, 400);
+-      }
+-      const storedKey = this.userStore.getKeyByCredentialId(credentialIdBytes);
+-      if (!storedKey || storedKey.userId !== user.id) {
+-        return json({ error: 'unknown_passkey' }, 400);
+-      }
+-      const verify = makeVerifyPasskeyAssertion(this.userStore);
+-      const ok = await verify({
+-        recordBytes: authorizationBytes,
+-        sig: authorizationSig,
+-        credentialId,
+-        publicKey: storedKey.publicKey,
+-        challenge: sha256(authorizationBytes),
+-      });
+-      if (!ok) {
+-        return json({ error: 'bad_authorization_sig' }, 400);
+-      }
+-    } else {
+-      return json({ error: 'bad_authorization' }, 400);
+-    }
++    const authErr = await this.verifyEnrollmentAuthorization(
++      user,
++      enrollPk,
++      authorizationBytes,
++      authorizationSig,
++      authorization
++    );
++    if (authErr) return json({ error: authErr }, 400);
+     const now = this.now();
+     const authExp = Number(authorization.exp);
+     const bodyExp = typeof body.exp === 'number' ? body.exp : authExp;
+@@ -474,183 +414,97 @@ export class HubRuntime {
+     );
+   }
+ 
++  private async verifyEnrollmentAuthorization(
++    user: UserRecord,
++    enrollPk: Uint8Array,
++    authorizationBytes: Uint8Array,
++    authorizationSig: Uint8Array,
++    authorization: ReturnType<typeof decodeAuthorization>
++  ): Promise<string | null> {
++    if (authorization.uid !== user.id) return 'uid_mismatch';
++    if (authorization.root_epoch !== user.rootEpoch) return 'epoch_mismatch';
++    if (!bytesEqual(authorization.enroll_pk, enrollPk)) return 'enroll_pk_mismatch';
++    if (authorization.signer === 'root') {
++      return authorizationSig.byteLength === 64 &&
++        verifyEd25519(authorizationSig, authorizationBytes, user.rootPublicKey)
++        ? null
++        : 'bad_authorization_sig';
++    }
++    if (authorization.signer !== 'passkey') return 'bad_authorization';
++    const credentialId = authorization.credential_id;
++    if (!credentialId) return 'missing_credential_id';
++    let credentialIdBytes: Uint8Array;
++    try {
++      credentialIdBytes = decodeBase64url(credentialId);
++    } catch {
++      return 'bad_authorization';
++    }
++    const storedKey = this.userStore.getKeyByCredentialId(credentialIdBytes);
++    if (!storedKey || storedKey.userId !== user.id) return 'unknown_passkey';
++    const ok = await makeVerifyPasskeyAssertion(this.userStore)({
++      recordBytes: authorizationBytes,
++      sig: authorizationSig,
++      credentialId,
++      publicKey: storedKey.publicKey,
++      challenge: sha256(authorizationBytes),
++    });
++    return ok ? null : 'bad_authorization_sig';
++  }
++
+   private async handleRedeem(req: Request): Promise<Response> {
+     const body = await readJsonObjectBody(req);
+     if (!body) return json({ error: 'invalid_body' }, 400);
+-    const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : 'node';
+-    const version = typeof body.version === 'string' ? body.version : '';
+-    let certBytes: Uint8Array;
+-    let certSig: Uint8Array;
+-    try {
+-      certBytes = b64urlToBytes(requireBodyString(body, 'certificate'));
+-      certSig = b64urlToBytes(requireBodyString(body, 'cert_sig'), 64);
+-    } catch (err) {
+-      return json({ error: err instanceof Error ? err.message : 'invalid_fields' }, 400);
+-    }
+-    let certificate: ReturnType<typeof decodeCertificate>;
+-    try {
+-      certificate = decodeCertificate(certBytes);
+-    } catch {
+-      return json({ error: 'bad_certificate' }, 400);
+-    }
+-    const token = this.userStore.getEnrollmentTokenByEnrollPublicKey(certificate.enroll_pk);
+-    if (!token) {
+-      return json({ error: 'unknown_enrollment' }, 400);
+-    }
+-    if (!verifyNodeCertificate(certBytes, certSig, token.enrollPublicKey)) {
+-      return json({ error: 'bad_cert_sig' }, 400);
+-    }
+-    const stored = parseStoredEnrollment(token.authorizationJson);
+-    if (!stored) {
+-      return json({ error: 'bad_token' }, 400);
+-    }
+-    let authorization: ReturnType<typeof decodeAuthorization>;
+-    try {
+-      authorization = decodeAuthorization(b64urlToBytes(stored.authorization_b64));
+-    } catch {
+-      return json({ error: 'bad_authorization' }, 400);
+-    }
+-    if (!bytesEqual(authorization.enroll_pk, certificate.enroll_pk)) {
+-      return json({ error: 'enroll_pk_mismatch' }, 400);
+-    }
+-    if (authorization.uid !== certificate.uid || authorization.uid !== token.userId) {
+-      return json({ error: 'uid_mismatch' }, 400);
+-    }
+-    const hexId = nodeIdToHex(certificate.node_id);
+-    const now = this.now();
+-    const providedName =
+-      typeof body.name === 'string' && body.name.trim() ? body.name.trim() : null;
+-    let replayUserId: string | null = null;
+-    let replacedExisting = false;
+-    let alreadyAdmitted = false;
+     try {
+-      this.db.transaction((tx) => {
+-        const authDb = tx as AuthDb;
+-        const store = new UserStore(authDb);
+-        const fresh = store.getEnrollmentTokenByEnrollPublicKey(certificate.enroll_pk);
+-        if (!fresh) {
+-          throw new RedeemAbort('unknown_enrollment', 400);
+-        }
+-        if (fresh.usedAt !== null) {
+-          const prev = parseStoredEnrollment(fresh.authorizationJson);
+-          if (
+-            prev?.certificate_b64 === encodeBase64url(certBytes) &&
+-            prev?.cert_sig_b64 === encodeBase64url(certSig)
+-          ) {
+-            throw new RedeemReplay(fresh.userId);
+-          }
+-          throw new RedeemAbort('reused', 400);
+-        }
+-        const userRow = store.getById(fresh.userId);
+-        if (!userRow) {
+-          throw new RedeemAbort('user_not_found', 500);
+-        }
+-        if (authorization.root_epoch !== userRow.rootEpoch) {
+-          throw new RedeemAbort('epoch_mismatch', 400);
+-        }
+-        if (fresh.expiresAt <= now) {
+-          throw new RedeemAbort('expired', 400);
+-        }
+-        const existing = store.getNode(hexId);
+-        const existingCert = store.getCert(hexId);
+-        if (existing) {
+-          if (existing.userId !== fresh.userId) {
+-            throw new RedeemAbort('node_exists', 409);
+-          }
+-          const existingKeys = readNodeIdentityKeys(store, hexId);
+-          if (
+-            !existingKeys ||
+-            !bytesEqual(existingKeys.edPk, certificate.ed_pk) ||
+-            !bytesEqual(existingKeys.x25519Pk, certificate.x25519_pk)
+-          ) {
+-            throw new RedeemAbort('node_exists', 409);
+-          }
+-          if (!verifyRedeemPop(body, certificate, existingKeys.edPk, certBytes)) {
+-            throw new RedeemAbort('node_exists', 409);
+-          }
+-          if (existingCert?.revokedLogSeq != null || existing.status === 'revoked') {
+-            throw new RedeemAbort('node_revoked', 409);
+-          }
+-          detachEnrollmentTokensFromNode(authDb, hexId);
+-        } else if (existingCert?.revokedLogSeq != null) {
+-          throw new RedeemAbort('node_revoked', 409);
+-        }
+-        if (existingCert && existingCert.revokedLogSeq === null) {
+-          alreadyAdmitted = true;
+-        }
+-        const consumed = store.consumeEnrollmentToken(certificate.enroll_pk, {
+-          nodeId: hexId,
+-          now,
+-          authorizationJson: JSON.stringify({
+-            ...stored,
+-            certificate_b64: encodeBase64url(certBytes),
+-            cert_sig_b64: encodeBase64url(certSig),
+-            node_id: hexId,
+-          } satisfies StoredEnrollmentPayload),
++      const parsed = parseRedeemRequest(body, this.userStore);
++      const { hexId, token, stored, providedName, version, certBytes, certSig, certificate } =
++        parsed;
++      const now = this.now();
++      let replayUserId: string | null = null;
++      let replacedExisting = false;
++      let alreadyAdmitted = false;
++      try {
++        this.db.transaction((tx) => {
++          const result = redeemInTransaction(tx as AuthDb, parsed, body, now);
++          replacedExisting = result.replacedExisting;
++          alreadyAdmitted = result.alreadyAdmitted;
+         });
+-        if (!consumed) {
+-          throw new RedeemAbort('reused', 400);
+-        }
+-        if (existing) {
+-          patchNode(authDb, hexId, {
+-            status: 'enrolled',
++      } catch (err) {
++        if (err instanceof RedeemReplay) replayUserId = err.userId;
++        else throw err;
++      }
++      if (replacedExisting) {
++        this.registry.updateMeta(
++          hexId,
++          {
+             ...(providedName ? { name: providedName } : {}),
+             ...(version ? { version } : {}),
+-          });
+-          replacedExisting = true;
+-        } else {
+-          store.createNode({
+-            id: hexId,
+-            userId: fresh.userId,
+-            name,
+-            status: 'enrolled',
+-            version: version || null,
+-            now,
+-          });
+-        }
+-      });
+-    } catch (err) {
+-      if (err instanceof RedeemReplay) {
+-        replayUserId = err.userId;
+-      } else if (err instanceof RedeemAbort) {
+-        return json({ error: err.error }, err.status);
+-      } else {
+-        throw err;
++          },
++          now
++        );
+       }
++      if (!replayUserId && stored.entry_node_id) {
++        const admitted = alreadyAdmitted ? this.userStore.getCert(hexId) : null;
++        this.uplink.sendTo(stored.entry_node_id, {
++          t: 'enroll.redeemed',
++          certificate: encodeBase64url(admitted?.certificateBytes ?? certBytes),
++          cert_sig: encodeBase64url(admitted?.certSig ?? certSig),
++          enroll_pk: encodeBase64url(certificate.enroll_pk),
++          node_id: hexId,
++          already_admitted: alreadyAdmitted,
++          ...(stored.entry_sid ? { entry_sid: stored.entry_sid } : {}),
++        });
++      }
++      if (replacedExisting) await this.uplink.broadcastNodeList(token.userId);
++      if (replayUserId) {
++        const replayedCert = this.userStore.getCert(hexId);
++        alreadyAdmitted = Boolean(replayedCert && replayedCert.revokedLogSeq === null);
++      }
++      if (alreadyAdmitted) console.info(`[hub] already admitted node=${hexId}`);
++      return this.redeemSuccessPayload(replayUserId ?? token.userId, alreadyAdmitted);
++    } catch (err) {
++      if (err instanceof RedeemAbort) return json({ error: err.error }, err.status);
++      return validationError(err);
+     }
+-    if (replacedExisting) {
+-      this.registry.updateMeta(
+-        hexId,
+-        {
+-          ...(providedName ? { name: providedName } : {}),
+-          ...(version ? { version } : {}),
+-        },
+-        now
+-      );
+-    }
+-    if (!replayUserId && stored.entry_node_id) {
+-      const admitted = alreadyAdmitted ? this.userStore.getCert(hexId) : null;
+-      this.uplink.sendTo(stored.entry_node_id, {
+-        t: 'enroll.redeemed',
+-        certificate: encodeBase64url(admitted?.certificateBytes ?? certBytes),
+-        cert_sig: encodeBase64url(admitted?.certSig ?? certSig),
+-        enroll_pk: encodeBase64url(certificate.enroll_pk),
+-        node_id: hexId,
+-        already_admitted: alreadyAdmitted,
+-        ...(stored.entry_sid ? { entry_sid: stored.entry_sid } : {}),
+-      });
+-    }
+-    if (replacedExisting) {
+-      await this.uplink.broadcastNodeList(token.userId);
+-    }
+-    if (replayUserId) {
+-      const replayedCert = this.userStore.getCert(hexId);
+-      alreadyAdmitted = Boolean(replayedCert && replayedCert.revokedLogSeq === null);
+-    }
+-    if (alreadyAdmitted) {
+-      console.info(`[hub] already admitted node=${hexId}`);
+-    }
+-    return this.redeemSuccessPayload(replayUserId ?? token.userId, alreadyAdmitted);
+   }
+ 
+   private async redeemSuccessPayload(userId: string, alreadyAdmitted: boolean): Promise<Response> {
+@@ -705,12 +559,132 @@ class RedeemReplay extends Error {
+   }
+ }
+ 
+-function requireBodyString(body: Record<string, unknown>, key: string): string {
+-  const value = body[key];
+-  if (typeof value !== 'string' || value.length === 0) {
+-    throw new Error(`missing ${key}`);
++function parseRedeemRequest(body: Record<string, unknown>, userStore: UserStore) {
++  const providedName = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : null;
++  const certBytes = requireB64url(body, 'certificate');
++  const certSig = requireB64url(body, 'cert_sig', 64);
++  let certificate: ReturnType<typeof decodeCertificate>;
++  try {
++    certificate = decodeCertificate(certBytes);
++  } catch {
++    throw new RedeemAbort('bad_certificate', 400);
++  }
++  const token = userStore.getEnrollmentTokenByEnrollPublicKey(certificate.enroll_pk);
++  if (!token) throw new RedeemAbort('unknown_enrollment', 400);
++  if (!verifyNodeCertificate(certBytes, certSig, token.enrollPublicKey)) {
++    throw new RedeemAbort('bad_cert_sig', 400);
++  }
++  const stored = parseStoredEnrollment(token.authorizationJson);
++  if (!stored) throw new RedeemAbort('bad_token', 400);
++  let authorization: ReturnType<typeof decodeAuthorization>;
++  try {
++    authorization = decodeAuthorization(decodeB64url(stored.authorization_b64));
++  } catch {
++    throw new RedeemAbort('bad_authorization', 400);
++  }
++  if (!bytesEqual(authorization.enroll_pk, certificate.enroll_pk)) {
++    throw new RedeemAbort('enroll_pk_mismatch', 400);
++  }
++  if (authorization.uid !== certificate.uid || authorization.uid !== token.userId) {
++    throw new RedeemAbort('uid_mismatch', 400);
+   }
+-  return value;
++  return {
++    name: providedName ?? 'node',
++    version: typeof body.version === 'string' ? body.version : '',
++    providedName,
++    certBytes,
++    certSig,
++    certificate,
++    token,
++    stored,
++    authorization,
++    hexId: nodeIdToHex(certificate.node_id),
++  };
++}
++
++function redeemInTransaction(
++  authDb: AuthDb,
++  parsed: ReturnType<typeof parseRedeemRequest>,
++  body: Record<string, unknown>,
++  now: number
++): { replacedExisting: boolean; alreadyAdmitted: boolean } {
++  const {
++    certificate,
++    certBytes,
++    certSig,
++    stored,
++    authorization,
++    hexId,
++    name,
++    version,
++    providedName,
++  } = parsed;
++  const store = new UserStore(authDb);
++  const fresh = store.getEnrollmentTokenByEnrollPublicKey(certificate.enroll_pk);
++  if (!fresh) throw new RedeemAbort('unknown_enrollment', 400);
++  if (fresh.usedAt !== null) {
++    const prev = parseStoredEnrollment(fresh.authorizationJson);
++    if (
++      prev?.certificate_b64 === encodeBase64url(certBytes) &&
++      prev?.cert_sig_b64 === encodeBase64url(certSig)
++    ) {
++      throw new RedeemReplay(fresh.userId);
++    }
++    throw new RedeemAbort('reused', 400);
++  }
++  const userRow = store.getById(fresh.userId);
++  if (!userRow) throw new RedeemAbort('user_not_found', 500);
++  if (authorization.root_epoch !== userRow.rootEpoch) throw new RedeemAbort('epoch_mismatch', 400);
++  if (fresh.expiresAt <= now) throw new RedeemAbort('expired', 400);
++  const existing = store.getNode(hexId);
++  const existingCert = store.getCert(hexId);
++  if (existing) {
++    const existingKeys = readNodeIdentityKeys(store, hexId);
++    if (
++      existing.userId !== fresh.userId ||
++      !existingKeys ||
++      !bytesEqual(existingKeys.edPk, certificate.ed_pk) ||
++      !bytesEqual(existingKeys.x25519Pk, certificate.x25519_pk) ||
++      !verifyRedeemPop(body, certificate, existingKeys.edPk, certBytes)
++    ) {
++      throw new RedeemAbort('node_exists', 409);
++    }
++    if (existingCert?.revokedLogSeq != null || existing.status === 'revoked') {
++      throw new RedeemAbort('node_revoked', 409);
++    }
++    detachEnrollmentTokensFromNode(authDb, hexId);
++  } else if (existingCert?.revokedLogSeq != null) {
++    throw new RedeemAbort('node_revoked', 409);
++  }
++  const alreadyAdmitted = Boolean(existingCert && existingCert.revokedLogSeq === null);
++  const consumed = store.consumeEnrollmentToken(certificate.enroll_pk, {
++    nodeId: hexId,
++    now,
++    authorizationJson: JSON.stringify({
++      ...stored,
++      certificate_b64: encodeBase64url(certBytes),
++      cert_sig_b64: encodeBase64url(certSig),
++      node_id: hexId,
++    } satisfies StoredEnrollmentPayload),
++  });
++  if (!consumed) throw new RedeemAbort('reused', 400);
++  if (existing) {
++    patchNode(authDb, hexId, {
++      status: 'enrolled',
++      ...(providedName ? { name: providedName } : {}),
++      ...(version ? { version } : {}),
++    });
++    return { replacedExisting: true, alreadyAdmitted };
++  }
++  store.createNode({
++    id: hexId,
++    userId: fresh.userId,
++    name,
++    status: 'enrolled',
++    version: version || null,
++    now,
++  });
++  return { replacedExisting: false, alreadyAdmitted };
+ }
+ 
+ function parseStoredEnrollment(raw: string): StoredEnrollmentPayload | null {
+@@ -719,13 +693,14 @@ function parseStoredEnrollment(raw: string): StoredEnrollmentPayload | null {
+     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+     const obj = parsed as Record<string, unknown>;
+     if (typeof obj.authorization_b64 !== 'string') return null;
++    const str = (key: string) => (typeof obj[key] === 'string' ? obj[key] : undefined);
+     return {
+       authorization_b64: obj.authorization_b64,
+       entry_node_id: typeof obj.entry_node_id === 'string' ? obj.entry_node_id : null,
+-      entry_sid: typeof obj.entry_sid === 'string' ? obj.entry_sid : undefined,
+-      certificate_b64: typeof obj.certificate_b64 === 'string' ? obj.certificate_b64 : undefined,
+-      cert_sig_b64: typeof obj.cert_sig_b64 === 'string' ? obj.cert_sig_b64 : undefined,
+-      node_id: typeof obj.node_id === 'string' ? obj.node_id : undefined,
++      entry_sid: str('entry_sid'),
++      certificate_b64: str('certificate_b64'),
++      cert_sig_b64: str('cert_sig_b64'),
++      node_id: str('node_id'),
+     };
+   } catch {
+     return null;
+@@ -739,18 +714,19 @@ function verifyRedeemPop(
+   certBytes: Uint8Array
+ ): boolean {
+   if (typeof body.pop !== 'string') return false;
+-  let sig: Uint8Array;
+   try {
+-    sig = b64urlToBytes(body.pop, 64);
++    return verifyEd25519(
++      decodeB64url(body.pop, 64),
++      encodeRedeemPopMessage({
++        enrollmentId: encodeBase64url(certificate.enroll_pk),
++        nodeId: certificate.node_id,
++        certBytes,
++      }),
++      existingPk
++    );
+   } catch {
+     return false;
+   }
+-  const message = encodeRedeemPopMessage({
+-    enrollmentId: encodeBase64url(certificate.enroll_pk),
+-    nodeId: certificate.node_id,
+-    certBytes,
+-  });
+-  return verifyEd25519(sig, message, existingPk);
+ }
+ 
+ function readNodeIdentityKeys(
+diff --git a/apps/gateway/src/hub/uplink-protocol.ts b/apps/gateway/src/hub/uplink-protocol.ts
+index 4f88c31a..43dd2825 100644
+--- a/apps/gateway/src/hub/uplink-protocol.ts
++++ b/apps/gateway/src/hub/uplink-protocol.ts
+@@ -1,550 +1,37 @@
+-import { decodeBase64url, encodeBase64url } from '@tmex/shared/auth';
+-import type { HubTurnConfig } from './types';
+-
+-export class UplinkCtlError extends Error {
+-  constructor(message: string) {
+-    super(message);
+-    this.name = 'UplinkCtlError';
+-  }
+-}
+-
+-export const UPLINK_CTL_TYPES = [
+-  'auth.challenge',
+-  'auth.response',
+-  'auth.ok',
+-  'ping',
+-  'pong',
+-  'node.status',
+-  'node.list',
+-  'key.log.req',
+-  'key.log.res',
+-  'key.log.append',
+-  'key.log.ack',
+-  'rtc.signal',
+-  'enroll.redeemed',
+-] as const;
+-
+-export type UplinkCtlType = (typeof UPLINK_CTL_TYPES)[number];
+-
+-export type AuthChallengeMessage = { t: 'auth.challenge'; nonce: string };
+-export type AuthResponseMessage = { t: 'auth.response'; node_id: string; sig: string };
+-export type AuthOkMessage = { t: 'auth.ok' };
+-export type PingMessage = { t: 'ping' };
+-export type PongMessage = { t: 'pong' };
+-
+-export type NodeStatusMessage = {
+-  t: 'node.status';
+-  version: string;
+-  tmux: boolean;
+-  direct_capable: boolean;
+-  inventory: unknown;
+-  endpoints: unknown;
+-};
+-
+-export type NodeListEntry = {
+-  id: string;
+-  name: string;
+-  online: boolean;
+-  endpoints: unknown;
+-  inventory: unknown;
+-  direct_capable: boolean;
+-  version: string | null;
+-};
+-
+-export type NodeListHubInfo = { nodeId: string; publicUrl: string; name?: string };
+-
+-export type NodeListMessage = {
+-  t: 'node.list';
+-  version: number;
+-  key_log_head: { seq: number | string; hash: string };
+-  rtc: { stun: string[]; turn: HubTurnConfig };
+-  nodes: NodeListEntry[];
+-  hub?: NodeListHubInfo;
+-};
+-
+-export type KeyLogReqMessage = {
+-  t: 'key.log.req';
+-  from_seq: number | string;
+-  id?: string;
+-  limit?: number;
+-};
+-export type KeyLogRecordWire = { seq: number | string; bytes: string; sig: string };
+-export type KeyLogResMessage = {
+-  t: 'key.log.res';
+-  records: KeyLogRecordWire[];
+-  id?: string;
+-  error?: string;
+-  has_more?: boolean;
+-  retry_after_ms?: number;
+-};
+-export type KeyLogAppendMessage = { t: 'key.log.append'; bytes: string; sig: string; id?: string };
+-export type KeyLogAckMessage = {
+-  t: 'key.log.ack';
+-  id: string;
+-  ok: boolean;
+-  seq?: number | string;
+-  error?: string;
+-};
+-
+-export type RtcSignalFrom = 'browser' | 'node';
+-export type RtcSignalMessage = {
+-  t: 'rtc.signal';
+-  rtcSession: string;
+-  from: RtcSignalFrom;
+-  to: string;
+-  sdp?: string;
+-  candidate?: string;
+-};
+-
+-export type EnrollRedeemedMessage = {
+-  t: 'enroll.redeemed';
+-  certificate: string;
+-  cert_sig: string;
+-  enroll_pk: string;
+-  node_id: string;
+-  entry_sid?: string;
+-  already_admitted?: boolean;
+-};
+-
+-export type UplinkCtlMessage =
+-  | AuthChallengeMessage
+-  | AuthResponseMessage
+-  | AuthOkMessage
+-  | PingMessage
+-  | PongMessage
+-  | NodeStatusMessage
+-  | NodeListMessage
+-  | KeyLogReqMessage
+-  | KeyLogResMessage
+-  | KeyLogAppendMessage
+-  | KeyLogAckMessage
+-  | RtcSignalMessage
+-  | EnrollRedeemedMessage;
+-
+-const KNOWN_TYPES = new Set<string>(UPLINK_CTL_TYPES);
+-const textEncoder = new TextEncoder();
+-const textDecoder = new TextDecoder();
+-
+-export const UPLINK_CTL_MAX_BYTES = 64 * 1024;
+-export const UPLINK_CTL_MAX_DEPTH = 8;
+-export const UPLINK_CTL_MAX_ARRAY_LEN = 1024;
+-export const UPLINK_CTL_MAX_STRING_LEN = 4 * 1024;
+-export const UPLINK_CTL_MAX_ENDPOINTS = 32;
+-export const UPLINK_CTL_MAX_CERT_BYTES = 2048;
+-export const UPLINK_CTL_MAX_U64 = 18446744073709551615n;
+-export const KEY_LOG_PAGE_DEFAULT_LIMIT = 256;
+-export const KEY_LOG_PAGE_MAX_LIMIT = 256;
+-export const KEY_LOG_PAGE_MAX_BYTES = 1024 * 1024;
+-const NODE_ID_HEX_RE = /^[0-9a-f]{32}$/;
+-
+-export function seqToWire(seq: bigint | number): number | string {
+-  const value = typeof seq === 'bigint' ? seq : BigInt(seq);
+-  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
+-}
+-
+-export function seqFromWire(value: number | string): bigint {
+-  if (typeof value === 'number') {
+-    if (!Number.isSafeInteger(value) || value < 0) {
+-      throw new UplinkCtlError('invalid seq');
+-    }
+-    return BigInt(value);
+-  }
+-  if (typeof value !== 'string' || !/^[0-9]{1,20}$/.test(value)) {
+-    throw new UplinkCtlError('invalid seq');
+-  }
+-  const n = BigInt(value);
+-  if (n > UPLINK_CTL_MAX_U64) {
+-    throw new UplinkCtlError('invalid seq');
+-  }
+-  return n;
+-}
+-
+-export function bytesToB64url(bytes: Uint8Array): string {
+-  return encodeBase64url(bytes);
+-}
+-
+-export function b64urlToBytes(value: string, expectedLen?: number): Uint8Array {
+-  if (typeof value !== 'string' || value.length === 0) {
+-    throw new UplinkCtlError('invalid b64url');
+-  }
+-  let bytes: Uint8Array;
+-  try {
+-    bytes = decodeBase64url(value);
+-  } catch {
+-    throw new UplinkCtlError('invalid b64url');
+-  }
+-  if (expectedLen !== undefined && bytes.byteLength !== expectedLen) {
+-    throw new UplinkCtlError(`expected ${expectedLen} bytes`);
+-  }
+-  return bytes;
+-}
+-
+-export function encodeUplinkCtl(msg: UplinkCtlMessage): Uint8Array {
+-  return textEncoder.encode(JSON.stringify(msg));
+-}
+-
+-export type DecodeUplinkCtlOptions = {
+-  allowKeyLogRes?: boolean;
+-};
+-
+-export function decodeUplinkCtl(
+-  input: Uint8Array | string,
+-  opts?: DecodeUplinkCtlOptions
+-): UplinkCtlMessage {
+-  const byteLength =
+-    typeof input === 'string' ? textEncoder.encode(input).byteLength : input.byteLength;
+-  if (byteLength > UPLINK_CTL_MAX_BYTES) {
+-    throw new UplinkCtlError('ctl too large');
+-  }
+-  const text = typeof input === 'string' ? input : textDecoder.decode(input);
+-  let parsed: unknown;
+-  try {
+-    parsed = JSON.parse(text);
+-  } catch {
+-    throw new UplinkCtlError('invalid json');
+-  }
+-  const parsedT =
+-    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+-      ? (parsed as { t?: unknown }).t
+-      : undefined;
+-  if (parsedT === 'key.log.res' && !opts?.allowKeyLogRes) {
+-    throw new UplinkCtlError('unexpected key.log.res');
+-  }
+-  if (parsedT !== 'key.log.res') {
+-    assertCtlBounds(parsed, 0);
+-  }
+-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+-    throw new UplinkCtlError('invalid ctl');
+-  }
+-  const obj = parsed as Record<string, unknown>;
+-  const t = obj.t;
+-  if (typeof t !== 'string' || !KNOWN_TYPES.has(t)) {
+-    throw new UplinkCtlError(`unknown t: ${String(t)}`);
+-  }
+-  switch (t as UplinkCtlType) {
+-    case 'auth.challenge':
+-      return {
+-        t: 'auth.challenge',
+-        nonce: bytesToB64url(b64urlToBytes(requireString(obj, 'nonce'), 32)),
+-      };
+-    case 'auth.response':
+-      return {
+-        t: 'auth.response',
+-        node_id: requireNodeIdHex(obj, 'node_id'),
+-        sig: bytesToB64url(b64urlToBytes(requireString(obj, 'sig'), 64)),
+-      };
+-    case 'auth.ok':
+-      return { t: 'auth.ok' };
+-    case 'ping':
+-      return { t: 'ping' };
+-    case 'pong':
+-      return { t: 'pong' };
+-    case 'node.status':
+-      return {
+-        t: 'node.status',
+-        version: requireString(obj, 'version'),
+-        tmux: requireBoolean(obj, 'tmux'),
+-        direct_capable: requireBoolean(obj, 'direct_capable'),
+-        inventory: obj.inventory ?? null,
+-        endpoints: requireEndpoints(obj.endpoints),
+-      };
+-    case 'node.list':
+-      return decodeNodeList(obj);
+-    case 'key.log.req': {
+-      const req: KeyLogReqMessage = { t: 'key.log.req', from_seq: requireSeq(obj, 'from_seq') };
+-      if (obj.id !== undefined && obj.id !== null) req.id = requireNonEmptyString(obj, 'id');
+-      if (obj.limit !== undefined && obj.limit !== null) {
+-        req.limit = requireInt(obj, 'limit');
+-        if (req.limit < 1) {
+-          throw new UplinkCtlError('invalid limit');
+-        }
+-      }
+-      return req;
+-    }
+-    case 'key.log.res': {
+-      const records = requireKeyLogRecords(obj.records);
+-      if (records.length > KEY_LOG_PAGE_MAX_LIMIT) {
+-        throw new UplinkCtlError('key.log.res too many records');
+-      }
+-      const res: KeyLogResMessage = {
+-        t: 'key.log.res',
+-        records,
+-      };
+-      if (obj.id !== undefined && obj.id !== null) res.id = requireNonEmptyString(obj, 'id');
+-      if (obj.error !== undefined && obj.error !== null) {
+-        res.error = requireNonEmptyString(obj, 'error');
+-      }
+-      if (obj.has_more !== undefined && obj.has_more !== null) {
+-        res.has_more = requireBoolean(obj, 'has_more');
+-      }
+-      if (obj.retry_after_ms !== undefined && obj.retry_after_ms !== null) {
+-        res.retry_after_ms = requireInt(obj, 'retry_after_ms');
+-        if (res.retry_after_ms < 0) {
+-          throw new UplinkCtlError('invalid retry_after_ms');
+-        }
+-      }
+-      return res;
+-    }
+-    case 'key.log.append':
+-      return decodeKeyLogAppend(obj);
+-    case 'key.log.ack':
+-      return decodeKeyLogAck(obj);
+-    case 'rtc.signal':
+-      return decodeRtcSignal(obj);
+-    case 'enroll.redeemed':
+-      return decodeEnrollRedeemed(obj);
+-  }
+-  throw new UplinkCtlError(`unknown t: ${t}`);
+-}
+-
+-function decodeNodeList(obj: Record<string, unknown>): NodeListMessage {
+-  const head = obj.key_log_head;
+-  if (!head || typeof head !== 'object' || Array.isArray(head)) {
+-    throw new UplinkCtlError('invalid key_log_head');
+-  }
+-  const headObj = head as Record<string, unknown>;
+-  const hashBytes = b64urlToBytes(requireString(headObj, 'hash'), 32);
+-  const rtc = obj.rtc;
+-  if (!rtc || typeof rtc !== 'object' || Array.isArray(rtc)) {
+-    throw new UplinkCtlError('invalid rtc');
+-  }
+-  const rtcObj = rtc as Record<string, unknown>;
+-  if (!Array.isArray(rtcObj.stun) || rtcObj.stun.some((s) => typeof s !== 'string')) {
+-    throw new UplinkCtlError('invalid rtc.stun');
+-  }
+-  const nodes = obj.nodes;
+-  if (!Array.isArray(nodes)) {
+-    throw new UplinkCtlError('invalid nodes');
+-  }
+-  const msg: NodeListMessage = {
+-    t: 'node.list',
+-    version: requireInt(obj, 'version'),
+-    key_log_head: { seq: requireSeq(headObj, 'seq'), hash: bytesToB64url(hashBytes) },
+-    rtc: {
+-      stun: rtcObj.stun as string[],
+-      turn: decodeTurn(rtcObj.turn),
+-    },
+-    nodes: nodes.map(decodeNodeListEntry),
+-  };
+-  if (obj.hub !== undefined && obj.hub !== null) {
+-    msg.hub = decodeHubInfo(obj.hub);
+-  }
+-  return msg;
+-}
+-
+-function decodeHubInfo(value: unknown): NodeListHubInfo {
+-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+-    throw new UplinkCtlError('invalid hub');
+-  }
+-  const obj = value as Record<string, unknown>;
+-  const info: NodeListHubInfo = {
+-    nodeId: requireNonEmptyString(obj, 'nodeId'),
+-    publicUrl: requireNonEmptyString(obj, 'publicUrl'),
+-  };
+-  if (obj.name !== undefined && obj.name !== null) {
+-    info.name = requireNonEmptyString(obj, 'name');
+-  }
+-  return info;
+-}
+-
+-function decodeKeyLogAppend(obj: Record<string, unknown>): KeyLogAppendMessage {
+-  const msg: KeyLogAppendMessage = {
+-    t: 'key.log.append',
+-    bytes: bytesToB64url(b64urlToBytes(requireString(obj, 'bytes'))),
+-    sig: bytesToB64url(b64urlToBytes(requireString(obj, 'sig'), 64)),
+-  };
+-  if (obj.id !== undefined && obj.id !== null) {
+-    msg.id = requireNonEmptyString(obj, 'id');
+-  }
+-  return msg;
+-}
+-
+-function decodeKeyLogAck(obj: Record<string, unknown>): KeyLogAckMessage {
+-  const ok = requireBoolean(obj, 'ok');
+-  const msg: KeyLogAckMessage = {
+-    t: 'key.log.ack',
+-    id: requireNonEmptyString(obj, 'id'),
+-    ok,
+-  };
+-  if (ok) {
+-    msg.seq = requireSeq(obj, 'seq');
+-  } else {
+-    msg.error = requireNonEmptyString(obj, 'error');
+-  }
+-  return msg;
+-}
+-
+-function decodeTurn(value: unknown): HubTurnConfig {
+-  if (value === null || value === undefined) return null;
+-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+-    throw new UplinkCtlError('invalid rtc.turn');
+-  }
+-  const obj = value as Record<string, unknown>;
+-  return {
+-    url: requireNonEmptyString(obj, 'url'),
+-    username: requireString(obj, 'username'),
+-    credential: requireString(obj, 'credential'),
+-  };
+-}
+-
+-function decodeNodeListEntry(value: unknown): NodeListEntry {
+-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+-    throw new UplinkCtlError('invalid node entry');
+-  }
+-  const obj = value as Record<string, unknown>;
+-  const version = obj.version;
+-  if (version !== null && version !== undefined && typeof version !== 'string') {
+-    throw new UplinkCtlError('invalid node.version');
+-  }
+-  return {
+-    id: requireNonEmptyString(obj, 'id'),
+-    name: requireString(obj, 'name'),
+-    online: requireBoolean(obj, 'online'),
+-    endpoints: requireEndpoints(obj.endpoints),
+-    inventory: obj.inventory ?? null,
+-    direct_capable: requireBoolean(obj, 'direct_capable'),
+-    version: typeof version === 'string' ? version : null,
+-  };
+-}
+-
+-function decodeEnrollRedeemed(obj: Record<string, unknown>): EnrollRedeemedMessage {
+-  const certBytes = b64urlToBytes(requireString(obj, 'certificate'));
+-  if (certBytes.byteLength > UPLINK_CTL_MAX_CERT_BYTES) {
+-    throw new UplinkCtlError('certificate too large');
+-  }
+-  const msg: EnrollRedeemedMessage = {
+-    t: 'enroll.redeemed',
+-    certificate: bytesToB64url(certBytes),
+-    cert_sig: bytesToB64url(b64urlToBytes(requireString(obj, 'cert_sig'), 64)),
+-    enroll_pk: bytesToB64url(b64urlToBytes(requireString(obj, 'enroll_pk'), 32)),
+-    node_id: requireNodeIdHex(obj, 'node_id'),
+-  };
+-  if (obj.entry_sid !== undefined && obj.entry_sid !== null) {
+-    msg.entry_sid = requireNonEmptyString(obj, 'entry_sid');
+-  }
+-  if (obj.already_admitted !== undefined && obj.already_admitted !== null) {
+-    msg.already_admitted = requireBoolean(obj, 'already_admitted');
+-  }
+-  return msg;
+-}
+-
+-function requireNodeIdHex(obj: Record<string, unknown>, key: string): string {
+-  const value = requireNonEmptyString(obj, key);
+-  if (!NODE_ID_HEX_RE.test(value)) {
+-    throw new UplinkCtlError(`invalid ${key}`);
+-  }
+-  return value;
+-}
+-
+-function decodeRtcSignal(obj: Record<string, unknown>): RtcSignalMessage {
+-  const from = obj.from;
+-  if (from !== 'browser' && from !== 'node') {
+-    throw new UplinkCtlError('invalid rtc.from');
+-  }
+-  const sdp = obj.sdp;
+-  const candidate = obj.candidate;
+-  if (sdp !== undefined && sdp !== null && typeof sdp !== 'string') {
+-    throw new UplinkCtlError('invalid rtc.sdp');
+-  }
+-  if (candidate !== undefined && candidate !== null && typeof candidate !== 'string') {
+-    throw new UplinkCtlError('invalid rtc.candidate');
+-  }
+-  const msg: RtcSignalMessage = {
+-    t: 'rtc.signal',
+-    rtcSession: requireNonEmptyString(obj, 'rtcSession'),
+-    from,
+-    to: requireNonEmptyString(obj, 'to'),
+-  };
+-  if (typeof sdp === 'string') msg.sdp = sdp;
+-  if (typeof candidate === 'string') msg.candidate = candidate;
+-  return msg;
+-}
+-
+-function requireKeyLogRecords(value: unknown): KeyLogRecordWire[] {
+-  if (!Array.isArray(value)) {
+-    throw new UplinkCtlError('invalid records');
+-  }
+-  return value.map((item) => {
+-    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+-      throw new UplinkCtlError('invalid record');
+-    }
+-    const obj = item as Record<string, unknown>;
+-    return {
+-      seq: requireSeq(obj, 'seq'),
+-      bytes: bytesToB64url(b64urlToBytes(requireString(obj, 'bytes'))),
+-      sig: bytesToB64url(b64urlToBytes(requireString(obj, 'sig'), 64)),
+-    };
+-  });
+-}
+-
+-function requireString(obj: Record<string, unknown>, key: string): string {
+-  const value = obj[key];
+-  if (typeof value !== 'string') {
+-    throw new UplinkCtlError(`missing ${key}`);
+-  }
+-  return value;
+-}
+-
+-function requireNonEmptyString(obj: Record<string, unknown>, key: string): string {
+-  const value = requireString(obj, key);
+-  if (value.length === 0) {
+-    throw new UplinkCtlError(`empty ${key}`);
+-  }
+-  return value;
+-}
+-
+-function requireBoolean(obj: Record<string, unknown>, key: string): boolean {
+-  const value = obj[key];
+-  if (typeof value !== 'boolean') {
+-    throw new UplinkCtlError(`missing ${key}`);
+-  }
+-  return value;
+-}
+-
+-function requireInt(obj: Record<string, unknown>, key: string): number {
+-  const value = obj[key];
+-  if (typeof value !== 'number' || !Number.isInteger(value)) {
+-    throw new UplinkCtlError(`invalid ${key}`);
+-  }
+-  return value;
+-}
+-
+-function requireSeq(obj: Record<string, unknown>, key: string): number | string {
+-  const value = obj[key];
+-  if (typeof value === 'number' || typeof value === 'string') {
+-    seqFromWire(value);
+-    return value;
+-  }
+-  throw new UplinkCtlError(`invalid ${key}`);
+-}
+-
+-function requireEndpoints(value: unknown): unknown {
+-  if (value === undefined || value === null) return null;
+-  if (Array.isArray(value) && value.length > UPLINK_CTL_MAX_ENDPOINTS) {
+-    throw new UplinkCtlError('too many endpoints');
+-  }
+-  return value;
+-}
+-
+-function assertCtlBounds(value: unknown, depth: number): void {
+-  if (depth > UPLINK_CTL_MAX_DEPTH) {
+-    throw new UplinkCtlError('ctl too deep');
+-  }
+-  if (typeof value === 'string' && value.length > UPLINK_CTL_MAX_STRING_LEN) {
+-    throw new UplinkCtlError('ctl string too long');
+-  }
+-  if (Array.isArray(value)) {
+-    if (value.length > UPLINK_CTL_MAX_ARRAY_LEN) {
+-      throw new UplinkCtlError('ctl array too long');
+-    }
+-    for (const item of value) {
+-      assertCtlBounds(item, depth + 1);
+-    }
+-    return;
+-  }
+-  if (value && typeof value === 'object') {
+-    for (const item of Object.values(value as Record<string, unknown>)) {
+-      assertCtlBounds(item, depth + 1);
+-    }
+-  }
+-}
++export {
++  KEY_LOG_PAGE_DEFAULT_LIMIT,
++  KEY_LOG_PAGE_MAX_BYTES,
++  KEY_LOG_PAGE_MAX_LIMIT,
++  UPLINK_CTL_MAX_ARRAY_LEN,
++  UPLINK_CTL_MAX_BYTES,
++  UPLINK_CTL_MAX_CERT_BYTES,
++  UPLINK_CTL_MAX_DEPTH,
++  UPLINK_CTL_MAX_ENDPOINTS,
++  UPLINK_CTL_MAX_STRING_LEN,
++  UPLINK_CTL_MAX_U64,
++  UPLINK_CTL_TYPES,
++  UplinkCtlError,
++  b64urlToBytes,
++  bytesToB64url,
++  decodeHubUplinkCtl as decodeUplinkCtl,
++  encodeHubUplinkCtl as encodeUplinkCtl,
++  seqFromWire,
++  seqToWire,
++  type AuthChallengeMessage,
++  type AuthOkMessage,
++  type AuthResponseMessage,
++  type EnrollRedeemedMessage,
++  type KeyLogAppendMessage,
++  type KeyLogRecordWire,
++  type KeyLogReqMessage,
++  type KeyLogResMessage,
++  type HubUplinkCtlMessage as UplinkCtlMessage,
++  type NodeListEntry,
++  type NodeListMessage,
++  type NodeStatusMessage,
++  type PingMessage,
++  type PongMessage,
++  type RtcSignalFrom,
++  type RtcSignalMessage,
++  type UplinkCtlType,
++} from '@tmex/shared/uplink';
+diff --git a/apps/gateway/src/mesh/auth-routes.ts b/apps/gateway/src/mesh/auth-routes.ts
+index 3e0c9e53..0e93dd60 100644
+--- a/apps/gateway/src/mesh/auth-routes.ts
++++ b/apps/gateway/src/mesh/auth-routes.ts
+@@ -1,5 +1,6 @@
+ import {
+   type Delegation,
++  type Login,
+   applyKeyLogRecord,
+   bytesEqual,
+   computeRecordHash,
+@@ -18,6 +19,7 @@ import {
+ } from '@tmex/shared/auth';
+ import type { KeyLogEffect, VerifyDelegationPasskey } from '@tmex/shared/auth';
+ import { readJsonObjectBody } from '../api/http';
++import { requiredStrings } from '../api/route-input';
+ import type { ChallengeStore } from '../auth/challenge-store';
+ import { NODE_SESSION_TTL_MS, type NodeSessionStore } from '../auth/node-session-store';
+ import {
+@@ -105,92 +107,68 @@ export class AuthRoutes {
+ 
+   async handle(req: Request): Promise<Response | null> {
+     const path = new URL(req.url).pathname;
+-    if (path === '/api/auth/mode' && req.method === 'GET') {
+-      return await this.handleMode(req);
+-    }
+-    if (path === '/api/auth/nodes' && req.method === 'GET') {
+-      return this.handlePublicNodes();
+-    }
+-    if (path === '/api/auth/challenge' && req.method === 'POST') {
+-      return this.handleChallenge(req);
+-    }
+-    if (path === '/api/auth/login' && req.method === 'POST') {
+-      return this.handleLogin(req);
+-    }
+-    if (path === '/api/auth/logout' && req.method === 'POST') {
+-      return requireSession(this.sessionDeps, (r, auth) => this.handleLogout(r, auth.userId))(req);
+-    }
+-    if (path === '/api/auth/passkey/register/options' && req.method === 'POST') {
+-      return requireSession(this.sessionDeps, (r, auth) =>
+-        this.handlePasskeyRegisterOptions(r, auth.userId)
+-      )(req);
+-    }
+-    if (path === '/api/auth/passkey/register/verify' && req.method === 'POST') {
+-      return requireSession(this.sessionDeps, (r, auth) =>
+-        this.handlePasskeyRegisterVerify(r, auth.userId)
+-      )(req);
+-    }
+-    if (path === '/api/auth/passkey/login/options' && req.method === 'POST') {
+-      return this.handlePasskeyLoginOptions(req);
+-    }
+-    if (path === '/api/auth/keylog/head' && req.method === 'GET') {
+-      return requireSession(this.sessionDeps, (_r, auth) => this.handleKeyLogHead(auth.userId))(
+-        req
+-      );
+-    }
+-    if (path === '/api/auth/passkeys' && req.method === 'GET') {
+-      return requireSession(this.sessionDeps, (r, auth) => this.handlePasskeys(r, auth.userId))(
+-        req
+-      );
+-    }
+-    if (path === '/api/auth/keylog' && req.method === 'POST') {
+-      return requireSession(this.sessionDeps, (r, auth) => this.handleKeyLog(r, auth.userId))(req);
+-    }
+-    if (path.startsWith('/api/auth/')) {
+-      return jsonError('method_not_allowed', 405);
+-    }
++    const session = (fn: (req: Request, uid: string | null) => Response | Promise<Response>) =>
++      requireSession(this.sessionDeps, (r, auth) => fn(r, auth.userId))(req);
++    const routes: Record<string, () => Response | Promise<Response>> = {
++      'GET /api/auth/mode': () => this.handleMode(req),
++      'GET /api/auth/nodes': () => this.handlePublicNodes(),
++      'POST /api/auth/challenge': () => this.handleChallenge(req),
++      'POST /api/auth/login': () => this.handleLogin(req),
++      'POST /api/auth/logout': () => session((r, uid) => this.handleLogout(r, uid)),
++      'POST /api/auth/passkey/register/options': () =>
++        session((r, uid) => this.handlePasskeyRegisterOptions(r, uid)),
++      'POST /api/auth/passkey/register/verify': () =>
++        session((r, uid) => this.handlePasskeyRegisterVerify(r, uid)),
++      'POST /api/auth/passkey/login/options': () => this.handlePasskeyLoginOptions(req),
++      'GET /api/auth/keylog/head': () => session((_r, uid) => this.handleKeyLogHead(uid)),
++      'GET /api/auth/passkeys': () => session((r, uid) => this.handlePasskeys(r, uid)),
++      'POST /api/auth/keylog': () => session((r, uid) => this.handleKeyLog(r, uid)),
++    };
++    const run = routes[`${req.method} ${path}`];
++    if (run) return run();
++    if (path.startsWith('/api/auth/')) return jsonError('method_not_allowed', 405);
+     return null;
+   }
+ 
+   private async handleMode(req: Request): Promise<Response> {
+     const origin = requestOrigin(req);
+     const tls = (await this.tlsInfoProvider?.()) ?? { caFingerprint: null, caPem: null };
++    const shared = {
++      nodeId: this.deps.nodeId,
++      passkeyAvailable: isPasskeyAvailable(origin),
++      caFingerprint: tls.caFingerprint,
++    };
+     if (isStandaloneRoles(this.deps.roles)) {
+       return jsonBody({
++        ...shared,
+         mode: 'none',
+-        nodeId: this.deps.nodeId,
+         uid: null,
+         username: null,
+         kdfParams: null,
+         passkeysForThisOrigin: false,
+-        passkeyAvailable: isPasskeyAvailable(origin),
+         totpEnabled: false,
+         rootEpoch: null,
+         rootPublicKey: null,
+         hubNodeId: null,
+         hubPublicUrl: null,
+-        caFingerprint: tls.caFingerprint,
+       });
+     }
+     const user = findPrimaryUser(this.deps.userStore, this.deps.primaryUserId);
+-    const keys = user ? this.deps.userStore.listKeysByUser(user.id) : [];
+-    const passkeysForThisOrigin = keys.some((k) => k.origin === origin);
+-    const kdfParams = user ? publicKdfParams(user.kdfParamsJson) : null;
+     const hub = this.resolveHub();
+     return jsonBody({
++      ...shared,
+       mode: 'mesh',
+-      nodeId: this.deps.nodeId,
+       uid: user?.id ?? null,
+       username: user?.username ?? null,
+-      kdfParams,
+-      passkeysForThisOrigin,
+-      passkeyAvailable: isPasskeyAvailable(origin),
++      kdfParams: user ? publicKdfParams(user.kdfParamsJson) : null,
++      passkeysForThisOrigin: user
++        ? this.deps.userStore.listKeysByUser(user.id).some((k) => k.origin === origin)
++        : false,
+       totpEnabled: user?.totpRecordSeq != null,
+       rootEpoch: user?.rootEpoch ?? null,
+       rootPublicKey: user ? encodeBase64url(user.rootPublicKey) : null,
+       hubNodeId: hub.nodeId,
+       hubPublicUrl: hub.publicUrl,
+-      caFingerprint: tls.caFingerprint,
+     });
+   }
+ 
+@@ -208,9 +186,7 @@ export class AuthRoutes {
+       return jsonError('MALFORMED', 400);
+     }
+     const user = resolveUser(this.deps.userStore, uidRaw);
+-    if (!user) {
+-      return jsonError('UNKNOWN_USER', 404);
+-    }
++    if (!user) return jsonError('UNKNOWN_USER', 404);
+     const via = getMeshRequestContext(req).via || MESH_VIA_SELF;
+     const created = this.deps.challengeStore.create({
+       uid: user.id,
+@@ -232,113 +208,50 @@ export class AuthRoutes {
+       this.recordFailure(`ip:${ip}`);
+       return jsonError('MALFORMED', 400);
+     }
+-
+-    let uidHint = '';
+-    try {
+-      if (typeof body.login === 'string') {
+-        uidHint = decodeLogin(decodeBase64url(body.login)).uid;
+-      }
+-    } catch {
+-      uidHint = '';
+-    }
+-    if (this.isRateLimited(uidHint, ip)) {
+-      return jsonError('RATE_LIMITED', 429);
+-    }
+-
++    let uidHint = peekLoginUid(body);
++    if (this.isRateLimited(uidHint, ip)) return jsonError('RATE_LIMITED', 429);
+     const fail = (code: string, status = 401): Response => {
+       this.recordFailure(`ip:${ip}`);
+       if (uidHint) this.recordFailure(`uid:${uidHint}`);
+       return jsonError(code, status);
+     };
+-
+     try {
+-      if (
+-        typeof body.login !== 'string' ||
+-        typeof body.sig !== 'string' ||
+-        typeof body.delegation !== 'string' ||
+-        typeof body.delegation_sig !== 'string'
+-      ) {
+-        return fail('MALFORMED', 400);
+-      }
+-      const login = decodeLogin(decodeBase64url(body.login));
+-      const sig = decodeBase64url(body.sig);
+-      const delegation = decodeDelegation(decodeBase64url(body.delegation));
+-      const delegationSig = decodeBase64url(body.delegation_sig);
+-      uidHint = login.uid;
+-
+-      if (this.isRateLimited(uidHint, ip)) {
+-        return jsonError('RATE_LIMITED', 429);
+-      }
+-
+-      const challenge = this.deps.challengeStore.consume(login.challenge_id);
+-      if (!challenge || challenge.kind !== 'login') {
+-        return fail('CHALLENGE_CONSUMED');
+-      }
+-      // 本机入口的 challenge 记录哨兵 'self'；浏览器按 /api/auth/mode.nodeId 填真实 id，CLI 填 'self'，两者都算本机
+-      const entryIsSelf = challenge.entryNodeId === MESH_VIA_SELF;
+-      const entryMatches =
+-        login.entry === challenge.entryNodeId || (entryIsSelf && login.entry === this.deps.nodeId);
+-      if (!entryMatches) {
+-        return fail('ENTRY_MISMATCH');
+-      }
+-      if (login.target !== this.deps.nodeId && login.target !== MESH_VIA_SELF) {
+-        return fail('TARGET_MISMATCH');
+-      }
+-      if (!bytesEqual(login.target_pk, this.deps.nodePk)) {
+-        return fail('TARGET_MISMATCH');
+-      }
+-      if (login.uid !== delegation.uid || login.uid !== challenge.uid) {
+-        return fail('UID_MISMATCH');
+-      }
+-
+-      const user = resolveUser(this.deps.userStore, login.uid);
+-      if (!user) {
+-        return fail('UNKNOWN_USER', 404);
+-      }
+-
++      const envelope = parseLoginEnvelope(body);
++      if (!envelope) return fail('MALFORMED', 400);
++      uidHint = envelope.login.uid;
++      if (this.isRateLimited(uidHint, ip)) return jsonError('RATE_LIMITED', 429);
++      const challenge = this.deps.challengeStore.consume(envelope.login.challenge_id);
++      if (!challenge || challenge.kind !== 'login') return fail('CHALLENGE_CONSUMED');
++      const bound = loginBindingError(
++        envelope.login,
++        challenge,
++        this.deps.nodeId,
++        this.deps.nodePk,
++        envelope.delegation.uid
++      );
++      if (bound) return fail(bound);
++      const user = resolveUser(this.deps.userStore, envelope.login.uid);
++      if (!user) return fail('UNKNOWN_USER', 404);
+       const now = this.now();
+-      const delOk = await this.verifyDelegationForLogin(delegation, delegationSig, user, now);
+-      if (!delOk.ok) {
+-        return fail(delOk.code);
+-      }
+-
+-      const loginOk = verifyLogin(login, sig, delegation.sess_pk, {
++      const delOk = await this.verifyDelegationForLogin(
++        envelope.delegation,
++        envelope.delegationSig,
++        user,
++        now
++      );
++      if (!delOk.ok) return fail(delOk.code);
++      const loginOk = verifyLogin(envelope.login, envelope.sig, envelope.delegation.sess_pk, {
+         challengeId: challenge.challengeId,
+         nonce: challenge.nonce,
+-        target: login.target,
++        target: envelope.login.target,
+         targetPk: this.deps.nodePk,
+         uid: challenge.uid,
+-        entry: login.entry,
+-      });
+-      if (!loginOk.ok) {
+-        return fail(loginErrorCode(loginOk.error));
+-      }
+-
+-      const totpBody = body.totp;
+-      const totpCheck = await this.checkTotp(user, delegation.method, totpBody);
+-      if (!totpCheck.ok) {
+-        return fail(totpCheck.code);
+-      }
+-
+-      const issued =
+-        delegation.method === 'passkey'
+-          ? this.issuePasskeySession(user.id, challenge.entryNodeId, delegation, now)
+-          : this.deps.nodeSessionStore.issue({
+-              userId: user.id,
+-              viaNodeId: challenge.entryNodeId,
+-              sessPublicKey: delegation.sess_pk,
+-              delegationMethod: 'root',
+-              now,
+-            });
+-      if ('code' in issued) {
+-        return fail(issued.code);
+-      }
+-      const maxAgeSec = Math.max(0, Math.floor((issued.expiresAt - now) / 1000));
+-      const headers = new Headers({
+-        'content-type': 'application/json',
+-        [X_TMEX_SET_SESSION]: `${issued.sid};${maxAgeSec || Math.floor(NODE_SESSION_TTL_MS / 1000)}`,
++        entry: envelope.login.entry,
+       });
+-      return jsonBody({ expires_at: issued.expiresAt }, 200, headers);
++      if (!loginOk.ok) return fail(loginErrorCode(loginOk.error));
++      const totpCheck = await this.checkTotp(user, envelope.delegation.method, body.totp);
++      if (!totpCheck.ok) return fail(totpCheck.code);
++      return this.issueLoginSession(user.id, challenge.entryNodeId, envelope.delegation, now, fail);
+     } catch {
+       return fail('MALFORMED', 400);
+     }
+@@ -360,13 +273,9 @@ export class AuthRoutes {
+     req: Request,
+     userId: string | null
+   ): Promise<Response> {
+-    if (!userId) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
++    if (!userId) return jsonError('UNAUTHORIZED', 401);
+     const user = this.deps.userStore.getById(userId);
+-    if (!user) {
+-      return jsonError('UNKNOWN_USER', 404);
+-    }
++    if (!user) return jsonError('UNKNOWN_USER', 404);
+     const origin = requestOrigin(req);
+     const rpId = rpIdFromOrigin(origin);
+     const existing = this.deps.userStore
+@@ -393,19 +302,14 @@ export class AuthRoutes {
+     req: Request,
+     userId: string | null
+   ): Promise<Response> {
+-    if (!userId) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
++    if (!userId) return jsonError('UNAUTHORIZED', 401);
+     const body = await readJsonObjectBody(req);
+     if (!body || typeof body.response !== 'object' || body.response === null) {
+       return jsonError('MALFORMED', 400);
+     }
++    const nested = body.response as { challenge_id?: unknown };
+     const challengeId =
+-      typeof body.challenge_id === 'string'
+-        ? body.challenge_id
+-        : typeof (body.response as { challenge_id?: string }).challenge_id === 'string'
+-          ? (body.response as { challenge_id: string }).challenge_id
+-          : null;
++      [body.challenge_id, nested.challenge_id].find((v) => typeof v === 'string') ?? null;
+     const origin = requestOrigin(req);
+     const rpId = rpIdFromOrigin(origin);
+     const entry = challengeId ? this.deps.challengeStore.consume(challengeId) : null;
+@@ -420,9 +324,7 @@ export class AuthRoutes {
+       origin: payload.origin ?? origin,
+       rpId: payload.rpId ?? rpId,
+     });
+-    if (!verified) {
+-      return jsonError('PASSKEY_VERIFY_FAILED', 400);
+-    }
++    if (!verified) return jsonError('PASSKEY_VERIFY_FAILED', 400);
+     return jsonBody({
+       credential_id: verified.credential_id,
+       public_key: encodeBase64url(verified.public_key),
+@@ -439,16 +341,13 @@ export class AuthRoutes {
+ 
+   private async handlePasskeyLoginOptions(req: Request): Promise<Response> {
+     const body = await readJsonObjectBody(req);
+-    if (!body || typeof body.uid !== 'string' || typeof body.delegation !== 'string') {
+-      return jsonError('MALFORMED', 400);
+-    }
+-    const user = resolveUser(this.deps.userStore, body.uid);
+-    if (!user) {
+-      return jsonError('UNKNOWN_USER', 404);
+-    }
++    const fields = body && requiredStrings(body, ['uid', 'delegation']);
++    if (!fields) return jsonError('MALFORMED', 400);
++    const user = resolveUser(this.deps.userStore, fields.uid);
++    if (!user) return jsonError('UNKNOWN_USER', 404);
+     let delegation: Delegation;
+     try {
+-      delegation = decodeDelegation(decodeBase64url(body.delegation));
++      delegation = decodeDelegation(decodeBase64url(fields.delegation));
+     } catch {
+       return jsonError('MALFORMED', 400);
+     }
+@@ -470,9 +369,7 @@ export class AuthRoutes {
+   }
+ 
+   private handleKeyLogHead(userId: string | null): Response {
+-    if (!userId) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
++    if (!userId) return jsonError('UNAUTHORIZED', 401);
+     try {
+       const state = this.deps.keyLogService.currentState(userId);
+       return jsonBody({
+@@ -487,9 +384,7 @@ export class AuthRoutes {
+   }
+ 
+   private handlePasskeys(req: Request, userId: string | null): Response {
+-    if (!userId) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
++    if (!userId) return jsonError('UNAUTHORIZED', 401);
+     const origin = requestOrigin(req);
+     const passkeys = this.deps.userStore.listKeysByUser(userId).map((k) => ({
+       credential_id: encodeBase64url(k.credentialId),
+@@ -504,18 +399,15 @@ export class AuthRoutes {
+   }
+ 
+   private async handleKeyLog(req: Request, userId: string | null): Promise<Response> {
+-    if (!userId) {
+-      return jsonError('UNAUTHORIZED', 401);
+-    }
++    if (!userId) return jsonError('UNAUTHORIZED', 401);
+     const body = await readJsonObjectBody(req);
+-    if (!body || typeof body.bytes !== 'string' || typeof body.sig !== 'string') {
+-      return jsonError('MALFORMED', 400);
+-    }
++    const fields = body && requiredStrings(body, ['bytes', 'sig']);
++    if (!fields) return jsonError('MALFORMED', 400);
+     let bytes: Uint8Array;
+     let sig: Uint8Array;
+     try {
+-      bytes = decodeBase64url(body.bytes);
+-      sig = decodeBase64url(body.sig);
++      bytes = decodeBase64url(fields.bytes);
++      sig = decodeBase64url(fields.sig);
+     } catch {
+       return jsonError('MALFORMED', 400);
+     }
+@@ -742,46 +634,31 @@ export class AuthRoutes {
+         rootPublicKey: user.rootPublicKey,
+         now,
+       });
+-      if (!verified.ok) {
+-        return { ok: false, code: delegationErrorCode(verified.error) };
+-      }
+-      return { ok: true };
++      return verified.ok ? { ok: true } : { ok: false, code: delegationErrorCode(verified.error) };
+     }
+     const times = verifyDelegationTimes(delegation, now);
+-    if (!times.ok) {
+-      return { ok: false, code: delegationErrorCode(times.error) };
+-    }
+-    if (!delegation.credential_id) {
+-      return { ok: false, code: 'DELEGATION_BAD_SIGNATURE' };
+-    }
+-    if (delegation.uid !== user.id) {
+-      return { ok: false, code: 'DELEGATION_BAD_SIGNATURE' };
+-    }
++    if (!times.ok) return { ok: false, code: delegationErrorCode(times.error) };
++    const bad = { ok: false as const, code: 'DELEGATION_BAD_SIGNATURE' };
++    if (!delegation.credential_id || delegation.uid !== user.id) return bad;
+     let stored: UserKeyRecord | null;
+     try {
+       stored = this.deps.userStore.getKeyByCredentialId(decodeBase64url(delegation.credential_id));
+     } catch {
+       stored = null;
+     }
+-    if (!stored || stored.userId !== user.id) {
+-      return { ok: false, code: 'DELEGATION_BAD_SIGNATURE' };
+-    }
+-    let assertion: ReturnType<typeof decodePasskeyAssertionSig>;
++    if (!stored || stored.userId !== user.id) return bad;
+     try {
+-      assertion = decodePasskeyAssertionSig(delegationSig);
++      const assertion = decodePasskeyAssertionSig(delegationSig);
++      const ok = await this.verifyPasskey({
++        challenge: delegationChallenge(delegation),
++        delegation,
++        assertion,
++        credentialId: delegation.credential_id,
++      });
++      return ok ? { ok: true } : bad;
+     } catch {
+-      return { ok: false, code: 'DELEGATION_BAD_SIGNATURE' };
+-    }
+-    const ok = await this.verifyPasskey({
+-      challenge: delegationChallenge(delegation),
+-      delegation,
+-      assertion,
+-      credentialId: delegation.credential_id,
+-    });
+-    if (!ok) {
+-      return { ok: false, code: 'DELEGATION_BAD_SIGNATURE' };
++      return bad;
+     }
+-    return { ok: true };
+   }
+ 
+   private async checkTotp(
+@@ -789,17 +666,11 @@ export class AuthRoutes {
+     method: Delegation['method'],
+     totpBody: unknown
+   ): Promise<{ ok: true } | { ok: false; code: string }> {
+-    if (method !== 'root') {
+-      return { ok: true };
+-    }
++    if (method !== 'root') return { ok: true };
+     const state = this.deps.keyLogService.currentState(user.id);
+-    if (!state.totp || user.totpRecordSeq == null) {
+-      return { ok: true };
+-    }
++    if (!state.totp || user.totpRecordSeq == null) return { ok: true };
+     const parsed = parseTotpBody(totpBody);
+-    if (!parsed) {
+-      return { ok: false, code: 'TOTP_REQUIRED' };
+-    }
++    if (!parsed) return { ok: false, code: 'TOTP_REQUIRED' };
+     try {
+       const secret = await decryptTotpSecret(parsed.kTotp, state.totp, {
+         uid: user.id,
+@@ -816,24 +687,40 @@ export class AuthRoutes {
+     }
+   }
+ 
+-  private issuePasskeySession(
++  private issueLoginSession(
+     userId: string,
+     viaNodeId: string,
+     delegation: Delegation,
+-    now: number
+-  ): { sid: string; expiresAt: number; hardExpiresAt: number } | { code: string } {
+-    const credentialId = credentialIdBytes(delegation.credential_id);
+-    if (!credentialId || credentialId.byteLength === 0) {
+-      return { code: 'DELEGATION_BAD_SIGNATURE' };
++    now: number,
++    fail: (code: string, status?: number) => Response
++  ): Response {
++    let issued: { sid: string; expiresAt: number };
++    if (delegation.method === 'passkey') {
++      const credentialId = credentialIdBytes(delegation.credential_id);
++      if (!credentialId || credentialId.byteLength === 0) return fail('DELEGATION_BAD_SIGNATURE');
++      issued = this.deps.nodeSessionStore.issue({
++        userId,
++        viaNodeId,
++        sessPublicKey: delegation.sess_pk,
++        delegationMethod: 'passkey',
++        credentialId,
++        now,
++      });
++    } else {
++      issued = this.deps.nodeSessionStore.issue({
++        userId,
++        viaNodeId,
++        sessPublicKey: delegation.sess_pk,
++        delegationMethod: 'root',
++        now,
++      });
+     }
+-    return this.deps.nodeSessionStore.issue({
+-      userId,
+-      viaNodeId,
+-      sessPublicKey: delegation.sess_pk,
+-      delegationMethod: 'passkey',
+-      credentialId,
+-      now,
++    const maxAgeSec = Math.max(0, Math.floor((issued.expiresAt - now) / 1000));
++    const headers = new Headers({
++      'content-type': 'application/json',
++      [X_TMEX_SET_SESSION]: `${issued.sid};${maxAgeSec || Math.floor(NODE_SESSION_TTL_MS / 1000)}`,
+     });
++    return jsonBody({ expires_at: issued.expiresAt }, 200, headers);
+   }
+ 
+   private now(): number {
+@@ -950,36 +837,61 @@ function parseTotpBody(value: unknown): { code: string; kTotp: Uint8Array } | nu
+   }
+ }
+ 
+-function loginErrorCode(error: string): string {
+-  switch (error) {
+-    case 'challenge_mismatch':
+-      return 'CHALLENGE_MISMATCH';
+-    case 'target_mismatch':
+-      return 'TARGET_MISMATCH';
+-    case 'uid_mismatch':
+-      return 'UID_MISMATCH';
+-    case 'entry_mismatch':
+-      return 'ENTRY_MISMATCH';
+-    case 'bad_signature':
+-      return 'BAD_SIGNATURE';
+-    default:
+-      return 'BAD_SIGNATURE';
++function peekLoginUid(body: Record<string, unknown>): string {
++  try {
++    return typeof body.login === 'string' ? decodeLogin(decodeBase64url(body.login)).uid : '';
++  } catch {
++    return '';
+   }
+ }
+ 
++function parseLoginEnvelope(body: Record<string, unknown>) {
++  const fields = requiredStrings(body, ['login', 'sig', 'delegation', 'delegation_sig']);
++  if (!fields) return null;
++  return {
++    login: decodeLogin(decodeBase64url(fields.login)),
++    sig: decodeBase64url(fields.sig),
++    delegation: decodeDelegation(decodeBase64url(fields.delegation)),
++    delegationSig: decodeBase64url(fields.delegation_sig),
++  };
++}
++
++function loginBindingError(
++  login: Login,
++  challenge: { entryNodeId: string; uid: string },
++  nodeId: string,
++  nodePk: Uint8Array,
++  delegationUid: string
++): string | null {
++  // 本机入口的 challenge 记录哨兵 'self'；浏览器按 /api/auth/mode.nodeId 填真实 id，CLI 填 'self'，两者都算本机
++  const selfEntry = challenge.entryNodeId === MESH_VIA_SELF && login.entry === nodeId;
++  if (login.entry !== challenge.entryNodeId && !selfEntry) return 'ENTRY_MISMATCH';
++  if (login.target !== nodeId && login.target !== MESH_VIA_SELF) return 'TARGET_MISMATCH';
++  if (!bytesEqual(login.target_pk, nodePk)) return 'TARGET_MISMATCH';
++  if (login.uid !== delegationUid || login.uid !== challenge.uid) return 'UID_MISMATCH';
++  return null;
++}
++
++function loginErrorCode(error: string): string {
++  return (
++    {
++      challenge_mismatch: 'CHALLENGE_MISMATCH',
++      target_mismatch: 'TARGET_MISMATCH',
++      uid_mismatch: 'UID_MISMATCH',
++      entry_mismatch: 'ENTRY_MISMATCH',
++      bad_signature: 'BAD_SIGNATURE',
++    }[error] ?? 'BAD_SIGNATURE'
++  );
++}
++
+ function delegationErrorCode(error: string): string {
+-  switch (error) {
+-    case 'expired':
+-      return 'DELEGATION_EXPIRED';
+-    case 'bad_signature':
+-      return 'DELEGATION_BAD_SIGNATURE';
+-    case 'method_mismatch':
+-      return 'DELEGATION_METHOD_MISMATCH';
+-    case 'invalid_ttl':
+-      return 'DELEGATION_INVALID_TTL';
+-    case 'issued_in_future':
+-      return 'DELEGATION_ISSUED_IN_FUTURE';
+-    default:
+-      return 'DELEGATION_BAD_SIGNATURE';
+-  }
++  return (
++    {
++      expired: 'DELEGATION_EXPIRED',
++      bad_signature: 'DELEGATION_BAD_SIGNATURE',
++      method_mismatch: 'DELEGATION_METHOD_MISMATCH',
++      invalid_ttl: 'DELEGATION_INVALID_TTL',
++      issued_in_future: 'DELEGATION_ISSUED_IN_FUTURE',
++    }[error] ?? 'DELEGATION_BAD_SIGNATURE'
++  );
+ }
+diff --git a/apps/gateway/src/mesh/forwarder.test.ts b/apps/gateway/src/mesh/forwarder.test.ts
+index e9014ced..8cea26bf 100644
+--- a/apps/gateway/src/mesh/forwarder.test.ts
++++ b/apps/gateway/src/mesh/forwarder.test.ts
+@@ -707,6 +707,84 @@ describe('forwarder', () => {
+     }
+   });
+ 
++  test('queued frames during failover are flushed exactly once after resume', async () => {
++    const dcLink = { id: 'dc' } as unknown as LinkSession;
++    const relayLink = { id: 'relay' } as unknown as LinkSession;
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dcLink);
++    peers.transport.set(OTHER, 'dc');
++    const streams = new FakeStreams();
++    const origGetLink = peers.getLink.bind(peers);
++    let blockLink = false;
++    let releaseLink: (() => void) | undefined;
++    peers.getLink = async (nodeId: string) => {
++      if (blockLink) {
++        await new Promise<void>((resolve) => {
++          releaseLink = resolve;
++        });
++      }
++      return origGetLink(nodeId);
++    };
++    const mesh = await bootMesh({ peers, streams, sleep: async () => {} });
++    try {
++      const { ws } = await openForwardWs(mesh.runtime, peers, streams, OTHER);
++      mesh.runtime.handleWebSocket.message(ws, encodeHelloFrame());
++      blockLink = true;
++      peers.links.set(OTHER, relayLink);
++      peers.transport.set(OTHER, 'relay');
++      streams.lastWs?.close(1011, 'reset');
++      await waitUntil(() => releaseLink !== undefined, 2_000);
++      const queued = new Uint8Array([0xff, 0xfe, 0xfd, 0xfc, 0x01]);
++      mesh.runtime.handleWebSocket.message(ws, queued);
++      releaseLink?.();
++      await waitUntil(() => streams.wsOpens.length === 2, 2_000);
++      const matches = (streams.wsOpens[1]?.ws.sent ?? []).filter((frame) =>
++        bytesEqual(frame, queued)
++      );
++      expect(matches).toHaveLength(1);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('HTTP forward removes the request abort listener after success and error', async () => {
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dummyLink);
++    const streams = new FakeStreams();
++    streams.nextResponse = new Response('ok', { headers: { 'content-type': 'text/plain' } });
++    const mesh = await bootMesh({ peers, streams });
++    try {
++      const success = trackAbort(new AbortController());
++      const ok = asResponse(
++        await mesh.runtime.handleRequest(
++          new Request(`http://localhost/n/${OTHER}/api/devices`, { signal: success.signal }),
++          dummyServer
++        )
++      );
++      expect(ok.status).toBe(200);
++      expect(success.added).toBe(1);
++      expect(success.removed).toBe(1);
++
++      streams.httpOpenError = new Error('upstream down');
++      const failure = trackAbort(new AbortController());
++      const err = asResponse(
++        await mesh.runtime.handleRequest(
++          new Request(`http://localhost/n/${OTHER}/api/mutate`, {
++            method: 'POST',
++            body: 'x',
++            signal: failure.signal,
++          }),
++          dummyServer
++        )
++      );
++      expect(err.status).toBe(503);
++      expect(failure.added).toBe(1);
++      expect(failure.removed).toBe(1);
++    } finally {
++      mesh.close();
++    }
++  });
++
+   test('GET http forward retries getLink after a transient failure', async () => {
+     const peers = new FakePeers();
+     peers.links.set(OTHER, dummyLink);
+@@ -873,6 +951,34 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+   return true;
+ }
+ 
++function trackAbort(controller: AbortController): {
++  signal: AbortSignal;
++  added: number;
++  removed: number;
++} {
++  const signal = controller.signal;
++  const add = signal.addEventListener.bind(signal);
++  const remove = signal.removeEventListener.bind(signal);
++  const tracked = { signal, added: 0, removed: 0 };
++  signal.addEventListener = ((
++    type: string,
++    listener: EventListenerOrEventListenerObject,
++    opts?: boolean | AddEventListenerOptions
++  ) => {
++    if (type === 'abort') tracked.added += 1;
++    return add(type, listener, opts);
++  }) as typeof signal.addEventListener;
++  signal.removeEventListener = ((
++    type: string,
++    listener: EventListenerOrEventListenerObject,
++    opts?: boolean | EventListenerOptions
++  ) => {
++    if (type === 'abort') tracked.removed += 1;
++    return remove(type, listener, opts);
++  }) as typeof signal.removeEventListener;
++  return tracked;
++}
++
+ async function openForwardWs(
+   runtime: Awaited<ReturnType<typeof bootMesh>>['runtime'],
+   _peers: FakePeers,
+diff --git a/apps/gateway/src/mesh/forwarder.ts b/apps/gateway/src/mesh/forwarder.ts
+index 8245739d..382cc8e5 100644
+--- a/apps/gateway/src/mesh/forwarder.ts
++++ b/apps/gateway/src/mesh/forwarder.ts
+@@ -281,7 +281,6 @@ export class Forwarder {
+     const abort = new AbortController();
+     pump.failoverAbort = abort;
+     const signal = abort.signal;
+-    let lastError: unknown;
+     try {
+       for (let attempt = 0; attempt < STREAM_FAILOVER_MAX_ATTEMPTS; attempt += 1) {
+         if (pump.browserClosed || signal.aborted) return;
+@@ -297,8 +296,7 @@ export class Forwarder {
+         let link: LinkSession;
+         try {
+           link = await this.deps.peers.getLink(pump.nodeId);
+-        } catch (err) {
+-          lastError = err;
++        } catch {
+           continue;
+         }
+         if (pump.browserClosed || signal.aborted) return;
+@@ -306,8 +304,7 @@ export class Forwarder {
+         let stream: OpenedWsStream;
+         try {
+           stream = await this.deps.streams.openWsStream(link, pump.auth, pump.cid);
+-        } catch (err) {
+-          lastError = err;
++        } catch {
+           continue;
+         }
+         pump.inflight = stream;
+@@ -328,13 +325,11 @@ export class Forwarder {
+         this.log(
+           `[mesh][stream] failover stream=${pump.id} from=${from} to=${to} resumed=${resumed} mode=${desc.mode} panes=${desc.panes} cursor=${desc.cursor}`
+         );
+-        this.flushQueue(pump);
+         pump.failingOver = false;
+         pump.failoverAbort = null;
+         this.flushQueue(pump);
+         return;
+       }
+-      void lastError;
+       this.closeBrowser(pump, { code: 1011, reason: 'failover-exhausted' });
+     } finally {
+       if (pump.failingOver) {
+@@ -441,53 +436,47 @@ export class Forwarder {
+       : (parseCookies(req.headers.get('cookie')).get(nodeSessionCookieName(nodeId)) ?? null);
+     const origin = req.headers.get('origin') ?? new URL(req.url).origin;
+     const abort = new AbortController();
+-    req.signal.addEventListener('abort', () => abort.abort(), { once: true });
++    const onAbort = (): void => abort.abort();
++    req.signal.addEventListener('abort', onAbort, { once: true });
+     const body = req.body && req.method !== 'GET' && req.method !== 'HEAD' ? req.body : null;
+     const retryable = IDEMPOTENT_HTTP.has(req.method) && !body;
+     const attempts = retryable ? HTTP_FAILOVER_MAX_ATTEMPTS : 1;
+-    let lastErr: unknown;
+-    for (let attempt = 0; attempt < attempts; attempt += 1) {
+-      if (abort.signal.aborted) {
+-        return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+-      }
+-      if (attempt > 0) {
+-        const delay = STREAM_FAILOVER_BACKOFF_MS[attempt] ?? 200;
++    try {
++      for (let attempt = 0; attempt < attempts; attempt += 1) {
++        if (abort.signal.aborted) break;
++        if (attempt > 0) {
++          try {
++            await this.sleep(STREAM_FAILOVER_BACKOFF_MS[attempt] ?? 200, abort.signal);
++          } catch {
++            break;
++          }
++        }
++        let link: LinkSession;
+         try {
+-          await this.sleep(delay, abort.signal);
++          link = await this.deps.peers.getLink(nodeId);
+         } catch {
+-          return jsonError('NODE_UNREACHABLE', 503, { nodeId });
++          if (!retryable) break;
++          continue;
++        }
++        try {
++          return this.adaptResponse(
++            req,
++            await this.deps.streams.openHttpStream(
++              link,
++              { method: req.method, path: rest, query: search, headers, origin, auth },
++              body,
++              abort.signal
++            ),
++            nodeId
++          );
++        } catch {
++          if (!retryable) break;
+         }
+       }
+-      let link: LinkSession;
+-      try {
+-        link = await this.deps.peers.getLink(nodeId);
+-      } catch (err) {
+-        lastErr = err;
+-        if (!retryable) break;
+-        continue;
+-      }
+-      try {
+-        const upstream = await this.deps.streams.openHttpStream(
+-          link,
+-          {
+-            method: req.method,
+-            path: rest,
+-            query: search,
+-            headers,
+-            origin,
+-            auth,
+-          },
+-          body,
+-          abort.signal
+-        );
+-        return this.adaptResponse(req, upstream, nodeId);
+-      } catch (err) {
+-        lastErr = err;
+-        if (!retryable) break;
+-      }
++      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
++    } finally {
++      req.signal.removeEventListener('abort', onAbort);
+     }
+-    void lastErr;
+-    return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+   }
+ 
+   private async handleRemoteWs(
+@@ -554,9 +543,7 @@ export class Forwarder {
+     let contentDisposition: string | null = null;
+     upstream.headers.forEach((value, key) => {
+       const lower = key.toLowerCase();
+-      if (lower === X_TMEX_SET_SESSION) {
+-        return;
+-      }
++      if (lower === X_TMEX_SET_SESSION) return;
+       if (lower === 'content-type') {
+         contentType = value;
+         return;
+@@ -565,9 +552,7 @@ export class Forwarder {
+         contentDisposition = value;
+         return;
+       }
+-      if (RESPONSE_ALLOW.has(lower) || lower.startsWith('x-tmex-')) {
+-        headers.set(key, value);
+-      }
++      if (RESPONSE_ALLOW.has(lower) || lower.startsWith('x-tmex-')) headers.set(key, value);
+     });
+     const mime = baseMime(contentType);
+     if (mime && MESH_ALLOWED_MIME.has(mime)) {
+@@ -583,15 +568,7 @@ export class Forwarder {
+     const setSession = upstream.headers.get(X_TMEX_SET_SESSION);
+     if (setSession) {
+       const parsed = parseSetSessionHeader(setSession);
+-      if (parsed) {
+-        headers.append(
+-          'set-cookie',
+-          buildSetCookie(nodeSessionCookieName(nodeId), parsed.sid, {
+-            maxAgeSec: parsed.maxAgeSec,
+-            secure: isHttps(req),
+-          })
+-        );
+-      }
++      if (parsed) appendNodeCookie(req, headers, nodeId, parsed.sid, parsed.maxAgeSec);
+     }
+     const renewed = upstream.headers.get(X_TMEX_SESSION_RENEWED);
+     if (renewed) {
+@@ -599,21 +576,18 @@ export class Forwarder {
+       const sid = parseCookies(req.headers.get('cookie')).get(nodeSessionCookieName(nodeId));
+       const expiresAt = Number(renewed);
+       if (sid && Number.isFinite(expiresAt)) {
+-        const maxAgeSec = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+-        headers.append(
+-          'set-cookie',
+-          buildSetCookie(nodeSessionCookieName(nodeId), sid, {
+-            maxAgeSec,
+-            secure: isHttps(req),
+-          })
++        appendNodeCookie(
++          req,
++          headers,
++          nodeId,
++          sid,
++          Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
+         );
+       }
+     }
+-
+     if (upstream.status !== 401) {
+       return new Response(upstream.body, { status: upstream.status, headers });
+     }
+-
+     const raw = await readBodyLimited(upstream, AUTH_401_BODY_LIMIT);
+     let body: Record<string, unknown> = { code: 'NODE_LOGIN_REQUIRED', nodeId };
+     try {
+@@ -624,9 +598,7 @@ export class Forwarder {
+     } catch {
+       if (raw) body.message = raw;
+     }
+-    for (const name of DROP_ON_401_REWRITE) {
+-      headers.delete(name);
+-    }
++    for (const name of DROP_ON_401_REWRITE) headers.delete(name);
+     headers.set('content-type', 'application/json');
+     return new Response(JSON.stringify(body), { status: 401, headers });
+   }
+@@ -960,6 +932,19 @@ export function takePendingForwardStream(token: string | undefined): OpenedWsStr
+   return stream;
+ }
+ 
++function appendNodeCookie(
++  req: Request,
++  headers: Headers,
++  nodeId: string,
++  sid: string,
++  maxAgeSec: number
++): void {
++  headers.append(
++    'set-cookie',
++    buildSetCookie(nodeSessionCookieName(nodeId), sid, { maxAgeSec, secure: isHttps(req) })
++  );
++}
++
+ function filterRequestHeaders(req: Request): Record<string, string> {
+   const out: Record<string, string> = {};
+   req.headers.forEach((value, key) => {
+@@ -1042,11 +1027,14 @@ async function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+   if (ms <= 0) return;
+   if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+   await new Promise<void>((resolve, reject) => {
+-    const timer = setTimeout(resolve, ms);
+-    const onAbort = () => {
++    const onAbort = (): void => {
+       clearTimeout(timer);
+       reject(new DOMException('The operation was aborted.', 'AbortError'));
+     };
++    const timer = setTimeout(() => {
++      signal?.removeEventListener('abort', onAbort);
++      resolve();
++    }, ms);
+     signal?.addEventListener('abort', onAbort, { once: true });
+   });
+ }
+diff --git a/apps/gateway/src/mesh/uplink-protocol.ts b/apps/gateway/src/mesh/uplink-protocol.ts
+index 2669c22c..254b079b 100644
+--- a/apps/gateway/src/mesh/uplink-protocol.ts
++++ b/apps/gateway/src/mesh/uplink-protocol.ts
+@@ -1,487 +1,22 @@
+-import { decodeBase64url, encodeBase64url } from '@tmex/shared/auth';
+-import {
+-  decodeJsonBytes,
+-  encodeCtlMessage,
+-  isRecord,
+-  optionalString,
+-  parseSeq,
+-  requireBoolean,
+-  requireString,
+-  seqToJson,
+-} from './ctl';
+-
+-export const UPLINK_CTL_TYPES = [
+-  'auth.challenge',
+-  'auth.response',
+-  'auth.ok',
+-  'ping',
+-  'pong',
+-  'node.status',
+-  'node.list',
+-  'key.log.req',
+-  'key.log.res',
+-  'key.log.append',
+-  'key.log.ack',
+-  'rtc.signal',
+-  'enroll.redeemed',
+-] as const;
+-
+-export type UplinkCtlType = (typeof UPLINK_CTL_TYPES)[number];
+-
+-export type UplinkAuthChallenge = { t: 'auth.challenge'; nonce: string };
+-export type UplinkAuthResponse = { t: 'auth.response'; node_id: string; sig: string };
+-export type UplinkAuthOk = { t: 'auth.ok' };
+-export type UplinkPing = { t: 'ping' };
+-export type UplinkPong = { t: 'pong' };
+-
+-export type UplinkNodeStatusMsg = {
+-  t: 'node.status';
+-  version: string;
+-  tmux: boolean;
+-  direct_capable: boolean;
+-  inventory: unknown;
+-  endpoints: unknown;
+-};
+-
+-export type UplinkNodeInfo = {
+-  id: string;
+-  name: string;
+-  online: boolean;
+-  endpoints: unknown;
+-  inventory: unknown;
+-  direct_capable: boolean;
+-  version: string | null;
+-};
+-
+-export type UplinkKeyLogHead = {
+-  seq: bigint;
+-  hash: Uint8Array;
+-};
+-
+-export type UplinkHubInfo = { nodeId: string; publicUrl: string; name?: string };
+-
+-export type UplinkNodeList = {
+-  t: 'node.list';
+-  version: number;
+-  key_log_head: UplinkKeyLogHead;
+-  rtc: { stun: string[]; turn: unknown };
+-  nodes: UplinkNodeInfo[];
+-  hub?: UplinkHubInfo;
+-};
+-
+-export type UplinkKeyLogReq = { t: 'key.log.req'; from_seq: bigint; id?: string; limit?: number };
+-export type UplinkKeyLogRecord = { seq: bigint; bytes: Uint8Array; sig: Uint8Array };
+-export type UplinkKeyLogRes = {
+-  t: 'key.log.res';
+-  records: UplinkKeyLogRecord[];
+-  id?: string;
+-  error?: string;
+-  has_more?: boolean;
+-  retry_after_ms?: number;
+-};
+-export type UplinkKeyLogAppend = {
+-  t: 'key.log.append';
+-  bytes: Uint8Array;
+-  sig: Uint8Array;
+-  id?: string;
+-};
+-export type UplinkKeyLogAck = {
+-  t: 'key.log.ack';
+-  id: string;
+-  ok: boolean;
+-  seq?: bigint;
+-  error?: string;
+-};
+-
+-export type UplinkRtcSignal = {
+-  t: 'rtc.signal';
+-  rtcSession: string;
+-  from: 'browser' | 'node';
+-  to: string;
+-  sdp?: string;
+-  candidate?: string;
+-};
+-
+-export type UplinkEnrollRedeemed = {
+-  t: 'enroll.redeemed';
+-  certificate: Uint8Array;
+-  cert_sig: Uint8Array;
+-  enroll_pk: Uint8Array;
+-  nodeId: string;
+-  entrySid?: string;
+-};
+-
+-export type UplinkCtlMessage =
+-  | UplinkAuthChallenge
+-  | UplinkAuthResponse
+-  | UplinkAuthOk
+-  | UplinkPing
+-  | UplinkPong
+-  | UplinkNodeStatusMsg
+-  | UplinkNodeList
+-  | UplinkKeyLogReq
+-  | UplinkKeyLogRes
+-  | UplinkKeyLogAppend
+-  | UplinkKeyLogAck
+-  | UplinkRtcSignal
+-  | UplinkEnrollRedeemed;
+-
+-const TYPE_SET = new Set<string>(UPLINK_CTL_TYPES);
+-const NODE_ID_HEX_RE = /^[0-9a-f]{32}$/i;
+-
+-export const UPLINK_CTL_MAX_BYTES = 64 * 1024;
+-export const UPLINK_CTL_MAX_DEPTH = 8;
+-export const UPLINK_CTL_MAX_ARRAY_LEN = 1024;
+-export const UPLINK_CTL_MAX_STRING_LEN = 4 * 1024;
+-export const UPLINK_CTL_MAX_CERT_BYTES = 2048;
+-export const KEY_LOG_PAGE_DEFAULT_LIMIT = 256;
+-export const KEY_LOG_PAGE_MAX_LIMIT = 256;
+-export const KEY_LOG_PAGE_MAX_BYTES = 1024 * 1024;
+-
+-function requireB64(value: unknown, field: string, expectedLen?: number): Uint8Array {
+-  const bytes = decodeBase64url(requireString(value, field));
+-  if (expectedLen !== undefined && bytes.byteLength !== expectedLen) {
+-    throw new Error(`ctl field ${field} expected ${expectedLen} bytes`);
+-  }
+-  return bytes;
+-}
+-
+-function requireNodeIdHex(value: unknown, field: string): string {
+-  const id = requireString(value, field);
+-  if (!NODE_ID_HEX_RE.test(id)) {
+-    throw new Error(`ctl field ${field} must be 32-hex`);
+-  }
+-  return id;
+-}
+-
+-function assertCtlBounds(value: unknown, depth: number): void {
+-  if (depth > UPLINK_CTL_MAX_DEPTH) {
+-    throw new Error('ctl too deep');
+-  }
+-  if (typeof value === 'string' && value.length > UPLINK_CTL_MAX_STRING_LEN) {
+-    throw new Error('ctl string too long');
+-  }
+-  if (Array.isArray(value)) {
+-    if (value.length > UPLINK_CTL_MAX_ARRAY_LEN) {
+-      throw new Error('ctl array too long');
+-    }
+-    for (const item of value) {
+-      assertCtlBounds(item, depth + 1);
+-    }
+-    return;
+-  }
+-  if (value && typeof value === 'object') {
+-    for (const item of Object.values(value as Record<string, unknown>)) {
+-      assertCtlBounds(item, depth + 1);
+-    }
+-  }
+-}
+-
+-function requireNumber(value: unknown, field: string): number {
+-  if (typeof value !== 'number' || !Number.isFinite(value)) {
+-    throw new Error(`ctl field ${field} must be a number`);
+-  }
+-  return value;
+-}
+-
+-function parseNodeInfo(value: unknown): UplinkNodeInfo {
+-  if (!isRecord(value)) {
+-    throw new Error('node.list node must be an object');
+-  }
+-  return {
+-    id: requireString(value.id, 'nodes[].id'),
+-    name: requireString(value.name, 'nodes[].name'),
+-    online: requireBoolean(value.online, 'nodes[].online'),
+-    endpoints: value.endpoints ?? [],
+-    inventory: value.inventory ?? {},
+-    direct_capable: requireBoolean(value.direct_capable, 'nodes[].direct_capable'),
+-    version: optionalString(value.version, 'nodes[].version') ?? null,
+-  };
+-}
+-
+-export type DecodeUplinkCtlOptions = {
+-  pendingKeyLogId?: string;
+-};
+-
+-export function decodeUplinkCtl(
+-  bytes: Uint8Array,
+-  opts?: DecodeUplinkCtlOptions
+-): UplinkCtlMessage {
+-  if (bytes.byteLength > KEY_LOG_PAGE_MAX_BYTES) {
+-    throw new Error('ctl too large');
+-  }
+-  const allowLarge = Boolean(opts?.pendingKeyLogId);
+-  if (bytes.byteLength > UPLINK_CTL_MAX_BYTES && !allowLarge) {
+-    throw new Error('ctl too large');
+-  }
+-  const parsed = decodeJsonBytes(bytes);
+-  if (!isRecord(parsed) || typeof parsed.t !== 'string') {
+-    throw new Error('uplink ctl must be a JSON object with t');
+-  }
+-  if (parsed.t === 'key.log.res' && bytes.byteLength > UPLINK_CTL_MAX_BYTES) {
+-    const resId = optionalString(parsed.id, 'id');
+-    if (!resId || resId !== opts?.pendingKeyLogId) {
+-      throw new Error('ctl too large');
+-    }
+-  } else if (parsed.t !== 'key.log.res') {
+-    if (bytes.byteLength > UPLINK_CTL_MAX_BYTES) {
+-      throw new Error('ctl too large');
+-    }
+-    assertCtlBounds(parsed, 0);
+-  }
+-  if (!TYPE_SET.has(parsed.t)) {
+-    throw new Error(`unknown uplink ctl t: ${parsed.t}`);
+-  }
+-  switch (parsed.t as UplinkCtlType) {
+-    case 'auth.challenge':
+-      return { t: 'auth.challenge', nonce: requireString(parsed.nonce, 'nonce') };
+-    case 'auth.response':
+-      return {
+-        t: 'auth.response',
+-        node_id: requireString(parsed.node_id, 'node_id'),
+-        sig: requireString(parsed.sig, 'sig'),
+-      };
+-    case 'auth.ok':
+-      return { t: 'auth.ok' };
+-    case 'ping':
+-      return { t: 'ping' };
+-    case 'pong':
+-      return { t: 'pong' };
+-    case 'node.status':
+-      return {
+-        t: 'node.status',
+-        version: requireString(parsed.version, 'version'),
+-        tmux: requireBoolean(parsed.tmux, 'tmux'),
+-        direct_capable: requireBoolean(parsed.direct_capable, 'direct_capable'),
+-        inventory: parsed.inventory ?? {},
+-        endpoints: parsed.endpoints ?? [],
+-      };
+-    case 'node.list': {
+-      if (!isRecord(parsed.key_log_head)) {
+-        throw new Error('node.list key_log_head must be an object');
+-      }
+-      if (!isRecord(parsed.rtc)) {
+-        throw new Error('node.list rtc must be an object');
+-      }
+-      if (!Array.isArray(parsed.nodes)) {
+-        throw new Error('node.list nodes must be an array');
+-      }
+-      const stun = parsed.rtc.stun;
+-      const list: UplinkNodeList = {
+-        t: 'node.list',
+-        version: requireNumber(parsed.version, 'version'),
+-        key_log_head: {
+-          seq: parseSeq(parsed.key_log_head.seq, 'key_log_head.seq'),
+-          hash: requireB64(parsed.key_log_head.hash, 'key_log_head.hash'),
+-        },
+-        rtc: {
+-          stun: Array.isArray(stun)
+-            ? stun.map((item, i) => requireString(item, `rtc.stun[${i}]`))
+-            : [],
+-          turn: parsed.rtc.turn ?? null,
+-        },
+-        nodes: parsed.nodes.map(parseNodeInfo),
+-      };
+-      if (parsed.hub !== undefined && parsed.hub !== null) {
+-        list.hub = parseHubInfo(parsed.hub);
+-      }
+-      return list;
+-    }
+-    case 'key.log.req': {
+-      const req: UplinkKeyLogReq = {
+-        t: 'key.log.req',
+-        from_seq: parseSeq(parsed.from_seq, 'from_seq'),
+-      };
+-      const reqId = optionalString(parsed.id, 'id');
+-      if (reqId) req.id = reqId;
+-      if (parsed.limit !== undefined && parsed.limit !== null) {
+-        const limit = requireNumber(parsed.limit, 'limit');
+-        if (!Number.isInteger(limit) || limit < 1) {
+-          throw new Error('ctl field limit must be a positive integer');
+-        }
+-        req.limit = limit;
+-      }
+-      return req;
+-    }
+-    case 'key.log.res': {
+-      if (!Array.isArray(parsed.records)) {
+-        throw new Error('key.log.res records must be an array');
+-      }
+-      if (parsed.records.length > KEY_LOG_PAGE_MAX_LIMIT) {
+-        throw new Error('key.log.res too many records');
+-      }
+-      const res: UplinkKeyLogRes = {
+-        t: 'key.log.res',
+-        records: parsed.records.map((row, i) => {
+-          if (!isRecord(row)) throw new Error(`key.log.res records[${i}] must be an object`);
+-          return {
+-            seq: parseSeq(row.seq, `records[${i}].seq`),
+-            bytes: requireB64(row.bytes, `records[${i}].bytes`),
+-            sig: requireB64(row.sig, `records[${i}].sig`),
+-          };
+-        }),
+-      };
+-      const resId = optionalString(parsed.id, 'id');
+-      if (resId) res.id = resId;
+-      const resError = optionalString(parsed.error, 'error');
+-      if (resError) res.error = resError;
+-      if (parsed.has_more !== undefined && parsed.has_more !== null) {
+-        res.has_more = requireBoolean(parsed.has_more, 'has_more');
+-      }
+-      if (parsed.retry_after_ms !== undefined && parsed.retry_after_ms !== null) {
+-        const retryAfter = requireNumber(parsed.retry_after_ms, 'retry_after_ms');
+-        if (!Number.isInteger(retryAfter) || retryAfter < 0) {
+-          throw new Error('ctl field retry_after_ms must be a non-negative integer');
+-        }
+-        res.retry_after_ms = retryAfter;
+-      }
+-      return res;
+-    }
+-    case 'key.log.append': {
+-      const append: UplinkKeyLogAppend = {
+-        t: 'key.log.append',
+-        bytes: requireB64(parsed.bytes, 'bytes'),
+-        sig: requireB64(parsed.sig, 'sig'),
+-      };
+-      const id = optionalString(parsed.id, 'id');
+-      if (id) append.id = id;
+-      return append;
+-    }
+-    case 'key.log.ack': {
+-      const ok = requireBoolean(parsed.ok, 'ok');
+-      const ack: UplinkKeyLogAck = {
+-        t: 'key.log.ack',
+-        id: requireString(parsed.id, 'id'),
+-        ok,
+-      };
+-      if (ok) {
+-        ack.seq = parseSeq(parsed.seq, 'seq');
+-      } else {
+-        ack.error = requireString(parsed.error, 'error');
+-      }
+-      return ack;
+-    }
+-    case 'rtc.signal': {
+-      const from = requireString(parsed.from, 'from');
+-      if (from !== 'browser' && from !== 'node') {
+-        throw new Error('rtc.signal from must be browser|node');
+-      }
+-      return {
+-        t: 'rtc.signal',
+-        rtcSession: requireString(parsed.rtcSession, 'rtcSession'),
+-        from,
+-        to: requireString(parsed.to, 'to'),
+-        sdp: optionalString(parsed.sdp, 'sdp'),
+-        candidate: optionalString(parsed.candidate, 'candidate'),
+-      };
+-    }
+-    case 'enroll.redeemed': {
+-      const certificate = requireB64(parsed.certificate, 'certificate');
+-      if (certificate.byteLength > UPLINK_CTL_MAX_CERT_BYTES) {
+-        throw new Error('ctl field certificate too large');
+-      }
+-      const msg: UplinkEnrollRedeemed = {
+-        t: 'enroll.redeemed',
+-        certificate,
+-        cert_sig: requireB64(parsed.cert_sig, 'cert_sig', 64),
+-        enroll_pk: requireB64(parsed.enroll_pk, 'enroll_pk', 32),
+-        nodeId: requireNodeIdHex(parsed.node_id, 'node_id'),
+-      };
+-      const entrySid = optionalString(parsed.entry_sid, 'entry_sid');
+-      if (entrySid) msg.entrySid = entrySid;
+-      return msg;
+-    }
+-  }
+-}
+-
+-function parseHubInfo(value: unknown): UplinkHubInfo {
+-  if (!isRecord(value)) {
+-    throw new Error('node.list hub must be an object');
+-  }
+-  const info: UplinkHubInfo = {
+-    nodeId: requireNodeIdHex(value.nodeId, 'hub.nodeId'),
+-    publicUrl: requireString(value.publicUrl, 'hub.publicUrl'),
+-  };
+-  const name = optionalString(value.name, 'hub.name');
+-  if (name) info.name = name;
+-  return info;
+-}
+-
+-export function encodeUplinkCtl(msg: UplinkCtlMessage): Uint8Array {
+-  switch (msg.t) {
+-    case 'auth.challenge':
+-    case 'auth.response':
+-    case 'auth.ok':
+-    case 'ping':
+-    case 'pong':
+-    case 'node.status':
+-      return encodeCtlMessage(msg);
+-    case 'node.list':
+-      return encodeCtlMessage({
+-        t: 'node.list',
+-        version: msg.version,
+-        key_log_head: {
+-          seq: seqToJson(msg.key_log_head.seq),
+-          hash: encodeBase64url(msg.key_log_head.hash),
+-        },
+-        rtc: msg.rtc,
+-        nodes: msg.nodes,
+-        ...(msg.hub ? { hub: msg.hub } : {}),
+-      });
+-    case 'key.log.req':
+-      return encodeCtlMessage({
+-        t: 'key.log.req',
+-        from_seq: seqToJson(msg.from_seq),
+-        ...(msg.id ? { id: msg.id } : {}),
+-        ...(msg.limit != null ? { limit: msg.limit } : {}),
+-      });
+-    case 'key.log.res':
+-      return encodeCtlMessage({
+-        t: 'key.log.res',
+-        records: msg.records.map((row) => ({
+-          seq: seqToJson(row.seq),
+-          bytes: encodeBase64url(row.bytes),
+-          sig: encodeBase64url(row.sig),
+-        })),
+-        ...(msg.id ? { id: msg.id } : {}),
+-        ...(msg.error ? { error: msg.error } : {}),
+-        ...(msg.has_more != null ? { has_more: msg.has_more } : {}),
+-        ...(msg.retry_after_ms != null ? { retry_after_ms: msg.retry_after_ms } : {}),
+-      });
+-    case 'key.log.append':
+-      return encodeCtlMessage({
+-        t: 'key.log.append',
+-        bytes: encodeBase64url(msg.bytes),
+-        sig: encodeBase64url(msg.sig),
+-        ...(msg.id ? { id: msg.id } : {}),
+-      });
+-    case 'key.log.ack':
+-      return encodeCtlMessage({
+-        t: 'key.log.ack',
+-        id: msg.id,
+-        ok: msg.ok,
+-        ...(msg.ok ? { seq: seqToJson(msg.seq ?? 0n) } : { error: msg.error ?? 'error' }),
+-      });
+-    case 'rtc.signal':
+-      return encodeCtlMessage({
+-        t: 'rtc.signal',
+-        rtcSession: msg.rtcSession,
+-        from: msg.from,
+-        to: msg.to,
+-        ...(msg.sdp !== undefined ? { sdp: msg.sdp } : {}),
+-        ...(msg.candidate !== undefined ? { candidate: msg.candidate } : {}),
+-      });
+-    case 'enroll.redeemed':
+-      return encodeCtlMessage({
+-        t: 'enroll.redeemed',
+-        certificate: encodeBase64url(msg.certificate),
+-        cert_sig: encodeBase64url(msg.cert_sig),
+-        enroll_pk: encodeBase64url(msg.enroll_pk),
+-        node_id: msg.nodeId,
+-        ...(msg.entrySid ? { entry_sid: msg.entrySid } : {}),
+-      });
+-  }
+-}
++export {
++  KEY_LOG_PAGE_DEFAULT_LIMIT,
++  KEY_LOG_PAGE_MAX_BYTES,
++  KEY_LOG_PAGE_MAX_LIMIT,
++  UPLINK_CTL_MAX_ARRAY_LEN,
++  UPLINK_CTL_MAX_BYTES,
++  UPLINK_CTL_MAX_CERT_BYTES,
++  UPLINK_CTL_MAX_DEPTH,
++  UPLINK_CTL_MAX_STRING_LEN,
++  UPLINK_CTL_TYPES,
++  decodeMeshUplinkCtl as decodeUplinkCtl,
++  encodeMeshUplinkCtl as encodeUplinkCtl,
++  type MeshUplinkCtlMessage as UplinkCtlMessage,
++  type MeshUplinkEnrollRedeemed as UplinkEnrollRedeemed,
++  type MeshUplinkKeyLogAck as UplinkKeyLogAck,
++  type MeshUplinkKeyLogRecord as UplinkKeyLogRecord,
++  type MeshUplinkNodeList as UplinkNodeList,
++  type MeshUplinkRtcSignal as UplinkRtcSignal,
++} from '@tmex/shared/uplink';
+ 
+ export function uplinkWsUrl(hubUrl: string): string {
+   const url = new URL(hubUrl);
+diff --git a/apps/gateway/src/tls/tls-config-store.ts b/apps/gateway/src/tls/tls-config-store.ts
+index 39644572..34e16d26 100644
+--- a/apps/gateway/src/tls/tls-config-store.ts
++++ b/apps/gateway/src/tls/tls-config-store.ts
+@@ -3,8 +3,6 @@ import type { AuthDb } from '../auth/types';
+ import { decryptWithContext, encrypt } from '../crypto';
+ import { tlsConfig } from '../db/schema';
+ import {
+-  type AcmeChallengeType,
+-  type AcmeStatus,
+   DEFAULT_TLS_BIND_HOST,
+   DEFAULT_TLS_PORT,
+   TLS_CONFIG_ENTITY_ID,
+@@ -12,29 +10,39 @@ import {
+   TLS_CONFIG_SCOPE,
+   type TlsConfigPatch,
+   type TlsConfigPublic,
+-  type TlsMode,
+   type TlsPrivateMaterial,
+ } from './types';
+ 
+-const SECRET_FIELDS = {
+-  caKeyPem: 'ca_key',
+-  keyPem: 'key',
+-  acmeCfToken: 'acme_cf_token',
+-  acmeAccountKey: 'acme_account_key',
+-} as const;
++const SECRET_SPECS = [
++  ['caKeyPem', 'caKeyEnc', 'ca_key'],
++  ['keyPem', 'keyEnc', 'key'],
++  ['acmeCfToken', 'acmeCfTokenEnc', 'acme_cf_token'],
++  ['acmeAccountKey', 'acmeAccountKeyEnc', 'acme_account_key'],
++] as const;
+ 
+-type SecretField = (typeof SECRET_FIELDS)[keyof typeof SECRET_FIELDS];
++const MERGE_KEYS = ['mode', 'tlsPort', 'bindHost', 'sans', 'acmeStaging', 'acmeStatus'] as const;
++const NULLABLE_KEYS = [
++  'caCertPem',
++  'certPem',
++  'certNotBefore',
++  'certNotAfter',
++  'acmeEmail',
++  'acmeDomain',
++  'acmeChallenge',
++  'acmeAccountUrl',
++  'acmeAccountDirectory',
++  'acmeLastError',
++  'acmeLastAttemptAt',
++  'acmeNextRenewAt',
++] as const;
+ 
+-function isTlsMode(value: string): value is TlsMode {
+-  return value === 'none' || value === 'external' || value === 'selfsigned' || value === 'acme';
+-}
+-
+-function isAcmeChallenge(value: string | null): value is AcmeChallengeType {
+-  return value === 'http-01' || value === 'dns-01';
+-}
+-
+-function isAcmeStatus(value: string): value is AcmeStatus {
+-  return value === 'idle' || value === 'pending' || value === 'ok' || value === 'error';
++function oneOf<T extends string>(
++  value: string | null | undefined,
++  allowed: readonly T[]
++): T | undefined {
++  return typeof value === 'string' && (allowed as readonly string[]).includes(value)
++    ? (value as T)
++    : undefined;
+ }
+ 
+ function emptyPublic(now = 0): TlsConfigPublic {
+@@ -88,12 +96,10 @@ export class TlsConfigStore {
+ 
+   async get(): Promise<TlsConfigPublic> {
+     const row = this.db.select().from(tlsConfig).where(eq(tlsConfig.id, TLS_CONFIG_ROW_ID)).get();
+-    if (!row) {
+-      return emptyPublic();
+-    }
++    if (!row) return emptyPublic();
+     return {
+       id: TLS_CONFIG_ROW_ID,
+-      mode: isTlsMode(row.mode) ? row.mode : 'none',
++      mode: oneOf(row.mode, ['none', 'external', 'selfsigned', 'acme'] as const) ?? 'none',
+       tlsPort: row.tlsPort,
+       bindHost: row.bindHost,
+       sans: parseSans(row.sans),
+@@ -103,11 +109,11 @@ export class TlsConfigStore {
+       certNotAfter: row.certNotAfter ?? null,
+       acmeEmail: row.acmeEmail ?? null,
+       acmeDomain: row.acmeDomain ?? null,
+-      acmeChallenge: isAcmeChallenge(row.acmeChallenge) ? row.acmeChallenge : null,
++      acmeChallenge: oneOf(row.acmeChallenge, ['http-01', 'dns-01'] as const) ?? null,
+       acmeStaging: Boolean(row.acmeStaging),
+       acmeAccountUrl: row.acmeAccountUrl ?? null,
+       acmeAccountDirectory: row.acmeAccountDirectory ?? null,
+-      acmeStatus: isAcmeStatus(row.acmeStatus) ? row.acmeStatus : 'idle',
++      acmeStatus: oneOf(row.acmeStatus, ['idle', 'pending', 'ok', 'error'] as const) ?? 'idle',
+       acmeLastError: row.acmeLastError ?? null,
+       acmeLastAttemptAt: row.acmeLastAttemptAt ?? null,
+       acmeNextRenewAt: row.acmeNextRenewAt ?? null,
+@@ -124,100 +130,38 @@ export class TlsConfigStore {
+     if (!row) {
+       return { caKeyPem: null, keyPem: null, acmeCfToken: null, acmeAccountKey: null };
+     }
+-    return {
+-      caKeyPem: await decryptField(row.caKeyEnc, SECRET_FIELDS.caKeyPem),
+-      keyPem: await decryptField(row.keyEnc, SECRET_FIELDS.keyPem),
+-      acmeCfToken: await decryptField(row.acmeCfTokenEnc, SECRET_FIELDS.acmeCfToken),
+-      acmeAccountKey: await decryptField(row.acmeAccountKeyEnc, SECRET_FIELDS.acmeAccountKey),
+-    };
++    return Object.fromEntries(
++      await Promise.all(
++        SECRET_SPECS.map(async ([key, enc, field]) => [key, await decryptField(row[enc], field)])
++      )
++    ) as TlsPrivateMaterial;
+   }
+ 
+   async upsert(partial: TlsConfigPatch): Promise<TlsConfigPublic> {
+     const current = await this.get();
+     const secrets = await this.getPrivateMaterial();
+-    const nextSecrets: TlsPrivateMaterial = {
+-      caKeyPem: 'caKeyPem' in partial ? (partial.caKeyPem ?? null) : secrets.caKeyPem,
+-      keyPem: 'keyPem' in partial ? (partial.keyPem ?? null) : secrets.keyPem,
+-      acmeCfToken: 'acmeCfToken' in partial ? (partial.acmeCfToken ?? null) : secrets.acmeCfToken,
+-      acmeAccountKey:
+-        'acmeAccountKey' in partial ? (partial.acmeAccountKey ?? null) : secrets.acmeAccountKey,
+-    };
+-    const [caKeyEnc, keyEnc, acmeCfTokenEnc, acmeAccountKeyEnc] = await Promise.all([
+-      encryptField(nextSecrets.caKeyPem),
+-      encryptField(nextSecrets.keyPem),
+-      encryptField(nextSecrets.acmeCfToken),
+-      encryptField(nextSecrets.acmeAccountKey),
+-    ]);
+-    const updatedAt = partial.updatedAt ?? Date.now();
++    const nextSecrets = Object.fromEntries(
++      SECRET_SPECS.map(([key]) => [key, key in partial ? (partial[key] ?? null) : secrets[key]])
++    ) as TlsPrivateMaterial;
++    const enc = Object.fromEntries(
++      await Promise.all(
++        SECRET_SPECS.map(async ([key, encKey]) => [encKey, await encryptField(nextSecrets[key])])
++      )
++    );
+     const values = {
+       id: TLS_CONFIG_ROW_ID,
+-      mode: partial.mode ?? current.mode,
+-      tlsPort: partial.tlsPort ?? current.tlsPort,
+-      bindHost: partial.bindHost ?? current.bindHost,
+-      sans: partial.sans ?? current.sans,
+-      caCertPem: 'caCertPem' in partial ? (partial.caCertPem ?? null) : current.caCertPem,
+-      caKeyEnc,
+-      certPem: 'certPem' in partial ? (partial.certPem ?? null) : current.certPem,
+-      keyEnc,
+-      certNotBefore:
+-        'certNotBefore' in partial ? (partial.certNotBefore ?? null) : current.certNotBefore,
+-      certNotAfter:
+-        'certNotAfter' in partial ? (partial.certNotAfter ?? null) : current.certNotAfter,
+-      acmeEmail: 'acmeEmail' in partial ? (partial.acmeEmail ?? null) : current.acmeEmail,
+-      acmeDomain: 'acmeDomain' in partial ? (partial.acmeDomain ?? null) : current.acmeDomain,
+-      acmeChallenge:
+-        'acmeChallenge' in partial ? (partial.acmeChallenge ?? null) : current.acmeChallenge,
+-      acmeStaging: partial.acmeStaging ?? current.acmeStaging,
+-      acmeCfTokenEnc,
+-      acmeAccountKeyEnc,
+-      acmeAccountUrl:
+-        'acmeAccountUrl' in partial ? (partial.acmeAccountUrl ?? null) : current.acmeAccountUrl,
+-      acmeAccountDirectory:
+-        'acmeAccountDirectory' in partial
+-          ? (partial.acmeAccountDirectory ?? null)
+-          : current.acmeAccountDirectory,
+-      acmeStatus: partial.acmeStatus ?? current.acmeStatus,
+-      acmeLastError:
+-        'acmeLastError' in partial ? (partial.acmeLastError ?? null) : current.acmeLastError,
+-      acmeLastAttemptAt:
+-        'acmeLastAttemptAt' in partial
+-          ? (partial.acmeLastAttemptAt ?? null)
+-          : current.acmeLastAttemptAt,
+-      acmeNextRenewAt:
+-        'acmeNextRenewAt' in partial ? (partial.acmeNextRenewAt ?? null) : current.acmeNextRenewAt,
+-      updatedAt,
++      updatedAt: partial.updatedAt ?? Date.now(),
++      ...Object.fromEntries(MERGE_KEYS.map((key) => [key, partial[key] ?? current[key]])),
++      ...Object.fromEntries(
++        NULLABLE_KEYS.map((key) => [key, key in partial ? (partial[key] ?? null) : current[key]])
++      ),
++      ...enc,
+     };
++    const { id: _id, ...set } = values;
+     this.db
+       .insert(tlsConfig)
+-      .values(values)
+-      .onConflictDoUpdate({
+-        target: tlsConfig.id,
+-        set: {
+-          mode: values.mode,
+-          tlsPort: values.tlsPort,
+-          bindHost: values.bindHost,
+-          sans: values.sans,
+-          caCertPem: values.caCertPem,
+-          caKeyEnc: values.caKeyEnc,
+-          certPem: values.certPem,
+-          keyEnc: values.keyEnc,
+-          certNotBefore: values.certNotBefore,
+-          certNotAfter: values.certNotAfter,
+-          acmeEmail: values.acmeEmail,
+-          acmeDomain: values.acmeDomain,
+-          acmeChallenge: values.acmeChallenge,
+-          acmeStaging: values.acmeStaging,
+-          acmeCfTokenEnc: values.acmeCfTokenEnc,
+-          acmeAccountKeyEnc: values.acmeAccountKeyEnc,
+-          acmeAccountUrl: values.acmeAccountUrl,
+-          acmeAccountDirectory: values.acmeAccountDirectory,
+-          acmeStatus: values.acmeStatus,
+-          acmeLastError: values.acmeLastError,
+-          acmeLastAttemptAt: values.acmeLastAttemptAt,
+-          acmeNextRenewAt: values.acmeNextRenewAt,
+-          updatedAt: values.updatedAt,
+-        },
+-      })
++      .values(values as typeof tlsConfig.$inferInsert)
++      .onConflictDoUpdate({ target: tlsConfig.id, set })
+       .run();
+     return this.get();
+   }
+@@ -230,7 +174,7 @@ async function encryptField(plaintext: string | null): Promise<string | null> {
+ 
+ async function decryptField(
+   ciphertext: string | null | undefined,
+-  field: SecretField
++  field: (typeof SECRET_SPECS)[number][2]
+ ): Promise<string | null> {
+   if (!ciphertext) return null;
+   return decryptWithContext(ciphertext, {
+diff --git a/packages/app/src/commands/enroll.test.ts b/packages/app/src/commands/enroll.test.ts
+index 4c7cfc12..bee66d71 100644
+--- a/packages/app/src/commands/enroll.test.ts
++++ b/packages/app/src/commands/enroll.test.ts
+@@ -278,6 +278,95 @@ describe('enroll', () => {
+     expect(decodeJoinToken(result.token).caFingerprint).toBe('ab'.repeat(32));
+   });
+ 
++  test('explicitly empty totpCode is rejected instead of prompting', async () => {
++    const auth = await openLocalAuth({
++      memory: true,
++      migrationsFolder: MIGRATIONS,
++      env: {
++        TMEX_MASTER_KEY: process.env.TMEX_MASTER_KEY || '',
++        TMEX_ROLES: 'node',
++        TMEX_HUB_URL: 'http://127.0.0.1:9',
++      },
++    });
++    handles.push(auth);
++    await runHubUserAdd(parsed, 'ivy', {
++      auth,
++      password: 'enroll-pass-word',
++      log: () => undefined,
++    });
++    await expect(
++      runEnroll(parsed, {
++        auth,
++        password: 'enroll-pass-word',
++        totpCode: '',
++        wait: false,
++        log: () => undefined,
++        fetcher: async () =>
++          Response.json({
++            mode: 'mesh',
++            nodeId: 'self',
++            uid: auth.userStore.getByUsername('ivy')?.id,
++            totpEnabled: true,
++          }),
++      })
++    ).rejects.toThrow('TOTP code cannot be empty');
++  });
++
++  test('poll sleep removes abort listeners when the timer completes', async () => {
++    const auth = await openLocalAuth({
++      memory: true,
++      migrationsFolder: MIGRATIONS,
++      env: {
++        TMEX_MASTER_KEY: process.env.TMEX_MASTER_KEY || '',
++        TMEX_ROLES: 'hub,node',
++        TMEX_HUB_PUBLIC_URL: 'https://hub.example',
++      },
++    });
++    handles.push(auth);
++    await runHubUserAdd(parsed, 'gina', {
++      auth,
++      password: 'enroll-pass-word',
++      log: () => undefined,
++    });
++    const controller = new AbortController();
++    const signal = controller.signal;
++    const add = signal.addEventListener.bind(signal);
++    const remove = signal.removeEventListener.bind(signal);
++    let added = 0;
++    let removed = 0;
++    signal.addEventListener = ((
++      type: string,
++      listener: EventListenerOrEventListenerObject,
++      opts?: boolean | AddEventListenerOptions
++    ) => {
++      if (type === 'abort') added += 1;
++      return add(type, listener, opts);
++    }) as typeof signal.addEventListener;
++    signal.removeEventListener = ((
++      type: string,
++      listener: EventListenerOrEventListenerObject,
++      opts?: boolean | EventListenerOptions
++    ) => {
++      if (type === 'abort') removed += 1;
++      return remove(type, listener, opts);
++    }) as typeof signal.removeEventListener;
++    let polls = 0;
++    await runEnroll(parsed, {
++      auth,
++      password: 'enroll-pass-word',
++      log: () => undefined,
++      pollIntervalMs: 15,
++      signal,
++      pollRedeemed: async () => {
++        polls += 1;
++        if (polls >= 3) controller.abort();
++        return null;
++      },
++    });
++    expect(added).toBeGreaterThanOrEqual(2);
++    expect(removed).toBe(added);
++  });
++
+   test('non-hub enroll reads x-tmex-set-session when Set-Cookie is absent', async () => {
+     const auth = await openLocalAuth({
+       memory: true,
+diff --git a/packages/app/src/commands/enroll.ts b/packages/app/src/commands/enroll.ts
+index e50df0d2..59ebdf8f 100644
+--- a/packages/app/src/commands/enroll.ts
++++ b/packages/app/src/commands/enroll.ts
+@@ -2,7 +2,6 @@ import { HubTrustStore } from '../../../../apps/gateway/src/auth/hub-trust-store
+ import { kdfParamsFromJson } from '../../../../apps/gateway/src/auth/user-key-service';
+ import { TlsConfigStore } from '../../../../apps/gateway/src/tls/tls-config-store';
+ import {
+-  type AdmitNodePayload,
+   ENROLLMENT_TTL_MS,
+   bytesEqual,
+   createEnrollment,
+@@ -72,15 +71,15 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+       reject(new Error('aborted'));
+       return;
+     }
+-    const timer = setTimeout(resolve, ms);
+-    signal?.addEventListener(
+-      'abort',
+-      () => {
+-        clearTimeout(timer);
+-        reject(new Error('aborted'));
+-      },
+-      { once: true }
+-    );
++    const onAbort = (): void => {
++      clearTimeout(timer);
++      reject(new Error('aborted'));
++    };
++    const timer = setTimeout(() => {
++      signal?.removeEventListener('abort', onAbort);
++      resolve();
++    }, ms);
++    signal?.addEventListener('abort', onAbort, { once: true });
+   });
+ }
+ 
+@@ -272,15 +271,170 @@ export async function pollHubNodesForCertificate(options: {
+ }
+ 
+ async function resolveTotpCode(io?: EnrollIo): Promise<string> {
+-  if (io?.totpCode) {
+-    if (!io.totpCode) {
+-      throw new Error('TOTP code cannot be empty');
+-    }
++  if (io?.totpCode !== undefined) {
++    if (!io.totpCode) throw new Error('TOTP code cannot be empty');
+     return io.totpCode;
+   }
+   return await promptPassword('TOTP code', { envKey: 'TMEX_TOTP', confirm: false });
+ }
+ 
++async function enrollOnLocalHub(
++  ctx: LocalAuthContext,
++  userId: string,
++  enrollment: Awaited<ReturnType<typeof createEnrollment>>,
++  now: number,
++  ttlMs: number
++): Promise<string | undefined> {
++  ctx.userStore.createEnrollmentToken({
++    id: crypto.randomUUID(),
++    userId,
++    enrollPublicKey: enrollment.enrollPk,
++    authorizationJson: JSON.stringify({
++      authorization_b64: encodeBase64url(enrollment.authorizationBytes),
++      entry_node_id: 'self',
++    }),
++    authorizationSig: enrollment.authorizationSig,
++    expiresAt: now + ttlMs,
++  });
++  const tls = await new TlsConfigStore(ctx.db).get();
++  if (tls.mode === 'selfsigned' && tls.caCertPem) {
++    return await spkiFingerprint(tls.caCertPem);
++  }
++  return undefined;
++}
++
++async function enrollOnRemoteHub(
++  ctx: LocalAuthContext,
++  io: EnrollIo,
++  user: { id: string; rootEpoch: number },
++  rootKey: Awaited<ReturnType<typeof deriveRootKey>>,
++  enrollment: Awaited<ReturnType<typeof createEnrollment>>,
++  now: number,
++  ttlMs: number
++) {
++  const hubUrl = ctx.env.TMEX_HUB_URL || process.env.TMEX_HUB_URL;
++  if (!hubUrl) {
++    throw new Error('TMEX_HUB_URL is required to enroll from a non-hub node');
++  }
++  const fetcher = io.fetcher ?? createHubFetcher(new HubTrustStore(ctx.db), hubUrl);
++  const mode = await fetchAuthMode(hubUrl, fetcher);
++  const caFingerprint =
++    typeof mode.caFingerprint === 'string' && /^[0-9a-f]{64}$/.test(mode.caFingerprint)
++      ? mode.caFingerprint
++      : undefined;
++  let totp: { code: string; kTotp: Uint8Array } | undefined;
++  if (mode.totpEnabled) {
++    totp = {
++      code: await resolveTotpCode(io),
++      kTotp: deriveTotpKey(rootKey.seed, user.id, user.rootEpoch),
++    };
++  }
++  const session = await loginWithRootKey({
++    baseUrl: hubUrl,
++    rootKey,
++    uid: user.id,
++    fetcher,
++    totp,
++  });
++  totp?.kTotp.fill(0);
++  const created = await postEnrollment({
++    baseUrl: hubUrl,
++    cookieHeader: session.cookieHeader,
++    enrollPk: enrollment.enrollPk,
++    authorization: enrollment.authorizationBytes,
++    authorizationSig: enrollment.authorizationSig,
++    exp: now + ttlMs,
++    fetcher,
++  });
++  return {
++    cookieHeader: session.cookieHeader,
++    hubUrl,
++    enrollmentId: created.id,
++    fetcher,
++    caFingerprint,
++  };
++}
++
++function makeRedeemPoll(
++  ctx: LocalAuthContext,
++  io: EnrollIo,
++  isHub: boolean,
++  enrollPk: Uint8Array,
++  remote: Awaited<ReturnType<typeof enrollOnRemoteHub>> | null
++): (() => Promise<AdmitCandidate | null>) | null {
++  if (io.pollRedeemed) return io.pollRedeemed;
++  if (isHub) return () => pollLocalEnrollmentRedeem(ctx, enrollPk);
++  if (!remote) return null;
++  if (remote.enrollmentId) {
++    return () =>
++      pollHubEnrollment({
++        baseUrl: remote.hubUrl,
++        cookieHeader: remote.cookieHeader,
++        enrollmentId: remote.enrollmentId,
++        fetcher: remote.fetcher,
++      });
++  }
++  return () =>
++    pollHubNodesForCertificate({
++      baseUrl: remote.hubUrl,
++      cookieHeader: remote.cookieHeader,
++      enrollPk,
++      fetcher: remote.fetcher,
++    });
++}
++
++async function pollAndAdmit(
++  ctx: LocalAuthContext,
++  io: EnrollIo,
++  userId: string,
++  rootKey: Awaited<ReturnType<typeof deriveRootKey>>,
++  enrollment: Awaited<ReturnType<typeof createEnrollment>>,
++  poll: (() => Promise<AdmitCandidate | null>) | null
++): Promise<boolean> {
++  const interval = io.pollIntervalMs ?? 1000;
++  const controller = io.signal ? null : new AbortController();
++  const signal = io.signal ?? controller?.signal;
++  const onSigint = (): void => {
++    log(io, 'confirm in the Nodes page');
++    controller?.abort();
++  };
++  if (controller && typeof process.on === 'function') process.on('SIGINT', onSigint);
++  try {
++    while (!signal?.aborted) {
++      const candidate = poll ? await poll() : null;
++      if (candidate) {
++        const existing = existingAdmission(ctx, candidate);
++        if (existing === 'revoked') throw new Error(NODE_REVOKED_REJOIN_ERROR);
++        if (candidate.alreadyAdmitted || existing === 'admitted') {
++          log(io, 'already admitted');
++          return true;
++        }
++        const applied = await ctx.userKeys.signAndApply(userId, rootKey, {
++          type: 'admit-node',
++          payload: encodeAdmitNodePayload({
++            authorization_bytes: enrollment.authorizationBytes,
++            authorization_sig: enrollment.authorizationSig,
++            certificate_bytes: candidate.certificateBytes,
++            cert_sig: candidate.certSig,
++          }),
++        });
++        if (!applied.ok) throw new Error(`admit-node failed: ${applied.error}`);
++        log(io, 'node admitted');
++        return true;
++      }
++      try {
++        await sleep(interval, signal);
++      } catch {
++        log(io, 'confirm in the Nodes page');
++        return false;
++      }
++    }
++  } finally {
++    if (controller && typeof process.off === 'function') process.off('SIGINT', onSigint);
++  }
++  return false;
++}
++
+ export async function runEnroll(
+   parsed: ParsedArgs,
+   io: EnrollIo = {}
+@@ -316,70 +470,12 @@ export async function runEnroll(
+       ttlMs,
+     });
+     const roles = parseTmexRoles(ctx.env.TMEX_ROLES ?? process.env.TMEX_ROLES);
+-
+-    let caFingerprint: string | undefined;
+-    let remoteSession: { cookieHeader: string; hubUrl: string; enrollmentId?: string } | null =
+-      null;
+-    let hubFetcher = io.fetcher;
+-    if (roles.hub) {
+-      ctx.userStore.createEnrollmentToken({
+-        id: crypto.randomUUID(),
+-        userId: user.id,
+-        enrollPublicKey: enrollment.enrollPk,
+-        authorizationJson: JSON.stringify({
+-          authorization_b64: encodeBase64url(enrollment.authorizationBytes),
+-          entry_node_id: 'self',
+-        }),
+-        authorizationSig: enrollment.authorizationSig,
+-        expiresAt: now + ttlMs,
+-      });
+-      const tls = await new TlsConfigStore(ctx.db).get();
+-      if (tls.mode === 'selfsigned' && tls.caCertPem) {
+-        caFingerprint = await spkiFingerprint(tls.caCertPem);
+-      }
+-    } else {
+-      const hubUrl = ctx.env.TMEX_HUB_URL || process.env.TMEX_HUB_URL;
+-      if (!hubUrl) {
+-        throw new Error('TMEX_HUB_URL is required to enroll from a non-hub node');
+-      }
+-      hubFetcher = io.fetcher ?? createHubFetcher(new HubTrustStore(ctx.db), hubUrl);
+-      const mode = await fetchAuthMode(hubUrl, hubFetcher);
+-      if (typeof mode.caFingerprint === 'string' && /^[0-9a-f]{64}$/.test(mode.caFingerprint)) {
+-        caFingerprint = mode.caFingerprint;
+-      }
+-      let totp: { code: string; kTotp: Uint8Array } | undefined;
+-      if (mode.totpEnabled) {
+-        const code = await resolveTotpCode(io);
+-        totp = {
+-          code,
+-          kTotp: deriveTotpKey(rootKey.seed, user.id, user.rootEpoch),
+-        };
+-      }
+-      const session = await loginWithRootKey({
+-        baseUrl: hubUrl,
+-        rootKey,
+-        uid: user.id,
+-        fetcher: hubFetcher,
+-        totp,
+-      });
+-      if (totp) {
+-        totp.kTotp.fill(0);
+-      }
+-      const created = await postEnrollment({
+-        baseUrl: hubUrl,
+-        cookieHeader: session.cookieHeader,
+-        enrollPk: enrollment.enrollPk,
+-        authorization: enrollment.authorizationBytes,
+-        authorizationSig: enrollment.authorizationSig,
+-        exp: now + ttlMs,
+-        fetcher: hubFetcher,
+-      });
+-      remoteSession = {
+-        cookieHeader: session.cookieHeader,
+-        hubUrl,
+-        enrollmentId: created.id,
+-      };
+-    }
++    const remote = roles.hub
++      ? null
++      : await enrollOnRemoteHub(ctx, io, user, rootKey, enrollment, now, ttlMs);
++    const caFingerprint = roles.hub
++      ? await enrollOnLocalHub(ctx, user.id, enrollment, now, ttlMs)
++      : remote?.caFingerprint;
+ 
+     const token = encodeJoinToken(
+       enrollment.enrollSk,
+@@ -387,92 +483,20 @@ export async function runEnroll(
+       user.keyLogHeadHash,
+       caFingerprint
+     );
+-
+-    const joinUrl = hubJoinUrl(ctx, io);
+-    const joinCommand = `npx tmex-cli hub join ${joinUrl} --token ${token}`;
++    const joinCommand = `npx tmex-cli hub join ${hubJoinUrl(ctx, io)} --token ${token}`;
+     log(io, `join token: ${token}`);
+     log(io, joinCommand);
+-
+-    const shouldWait = io.wait !== false;
+-    if (!shouldWait) {
++    if (io.wait === false) {
+       return { token, joinCommand, admitted: false };
+     }
+-
+-    const remote = remoteSession;
+-    const poll =
+-      io.pollRedeemed ??
+-      (roles.hub
+-        ? () => pollLocalEnrollmentRedeem(ctx, enrollment.enrollPk)
+-        : remote
+-          ? () =>
+-              remote.enrollmentId
+-                ? pollHubEnrollment({
+-                    baseUrl: remote.hubUrl,
+-                    cookieHeader: remote.cookieHeader,
+-                    enrollmentId: remote.enrollmentId,
+-                    fetcher: hubFetcher,
+-                  })
+-                : pollHubNodesForCertificate({
+-                    baseUrl: remote.hubUrl,
+-                    cookieHeader: remote.cookieHeader,
+-                    enrollPk: enrollment.enrollPk,
+-                    fetcher: hubFetcher,
+-                  })
+-          : null);
+-    const interval = io.pollIntervalMs ?? 1000;
+-    const controller = io.signal ? null : new AbortController();
+-    const signal = io.signal ?? controller?.signal;
+-    let admitted = false;
+-    const onSigint = (): void => {
+-      log(io, 'confirm in the Nodes page');
+-      controller?.abort();
+-    };
+-    if (controller && typeof process.on === 'function') {
+-      process.on('SIGINT', onSigint);
+-    }
+-    try {
+-      while (!signal?.aborted) {
+-        const candidate = poll ? await poll() : null;
+-        if (candidate) {
+-          const existing = existingAdmission(ctx, candidate);
+-          if (existing === 'revoked') {
+-            throw new Error(NODE_REVOKED_REJOIN_ERROR);
+-          }
+-          if (candidate.alreadyAdmitted || existing === 'admitted') {
+-            log(io, 'already admitted');
+-            admitted = true;
+-            break;
+-          }
+-          const payload: AdmitNodePayload = {
+-            authorization_bytes: enrollment.authorizationBytes,
+-            authorization_sig: enrollment.authorizationSig,
+-            certificate_bytes: candidate.certificateBytes,
+-            cert_sig: candidate.certSig,
+-          };
+-          const applied = await ctx.userKeys.signAndApply(user.id, rootKey, {
+-            type: 'admit-node',
+-            payload: encodeAdmitNodePayload(payload),
+-          });
+-          if (!applied.ok) {
+-            throw new Error(`admit-node failed: ${applied.error}`);
+-          }
+-          admitted = true;
+-          log(io, 'node admitted');
+-          break;
+-        }
+-        try {
+-          await sleep(interval, signal);
+-        } catch {
+-          log(io, 'confirm in the Nodes page');
+-          break;
+-        }
+-      }
+-    } finally {
+-      if (controller && typeof process.off === 'function') {
+-        process.off('SIGINT', onSigint);
+-      }
+-    }
+-
++    const admitted = await pollAndAdmit(
++      ctx,
++      io,
++      user.id,
++      rootKey,
++      enrollment,
++      makeRedeemPoll(ctx, io, roles.hub, enrollment.enrollPk, remote)
++    );
+     return { token, joinCommand, admitted };
+   });
+ }
+diff --git a/packages/app/src/commands/hub.ts b/packages/app/src/commands/hub.ts
+index baf78dc6..177bd441 100644
+--- a/packages/app/src/commands/hub.ts
++++ b/packages/app/src/commands/hub.ts
+@@ -169,28 +169,20 @@ function isTlsVerifyError(error: unknown): boolean {
+ 
+ function authModeJoinError(error: unknown, pinned: boolean): JoinError {
+   const cause = joinErrorMessage(error, 'unable to resolve hub uid from GET /api/auth/mode');
++  const prefix = 'unable to resolve hub uid from GET /api/auth/mode';
+   if (isTlsVerifyError(error)) {
+-    if (pinned) {
+-      return new JoinError(
+-        'hub_unreachable',
+-        `unable to resolve hub uid from GET /api/auth/mode: TLS verification failed (${cause}). Check the pinned CA and hub hostname.`
+-      );
+-    }
++    const hint = pinned
++      ? 'Check the pinned CA and hub hostname.'
++      : 'This hub may be using a self-signed certificate; generate a v2 join token from the hub.';
+     return new JoinError(
+       'hub_unreachable',
+-      `unable to resolve hub uid from GET /api/auth/mode: TLS verification failed (${cause}). This hub may be using a self-signed certificate; generate a v2 join token from the hub.`
++      `${prefix}: TLS verification failed (${cause}). ${hint}`
+     );
+   }
+   if (isNetworkFetchError(error)) {
+-    return new JoinError(
+-      'hub_unreachable',
+-      `unable to resolve hub uid from GET /api/auth/mode: network error (${cause})`
+-    );
++    return new JoinError('hub_unreachable', `${prefix}: network error (${cause})`);
+   }
+-  return new JoinError(
+-    'hub_unreachable',
+-    `unable to resolve hub uid from GET /api/auth/mode: ${cause}`
+-  );
++  return new JoinError('hub_unreachable', `${prefix}: ${cause}`);
+ }
+ 
+ async function fetchPinnedHubCa(
+@@ -309,12 +301,12 @@ async function maybeRestart(
+ async function maybeStop(
+   parsed: ParsedArgs,
+   io: HubIo | undefined,
+-  installDir: string
++  installDir: string,
++  skipIfAuth = false
+ ): Promise<void> {
+-  const stop = io?.stop ?? (io?.skipRestart ? undefined : stopService);
++  const stop = io?.stop ?? (io?.skipRestart || (skipIfAuth && io?.auth) ? undefined : stopService);
+   if (!stop) return;
+-  const serviceName = await resolveServiceName(parsed, installDir);
+-  await stop(serviceName, installDir);
++  await stop(await resolveServiceName(parsed, installDir), installDir);
+ }
+ 
+ async function maybeStart(
+@@ -324,8 +316,7 @@ async function maybeStart(
+ ): Promise<void> {
+   const start = io?.start ?? (io?.skipRestart || io?.auth ? undefined : startService);
+   if (!start) return;
+-  const serviceName = await resolveServiceName(parsed, installDir);
+-  await start(serviceName, installDir);
++  await start(await resolveServiceName(parsed, installDir), installDir);
+ }
+ 
+ async function resolveLeaveServicePlan(
+@@ -337,17 +328,6 @@ async function resolveLeaveServicePlan(
+   return { manage: manager !== 'none' };
+ }
+ 
+-async function stopForLeave(
+-  parsed: ParsedArgs,
+-  io: HubIo | undefined,
+-  installDir: string
+-): Promise<void> {
+-  const stop = io?.stop ?? (io?.skipRestart || io?.auth ? undefined : stopService);
+-  if (!stop) return;
+-  const serviceName = await resolveServiceName(parsed, installDir);
+-  await stop(serviceName, installDir);
+-}
+-
+ export async function runHubUserAdd(
+   parsed: ParsedArgs,
+   username: string,
+@@ -486,17 +466,13 @@ export async function runHubUserReset(
+   });
+ }
+ 
+-export async function performHubJoin(
+-  input: PerformHubJoinInput,
+-  deps: PerformHubJoinDeps
+-): Promise<{ userId: string; username: string; hubUrl: string; replacedStaleUsername?: string }> {
++async function prepareHubJoin(input: PerformHubJoinInput, deps: PerformHubJoinDeps) {
+   let decoded: ReturnType<typeof decodeJoinToken>;
+   try {
+     decoded = decodeJoinToken(input.token);
+   } catch (error) {
+     throw new JoinError('invalid_token', joinErrorMessage(error, 'invalid join token'));
+   }
+-
+   let hubUrl: string;
+   try {
+     hubUrl = canonicalHubUrl(
+@@ -509,7 +485,6 @@ export async function performHubJoin(
+   } catch (error) {
+     throw new JoinError('invalid_url', joinErrorMessage(error, 'invalid hub url'));
+   }
+-
+   const identity = await ensureNodeIdentity(deps.auth.identityStore);
+   const baseFetcher: HubFetch = deps.fetcher ?? fetch;
+   let pinnedPem: string | null = null;
+@@ -520,23 +495,31 @@ export async function performHubJoin(
+   }
+   let uid: string | null = null;
+   try {
+-    const mode = await fetchAuthMode(hubUrl, hubFetcher);
+-    uid = mode.uid;
++    uid = (await fetchAuthMode(hubUrl, hubFetcher)).uid;
+   } catch (error) {
+     throw authModeJoinError(error, Boolean(decoded.caFingerprint));
+   }
+   if (!uid) {
+     throw new JoinError('hub_unreachable', 'unable to resolve hub uid from GET /api/auth/mode');
+   }
+-  const enrollPkResolved = rootKeyFromSeed(decoded.enrollSk).publicKey;
+-  const now = deps.now?.() ?? Date.now();
++  return { decoded, hubUrl, identity, hubFetcher, pinnedPem, uid };
++}
+ 
++export async function performHubJoin(
++  input: PerformHubJoinInput,
++  deps: PerformHubJoinDeps
++): Promise<{ userId: string; username: string; hubUrl: string; replacedStaleUsername?: string }> {
++  const { decoded, hubUrl, identity, hubFetcher, pinnedPem, uid } = await prepareHubJoin(
++    input,
++    deps
++  );
++  const enrollPkResolved = rootKeyFromSeed(decoded.enrollSk).publicKey;
+   const cert = createNodeCertificate(decoded.enrollSk, {
+     uid,
+     edPk: identity.edPublicKey,
+     x25519Pk: identity.x25519PublicKey,
+     enrollPk: enrollPkResolved,
+-    now,
++    now: deps.now?.() ?? Date.now(),
+     nodeId: identity.nodeId,
+   });
+   const pop = encodeBase64url(
+@@ -549,7 +532,6 @@ export async function performHubJoin(
+       })
+     )
+   );
+-
+   let redeemed: RedeemResponse;
+   try {
+     redeemed = await redeemEnrollment({
+@@ -562,7 +544,6 @@ export async function performHubJoin(
+   } catch (error) {
+     throw toJoinError(error, isNetworkFetchError(error) ? 'hub_unreachable' : 'join_failed');
+   }
+-
+   let admittedCert: { certificateBytes: Uint8Array; certSig: Uint8Array } | null;
+   try {
+     admittedCert = assertJoinCertReusable(
+@@ -574,7 +555,6 @@ export async function performHubJoin(
+   } catch (error) {
+     throw toJoinError(error, 'join_failed');
+   }
+-
+   let committed: { replacedStaleUsername?: string };
+   try {
+     committed = await commitVerifiedJoin(deps.auth, {
+@@ -589,7 +569,6 @@ export async function performHubJoin(
+   } catch (error) {
+     throw toJoinError(error, 'join_failed');
+   }
+-
+   if (pinnedPem && decoded.caFingerprint) {
+     new HubTrustStore(deps.auth.db).put({
+       hubUrl,
+@@ -597,7 +576,6 @@ export async function performHubJoin(
+       fingerprint: decoded.caFingerprint,
+     });
+   }
+-
+   return {
+     userId: redeemed.user.id,
+     username: redeemed.user.username || redeemed.user.id,
+@@ -830,7 +808,7 @@ export async function runHubLeave(parsed: ParsedArgs, io: HubIo = {}): Promise<v
+   const { manage } = await resolveLeaveServicePlan(io, installDir);
+   let stopped = false;
+   if (manage) {
+-    await stopForLeave(parsed, io, installDir);
++    await maybeStop(parsed, io, installDir, true);
+     stopped = true;
+   }
+   try {
+diff --git a/packages/app/src/commands/init.ts b/packages/app/src/commands/init.ts
+index af5d78c3..07b46958 100644
+--- a/packages/app/src/commands/init.ts
++++ b/packages/app/src/commands/init.ts
+@@ -65,11 +65,9 @@ export async function enableDirectAfterInit(
+   try {
+     const result = await enable({ installDir: config.installDir });
+     if (result.ok) {
+-      if (result.skipped) {
+-        log(`direct already enabled (${result.platformId} ${result.version})`);
+-      } else {
+-        log(`direct enabled (${result.platformId} ${result.version})`);
+-      }
++      log(
++        `direct ${result.skipped ? 'already enabled' : 'enabled'} (${result.platformId} ${result.version})`
++      );
+     } else {
+       log(`direct enable skipped: ${result.reason}`);
+     }
+@@ -105,121 +103,69 @@ async function directoryHasContent(path: string): Promise<boolean> {
+ }
+ 
+ async function buildInitConfig(parsed: ParsedArgs): Promise<InitConfig> {
+-  const nonInteractive = parsed.flags['no-interactive'] === true;
+-  const force = asBoolean(parsed.flags.force) ?? false;
+-  const installDeps = asBoolean(parsed.flags['install-deps']) ?? false;
+-  const skipDepCheck = asBoolean(parsed.flags['skip-dep-check']) ?? false;
+-
+-  if (nonInteractive) {
+-    const installDir = resolveInstallDir(
+-      assertNonEmpty(mustGetStringFlag(parsed.flags, 'install-dir'), 'install-dir')
+-    );
+-    const host = assertNonEmpty(mustGetStringFlag(parsed.flags, 'host'), 'host');
+-    const port = parsePort(assertNonEmpty(mustGetStringFlag(parsed.flags, 'port'), 'port'));
+-    const databasePath = resolve(
+-      assertNonEmpty(mustGetStringFlag(parsed.flags, 'db-path'), 'db-path')
+-    );
+-    const autostart = mustGetBooleanFlag(parsed.flags, 'autostart');
+-    const serviceName = assertNonEmpty(
+-      asString(parsed.flags['service-name']) || DEFAULT_SERVICE_NAME,
+-      'service-name'
+-    );
+-
+-    const role = parseTmexRoleName(asString(parsed.flags.role) || 'standalone');
+-    const hubUrl = asString(parsed.flags['hub-url']) || '';
+-    const peerPort = parsePort(asString(parsed.flags['peer-port']) || String(DEFAULT_PEER_PORT));
+-    const hubPublicUrl = asString(parsed.flags['hub-public-url']) || '';
+-    if (role === 'hub,node' && !hubPublicUrl) {
+-      throw new Error('init --role hub,node requires --hub-public-url in non-interactive mode');
++  const flags = parsed.flags;
++  const ni = flags['no-interactive'] === true;
++  const ask = async (
++    key: string,
++    prompt: string,
++    fallback: string,
++    required = true
++  ): Promise<string> => {
++    if (ni) {
++      if (required) return assertNonEmpty(mustGetStringFlag(flags, key), key);
++      return asString(flags[key]) || fallback;
+     }
++    const value = await promptText(
++      { nonInteractive: false },
++      prompt,
++      asString(flags[key]) || fallback
++    );
++    return required ? assertNonEmpty(value, key) : value;
++  };
+ 
+-    return {
+-      installDir,
+-      host,
+-      port,
+-      databasePath,
+-      autostart,
+-      serviceName,
+-      force,
+-      nonInteractive,
+-      installDeps,
+-      skipDepCheck,
+-      role,
+-      hubUrl,
+-      peerPort,
+-      hubPublicUrl,
+-      stunServers: asString(parsed.flags['stun-servers']) || DEFAULT_STUN_SERVERS,
+-    };
+-  }
+-
+-  const fallbackInstallDir = defaultInstallDir(process.platform);
+-  const installDirPrompt = await promptText(
+-    { nonInteractive: false },
+-    t('init.prompt.installDir'),
+-    asString(parsed.flags['install-dir']) || fallbackInstallDir
+-  );
+-  const installDir = resolveInstallDir(assertNonEmpty(installDirPrompt, 'install-dir'));
+-
+-  const hostPrompt = await promptText(
+-    { nonInteractive: false },
+-    t('init.prompt.host'),
+-    asString(parsed.flags.host) || defaultHost()
+-  );
+-  const host = assertNonEmpty(hostPrompt, 'host');
+-
+-  const portPrompt = await promptText(
+-    { nonInteractive: false },
+-    t('init.prompt.port'),
+-    asString(parsed.flags.port) || String(defaultPort())
++  const installDir = resolveInstallDir(
++    await ask('install-dir', t('init.prompt.installDir'), defaultInstallDir(process.platform))
+   );
+-  const port = parsePort(assertNonEmpty(portPrompt, 'port'));
+-
+-  const databasePathPrompt = await promptText(
+-    { nonInteractive: false },
+-    t('init.prompt.dbPath'),
+-    asString(parsed.flags['db-path']) || defaultDatabasePath(installDir)
++  const host = await ask('host', t('init.prompt.host'), defaultHost());
++  const port = parsePort(await ask('port', t('init.prompt.port'), String(defaultPort())));
++  const databasePath = resolve(
++    await ask('db-path', t('init.prompt.dbPath'), defaultDatabasePath(installDir))
+   );
+-  const databasePath = resolve(assertNonEmpty(databasePathPrompt, 'db-path'));
+-
+-  const autostart =
+-    asBoolean(parsed.flags.autostart) ??
+-    (await promptConfirm({ nonInteractive: false }, t('init.prompt.autostart'), true));
+-
+-  const serviceNamePrompt = await promptText(
+-    { nonInteractive: false },
+-    t('init.prompt.serviceName'),
+-    asString(parsed.flags['service-name']) || DEFAULT_SERVICE_NAME
++  const autostart = ni
++    ? mustGetBooleanFlag(flags, 'autostart')
++    : (asBoolean(flags.autostart) ??
++      (await promptConfirm({ nonInteractive: false }, t('init.prompt.autostart'), true)));
++  const serviceName = assertNonEmpty(
++    ni
++      ? asString(flags['service-name']) || DEFAULT_SERVICE_NAME
++      : await promptText(
++          { nonInteractive: false },
++          t('init.prompt.serviceName'),
++          asString(flags['service-name']) || DEFAULT_SERVICE_NAME
++        ),
++    'service-name'
+   );
+-  const serviceName = assertNonEmpty(serviceNamePrompt, 'service-name');
+-
+   const role = parseTmexRoleName(
+-    (await promptText(
+-      { nonInteractive: false },
+-      'Role (standalone|node|hub,node)',
+-      asString(parsed.flags.role) || 'standalone'
+-    )) || 'standalone'
+-  );
+-  const hubUrl = await promptText(
+-    { nonInteractive: false },
+-    'Hub URL (TMEX_HUB_URL, empty allowed)',
+-    asString(parsed.flags['hub-url']) || ''
++    (await ask('role', 'Role (standalone|node|hub,node)', 'standalone', false)) || 'standalone'
+   );
++  const hubUrl = await ask('hub-url', 'Hub URL (TMEX_HUB_URL, empty allowed)', '', false);
+   const peerPort = parsePort(
+-    (await promptText(
+-      { nonInteractive: false },
+-      'Peer port (TMEX_PEER_PORT)',
+-      asString(parsed.flags['peer-port']) || String(DEFAULT_PEER_PORT)
+-    )) || String(DEFAULT_PEER_PORT)
++    (await ask('peer-port', 'Peer port (TMEX_PEER_PORT)', String(DEFAULT_PEER_PORT), false)) ||
++      String(DEFAULT_PEER_PORT)
+   );
+-  let hubPublicUrl = asString(parsed.flags['hub-public-url']) || '';
++  let hubPublicUrl = asString(flags['hub-public-url']) || '';
+   if (role === 'hub,node') {
+-    hubPublicUrl = await promptText(
+-      { nonInteractive: false },
+-      'Hub public URL (TMEX_HUB_PUBLIC_URL)',
+-      hubPublicUrl
+-    );
++    if (ni && !hubPublicUrl) {
++      throw new Error('init --role hub,node requires --hub-public-url in non-interactive mode');
++    }
++    if (!ni) {
++      hubPublicUrl = await promptText(
++        { nonInteractive: false },
++        'Hub public URL (TMEX_HUB_PUBLIC_URL)',
++        hubPublicUrl
++      );
++    }
+   }
+-
+   return {
+     installDir,
+     host,
+@@ -227,15 +173,15 @@ async function buildInitConfig(parsed: ParsedArgs): Promise<InitConfig> {
+     databasePath,
+     autostart,
+     serviceName,
+-    force,
+-    nonInteractive,
+-    installDeps,
+-    skipDepCheck,
++    force: asBoolean(flags.force) ?? false,
++    nonInteractive: ni,
++    installDeps: asBoolean(flags['install-deps']) ?? false,
++    skipDepCheck: asBoolean(flags['skip-dep-check']) ?? false,
+     role,
+     hubUrl,
+     peerPort,
+     hubPublicUrl,
+-    stunServers: asString(parsed.flags['stun-servers']) || DEFAULT_STUN_SERVERS,
++    stunServers: asString(flags['stun-servers']) || DEFAULT_STUN_SERVERS,
+   };
+ }
+ 
+diff --git a/packages/app/src/runtime/http.ts b/packages/app/src/runtime/http.ts
+index 6b785f50..f110fc72 100644
+--- a/packages/app/src/runtime/http.ts
++++ b/packages/app/src/runtime/http.ts
+@@ -1,3 +1,5 @@
++import { SetupError } from './setup-service';
++
+ export function jsonOk(data: unknown, status = 200): Response {
+   return new Response(JSON.stringify(data), {
+     status,
+@@ -9,6 +11,14 @@ export function jsonErr(code: string, message: string, status: number): Response
+   return jsonOk({ error: { code, message } }, status);
+ }
+ 
++export function mapError(error: unknown, fallback = 'internal_error'): Response {
++  if (error instanceof SetupError) {
++    return jsonErr(error.code, error.message, error.httpStatus);
++  }
++  const message = error instanceof Error ? error.message : String(error);
++  return jsonErr(fallback, message, 500);
++}
++
+ export async function readJsonBody(req: Request): Promise<Record<string, unknown> | null> {
+   let parsed: unknown;
+   try {
+diff --git a/packages/app/src/runtime/local-routes.ts b/packages/app/src/runtime/local-routes.ts
+index 8538ee49..2a48f2b6 100644
+--- a/packages/app/src/runtime/local-routes.ts
++++ b/packages/app/src/runtime/local-routes.ts
+@@ -1,15 +1,15 @@
+ import type { AuthenticateResult } from '../../../../apps/gateway/src/mesh/session-middleware';
+ import type { TlsMode } from '../../../../apps/gateway/src/tls/types';
+ import { isStandaloneRoles } from '../lib/roles';
+-import { jsonErr, jsonOk, readJsonBody } from './http';
++import { jsonErr, jsonOk, mapError, readJsonBody } from './http';
+ import { type MeshRoleName, leaveMesh } from './membership-reset';
+ import {
+   type DirectSetResult,
+   type LocalStatus,
+-  SetupError,
+   type SetupServiceDeps,
++  getLocalStatus,
++  setLocalDirect,
+ } from './setup-service';
+-import { getLocalStatus, setLocalDirect } from './setup-service';
+ 
+ export type LocalTlsStatus = {
+   mode: TlsMode;
+@@ -22,14 +22,6 @@ export type LocalRouteDeps = SetupServiceDeps & {
+   tlsStatus: () => Promise<LocalTlsStatus>;
+ };
+ 
+-function mapError(error: unknown, fallback = 'direct_failed'): Response {
+-  if (error instanceof SetupError) {
+-    return jsonErr(error.code, error.message, error.httpStatus);
+-  }
+-  const message = error instanceof Error ? error.message : String(error);
+-  return jsonErr(fallback, message, 500);
+-}
+-
+ function isMeshRoleName(value: unknown): value is MeshRoleName {
+   return value === 'node' || value === 'hub,node';
+ }
+@@ -91,7 +83,7 @@ export async function handleLocalRequest(
+         },
+       });
+     } catch (error) {
+-      return mapError(error);
++      return mapError(error, 'direct_failed');
+     }
+   }
+ 
+@@ -107,6 +99,6 @@ export async function handleLocalRequest(
+     const result: DirectSetResult = await setLocalDirect(action, deps);
+     return jsonOk(result);
+   } catch (error) {
+-    return mapError(error);
++    return mapError(error, 'direct_failed');
+   }
+ }
+diff --git a/packages/app/src/runtime/setup-routes.ts b/packages/app/src/runtime/setup-routes.ts
+index a2cc1483..ef706301 100644
+--- a/packages/app/src/runtime/setup-routes.ts
++++ b/packages/app/src/runtime/setup-routes.ts
+@@ -1,20 +1,6 @@
+ import { isStandaloneRoles } from '../lib/roles';
+-import { jsonErr, jsonOk, readJsonBody } from './http';
+-import {
+-  SetupError,
+-  type SetupServiceDeps,
+-  becomeHub,
+-  joinHub,
+-  precheckHubUrl,
+-} from './setup-service';
+-
+-function mapError(error: unknown): Response {
+-  if (error instanceof SetupError) {
+-    return jsonErr(error.code, error.message, error.httpStatus);
+-  }
+-  const message = error instanceof Error ? error.message : String(error);
+-  return jsonErr('internal_error', message, 500);
+-}
++import { jsonErr, jsonOk, mapError, readJsonBody } from './http';
++import { type SetupServiceDeps, becomeHub, joinHub, precheckHubUrl } from './setup-service';
+ 
+ function readString(body: Record<string, unknown>, key: string): string {
+   const value = body[key];
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index 465129de..bdebba04 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -11,7 +11,8 @@
+     "./i18n/locales/en_US.json": "./src/i18n/locales/en_US.json",
+     "./i18n/locales/zh_CN.json": "./src/i18n/locales/zh_CN.json",
+     "./i18n/locales/ja_JP.json": "./src/i18n/locales/ja_JP.json",
+-    "./link": "./src/link/index.ts"
++    "./link": "./src/link/index.ts",
++    "./uplink": "./src/uplink/codec.ts"
+   },
+   "scripts": {
+     "build:i18n": "bun scripts/build-i18n.ts",
+diff --git a/packages/shared/src/uplink/codec.test.ts b/packages/shared/src/uplink/codec.test.ts
+new file mode 100644
+index 00000000..e317fd5a
+--- /dev/null
++++ b/packages/shared/src/uplink/codec.test.ts
+@@ -0,0 +1,67 @@
++import { describe, expect, test } from 'bun:test';
++import { encodeBase64url, randomBytes } from '../auth/encoding';
++import {
++  KEY_LOG_PAGE_MAX_BYTES,
++  UPLINK_CTL_MAX_BYTES,
++  UplinkCtlError,
++  assertCtlBounds,
++  b64urlToBytes,
++  bytesToB64url,
++  decodeHubUplinkCtl,
++  decodeMeshUplinkCtl,
++  encodeHubUplinkCtl,
++  encodeMeshUplinkCtl,
++  seqFromWire,
++  seqToWire,
++} from './codec';
++
++describe('uplink codec primitives', () => {
++  test('seqToWire / seqFromWire 与 u64 边界', () => {
++    expect(seqToWire(3n)).toBe(3);
++    expect(seqFromWire(3)).toBe(3n);
++    expect(seqFromWire('9')).toBe(9n);
++    expect(() => seqFromWire(-1)).toThrow(UplinkCtlError);
++    expect(() => seqFromWire(1.5)).toThrow(UplinkCtlError);
++    expect(seqFromWire('18446744073709551615')).toBe(18446744073709551615n);
++    expect(() => seqFromWire('18446744073709551616')).toThrow(UplinkCtlError);
++  });
++
++  test('b64url 往返与长度校验', () => {
++    const bytes = randomBytes(32);
++    expect(b64urlToBytes(bytesToB64url(bytes), 32)).toEqual(bytes);
++    expect(() => b64urlToBytes('', 32)).toThrow(UplinkCtlError);
++    expect(() => b64urlToBytes(encodeBase64url(randomBytes(16)), 32)).toThrow(/32 bytes/);
++  });
++
++  test('assertCtlBounds 拒绝过深 / 过长', () => {
++    expect(() => assertCtlBounds('x'.repeat(4097))).toThrow(/string too long/);
++    let deep: unknown = 1;
++    for (let i = 0; i < 10; i++) deep = { k: deep };
++    expect(() => assertCtlBounds(deep)).toThrow(/too deep/);
++  });
++});
++
++describe('mesh vs hub large-page policy', () => {
++  test('mesh 仅在 pending id 匹配时接受 1MiB key.log.res；hub 默认拒绝 key.log.res', () => {
++    const id = 'pending-1';
++    const empty = JSON.stringify({ t: 'key.log.res', records: [], id, pad: '' });
++    const prefix = empty.slice(0, -2);
++    const pad = 'x'.repeat(KEY_LOG_PAGE_MAX_BYTES - prefix.length - 2);
++    const huge = new TextEncoder().encode(`${prefix}${pad}"}`);
++    expect(huge.byteLength).toBe(KEY_LOG_PAGE_MAX_BYTES);
++    expect(() => decodeMeshUplinkCtl(huge)).toThrow(/too large/);
++    expect(decodeMeshUplinkCtl(huge, { pendingKeyLogId: id }).t).toBe('key.log.res');
++    expect(() => decodeHubUplinkCtl(huge)).toThrow(UplinkCtlError);
++    const small = JSON.stringify({ t: 'key.log.res', records: [] });
++    expect(() => decodeHubUplinkCtl(small)).toThrow(UplinkCtlError);
++    expect(decodeHubUplinkCtl(small, { allowKeyLogRes: true }).t).toBe('key.log.res');
++  });
++
++  test('ping round-trip 两侧一致', () => {
++    expect(decodeMeshUplinkCtl(encodeMeshUplinkCtl({ t: 'ping' }))).toEqual({ t: 'ping' });
++    expect(decodeHubUplinkCtl(encodeHubUplinkCtl({ t: 'ping' }))).toEqual({ t: 'ping' });
++    expect(() => decodeHubUplinkCtl(new Uint8Array(UPLINK_CTL_MAX_BYTES + 1))).toThrow(
++      UplinkCtlError
++    );
++  });
++});
+diff --git a/packages/shared/src/uplink/codec.ts b/packages/shared/src/uplink/codec.ts
+new file mode 100644
+index 00000000..8f5f86d8
+--- /dev/null
++++ b/packages/shared/src/uplink/codec.ts
+@@ -0,0 +1,843 @@
++import { decodeBase64url, encodeBase64url } from '../auth/encoding';
++
++export const UPLINK_CTL_TYPES = [
++  'auth.challenge',
++  'auth.response',
++  'auth.ok',
++  'ping',
++  'pong',
++  'node.status',
++  'node.list',
++  'key.log.req',
++  'key.log.res',
++  'key.log.append',
++  'key.log.ack',
++  'rtc.signal',
++  'enroll.redeemed',
++] as const;
++
++export type UplinkCtlType = (typeof UPLINK_CTL_TYPES)[number];
++
++const TYPE_SET = new Set<string>(UPLINK_CTL_TYPES);
++const te = new TextEncoder();
++const td = new TextDecoder();
++const NODE_ID_HEX = /^[0-9a-f]{32}$/;
++const NODE_ID_HEX_I = /^[0-9a-f]{32}$/i;
++
++export const UPLINK_CTL_MAX_BYTES = 64 * 1024;
++export const UPLINK_CTL_MAX_DEPTH = 8;
++export const UPLINK_CTL_MAX_ARRAY_LEN = 1024;
++export const UPLINK_CTL_MAX_STRING_LEN = 4 * 1024;
++export const UPLINK_CTL_MAX_ENDPOINTS = 32;
++export const UPLINK_CTL_MAX_CERT_BYTES = 2048;
++export const UPLINK_CTL_MAX_U64 = 18446744073709551615n;
++export const KEY_LOG_PAGE_DEFAULT_LIMIT = 256;
++export const KEY_LOG_PAGE_MAX_LIMIT = 256;
++export const KEY_LOG_PAGE_MAX_BYTES = 1024 * 1024;
++
++export class UplinkCtlError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'UplinkCtlError';
++  }
++}
++
++export function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++export function encodeJsonBytes(value: unknown): Uint8Array {
++  return te.encode(JSON.stringify(value));
++}
++
++export function decodeJsonBytes(bytes: Uint8Array): unknown {
++  return JSON.parse(td.decode(bytes));
++}
++
++export function seqToWire(seq: bigint | number): number | string {
++  const value = typeof seq === 'bigint' ? seq : BigInt(seq);
++  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
++}
++
++export function seqFromWire(value: number | string): bigint {
++  if (typeof value === 'number') {
++    if (!Number.isSafeInteger(value) || value < 0) throw new UplinkCtlError('invalid seq');
++    return BigInt(value);
++  }
++  if (typeof value !== 'string' || !/^[0-9]{1,20}$/.test(value)) {
++    throw new UplinkCtlError('invalid seq');
++  }
++  const n = BigInt(value);
++  if (n > UPLINK_CTL_MAX_U64) throw new UplinkCtlError('invalid seq');
++  return n;
++}
++
++export function bytesToB64url(bytes: Uint8Array): string {
++  return encodeBase64url(bytes);
++}
++
++export function b64urlToBytes(value: string, expectedLen?: number): Uint8Array {
++  if (typeof value !== 'string' || value.length === 0) throw new UplinkCtlError('invalid b64url');
++  let bytes: Uint8Array;
++  try {
++    bytes = decodeBase64url(value);
++  } catch {
++    throw new UplinkCtlError('invalid b64url');
++  }
++  if (expectedLen !== undefined && bytes.byteLength !== expectedLen) {
++    throw new UplinkCtlError(`expected ${expectedLen} bytes`);
++  }
++  return bytes;
++}
++
++export function assertCtlBounds(value: unknown, depth = 0): void {
++  if (depth > UPLINK_CTL_MAX_DEPTH) throw new Error('ctl too deep');
++  if (typeof value === 'string' && value.length > UPLINK_CTL_MAX_STRING_LEN) {
++    throw new Error('ctl string too long');
++  }
++  if (Array.isArray(value)) {
++    if (value.length > UPLINK_CTL_MAX_ARRAY_LEN) throw new Error('ctl array too long');
++    for (const item of value) assertCtlBounds(item, depth + 1);
++    return;
++  }
++  if (value && typeof value === 'object') {
++    for (const item of Object.values(value as Record<string, unknown>)) {
++      assertCtlBounds(item, depth + 1);
++    }
++  }
++}
++
++function wrapHub<T>(fn: () => T): T {
++  try {
++    return fn();
++  } catch (e) {
++    if (e instanceof UplinkCtlError) throw e;
++    throw new UplinkCtlError(e instanceof Error ? e.message : 'invalid ctl');
++  }
++}
++
++function mStr(value: unknown, field: string): string {
++  if (typeof value !== 'string') throw new Error(`ctl field ${field} must be a string`);
++  return value;
++}
++
++function mOptStr(value: unknown, field: string): string | undefined {
++  if (value === undefined || value === null) return undefined;
++  return mStr(value, field);
++}
++
++function mBool(value: unknown, field: string): boolean {
++  if (typeof value !== 'boolean') throw new Error(`ctl field ${field} must be a boolean`);
++  return value;
++}
++
++function mNum(value: unknown, field: string): number {
++  if (typeof value !== 'number' || !Number.isFinite(value)) {
++    throw new Error(`ctl field ${field} must be a number`);
++  }
++  return value;
++}
++
++function mSeq(value: unknown, field: string): bigint {
++  if (typeof value === 'bigint') return value;
++  if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
++  if (typeof value === 'string' && value !== '') return BigInt(value);
++  throw new Error(`ctl field ${field} must be a seq`);
++}
++
++function mB64(value: unknown, field: string, expectedLen?: number): Uint8Array {
++  const bytes = decodeBase64url(mStr(value, field));
++  if (expectedLen !== undefined && bytes.byteLength !== expectedLen) {
++    throw new Error(`ctl field ${field} expected ${expectedLen} bytes`);
++  }
++  return bytes;
++}
++
++function mNodeId(value: unknown, field: string): string {
++  const id = mStr(value, field);
++  if (!NODE_ID_HEX_I.test(id)) throw new Error(`ctl field ${field} must be 32-hex`);
++  return id;
++}
++
++type MeshNodeInfo = {
++  id: string;
++  name: string;
++  online: boolean;
++  endpoints: unknown;
++  inventory: unknown;
++  direct_capable: boolean;
++  version: string | null;
++};
++
++type MeshHubInfo = { nodeId: string; publicUrl: string; name?: string };
++
++export type MeshUplinkNodeList = {
++  t: 'node.list';
++  version: number;
++  key_log_head: { seq: bigint; hash: Uint8Array };
++  rtc: { stun: string[]; turn: unknown };
++  nodes: MeshNodeInfo[];
++  hub?: MeshHubInfo;
++};
++
++export type MeshUplinkKeyLogRecord = { seq: bigint; bytes: Uint8Array; sig: Uint8Array };
++export type MeshUplinkKeyLogAck = {
++  t: 'key.log.ack';
++  id: string;
++  ok: boolean;
++  seq?: bigint;
++  error?: string;
++};
++export type MeshUplinkRtcSignal = {
++  t: 'rtc.signal';
++  rtcSession: string;
++  from: 'browser' | 'node';
++  to: string;
++  sdp?: string;
++  candidate?: string;
++};
++export type MeshUplinkEnrollRedeemed = {
++  t: 'enroll.redeemed';
++  certificate: Uint8Array;
++  cert_sig: Uint8Array;
++  enroll_pk: Uint8Array;
++  nodeId: string;
++  entrySid?: string;
++};
++
++export type MeshUplinkCtlMessage =
++  | { t: 'auth.challenge'; nonce: string }
++  | { t: 'auth.response'; node_id: string; sig: string }
++  | { t: 'auth.ok' }
++  | { t: 'ping' }
++  | { t: 'pong' }
++  | {
++      t: 'node.status';
++      version: string;
++      tmux: boolean;
++      direct_capable: boolean;
++      inventory: unknown;
++      endpoints: unknown;
++    }
++  | MeshUplinkNodeList
++  | { t: 'key.log.req'; from_seq: bigint; id?: string; limit?: number }
++  | {
++      t: 'key.log.res';
++      records: MeshUplinkKeyLogRecord[];
++      id?: string;
++      error?: string;
++      has_more?: boolean;
++      retry_after_ms?: number;
++    }
++  | { t: 'key.log.append'; bytes: Uint8Array; sig: Uint8Array; id?: string }
++  | MeshUplinkKeyLogAck
++  | MeshUplinkRtcSignal
++  | MeshUplinkEnrollRedeemed;
++
++function parseMeshNode(value: unknown): MeshNodeInfo {
++  if (!isRecord(value)) throw new Error('node.list node must be an object');
++  return {
++    id: mStr(value.id, 'nodes[].id'),
++    name: mStr(value.name, 'nodes[].name'),
++    online: mBool(value.online, 'nodes[].online'),
++    endpoints: value.endpoints ?? [],
++    inventory: value.inventory ?? {},
++    direct_capable: mBool(value.direct_capable, 'nodes[].direct_capable'),
++    version: mOptStr(value.version, 'nodes[].version') ?? null,
++  };
++}
++
++function parseMeshHub(value: unknown): MeshHubInfo {
++  if (!isRecord(value)) throw new Error('node.list hub must be an object');
++  const info: MeshHubInfo = {
++    nodeId: mNodeId(value.nodeId, 'hub.nodeId'),
++    publicUrl: mStr(value.publicUrl, 'hub.publicUrl'),
++  };
++  const name = mOptStr(value.name, 'hub.name');
++  if (name) info.name = name;
++  return info;
++}
++
++export function decodeMeshUplinkCtl(
++  bytes: Uint8Array,
++  opts?: { pendingKeyLogId?: string }
++): MeshUplinkCtlMessage {
++  if (bytes.byteLength > KEY_LOG_PAGE_MAX_BYTES) throw new Error('ctl too large');
++  if (bytes.byteLength > UPLINK_CTL_MAX_BYTES && !opts?.pendingKeyLogId) {
++    throw new Error('ctl too large');
++  }
++  const parsed = decodeJsonBytes(bytes);
++  if (!isRecord(parsed) || typeof parsed.t !== 'string') {
++    throw new Error('uplink ctl must be a JSON object with t');
++  }
++  if (parsed.t === 'key.log.res' && bytes.byteLength > UPLINK_CTL_MAX_BYTES) {
++    const resId = mOptStr(parsed.id, 'id');
++    if (!resId || resId !== opts?.pendingKeyLogId) throw new Error('ctl too large');
++  } else if (parsed.t !== 'key.log.res') {
++    if (bytes.byteLength > UPLINK_CTL_MAX_BYTES) throw new Error('ctl too large');
++    assertCtlBounds(parsed, 0);
++  }
++  if (!TYPE_SET.has(parsed.t)) throw new Error(`unknown uplink ctl t: ${parsed.t}`);
++  switch (parsed.t as UplinkCtlType) {
++    case 'auth.challenge':
++      return { t: 'auth.challenge', nonce: mStr(parsed.nonce, 'nonce') };
++    case 'auth.response':
++      return {
++        t: 'auth.response',
++        node_id: mStr(parsed.node_id, 'node_id'),
++        sig: mStr(parsed.sig, 'sig'),
++      };
++    case 'auth.ok':
++      return { t: 'auth.ok' };
++    case 'ping':
++      return { t: 'ping' };
++    case 'pong':
++      return { t: 'pong' };
++    case 'node.status':
++      return {
++        t: 'node.status',
++        version: mStr(parsed.version, 'version'),
++        tmux: mBool(parsed.tmux, 'tmux'),
++        direct_capable: mBool(parsed.direct_capable, 'direct_capable'),
++        inventory: parsed.inventory ?? {},
++        endpoints: parsed.endpoints ?? [],
++      };
++    case 'node.list': {
++      if (!isRecord(parsed.key_log_head))
++        throw new Error('node.list key_log_head must be an object');
++      if (!isRecord(parsed.rtc)) throw new Error('node.list rtc must be an object');
++      if (!Array.isArray(parsed.nodes)) throw new Error('node.list nodes must be an array');
++      const stun = parsed.rtc.stun;
++      const list: MeshUplinkNodeList = {
++        t: 'node.list',
++        version: mNum(parsed.version, 'version'),
++        key_log_head: {
++          seq: mSeq(parsed.key_log_head.seq, 'key_log_head.seq'),
++          hash: mB64(parsed.key_log_head.hash, 'key_log_head.hash'),
++        },
++        rtc: {
++          stun: Array.isArray(stun) ? stun.map((item, i) => mStr(item, `rtc.stun[${i}]`)) : [],
++          turn: parsed.rtc.turn ?? null,
++        },
++        nodes: parsed.nodes.map(parseMeshNode),
++      };
++      if (parsed.hub !== undefined && parsed.hub !== null) list.hub = parseMeshHub(parsed.hub);
++      return list;
++    }
++    case 'key.log.req': {
++      const req: Extract<MeshUplinkCtlMessage, { t: 'key.log.req' }> = {
++        t: 'key.log.req',
++        from_seq: mSeq(parsed.from_seq, 'from_seq'),
++      };
++      const reqId = mOptStr(parsed.id, 'id');
++      if (reqId) req.id = reqId;
++      if (parsed.limit !== undefined && parsed.limit !== null) {
++        const limit = mNum(parsed.limit, 'limit');
++        if (!Number.isInteger(limit) || limit < 1) {
++          throw new Error('ctl field limit must be a positive integer');
++        }
++        req.limit = limit;
++      }
++      return req;
++    }
++    case 'key.log.res': {
++      if (!Array.isArray(parsed.records)) throw new Error('key.log.res records must be an array');
++      if (parsed.records.length > KEY_LOG_PAGE_MAX_LIMIT) {
++        throw new Error('key.log.res too many records');
++      }
++      const res: Extract<MeshUplinkCtlMessage, { t: 'key.log.res' }> = {
++        t: 'key.log.res',
++        records: parsed.records.map((row, i) => {
++          if (!isRecord(row)) throw new Error(`key.log.res records[${i}] must be an object`);
++          return {
++            seq: mSeq(row.seq, `records[${i}].seq`),
++            bytes: mB64(row.bytes, `records[${i}].bytes`),
++            sig: mB64(row.sig, `records[${i}].sig`),
++          };
++        }),
++      };
++      const resId = mOptStr(parsed.id, 'id');
++      if (resId) res.id = resId;
++      const resError = mOptStr(parsed.error, 'error');
++      if (resError) res.error = resError;
++      if (parsed.has_more !== undefined && parsed.has_more !== null) {
++        res.has_more = mBool(parsed.has_more, 'has_more');
++      }
++      if (parsed.retry_after_ms !== undefined && parsed.retry_after_ms !== null) {
++        const retryAfter = mNum(parsed.retry_after_ms, 'retry_after_ms');
++        if (!Number.isInteger(retryAfter) || retryAfter < 0) {
++          throw new Error('ctl field retry_after_ms must be a non-negative integer');
++        }
++        res.retry_after_ms = retryAfter;
++      }
++      return res;
++    }
++    case 'key.log.append': {
++      const append: Extract<MeshUplinkCtlMessage, { t: 'key.log.append' }> = {
++        t: 'key.log.append',
++        bytes: mB64(parsed.bytes, 'bytes'),
++        sig: mB64(parsed.sig, 'sig'),
++      };
++      const id = mOptStr(parsed.id, 'id');
++      if (id) append.id = id;
++      return append;
++    }
++    case 'key.log.ack': {
++      const ok = mBool(parsed.ok, 'ok');
++      const ack: MeshUplinkKeyLogAck = { t: 'key.log.ack', id: mStr(parsed.id, 'id'), ok };
++      if (ok) ack.seq = mSeq(parsed.seq, 'seq');
++      else ack.error = mStr(parsed.error, 'error');
++      return ack;
++    }
++    case 'rtc.signal': {
++      const from = mStr(parsed.from, 'from');
++      if (from !== 'browser' && from !== 'node') {
++        throw new Error('rtc.signal from must be browser|node');
++      }
++      return {
++        t: 'rtc.signal',
++        rtcSession: mStr(parsed.rtcSession, 'rtcSession'),
++        from,
++        to: mStr(parsed.to, 'to'),
++        sdp: mOptStr(parsed.sdp, 'sdp'),
++        candidate: mOptStr(parsed.candidate, 'candidate'),
++      };
++    }
++    case 'enroll.redeemed': {
++      const certificate = mB64(parsed.certificate, 'certificate');
++      if (certificate.byteLength > UPLINK_CTL_MAX_CERT_BYTES) {
++        throw new Error('ctl field certificate too large');
++      }
++      const msg: MeshUplinkEnrollRedeemed = {
++        t: 'enroll.redeemed',
++        certificate,
++        cert_sig: mB64(parsed.cert_sig, 'cert_sig', 64),
++        enroll_pk: mB64(parsed.enroll_pk, 'enroll_pk', 32),
++        nodeId: mNodeId(parsed.node_id, 'node_id'),
++      };
++      const entrySid = mOptStr(parsed.entry_sid, 'entry_sid');
++      if (entrySid) msg.entrySid = entrySid;
++      return msg;
++    }
++  }
++}
++
++export function encodeMeshUplinkCtl(msg: MeshUplinkCtlMessage): Uint8Array {
++  switch (msg.t) {
++    case 'auth.challenge':
++    case 'auth.response':
++    case 'auth.ok':
++    case 'ping':
++    case 'pong':
++    case 'node.status':
++      return encodeJsonBytes(msg);
++    case 'node.list':
++      return encodeJsonBytes({
++        t: 'node.list',
++        version: msg.version,
++        key_log_head: {
++          seq: seqToWire(msg.key_log_head.seq),
++          hash: encodeBase64url(msg.key_log_head.hash),
++        },
++        rtc: msg.rtc,
++        nodes: msg.nodes,
++        ...(msg.hub ? { hub: msg.hub } : {}),
++      });
++    case 'key.log.req':
++      return encodeJsonBytes({
++        t: 'key.log.req',
++        from_seq: seqToWire(msg.from_seq),
++        ...(msg.id ? { id: msg.id } : {}),
++        ...(msg.limit != null ? { limit: msg.limit } : {}),
++      });
++    case 'key.log.res':
++      return encodeJsonBytes({
++        t: 'key.log.res',
++        records: msg.records.map((row) => ({
++          seq: seqToWire(row.seq),
++          bytes: encodeBase64url(row.bytes),
++          sig: encodeBase64url(row.sig),
++        })),
++        ...(msg.id ? { id: msg.id } : {}),
++        ...(msg.error ? { error: msg.error } : {}),
++        ...(msg.has_more != null ? { has_more: msg.has_more } : {}),
++        ...(msg.retry_after_ms != null ? { retry_after_ms: msg.retry_after_ms } : {}),
++      });
++    case 'key.log.append':
++      return encodeJsonBytes({
++        t: 'key.log.append',
++        bytes: encodeBase64url(msg.bytes),
++        sig: encodeBase64url(msg.sig),
++        ...(msg.id ? { id: msg.id } : {}),
++      });
++    case 'key.log.ack':
++      return encodeJsonBytes({
++        t: 'key.log.ack',
++        id: msg.id,
++        ok: msg.ok,
++        ...(msg.ok ? { seq: seqToWire(msg.seq ?? 0n) } : { error: msg.error ?? 'error' }),
++      });
++    case 'rtc.signal':
++      return encodeJsonBytes({
++        t: 'rtc.signal',
++        rtcSession: msg.rtcSession,
++        from: msg.from,
++        to: msg.to,
++        ...(msg.sdp !== undefined ? { sdp: msg.sdp } : {}),
++        ...(msg.candidate !== undefined ? { candidate: msg.candidate } : {}),
++      });
++    case 'enroll.redeemed':
++      return encodeJsonBytes({
++        t: 'enroll.redeemed',
++        certificate: encodeBase64url(msg.certificate),
++        cert_sig: encodeBase64url(msg.cert_sig),
++        enroll_pk: encodeBase64url(msg.enroll_pk),
++        node_id: msg.nodeId,
++        ...(msg.entrySid ? { entry_sid: msg.entrySid } : {}),
++      });
++  }
++}
++
++export type AuthChallengeMessage = { t: 'auth.challenge'; nonce: string };
++export type AuthResponseMessage = { t: 'auth.response'; node_id: string; sig: string };
++export type AuthOkMessage = { t: 'auth.ok' };
++export type PingMessage = { t: 'ping' };
++export type PongMessage = { t: 'pong' };
++export type NodeStatusMessage = {
++  t: 'node.status';
++  version: string;
++  tmux: boolean;
++  direct_capable: boolean;
++  inventory: unknown;
++  endpoints: unknown;
++};
++export type NodeListEntry = {
++  id: string;
++  name: string;
++  online: boolean;
++  endpoints: unknown;
++  inventory: unknown;
++  direct_capable: boolean;
++  version: string | null;
++};
++type NodeListHubInfo = { nodeId: string; publicUrl: string; name?: string };
++export type NodeListMessage = {
++  t: 'node.list';
++  version: number;
++  key_log_head: { seq: number | string; hash: string };
++  rtc: { stun: string[]; turn: { url: string; username: string; credential: string } | null };
++  nodes: NodeListEntry[];
++  hub?: NodeListHubInfo;
++};
++export type KeyLogReqMessage = {
++  t: 'key.log.req';
++  from_seq: number | string;
++  id?: string;
++  limit?: number;
++};
++export type KeyLogRecordWire = { seq: number | string; bytes: string; sig: string };
++export type KeyLogResMessage = {
++  t: 'key.log.res';
++  records: KeyLogRecordWire[];
++  id?: string;
++  error?: string;
++  has_more?: boolean;
++  retry_after_ms?: number;
++};
++export type KeyLogAppendMessage = { t: 'key.log.append'; bytes: string; sig: string; id?: string };
++type KeyLogAckMessage = {
++  t: 'key.log.ack';
++  id: string;
++  ok: boolean;
++  seq?: number | string;
++  error?: string;
++};
++export type RtcSignalFrom = 'browser' | 'node';
++export type RtcSignalMessage = {
++  t: 'rtc.signal';
++  rtcSession: string;
++  from: RtcSignalFrom;
++  to: string;
++  sdp?: string;
++  candidate?: string;
++};
++export type EnrollRedeemedMessage = {
++  t: 'enroll.redeemed';
++  certificate: string;
++  cert_sig: string;
++  enroll_pk: string;
++  node_id: string;
++  entry_sid?: string;
++  already_admitted?: boolean;
++};
++export type HubUplinkCtlMessage =
++  | AuthChallengeMessage
++  | AuthResponseMessage
++  | AuthOkMessage
++  | PingMessage
++  | PongMessage
++  | NodeStatusMessage
++  | NodeListMessage
++  | KeyLogReqMessage
++  | KeyLogResMessage
++  | KeyLogAppendMessage
++  | KeyLogAckMessage
++  | RtcSignalMessage
++  | EnrollRedeemedMessage;
++
++function hStr(obj: Record<string, unknown>, key: string): string {
++  const value = obj[key];
++  if (typeof value !== 'string') throw new UplinkCtlError(`missing ${key}`);
++  return value;
++}
++
++function hNe(obj: Record<string, unknown>, key: string): string {
++  const value = hStr(obj, key);
++  if (value.length === 0) throw new UplinkCtlError(`empty ${key}`);
++  return value;
++}
++
++function hBool(obj: Record<string, unknown>, key: string): boolean {
++  const value = obj[key];
++  if (typeof value !== 'boolean') throw new UplinkCtlError(`missing ${key}`);
++  return value;
++}
++
++function hInt(obj: Record<string, unknown>, key: string): number {
++  const value = obj[key];
++  if (typeof value !== 'number' || !Number.isInteger(value))
++    throw new UplinkCtlError(`invalid ${key}`);
++  return value;
++}
++
++function hSeq(obj: Record<string, unknown>, key: string): number | string {
++  const value = obj[key];
++  if (typeof value === 'number' || typeof value === 'string') {
++    seqFromWire(value);
++    return value;
++  }
++  throw new UplinkCtlError(`invalid ${key}`);
++}
++
++function hNodeId(obj: Record<string, unknown>, key: string): string {
++  const value = hNe(obj, key);
++  if (!NODE_ID_HEX.test(value)) throw new UplinkCtlError(`invalid ${key}`);
++  return value;
++}
++
++function hEndpoints(value: unknown): unknown {
++  if (value === undefined || value === null) return null;
++  if (Array.isArray(value) && value.length > UPLINK_CTL_MAX_ENDPOINTS) {
++    throw new UplinkCtlError('too many endpoints');
++  }
++  return value;
++}
++
++function hTurn(value: unknown): NodeListMessage['rtc']['turn'] {
++  if (value === null || value === undefined) return null;
++  if (!isRecord(value)) throw new UplinkCtlError('invalid rtc.turn');
++  return {
++    url: hNe(value, 'url'),
++    username: hStr(value, 'username'),
++    credential: hStr(value, 'credential'),
++  };
++}
++
++function decodeHubNodeList(obj: Record<string, unknown>): NodeListMessage {
++  if (!isRecord(obj.key_log_head)) throw new UplinkCtlError('invalid key_log_head');
++  const hashBytes = b64urlToBytes(hStr(obj.key_log_head, 'hash'), 32);
++  if (!isRecord(obj.rtc)) throw new UplinkCtlError('invalid rtc');
++  if (!Array.isArray(obj.rtc.stun) || obj.rtc.stun.some((s) => typeof s !== 'string')) {
++    throw new UplinkCtlError('invalid rtc.stun');
++  }
++  if (!Array.isArray(obj.nodes)) throw new UplinkCtlError('invalid nodes');
++  const msg: NodeListMessage = {
++    t: 'node.list',
++    version: hInt(obj, 'version'),
++    key_log_head: { seq: hSeq(obj.key_log_head, 'seq'), hash: bytesToB64url(hashBytes) },
++    rtc: { stun: obj.rtc.stun as string[], turn: hTurn(obj.rtc.turn) },
++    nodes: obj.nodes.map((value) => {
++      if (!isRecord(value)) throw new UplinkCtlError('invalid node entry');
++      const version = value.version;
++      if (version !== null && version !== undefined && typeof version !== 'string') {
++        throw new UplinkCtlError('invalid node.version');
++      }
++      return {
++        id: hNe(value, 'id'),
++        name: hStr(value, 'name'),
++        online: hBool(value, 'online'),
++        endpoints: hEndpoints(value.endpoints),
++        inventory: value.inventory ?? null,
++        direct_capable: hBool(value, 'direct_capable'),
++        version: typeof version === 'string' ? version : null,
++      };
++    }),
++  };
++  if (obj.hub !== undefined && obj.hub !== null) {
++    if (!isRecord(obj.hub)) throw new UplinkCtlError('invalid hub');
++    const info: NodeListHubInfo = {
++      nodeId: hNe(obj.hub, 'nodeId'),
++      publicUrl: hNe(obj.hub, 'publicUrl'),
++    };
++    if (obj.hub.name !== undefined && obj.hub.name !== null) info.name = hNe(obj.hub, 'name');
++    msg.hub = info;
++  }
++  return msg;
++}
++
++function decodeHubInner(
++  input: Uint8Array | string,
++  opts?: { allowKeyLogRes?: boolean }
++): HubUplinkCtlMessage {
++  const byteLength = typeof input === 'string' ? te.encode(input).byteLength : input.byteLength;
++  if (byteLength > UPLINK_CTL_MAX_BYTES) throw new UplinkCtlError('ctl too large');
++  const text = typeof input === 'string' ? input : td.decode(input);
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(text);
++  } catch {
++    throw new UplinkCtlError('invalid json');
++  }
++  const parsedT = isRecord(parsed) ? parsed.t : undefined;
++  if (parsedT === 'key.log.res' && !opts?.allowKeyLogRes) {
++    throw new UplinkCtlError('unexpected key.log.res');
++  }
++  if (parsedT !== 'key.log.res') assertCtlBounds(parsed, 0);
++  if (!isRecord(parsed)) throw new UplinkCtlError('invalid ctl');
++  const t = parsed.t;
++  if (typeof t !== 'string' || !TYPE_SET.has(t))
++    throw new UplinkCtlError(`unknown t: ${String(t)}`);
++  switch (t as UplinkCtlType) {
++    case 'auth.challenge':
++      return {
++        t: 'auth.challenge',
++        nonce: bytesToB64url(b64urlToBytes(hStr(parsed, 'nonce'), 32)),
++      };
++    case 'auth.response':
++      return {
++        t: 'auth.response',
++        node_id: hNodeId(parsed, 'node_id'),
++        sig: bytesToB64url(b64urlToBytes(hStr(parsed, 'sig'), 64)),
++      };
++    case 'auth.ok':
++      return { t: 'auth.ok' };
++    case 'ping':
++      return { t: 'ping' };
++    case 'pong':
++      return { t: 'pong' };
++    case 'node.status':
++      return {
++        t: 'node.status',
++        version: hStr(parsed, 'version'),
++        tmux: hBool(parsed, 'tmux'),
++        direct_capable: hBool(parsed, 'direct_capable'),
++        inventory: parsed.inventory ?? null,
++        endpoints: hEndpoints(parsed.endpoints),
++      };
++    case 'node.list':
++      return decodeHubNodeList(parsed);
++    case 'key.log.req': {
++      const req: KeyLogReqMessage = { t: 'key.log.req', from_seq: hSeq(parsed, 'from_seq') };
++      if (parsed.id !== undefined && parsed.id !== null) req.id = hNe(parsed, 'id');
++      if (parsed.limit !== undefined && parsed.limit !== null) {
++        req.limit = hInt(parsed, 'limit');
++        if (req.limit < 1) throw new UplinkCtlError('invalid limit');
++      }
++      return req;
++    }
++    case 'key.log.res': {
++      if (!Array.isArray(parsed.records)) throw new UplinkCtlError('invalid records');
++      const records = parsed.records.map((item) => {
++        if (!isRecord(item)) throw new UplinkCtlError('invalid record');
++        return {
++          seq: hSeq(item, 'seq'),
++          bytes: bytesToB64url(b64urlToBytes(hStr(item, 'bytes'))),
++          sig: bytesToB64url(b64urlToBytes(hStr(item, 'sig'), 64)),
++        };
++      });
++      if (records.length > KEY_LOG_PAGE_MAX_LIMIT)
++        throw new UplinkCtlError('key.log.res too many records');
++      const res: KeyLogResMessage = { t: 'key.log.res', records };
++      if (parsed.id !== undefined && parsed.id !== null) res.id = hNe(parsed, 'id');
++      if (parsed.error !== undefined && parsed.error !== null) res.error = hNe(parsed, 'error');
++      if (parsed.has_more !== undefined && parsed.has_more !== null) {
++        res.has_more = hBool(parsed, 'has_more');
++      }
++      if (parsed.retry_after_ms !== undefined && parsed.retry_after_ms !== null) {
++        res.retry_after_ms = hInt(parsed, 'retry_after_ms');
++        if (res.retry_after_ms < 0) throw new UplinkCtlError('invalid retry_after_ms');
++      }
++      return res;
++    }
++    case 'key.log.append': {
++      const msg: KeyLogAppendMessage = {
++        t: 'key.log.append',
++        bytes: bytesToB64url(b64urlToBytes(hStr(parsed, 'bytes'))),
++        sig: bytesToB64url(b64urlToBytes(hStr(parsed, 'sig'), 64)),
++      };
++      if (parsed.id !== undefined && parsed.id !== null) msg.id = hNe(parsed, 'id');
++      return msg;
++    }
++    case 'key.log.ack': {
++      const ok = hBool(parsed, 'ok');
++      const msg: KeyLogAckMessage = { t: 'key.log.ack', id: hNe(parsed, 'id'), ok };
++      if (ok) msg.seq = hSeq(parsed, 'seq');
++      else msg.error = hNe(parsed, 'error');
++      return msg;
++    }
++    case 'rtc.signal': {
++      const from = parsed.from;
++      if (from !== 'browser' && from !== 'node') throw new UplinkCtlError('invalid rtc.from');
++      if (parsed.sdp !== undefined && parsed.sdp !== null && typeof parsed.sdp !== 'string') {
++        throw new UplinkCtlError('invalid rtc.sdp');
++      }
++      if (
++        parsed.candidate !== undefined &&
++        parsed.candidate !== null &&
++        typeof parsed.candidate !== 'string'
++      ) {
++        throw new UplinkCtlError('invalid rtc.candidate');
++      }
++      const msg: RtcSignalMessage = {
++        t: 'rtc.signal',
++        rtcSession: hNe(parsed, 'rtcSession'),
++        from,
++        to: hNe(parsed, 'to'),
++      };
++      if (typeof parsed.sdp === 'string') msg.sdp = parsed.sdp;
++      if (typeof parsed.candidate === 'string') msg.candidate = parsed.candidate;
++      return msg;
++    }
++    case 'enroll.redeemed': {
++      const certBytes = b64urlToBytes(hStr(parsed, 'certificate'));
++      if (certBytes.byteLength > UPLINK_CTL_MAX_CERT_BYTES)
++        throw new UplinkCtlError('certificate too large');
++      const msg: EnrollRedeemedMessage = {
++        t: 'enroll.redeemed',
++        certificate: bytesToB64url(certBytes),
++        cert_sig: bytesToB64url(b64urlToBytes(hStr(parsed, 'cert_sig'), 64)),
++        enroll_pk: bytesToB64url(b64urlToBytes(hStr(parsed, 'enroll_pk'), 32)),
++        node_id: hNodeId(parsed, 'node_id'),
++      };
++      if (parsed.entry_sid !== undefined && parsed.entry_sid !== null) {
++        msg.entry_sid = hNe(parsed, 'entry_sid');
++      }
++      if (parsed.already_admitted !== undefined && parsed.already_admitted !== null) {
++        msg.already_admitted = hBool(parsed, 'already_admitted');
++      }
++      return msg;
++    }
++  }
++  throw new UplinkCtlError(`unknown t: ${t}`);
++}
++
++export function decodeHubUplinkCtl(
++  input: Uint8Array | string,
++  opts?: { allowKeyLogRes?: boolean }
++): HubUplinkCtlMessage {
++  return wrapHub(() => decodeHubInner(input, opts));
++}
++
++export function encodeHubUplinkCtl(msg: HubUplinkCtlMessage): Uint8Array {
++  return encodeJsonBytes(msg);
++}

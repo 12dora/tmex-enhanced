@@ -1,0 +1,3491 @@
+diff --git a/apps/fe/src/auth/session-key-store.ts b/apps/fe/src/auth/session-key-store.ts
+index 7fb17f26..62190283 100644
+--- a/apps/fe/src/auth/session-key-store.ts
++++ b/apps/fe/src/auth/session-key-store.ts
+@@ -410,6 +410,16 @@ interface LoginToNodeOptions {
+ /** self bootstrap 登录时用过的 nodePk，登录后必须与 mesh 列表里的公钥核对。 */
+ let selfChallengePk: Uint8Array | null = null;
+ 
++/** 需要 TOTP 但码不在内存里 → null（回 TOTP_REQUIRED，一个请求都不发）；不需要 TOTP → undefined。 */
++function resolveTotp(session: SessionKeyInfo) {
++  if (session.method !== 'root' || !session.hasTotp) return undefined;
++  if (!current?.kTotp || !current.totpCode) return null;
++  return { code: current.totpCode, k_totp: encodeBase64url(current.kTotp) };
++}
++
++const pinnedPkOk = (targetPk: Uint8Array, node: MeshNode | undefined): boolean =>
++  !node || bytesEqual(targetPk, decodeBase64url(node.publicKey));
++
+ /**
+  * 对单台 node 执行设计 §2「登录」的 1–3 步。
+  * 第 1 步拿到的 `nodePk` 必须与 `/api/mesh/nodes` 中该 node 的公钥一致，
+@@ -417,36 +427,27 @@ let selfChallengePk: Uint8Array | null = null;
+  */
+ export async function loginToNode(
+   nodeId: string,
+-  opts: LoginToNodeOptions = {}
++  { api = defaultAuthApi, node: knownNode, selfBootstrap }: LoginToNodeOptions = {}
+ ): Promise<LoginNodeResult> {
+   const session = getSessionKey();
+   if (!current || !session) return { ok: false, code: 'NO_SESSION_KEY' };
+-  const api = opts.api ?? defaultAuthApi;
+ 
+-  let node = opts.node;
+-  if (!node && !(opts.selfBootstrap && nodeId === SELF_NODE_ID)) {
++  let node = knownNode;
++  if (!node && !(selfBootstrap && nodeId === SELF_NODE_ID)) {
+     const nodes = await api.listNodes().catch(() => null);
+     if (!nodes) return { ok: false, code: 'NETWORK_ERROR' };
+     node = nodes.find((item) => item.id === nodeId);
+     if (!node) return { ok: false, code: 'UNKNOWN_NODE' };
+   }
+ 
+-  // 需要 TOTP 但码不在内存里 → null（回 TOTP_REQUIRED，一个请求都不发）；不需要 TOTP → undefined。
+-  const totp =
+-    session.method === 'root' && session.hasTotp
+-      ? current.kTotp && current.totpCode
+-        ? { code: current.totpCode, k_totp: encodeBase64url(current.kTotp) }
+-        : null
+-      : undefined;
++  const totp = resolveTotp(session);
+   if (totp === null) return { ok: false, code: 'TOTP_REQUIRED' };
+ 
+   const challenge = await api.challenge(nodeId, session.uid).catch(() => null);
+   if (!challenge) return { ok: false, code: 'NETWORK_ERROR' };
+ 
+   const targetPk = decodeBase64url(challenge.nodePk);
+-  if (node && !bytesEqual(targetPk, decodeBase64url(node.publicKey))) {
+-    return { ok: false, code: 'NODE_PK_MISMATCH' };
+-  }
++  if (!pinnedPkOk(targetPk, node)) return { ok: false, code: 'NODE_PK_MISMATCH' };
+   if (!node) selfChallengePk = targetPk;
+ 
+   const login = buildLogin({
+@@ -457,15 +458,14 @@ export async function loginToNode(
+     uid: session.uid,
+     entry: session.entryNodeId,
+   });
+-  const result = await api
+-    .login(nodeId, {
+-      login: encodeBase64url(encodeLogin(login)),
+-      sig: encodeBase64url(signLogin(current.sessSk, login)),
+-      delegation: encodeBase64url(current.delegationBytes),
+-      delegation_sig: encodeBase64url(current.delegationSig),
+-      ...(totp ? { totp } : {}),
+-    })
+-    .catch(() => null);
++  const body = {
++    login: encodeBase64url(encodeLogin(login)),
++    sig: encodeBase64url(signLogin(current.sessSk, login)),
++    delegation: encodeBase64url(current.delegationBytes),
++    delegation_sig: encodeBase64url(current.delegationSig),
++    totp,
++  };
++  const result = await api.login(nodeId, body).catch(() => null);
+   if (!result) return { ok: false, code: 'NETWORK_ERROR' };
+   return result.ok ? { ok: true } : { ok: false, code: result.code };
+ }
+@@ -504,7 +504,7 @@ export async function loginSelf(opts: LoginSelfOptions = {}): Promise<LoginNodeR
+   const selfRow = nodes.find((node) => node.id === current?.info.entryNodeId);
+   const pinnedPk = selfChallengePk;
+   selfChallengePk = null;
+-  if (selfRow && pinnedPk && !bytesEqual(pinnedPk, decodeBase64url(selfRow.publicKey))) {
++  if (pinnedPk && !pinnedPkOk(pinnedPk, selfRow)) {
+     clearSessionKey();
+     return { ok: false, code: 'NODE_PK_MISMATCH' };
+   }
+@@ -540,7 +540,7 @@ export function ensureNodeLogin(
+   if (existing) return existing;
+   if (!hasSessionKey()) return Promise.resolve({ ok: false, code: 'NO_SESSION_KEY' });
+ 
+-  const task = loginToNode(nodeId, { api: opts.api, node: opts.node })
++  const task = loginToNode(nodeId, opts)
+     .then((result) => {
+       if (result.ok) markLoggedIn(nodeId);
+       return result;
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+index bc93fd98..17f636cb 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx
+@@ -5,7 +5,6 @@ import { useGlobalDevice } from '@/components/global-device-provider';
+ import {
+   SideBarDeviceList as DeviceTreeSideBarDeviceList,
+   shouldHideSidebarNodeSection,
+-  useDeviceTreeSelection,
+   useSidebarDeviceStats,
+ } from '@tmex/panels/device-tree';
+ import { useRuntime } from '@tmex/stores/react';
+@@ -40,8 +39,8 @@ export interface SideBarDeviceListForRuntimeProps {
+ function DeviceTree({
+   expansionKeyFor,
+   emptyLabel,
+-  pinnedDeviceId,
+-}: Omit<SideBarDeviceListForRuntimeProps, 'section'> & { pinnedDeviceId?: string }) {
++  pinnedDeviceIds,
++}: Omit<SideBarDeviceListForRuntimeProps, 'section'> & { pinnedDeviceIds?: readonly string[] }) {
+   const { ensureDeviceSubscribed, connection } = useGlobalDevice();
+   const agentUi = useRuntime().features.agentUi;
+   const agentAdapter = useSidebarAgentAdapter();
+@@ -53,7 +52,7 @@ function DeviceTree({
+       agent={agentUi ? agentAdapter : undefined}
+       expansionKeyFor={expansionKeyFor}
+       emptyLabel={emptyLabel}
+-      pinnedDeviceId={pinnedDeviceId}
++      pinnedDeviceIds={pinnedDeviceIds}
+     />
+   );
+ 
+@@ -75,9 +74,8 @@ function NodeSection({
+   const visible =
+     stats.failed || !shouldHideSidebarNodeSection(stats, section.keepWhenNoDevices ?? false);
+   // 切 node 会让「选中的那台无条件保留」失效，整节可能就此隐藏：淡出后再卸载，别硬切；
+-  // 退场期间把上一个选中设备钉住，否则设备行先消失、只剩分节头在淡
+-  const { selectedDeviceId } = useDeviceTreeSelection();
+-  const presence = useSectionPresence(visible, selectedDeviceId);
++  // 退场期间把上一帧的可见设备集合钉住，否则设备行先消失、只剩分节头在淡
++  const presence = useSectionPresence(visible, stats.visibleIds);
+   if (!presence.rendered) {
+     return null;
+   }
+@@ -90,7 +88,7 @@ function NodeSection({
+       className={cn('space-y-0.5', presence.className, section.containerClassName)}
+     >
+       {section.header}
+-      <DeviceTree {...rest} pinnedDeviceId={presence.value} />
++      <DeviceTree {...rest} pinnedDeviceIds={visible ? undefined : presence.value} />
+     </div>
+   );
+ }
+diff --git a/apps/fe/src/pages/settings/nodes/direct-section.tsx b/apps/fe/src/pages/settings/nodes/direct-section.tsx
+index edd08488..515baccf 100644
+--- a/apps/fe/src/pages/settings/nodes/direct-section.tsx
++++ b/apps/fe/src/pages/settings/nodes/direct-section.tsx
+@@ -156,6 +156,22 @@ export function useDirectMutations(api: DirectApi, callbacks: DirectMutationCall
+   };
+ }
+ 
++/** 徽章列表：不支持时只有一枚，支持时按「支持 / 安装 / 生效 / 已停用」顺序累加。 */
++function directBadges(direct: LocalDirectStatus, t: Translate): Array<[string, string]> {
++  const { supported, installed, enabled, capable, version } = direct;
++  if (!supported) return [['unsupported', t('nodes.machine.directUnsupported')]];
++  const installedText = version
++    ? t('nodes.machine.directInstalledVersion', { version })
++    : t('nodes.machine.directInstalled');
++  const badges: Array<[string, string]> = [
++    ['supported', t('nodes.machine.directSupported')],
++    ['installed', installed ? installedText : t('nodes.machine.directNotInstalled')],
++  ];
++  if (installed && capable) badges.push(['active', t('nodes.machine.directActive')]);
++  if (installed && !enabled) badges.push(['disabled', t('nodes.machine.directDisabled')]);
++  return badges;
++}
++
+ export function DirectSection({
+   direct,
+   busy,
+@@ -170,32 +186,18 @@ export function DirectSection({
+   onAction: (action: LocalDirectAction) => void;
+ }) {
+   const { t } = useTranslation();
+-  const { supported, installed, enabled, capable, version } = direct;
++  const { supported, installed, enabled } = direct;
+   const primary = installed ? 'remove' : 'install';
+   const PrimaryIcon = installed ? Trash2 : Download;
+-  const installedLabel = installed
+-    ? version
+-      ? t('nodes.machine.directInstalledVersion', { version })
+-      : t('nodes.machine.directInstalled')
+-    : t('nodes.machine.directNotInstalled');
+   return (
+     <>
+       <Row label={t('nodes.machine.direct')}>
+         <div className="flex flex-wrap items-center gap-2">
+-          {supported ? (
+-            <>
+-              <DirectBadge id="supported">{t('nodes.machine.directSupported')}</DirectBadge>
+-              <DirectBadge id="installed">{installedLabel}</DirectBadge>
+-              {installed && capable && (
+-                <DirectBadge id="active">{t('nodes.machine.directActive')}</DirectBadge>
+-              )}
+-              {installed && !enabled && (
+-                <DirectBadge id="disabled">{t('nodes.machine.directDisabled')}</DirectBadge>
+-              )}
+-            </>
+-          ) : (
+-            <DirectBadge id="unsupported">{t('nodes.machine.directUnsupported')}</DirectBadge>
+-          )}
++          {directBadges(direct, t).map(([id, text]) => (
++            <Badge key={id} variant="outline" data-testid={`local-machine-direct-${id}`}>
++              {text}
++            </Badge>
++          ))}
+           <Button
+             type="button"
+             size="xs"
+@@ -235,14 +237,6 @@ export function DirectSection({
+   );
+ }
+ 
+-function DirectBadge({ id, children }: { id: string; children: React.ReactNode }) {
+-  return (
+-    <Badge variant="outline" data-testid={`local-machine-direct-${id}`}>
+-      {children}
+-    </Badge>
+-  );
+-}
+-
+ export function RemoveConfirm({
+   open,
+   onConfirm,
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+index c68b3be2..ab3e2f83 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+@@ -46,11 +46,20 @@ export function NodesTable({ rows, ...deps }: { rows: NodeRow[] } & NodeActionDe
+   );
+ }
+ 
++function deriveNodeRow(row: NodeRow, t: (key: string) => string) {
++  return {
++    statusClass: row.online ? 'text-emerald-500' : 'text-muted-foreground',
++    statusText: t(row.online ? 'nodes.status.online' : 'nodes.status.offline'),
++    reachText: row.reach ? t(`nodes.reach.${row.reach}`) : '—',
++  };
++}
++
+ function NodeRowView({ row, ...deps }: { row: NodeRow } & NodeActionDeps) {
+   const { t } = useTranslation();
+   const { renaming, setRenaming, nameDraft, setNameDraft, busy, rename, revoke } =
+     useNodeRowActions(row, deps);
+   const disabledHint = deps.hubOnline ? undefined : t('nodes.hubOffline');
++  const view = deriveNodeRow(row, t);
+ 
+   return (
+     <tr className="border-b border-border/60 last:border-0" data-testid={`nodes-row-${row.id}`}>
+@@ -76,21 +85,12 @@ function NodeRowView({ row, ...deps }: { row: NodeRow } & NodeActionDeps) {
+         )}
+       </Td>
+       <Td>
+-        <span
+-          data-testid={`nodes-status-${row.id}`}
+-          className={row.online ? 'text-emerald-500' : 'text-muted-foreground'}
+-        >
+-          {row.online ? t('nodes.status.online') : t('nodes.status.offline')}
++        <span data-testid={`nodes-status-${row.id}`} className={view.statusClass}>
++          {view.statusText}
+         </span>
+       </Td>
+       <Td>
+-        <span data-testid={`nodes-reach-${row.id}`}>
+-          {row.reach === 'lan'
+-            ? t('nodes.reach.lan')
+-            : row.reach === 'relay'
+-              ? t('nodes.reach.relay')
+-              : '—'}
+-        </span>
++        <span data-testid={`nodes-reach-${row.id}`}>{view.reachText}</span>
+       </Td>
+       <Td>{row.version ?? '—'}</Td>
+       <Td>{row.lastSeenAt ? new Date(row.lastSeenAt).toLocaleString() : '—'}</Td>
+diff --git a/apps/gateway/src/hub/hub-runtime.ts b/apps/gateway/src/hub/hub-runtime.ts
+index 68cd53e9..9e962a97 100644
+--- a/apps/gateway/src/hub/hub-runtime.ts
++++ b/apps/gateway/src/hub/hub-runtime.ts
+@@ -209,10 +209,11 @@ export class HubRuntime {
+   handleUplinkOpen(ws: HubServerWebSocket): void {
+     const adapter = new BunServerWsAdapter(ws);
+     ws.data.adapter = adapter;
+-    const link = new WebSocketLink(adapter, { role: 'acceptor' });
+-    const remoteAddressValue = (ws as unknown as { remoteAddress?: unknown }).remoteAddress;
+-    const remoteAddress = typeof remoteAddressValue === 'string' ? remoteAddressValue : undefined;
+-    this.uplink.accept(link, remoteAddress ? { remoteAddress } : undefined);
++    const remote = (ws as unknown as { remoteAddress?: unknown }).remoteAddress;
++    this.uplink.accept(
++      new WebSocketLink(adapter, { role: 'acceptor' }),
++      typeof remote === 'string' ? { remoteAddress: remote } : undefined
++    );
+   }
+ 
+   handleUplinkMessage(ws: HubServerWebSocket, message: string | ArrayBuffer | Uint8Array): void {
+@@ -282,14 +283,14 @@ export class HubRuntime {
+     const nodeId = stored?.node_id ?? token.nodeId;
+     if (nodeId) body.node_id = nodeId;
+     const admitted = nodeId ? this.userStore.getCert(nodeId) : null;
+-    const alreadyAdmitted = Boolean(admitted && admitted.revokedLogSeq === null);
++    const alreadyAdmitted = admitted?.revokedLogSeq === null;
+     body.already_admitted = alreadyAdmitted;
+     if (alreadyAdmitted && admitted) {
+       body.certificate = encodeBase64url(admitted.certificateBytes);
+       body.cert_sig = encodeBase64url(admitted.certSig);
+     } else {
+-      if (stored?.certificate_b64) body.certificate = stored.certificate_b64;
+-      if (stored?.cert_sig_b64) body.cert_sig = stored.cert_sig_b64;
++      body.certificate = stored?.certificate_b64;
++      body.cert_sig = stored?.cert_sig_b64;
+     }
+     return json(body);
+   }
+@@ -328,22 +329,16 @@ export class HubRuntime {
+     } catch {
+       return json({ error: 'bad_record' }, 400);
+     }
+-    if (record.type !== 'revoke-node') {
+-      return json({ error: 'not_revoke_node' }, 400);
+-    }
++    if (record.type !== 'revoke-node') return json({ error: 'not_revoke_node' }, 400);
+     let payload: ReturnType<typeof decodeRevokeNodePayload>;
+     try {
+       payload = decodeRevokeNodePayload(record.payload);
+     } catch {
+       return json({ error: 'bad_payload' }, 400);
+     }
+-    if (nodeIdToHex(payload.node_id) !== nodeId) {
+-      return json({ error: 'node_mismatch' }, 400);
+-    }
++    if (nodeIdToHex(payload.node_id) !== nodeId) return json({ error: 'node_mismatch' }, 400);
+     const result = await this.keyLogSource.append(auth.userId, { bytes, sig });
+-    if (!result.ok) {
+-      return json({ error: result.error }, 400);
+-    }
++    if (!result.ok) return json({ error: result.error }, 400);
+     await this.uplink.applyAppendEffects(auth.userId, result);
+     return json({ ok: true, id: nodeId, status: 'revoked' });
+   }
+@@ -381,16 +376,14 @@ export class HubRuntime {
+     const authExp = Number(authorization.exp);
+     const bodyExp = typeof body.exp === 'number' ? body.exp : authExp;
+     const expiresAt = Math.min(authExp, bodyExp);
+-    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+-      return json({ error: 'expired' }, 400);
+-    }
++    if (!Number.isFinite(expiresAt) || expiresAt <= now) return json({ error: 'expired' }, 400);
+     if (this.userStore.getEnrollmentTokenByEnrollPublicKey(enrollPk)) {
+       return json({ error: 'duplicate_enroll_pk' }, 409);
+     }
+     const payload: StoredEnrollmentPayload = {
+       authorization_b64: encodeBase64url(authorizationBytes),
+       entry_node_id: auth.entryNodeId,
+-      ...(auth.sid ? { entry_sid: auth.sid } : {}),
++      ...(auth.sid && { entry_sid: auth.sid }),
+     };
+     const token = this.userStore.createEnrollmentToken({
+       id: crypto.randomUUID(),
+@@ -458,66 +451,59 @@ export class HubRuntime {
+     try {
+       parsed = parseRedeemRequest(body, this.userStore);
+     } catch (err) {
+-      if (err instanceof RedeemAbort) return json({ error: err.error }, err.status);
+-      return validationError(err);
++      return redeemCatch(err, true);
+     }
+-    const { hexId, token, stored, providedName, version, certBytes, certSig, certificate } =
+-      parsed;
++    try {
++      return await this.finishRedeem(parsed, body);
++    } catch (err) {
++      return redeemCatch(err, false);
++    }
++  }
++
++  private async finishRedeem(
++    parsed: ReturnType<typeof parseRedeemRequest>,
++    body: Record<string, unknown>
++  ): Promise<Response> {
++    const { hexId, token, stored, providedName, version, certBytes, certSig, certificate } = parsed;
+     const now = this.now();
++    let replayUserId: string | null = null;
++    let replacedExisting = false;
++    let alreadyAdmitted = false;
+     try {
+-      let replayUserId: string | null = null;
+-      let replacedExisting = false;
+-      let alreadyAdmitted = false;
+-      try {
+-        this.db.transaction((tx) => {
+-          const result = redeemInTransaction(tx as AuthDb, parsed, body, now);
+-          replacedExisting = result.replacedExisting;
+-          alreadyAdmitted = result.alreadyAdmitted;
+-        });
+-      } catch (err) {
+-        if (err instanceof RedeemReplay) replayUserId = err.userId;
+-        else throw err;
+-      }
+-      if (replacedExisting) {
+-        this.registry.updateMeta(
+-          hexId,
+-          {
+-            ...(providedName ? { name: providedName } : {}),
+-            ...(version ? { version } : {}),
+-          },
++      this.db.transaction((tx) => {
++        ({ replacedExisting, alreadyAdmitted } = redeemInTransaction(
++          tx as AuthDb,
++          parsed,
++          body,
+           now
+-        );
+-      }
+-      if (!replayUserId && stored.entry_node_id) {
+-        const admitted = alreadyAdmitted ? this.userStore.getCert(hexId) : null;
+-        this.uplink.sendTo(stored.entry_node_id, {
+-          t: 'enroll.redeemed',
+-          certificate: encodeBase64url(admitted?.certificateBytes ?? certBytes),
+-          cert_sig: encodeBase64url(admitted?.certSig ?? certSig),
+-          enroll_pk: encodeBase64url(certificate.enroll_pk),
+-          node_id: hexId,
+-          already_admitted: alreadyAdmitted,
+-          ...(stored.entry_sid ? { entry_sid: stored.entry_sid } : {}),
+-        });
+-      }
+-      if (replacedExisting) await this.uplink.broadcastNodeList(token.userId);
+-      if (replayUserId) {
+-        const replayedCert = this.userStore.getCert(hexId);
+-        alreadyAdmitted = Boolean(replayedCert && replayedCert.revokedLogSeq === null);
+-      }
+-      if (alreadyAdmitted) console.info(`[hub] already admitted node=${hexId}`);
+-      return this.redeemSuccessPayload(replayUserId ?? token.userId, alreadyAdmitted);
++        ));
++      });
+     } catch (err) {
+-      if (err instanceof RedeemAbort) return json({ error: err.error }, err.status);
+-      throw err;
++      if (!(err instanceof RedeemReplay)) throw err;
++      replayUserId = err.userId;
++    }
++    if (replacedExisting) this.registry.updateMeta(hexId, nameVersion(providedName, version), now);
++    if (!replayUserId && stored.entry_node_id) {
++      const admitted = alreadyAdmitted ? this.userStore.getCert(hexId) : null;
++      this.uplink.sendTo(stored.entry_node_id, {
++        t: 'enroll.redeemed',
++        certificate: encodeBase64url(admitted ? admitted.certificateBytes : certBytes),
++        cert_sig: encodeBase64url(admitted ? admitted.certSig : certSig),
++        enroll_pk: encodeBase64url(certificate.enroll_pk),
++        node_id: hexId,
++        already_admitted: alreadyAdmitted,
++        ...(stored.entry_sid && { entry_sid: stored.entry_sid }),
++      });
+     }
++    if (replacedExisting) await this.uplink.broadcastNodeList(token.userId);
++    if (replayUserId) alreadyAdmitted = this.userStore.getCert(hexId)?.revokedLogSeq === null;
++    if (alreadyAdmitted) console.info(`[hub] already admitted node=${hexId}`);
++    return this.redeemSuccessPayload(replayUserId ?? token.userId, alreadyAdmitted);
+   }
+ 
+   private async redeemSuccessPayload(userId: string, alreadyAdmitted: boolean): Promise<Response> {
+     const user = this.userStore.getById(userId);
+-    if (!user) {
+-      return json({ error: 'user_not_found' }, 500);
+-    }
++    if (!user) return json({ error: 'user_not_found' }, 500);
+     const records = await this.keyLogSource.list(user.id);
+     const certs = this.userStore.listCerts().filter((c) => c.userId === user.id);
+     return json({
+@@ -565,38 +551,53 @@ class RedeemReplay extends Error {
+   }
+ }
+ 
++function redeemCatch(err: unknown, parsePhase: boolean): Response {
++  if (err instanceof RedeemAbort) return json({ error: err.error }, err.status);
++  if (parsePhase) return validationError(err);
++  throw err;
++}
++
++function abortRedeem(cond: boolean, error: string, status = 400): asserts cond is false {
++  if (cond) throw new RedeemAbort(error, status);
++}
++
++function decodeOrAbort<T>(fn: () => T, error: string): T {
++  try {
++    return fn();
++  } catch {
++    throw new RedeemAbort(error, 400);
++  }
++}
++
++function nameVersion(
++  name: string | null,
++  version: string | null
++): { name?: string; version?: string } {
++  return { ...(name && { name }), ...(version && { version }) };
++}
++
+ function parseRedeemRequest(body: Record<string, unknown>, userStore: UserStore) {
+   const providedName = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : null;
+   const certBytes = requireB64url(body, 'certificate');
+   const certSig = requireB64url(body, 'cert_sig', 64);
+-  let certificate: ReturnType<typeof decodeCertificate>;
+-  try {
+-    certificate = decodeCertificate(certBytes);
+-  } catch {
+-    throw new RedeemAbort('bad_certificate', 400);
+-  }
++  const certificate = decodeOrAbort(() => decodeCertificate(certBytes), 'bad_certificate');
+   const token = userStore.getEnrollmentTokenByEnrollPublicKey(certificate.enroll_pk);
+   if (!token) throw new RedeemAbort('unknown_enrollment', 400);
+-  if (!verifyNodeCertificate(certBytes, certSig, token.enrollPublicKey)) {
+-    throw new RedeemAbort('bad_cert_sig', 400);
+-  }
++  abortRedeem(!verifyNodeCertificate(certBytes, certSig, token.enrollPublicKey), 'bad_cert_sig');
+   const stored = parseStoredEnrollment(token.authorizationJson);
+   if (!stored) throw new RedeemAbort('bad_token', 400);
+-  let authorization: ReturnType<typeof decodeAuthorization>;
+-  try {
+-    authorization = decodeAuthorization(decodeB64url(stored.authorization_b64));
+-  } catch {
+-    throw new RedeemAbort('bad_authorization', 400);
+-  }
+-  if (!bytesEqual(authorization.enroll_pk, certificate.enroll_pk)) {
+-    throw new RedeemAbort('enroll_pk_mismatch', 400);
+-  }
+-  if (authorization.uid !== certificate.uid || authorization.uid !== token.userId) {
+-    throw new RedeemAbort('uid_mismatch', 400);
+-  }
++  const authorization = decodeOrAbort(
++    () => decodeAuthorization(decodeB64url(stored.authorization_b64)),
++    'bad_authorization'
++  );
++  abortRedeem(!bytesEqual(authorization.enroll_pk, certificate.enroll_pk), 'enroll_pk_mismatch');
++  abortRedeem(
++    authorization.uid !== certificate.uid || authorization.uid !== token.userId,
++    'uid_mismatch'
++  );
+   return {
+     name: providedName ?? 'node',
+-    version: typeof body.version === 'string' ? body.version : '',
++    version: typeof body.version === 'string' && body.version ? body.version : null,
+     providedName,
+     certBytes,
+     certSig,
+@@ -639,70 +640,71 @@ function redeemInTransaction(
+     throw new RedeemAbort('reused', 400);
+   }
+   const userRow = store.getById(fresh.userId);
+-  if (!userRow) throw new RedeemAbort('user_not_found', 500);
+-  if (authorization.root_epoch !== userRow.rootEpoch) throw new RedeemAbort('epoch_mismatch', 400);
+-  if (fresh.expiresAt <= now) throw new RedeemAbort('expired', 400);
+   const existing = store.getNode(hexId);
+   const existingCert = store.getCert(hexId);
++  const keys = existing ? readNodeIdentityKeys(store, hexId) : null;
++  abortRedeem(!userRow, 'user_not_found', 500);
++  abortRedeem(authorization.root_epoch !== userRow?.rootEpoch, 'epoch_mismatch');
++  abortRedeem(fresh.expiresAt <= now, 'expired');
++  abortRedeem(
++    Boolean(
++      existing &&
++        (existing.userId !== fresh.userId ||
++          !keys ||
++          !bytesEqual(keys.edPk, certificate.ed_pk) ||
++          !bytesEqual(keys.x25519Pk, certificate.x25519_pk) ||
++          !verifyRedeemPop(body, certificate, keys.edPk, certBytes))
++    ),
++    'node_exists',
++    409
++  );
++  abortRedeem(
++    existingCert?.revokedLogSeq != null || existing?.status === 'revoked',
++    'node_revoked',
++    409
++  );
++  if (existing) detachEnrollmentTokensFromNode(authDb, hexId);
++  abortRedeem(
++    !store.consumeEnrollmentToken(certificate.enroll_pk, {
++      nodeId: hexId,
++      now,
++      authorizationJson: JSON.stringify({
++        ...stored,
++        certificate_b64: encodeBase64url(certBytes),
++        cert_sig_b64: encodeBase64url(certSig),
++        node_id: hexId,
++      } satisfies StoredEnrollmentPayload),
++    }),
++    'reused'
++  );
+   if (existing) {
+-    const existingKeys = readNodeIdentityKeys(store, hexId);
+-    if (
+-      existing.userId !== fresh.userId ||
+-      !existingKeys ||
+-      !bytesEqual(existingKeys.edPk, certificate.ed_pk) ||
+-      !bytesEqual(existingKeys.x25519Pk, certificate.x25519_pk) ||
+-      !verifyRedeemPop(body, certificate, existingKeys.edPk, certBytes)
+-    ) {
+-      throw new RedeemAbort('node_exists', 409);
+-    }
+-    if (existingCert?.revokedLogSeq != null || existing.status === 'revoked') {
+-      throw new RedeemAbort('node_revoked', 409);
+-    }
+-    detachEnrollmentTokensFromNode(authDb, hexId);
+-  } else if (existingCert?.revokedLogSeq != null) {
+-    throw new RedeemAbort('node_revoked', 409);
+-  }
+-  const alreadyAdmitted = Boolean(existingCert && existingCert.revokedLogSeq === null);
+-  const consumed = store.consumeEnrollmentToken(certificate.enroll_pk, {
+-    nodeId: hexId,
+-    now,
+-    authorizationJson: JSON.stringify({
+-      ...stored,
+-      certificate_b64: encodeBase64url(certBytes),
+-      cert_sig_b64: encodeBase64url(certSig),
+-      node_id: hexId,
+-    } satisfies StoredEnrollmentPayload),
+-  });
+-  if (!consumed) throw new RedeemAbort('reused', 400);
+-  if (existing) {
+-    patchNode(authDb, hexId, {
++    patchNode(authDb, hexId, { status: 'enrolled', ...nameVersion(providedName, version) });
++  } else {
++    store.createNode({
++      id: hexId,
++      userId: fresh.userId,
++      name,
+       status: 'enrolled',
+-      ...(providedName ? { name: providedName } : {}),
+-      ...(version ? { version } : {}),
++      version,
++      now,
+     });
+-    return { replacedExisting: true, alreadyAdmitted };
+   }
+-  store.createNode({
+-    id: hexId,
+-    userId: fresh.userId,
+-    name,
+-    status: 'enrolled',
+-    version: version || null,
+-    now,
+-  });
+-  return { replacedExisting: false, alreadyAdmitted };
++  return {
++    replacedExisting: Boolean(existing),
++    alreadyAdmitted: existingCert?.revokedLogSeq === null,
++  };
+ }
+ 
+ function parseStoredEnrollment(raw: string): StoredEnrollmentPayload | null {
+   try {
+-    const parsed: unknown = JSON.parse(raw);
+-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+-    const obj = parsed as Record<string, unknown>;
+-    if (typeof obj.authorization_b64 !== 'string') return null;
+-    const str = (key: string) => (typeof obj[key] === 'string' ? obj[key] : undefined);
++    const obj: unknown = JSON.parse(raw);
++    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
++    const rec = obj as Record<string, unknown>;
++    if (typeof rec.authorization_b64 !== 'string') return null;
++    const str = (key: string) => (typeof rec[key] === 'string' ? rec[key] : undefined);
+     return {
+-      authorization_b64: obj.authorization_b64,
+-      entry_node_id: typeof obj.entry_node_id === 'string' ? obj.entry_node_id : null,
++      authorization_b64: rec.authorization_b64,
++      entry_node_id: typeof rec.entry_node_id === 'string' ? rec.entry_node_id : null,
+       entry_sid: str('entry_sid'),
+       certificate_b64: str('certificate_b64'),
+       cert_sig_b64: str('cert_sig_b64'),
+diff --git a/apps/gateway/src/mesh/forwarder.ts b/apps/gateway/src/mesh/forwarder.ts
+index 382cc8e5..931b7fff 100644
+--- a/apps/gateway/src/mesh/forwarder.ts
++++ b/apps/gateway/src/mesh/forwarder.ts
+@@ -1,5 +1,4 @@
+ import { wsBorsh } from '@tmex/shared';
+-import type { LinkSession } from '@tmex/shared/link';
+ import { buildSetCookie, nodeSessionCookieName, parseCookies } from '../auth/cookies';
+ import {
+   AUTH_401_BODY_LIMIT,
+@@ -10,7 +9,6 @@ import {
+   MESH_REJECT_4401_KIND,
+   MESH_VIA_SELF,
+   type MeshHandleResult,
+-  type MeshRewritten,
+   type MeshServerWebSocket,
+   type MeshUpgradeServer,
+   type OpenedWsStream,
+@@ -20,7 +18,6 @@ import {
+   STREAM_FAILOVER_MAX_ATTEMPTS,
+   STREAM_FAILOVER_RESUME_WAIT_MS,
+   type StreamOpener,
+-  WS_CLOSE_LOGIN_REQUIRED,
+   X_TMEX_SESSION_RENEWED,
+   X_TMEX_SET_SESSION,
+   getMeshRequestContext,
+@@ -30,26 +27,23 @@ import {
+ import { isHttps, jsonError } from './session-middleware';
+ 
+ const AUTH_SKIP = new Set(['/api/auth/challenge', '/api/auth/login']);
+-
+ const RESPONSE_ALLOW = new Set([
+-  'content-type',
+   'content-length',
+   'content-range',
+   'accept-ranges',
+   'cache-control',
+   'etag',
+   'last-modified',
+-  'content-disposition',
+ ]);
+-
+ const DROP_ON_401_REWRITE = new Set([
+   'content-length',
+   'content-range',
+   'etag',
+   'content-disposition',
+ ]);
++const DROP_REQUEST_HEADERS = new Set(['cookie', 'authorization', 'host', 'connection', 'upgrade']);
+ 
+-export type ForwarderDeps = {
++type ForwarderDeps = {
+   nodeId: string;
+   peers: PeerLinkProvider;
+   streams: StreamOpener;
+@@ -57,13 +51,10 @@ export type ForwarderDeps = {
+   log?: (line: string) => void;
+ };
+ 
+-export type ForwardResult = MeshHandleResult;
+-
+ type ForwardMeta = {
+   nodeId: string;
+   auth: string;
+   cid?: string;
+-  link: LinkSession;
+   transport: PeerTransportKind | null;
+ };
+ 
+@@ -74,7 +65,6 @@ type ForwardPump = {
+   auth: string;
+   cid?: string;
+   stream: OpenedWsStream | null;
+-  boundLink: LinkSession | null;
+   boundTransport: PeerTransportKind | null;
+   replay: StreamReplayState;
+   generation: number;
+@@ -91,18 +81,14 @@ type ForwardPump = {
+ const pendingMeta = new WeakMap<OpenedWsStream, ForwardMeta>();
+ const IDEMPOTENT_HTTP = new Set(['GET', 'HEAD']);
+ 
+-const selfRewrites = new WeakMap<Request, string>();
+-
+ export function getSelfRewrite(req: Request): string | null {
+-  return selfRewrites.get(req) ?? getMeshRequestContext(req).selfRewrite ?? null;
++  return getMeshRequestContext(req).selfRewrite ?? null;
+ }
+ 
+-export function parseNodePrefix(pathname: string): { nodeId: string; rest: string } | null {
++function parseNodePrefix(pathname: string): { nodeId: string; rest: string } | null {
+   const match = pathname.match(/^\/n\/([^/]+)(\/.*)?$/);
+   if (!match) return null;
+-  const nodeId = decodeURIComponent(match[1] ?? '');
+-  const rest = match[2] && match[2].length > 0 ? match[2] : '/';
+-  return { nodeId, rest };
++  return { nodeId: decodeURIComponent(match[1] ?? ''), rest: match[2] || '/' };
+ }
+ 
+ export function rewriteSelf(req: Request, localNodeId: string): Request | null {
+@@ -113,19 +99,17 @@ export function rewriteSelf(req: Request, localNodeId: string): Request | null {
+   return rewriteRequest(req, parsed.rest + url.search);
+ }
+ 
+-export function rewriteRequest(req: Request, rewrite: string): Request {
++function rewriteRequest(req: Request, rewrite: string): Request {
+   const url = new URL(req.url);
+   const q = rewrite.indexOf('?');
+-  if (q === -1) {
+-    url.pathname = rewrite;
+-    url.search = '';
+-  } else {
+-    url.pathname = rewrite.slice(0, q);
+-    url.search = rewrite.slice(q);
+-  }
++  url.pathname = q === -1 ? rewrite : rewrite.slice(0, q);
++  url.search = q === -1 ? '' : rewrite.slice(q);
+   const inner = new Request(url, req);
+-  const ctx = getMeshRequestContext(req);
+-  setMeshRequestContext(inner, { ...ctx, via: MESH_VIA_SELF, selfRewrite: undefined });
++  setMeshRequestContext(inner, {
++    ...getMeshRequestContext(req),
++    via: MESH_VIA_SELF,
++    selfRewrite: undefined,
++  });
+   return inner;
+ }
+ 
+@@ -139,7 +123,7 @@ export class Forwarder {
+     this.log = deps.log ?? ((line) => console.info(line));
+   }
+ 
+-  async handle(req: Request, server: MeshUpgradeServer): Promise<ForwardResult> {
++  async handle(req: Request, server: MeshUpgradeServer): Promise<MeshHandleResult> {
+     const url = new URL(req.url);
+     const parsed = parseNodePrefix(url.pathname);
+     if (!parsed) return null;
+@@ -155,10 +139,6 @@ export class Forwarder {
+     return null;
+   }
+ 
+-  handleForwardSocketOpen(ws: MeshServerWebSocket): void {
+-    void ws;
+-  }
+-
+   handleForwardSocketMessage(ws: MeshServerWebSocket, message: unknown): void {
+     const pump = this.pumps.get(ws);
+     if (!pump || pump.browserClosed) return;
+@@ -197,7 +177,6 @@ export class Forwarder {
+       auth: meta?.auth ?? ws.data.auth ?? '',
+       cid: meta?.cid ?? ws.data.cid,
+       stream: null,
+-      boundLink: meta?.link ?? null,
+       boundTransport: meta?.transport ?? null,
+       replay: new StreamReplayState(),
+       generation: 0,
+@@ -211,19 +190,17 @@ export class Forwarder {
+       inflight: null,
+     };
+     this.pumps.set(ws, pump);
+-    this.bindStream(pump, stream, meta?.link ?? null, meta?.transport ?? null);
++    this.bindStream(pump, stream, meta?.transport ?? null);
+   }
+ 
+   private bindStream(
+     pump: ForwardPump,
+     stream: OpenedWsStream,
+-    link: LinkSession | null,
+     transport: PeerTransportKind | null
+   ): void {
+     pump.generation += 1;
+     const generation = pump.generation;
+     pump.stream = stream;
+-    pump.boundLink = link;
+     pump.boundTransport = transport;
+     pump.streamAlive = true;
+     stream.onMessage((bytes) => {
+@@ -241,17 +218,11 @@ export class Forwarder {
+   }
+ 
+   private handleRemoteBytes(pump: ForwardPump, bytes: Uint8Array): void {
+-    pump.replay.noteInbound(bytes);
++    const kind = pump.replay.noteInbound(bytes);
+     if (pump.resumeWait && pump.replay.isResumeReady()) {
+       pump.resumeWait();
+       pump.resumeWait = null;
+     }
+-    let kind: number | null = null;
+-    try {
+-      kind = wsBorsh.decodeEnvelope(bytes).kind;
+-    } catch {
+-      kind = null;
+-    }
+     if (kind === wsBorsh.KIND_HELLO_S2C) {
+       pump.helloWait?.();
+       pump.helloWait = null;
+@@ -280,55 +251,12 @@ export class Forwarder {
+     const from = pump.boundTransport ?? 'none';
+     const abort = new AbortController();
+     pump.failoverAbort = abort;
+-    const signal = abort.signal;
+     try {
+       for (let attempt = 0; attempt < STREAM_FAILOVER_MAX_ATTEMPTS; attempt += 1) {
+-        if (pump.browserClosed || signal.aborted) return;
+-        const delay = STREAM_FAILOVER_BACKOFF_MS[attempt] ?? 1600;
+-        if (delay > 0) {
+-          try {
+-            await this.sleep(delay, signal);
+-          } catch {
+-            return;
+-          }
+-        }
+-        if (pump.browserClosed || signal.aborted) return;
+-        let link: LinkSession;
+-        try {
+-          link = await this.deps.peers.getLink(pump.nodeId);
+-        } catch {
+-          continue;
+-        }
+-        if (pump.browserClosed || signal.aborted) return;
+-        const transport = this.deps.peers.transportOf?.(pump.nodeId) ?? null;
+-        let stream: OpenedWsStream;
+-        try {
+-          stream = await this.deps.streams.openWsStream(link, pump.auth, pump.cid);
+-        } catch {
+-          continue;
+-        }
+-        pump.inflight = stream;
+-        if (pump.browserClosed || signal.aborted) {
+-          this.discardStream(pump, stream);
+-          return;
+-        }
+-        this.bindStream(pump, stream, link, transport);
+-        pump.inflight = null;
+-        const resumed = await this.replaySubscription(pump, stream, signal);
+-        if (pump.browserClosed || signal.aborted) {
+-          this.discardStream(pump, stream);
+-          return;
+-        }
+-        if (!pump.streamAlive || pump.stream !== stream) continue;
+-        const to = transport ?? 'none';
+-        const desc = pump.replay.describeReplay();
+-        this.log(
+-          `[mesh][stream] failover stream=${pump.id} from=${from} to=${to} resumed=${resumed} mode=${desc.mode} panes=${desc.panes} cursor=${desc.cursor}`
+-        );
+-        pump.failingOver = false;
+-        pump.failoverAbort = null;
+-        this.flushQueue(pump);
+-        return;
++        const stream = await this.openFailoverStream(pump, abort.signal, attempt);
++        if (stream === 'aborted') return;
++        if (!stream) continue;
++        if (await this.completeFailover(pump, stream, from, abort.signal)) return;
+       }
+       this.closeBrowser(pump, { code: 1011, reason: 'failover-exhausted' });
+     } finally {
+@@ -339,42 +267,89 @@ export class Forwarder {
+     }
+   }
+ 
++  private async openFailoverStream(
++    pump: ForwardPump,
++    signal: AbortSignal,
++    attempt: number
++  ): Promise<OpenedWsStream | null | 'aborted'> {
++    if (pumpDead(pump, signal)) return 'aborted';
++    const delay = STREAM_FAILOVER_BACKOFF_MS[attempt] ?? 1600;
++    if (delay > 0) {
++      try {
++        await this.sleep(delay, signal);
++      } catch {
++        return 'aborted';
++      }
++    }
++    if (pumpDead(pump, signal)) return 'aborted';
++    const link = await this.deps.peers.getLink(pump.nodeId).catch(() => null);
++    if (pumpDead(pump, signal)) return 'aborted';
++    if (!link) return null;
++    const transport = this.deps.peers.transportOf?.(pump.nodeId) ?? null;
++    const stream = await this.deps.streams
++      .openWsStream(link, pump.auth, pump.cid)
++      .catch(() => null);
++    if (!stream) return pumpDead(pump, signal) ? 'aborted' : null;
++    pump.inflight = stream;
++    if (pumpDead(pump, signal)) {
++      this.discardStream(pump, stream);
++      return 'aborted';
++    }
++    this.bindStream(pump, stream, transport);
++    pump.inflight = null;
++    return stream;
++  }
++
++  private async completeFailover(
++    pump: ForwardPump,
++    stream: OpenedWsStream,
++    from: string,
++    signal: AbortSignal
++  ): Promise<boolean> {
++    const resumed = await this.replaySubscription(pump, stream, signal);
++    if (pumpDead(pump, signal)) {
++      this.discardStream(pump, stream);
++      return true;
++    }
++    if (!pump.streamAlive || pump.stream !== stream) return false;
++    const desc = pump.replay.describeReplay();
++    this.log(
++      `[mesh][stream] failover stream=${pump.id} from=${from} to=${pump.boundTransport ?? 'none'} resumed=${resumed} mode=${desc.mode} panes=${desc.panes} cursor=${desc.cursor}`
++    );
++    pump.failingOver = false;
++    pump.failoverAbort = null;
++    this.flushQueue(pump);
++    return true;
++  }
++
+   private async replaySubscription(
+     pump: ForwardPump,
+     stream: OpenedWsStream,
+     signal: AbortSignal
+   ): Promise<number> {
+     pump.replay.beginResume();
+-    const hello = pump.replay.hello;
+-    if (hello) {
++    const wait = async (key: 'helloWait' | 'resumeWait', ms: number, before?: () => void) => {
+       const waited = new Promise<void>((resolve) => {
+-        pump.helloWait = resolve;
++        pump[key] = resolve;
+       });
+-      stream.send(hello);
+-      await Promise.race([waited, this.sleep(2_000, signal).catch(() => undefined)]);
+-      pump.helloWait = null;
+-    }
+-    for (const frame of pump.replay.buildConnectFrames()) {
+-      if (signal.aborted || pump.browserClosed) break;
+-      stream.send(frame);
+-    }
++      before?.();
++      await Promise.race([waited, this.sleep(ms, signal).catch(() => undefined)]);
++      pump[key] = null;
++    };
++    const hello = pump.replay.hello;
++    if (hello) await wait('helloWait', 2_000, () => stream.send(hello));
++    const sendAll = (frames: Uint8Array[]): void => {
++      for (const frame of frames) {
++        if (pumpDead(pump, signal)) return;
++        stream.send(frame);
++      }
++    };
++    sendAll(pump.replay.buildConnectFrames());
+     if (pump.replay.devices.size > 0 && !pump.replay.isResumeReady()) {
+-      const waited = new Promise<void>((resolve) => {
+-        pump.resumeWait = resolve;
+-      });
+-      await Promise.race([
+-        waited,
+-        this.sleep(STREAM_FAILOVER_RESUME_WAIT_MS, signal).catch(() => undefined),
+-      ]);
+-      pump.resumeWait = null;
+-    }
+-    for (const frame of pump.replay.buildPostConnectFrames()) {
+-      if (signal.aborted || pump.browserClosed) break;
+-      stream.send(frame);
+-    }
+-    if (!signal.aborted && !pump.browserClosed) {
+-      pump.replay.markCanonicalResumeSent();
++      await wait('resumeWait', STREAM_FAILOVER_RESUME_WAIT_MS);
+     }
++    sendAll(pump.replay.buildPostConnectFrames());
++    if (!pumpDead(pump, signal)) pump.replay.markCanonicalResumeSent();
+     return pump.replay.resumedPaneCount();
+   }
+ 
+@@ -396,9 +371,7 @@ export class Forwarder {
+     }
+     try {
+       stream.close();
+-    } catch {
+-      // already closed
+-    }
++    } catch {}
+   }
+ 
+   private closeBrowser(pump: ForwardPump, info: { code?: number; reason?: string }): void {
+@@ -407,20 +380,20 @@ export class Forwarder {
+     this.pumps.delete(pump.ws);
+     try {
+       pump.ws.close(info.code, info.reason);
+-    } catch {
+-      // already closed
+-    }
++    } catch {}
+   }
+ 
+   private isLocalNode(id: string): boolean {
+     return id === MESH_VIA_SELF || id === this.deps.nodeId;
+   }
+ 
+-  private handleSelf(req: Request, rest: string, search: string): MeshRewritten {
++  private handleSelf(req: Request, rest: string, search: string) {
+     const rewrite = rest + search;
+-    selfRewrites.set(req, rewrite);
+-    const ctx = getMeshRequestContext(req);
+-    setMeshRequestContext(req, { ...ctx, via: MESH_VIA_SELF, selfRewrite: rewrite });
++    setMeshRequestContext(req, {
++      ...getMeshRequestContext(req),
++      via: MESH_VIA_SELF,
++      selfRewrite: rewrite,
++    });
+     return { rewritten: rewriteRequest(req, rewrite) };
+   }
+ 
+@@ -429,54 +402,58 @@ export class Forwarder {
+     nodeId: string,
+     rest: string,
+     search: string
++  ): Promise<Response> {
++    const abort = new AbortController();
++    const onAbort = (): void => abort.abort();
++    req.signal.addEventListener('abort', onAbort, { once: true });
++    try {
++      return await this.forwardHttp(req, nodeId, rest, search, abort.signal);
++    } finally {
++      req.signal.removeEventListener('abort', onAbort);
++    }
++  }
++
++  private async forwardHttp(
++    req: Request,
++    nodeId: string,
++    rest: string,
++    search: string,
++    signal: AbortSignal
+   ): Promise<Response> {
+     const headers = filterRequestHeaders(req);
+-    const auth = AUTH_SKIP.has(stripQuery(rest))
++    const auth = AUTH_SKIP.has(rest)
+       ? null
+       : (parseCookies(req.headers.get('cookie')).get(nodeSessionCookieName(nodeId)) ?? null);
+     const origin = req.headers.get('origin') ?? new URL(req.url).origin;
+-    const abort = new AbortController();
+-    const onAbort = (): void => abort.abort();
+-    req.signal.addEventListener('abort', onAbort, { once: true });
+-    const body = req.body && req.method !== 'GET' && req.method !== 'HEAD' ? req.body : null;
+-    const retryable = IDEMPOTENT_HTTP.has(req.method) && !body;
++    const retryable = IDEMPOTENT_HTTP.has(req.method);
++    const body = retryable ? null : req.body;
+     const attempts = retryable ? HTTP_FAILOVER_MAX_ATTEMPTS : 1;
+-    try {
+-      for (let attempt = 0; attempt < attempts; attempt += 1) {
+-        if (abort.signal.aborted) break;
+-        if (attempt > 0) {
+-          try {
+-            await this.sleep(STREAM_FAILOVER_BACKOFF_MS[attempt] ?? 200, abort.signal);
+-          } catch {
+-            break;
+-          }
+-        }
+-        let link: LinkSession;
++    for (let attempt = 0; attempt < attempts; attempt += 1) {
++      if (signal.aborted) break;
++      if (attempt > 0) {
+         try {
+-          link = await this.deps.peers.getLink(nodeId);
++          await this.sleep(STREAM_FAILOVER_BACKOFF_MS[attempt] ?? 200, signal);
+         } catch {
+-          if (!retryable) break;
+-          continue;
+-        }
+-        try {
+-          return this.adaptResponse(
+-            req,
+-            await this.deps.streams.openHttpStream(
+-              link,
+-              { method: req.method, path: rest, query: search, headers, origin, auth },
+-              body,
+-              abort.signal
+-            ),
+-            nodeId
+-          );
+-        } catch {
+-          if (!retryable) break;
++          break;
+         }
+       }
+-      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+-    } finally {
+-      req.signal.removeEventListener('abort', onAbort);
++      try {
++        const link = await this.deps.peers.getLink(nodeId);
++        return await this.adaptResponse(
++          req,
++          await this.deps.streams.openHttpStream(
++            link,
++            { method: req.method, path: rest, query: search, headers, origin, auth },
++            body,
++            signal
++          ),
++          nodeId
++        );
++      } catch {
++        if (!retryable) break;
++      }
+     }
++    return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+   }
+ 
+   private async handleRemoteWs(
+@@ -489,30 +466,16 @@ export class Forwarder {
+       const upgraded = server.upgrade(req, {
+         data: { kind: MESH_REJECT_4401_KIND, nodeId, auth: null },
+       });
+-      if (!upgraded) {
+-        return jsonError('UNAUTHORIZED', 401, { code: 'NODE_LOGIN_REQUIRED', nodeId });
+-      }
+-      return undefined;
+-    }
+-    if (req.signal.aborted) {
+-      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+-    }
+-    let link: LinkSession;
+-    try {
+-      link = await this.deps.peers.getLink(nodeId);
+-    } catch {
+-      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+-    }
+-    if (req.signal.aborted) {
+-      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+-    }
+-    const cid = new URL(req.url).searchParams.get('cid')?.trim() || '';
+-    let stream: OpenedWsStream;
+-    try {
+-      stream = await this.deps.streams.openWsStream(link, auth, cid || undefined);
+-    } catch {
+-      return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+-    }
++      return upgraded
++        ? undefined
++        : jsonError('UNAUTHORIZED', 401, { code: 'NODE_LOGIN_REQUIRED', nodeId });
++    }
++    if (req.signal.aborted) return jsonError('NODE_UNREACHABLE', 503, { nodeId });
++    const link = await this.deps.peers.getLink(nodeId).catch(() => null);
++    if (!link || req.signal.aborted) return jsonError('NODE_UNREACHABLE', 503, { nodeId });
++    const cid = new URL(req.url).searchParams.get('cid')?.trim() || undefined;
++    const stream = await this.deps.streams.openWsStream(link, auth, cid).catch(() => null);
++    if (!stream) return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+     if (req.signal.aborted) {
+       stream.close();
+       return jsonError('NODE_UNREACHABLE', 503, { nodeId });
+@@ -522,12 +485,11 @@ export class Forwarder {
+     pendingMeta.set(stream, {
+       nodeId,
+       auth,
+-      cid: cid || undefined,
+-      link,
++      cid,
+       transport: this.deps.peers.transportOf?.(nodeId) ?? null,
+     });
+     const ok = server.upgrade(req, {
+-      data: { kind: MESH_FORWARD_WS_KIND, nodeId, auth, token, cid: cid || undefined },
++      data: { kind: MESH_FORWARD_WS_KIND, nodeId, auth, token, cid },
+     });
+     if (!ok) {
+       pendingStreams.delete(token);
+@@ -538,69 +500,11 @@ export class Forwarder {
+   }
+ 
+   private async adaptResponse(req: Request, upstream: Response, nodeId: string): Promise<Response> {
+-    const headers = new Headers();
+-    let contentType = '';
+-    let contentDisposition: string | null = null;
+-    upstream.headers.forEach((value, key) => {
+-      const lower = key.toLowerCase();
+-      if (lower === X_TMEX_SET_SESSION) return;
+-      if (lower === 'content-type') {
+-        contentType = value;
+-        return;
+-      }
+-      if (lower === 'content-disposition') {
+-        contentDisposition = value;
+-        return;
+-      }
+-      if (RESPONSE_ALLOW.has(lower) || lower.startsWith('x-tmex-')) headers.set(key, value);
+-    });
+-    const mime = baseMime(contentType);
+-    if (mime && MESH_ALLOWED_MIME.has(mime)) {
+-      headers.set('content-type', contentType || mime);
+-      if (contentDisposition) headers.set('content-disposition', contentDisposition);
+-    } else {
+-      headers.set('content-type', 'application/octet-stream');
+-      headers.set('content-disposition', 'attachment');
+-    }
+-    headers.set('content-security-policy', MESH_FORWARD_CSP);
+-    headers.set('x-content-type-options', 'nosniff');
+-
+-    const setSession = upstream.headers.get(X_TMEX_SET_SESSION);
+-    if (setSession) {
+-      const parsed = parseSetSessionHeader(setSession);
+-      if (parsed) appendNodeCookie(req, headers, nodeId, parsed.sid, parsed.maxAgeSec);
+-    }
+-    const renewed = upstream.headers.get(X_TMEX_SESSION_RENEWED);
+-    if (renewed) {
+-      headers.set(X_TMEX_SESSION_RENEWED, renewed);
+-      const sid = parseCookies(req.headers.get('cookie')).get(nodeSessionCookieName(nodeId));
+-      const expiresAt = Number(renewed);
+-      if (sid && Number.isFinite(expiresAt)) {
+-        appendNodeCookie(
+-          req,
+-          headers,
+-          nodeId,
+-          sid,
+-          Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
+-        );
+-      }
+-    }
+-    if (upstream.status !== 401) {
+-      return new Response(upstream.body, { status: upstream.status, headers });
+-    }
+-    const raw = await readBodyLimited(upstream, AUTH_401_BODY_LIMIT);
+-    let body: Record<string, unknown> = { code: 'NODE_LOGIN_REQUIRED', nodeId };
+-    try {
+-      const parsed = JSON.parse(raw) as unknown;
+-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+-        body = { ...(parsed as Record<string, unknown>), code: 'NODE_LOGIN_REQUIRED', nodeId };
+-      }
+-    } catch {
+-      if (raw) body.message = raw;
+-    }
+-    for (const name of DROP_ON_401_REWRITE) headers.delete(name);
+-    headers.set('content-type', 'application/json');
+-    return new Response(JSON.stringify(body), { status: 401, headers });
++    const headers = copyUpstreamHeaders(upstream);
++    return (
++      (await applyAuthPolicy(req, headers, upstream, nodeId)) ??
++      new Response(upstream.body, { status: upstream.status, headers })
++    );
+   }
+ }
+ 
+@@ -690,40 +594,37 @@ class StreamReplayState {
+           }
+         }
+       }
+-    } catch {
+-      // ignore undecodable tracking frames
+-    }
++    } catch {}
+   }
+ 
+-  noteInbound(bytes: Uint8Array): void {
++  noteInbound(bytes: Uint8Array): number | null {
+     let env: ReturnType<typeof wsBorsh.decodeEnvelope>;
+     try {
+       env = wsBorsh.decodeEnvelope(bytes);
+     } catch {
+-      return;
++      return null;
+     }
+     if (env.kind === wsBorsh.KIND_DEVICE_CONNECTED) {
+       const deviceId = this.noteDeviceConnected(bytes);
+       if (deviceId) this.resumeDevices.add(deviceId);
+-      return;
++      return env.kind;
+     }
+     if (env.kind === wsBorsh.KIND_STATE_SNAPSHOT || env.kind === wsBorsh.KIND_CHUNK) {
+       if (this.resumeDevices.size > 0) this.resumeSnapshot = true;
+-      return;
++      return env.kind;
+     }
+-    if (env.kind !== wsBorsh.KIND_CANONICAL_EVENT) return;
++    if (env.kind !== wsBorsh.KIND_CANONICAL_EVENT) return env.kind;
+     try {
+       const event = wsBorsh.decodeCanonicalEventPayload(env.payload).event;
+-      if (!('PaneData' in event)) return;
++      if (!('PaneData' in event)) return env.kind;
+       const paneData = event.PaneData;
+       this.paneCursors.set(paneCursorKey(paneData.pane.deviceId, paneData.pane.paneId), {
+         pane: paneData.pane,
+         paneEpoch: paneData.paneEpoch,
+         terminalSeq: paneData.seqEnd,
+       });
+-    } catch {
+-      // ignore
+-    }
++    } catch {}
++    return env.kind;
+   }
+ 
+   noteDeviceConnected(bytes: Uint8Array): string | null {
+@@ -755,14 +656,14 @@ class StreamReplayState {
+   }
+ 
+   buildPostConnectFrames(): Uint8Array[] {
+-    const frames: Uint8Array[] = [];
+     const canonical = this.buildCanonicalResume();
+-    if (canonical) frames.push(canonical);
+-    for (const frame of this.paneSubs.values()) frames.push(frame);
+-    for (const frame of this.lastSelect.values()) frames.push(frame);
+-    for (const frame of this.buildLegacyHistoryRequests()) frames.push(frame);
+-    for (const frame of this.agents.values()) frames.push(frame);
+-    return frames;
++    return [
++      ...(canonical ? [canonical] : []),
++      ...this.paneSubs.values(),
++      ...this.lastSelect.values(),
++      ...this.buildLegacyHistoryRequests(),
++      ...this.agents.values(),
++    ];
+   }
+ 
+   markCanonicalResumeSent(): void {
+@@ -810,29 +711,23 @@ class StreamReplayState {
+   }
+ 
+   describeReplay(): { mode: string; panes: string; cursor: string } {
+-    if (this.canonicalSub) {
+-      const rows = [...this.canonicalSub.activePanes, ...this.canonicalSub.hotPanes];
+-      const panes = rows.map((row) => row.pane.paneId);
+-      const cursorParts = rows.map((row) => {
+-        const cursor = this.paneCursors.get(paneCursorKey(row.pane.deviceId, row.pane.paneId));
+-        return cursor ? `${row.pane.paneId}:${cursor.terminalSeq}` : `${row.pane.paneId}:-`;
+-      });
++    const rows = this.canonicalRows();
++    if (rows) {
+       return {
+         mode: 'canonical',
+-        panes: panes.join(',') || '-',
+-        cursor: cursorParts.join(',') || '-',
++        panes: rows.map((row) => row.pane.paneId).join(',') || '-',
++        cursor:
++          rows
++            .map((row) => {
++              const cursor = this.paneCursors.get(
++                paneCursorKey(row.pane.deviceId, row.pane.paneId)
++              );
++              return `${row.pane.paneId}:${cursor ? cursor.terminalSeq : '-'}`;
++            })
++            .join(',') || '-',
+       };
+     }
+-    const paneIds: string[] = [];
+-    for (const frame of this.paneSubs.values()) {
+-      try {
+-        const env = wsBorsh.decodeEnvelope(frame);
+-        const payload = wsBorsh.decodePayload(wsBorsh.schema.TmuxSubscribePanesSchema, env.payload);
+-        paneIds.push(...payload.paneIds);
+-      } catch {
+-        // ignore
+-      }
+-    }
++    const paneIds = this.paneSubPayloads().flatMap((row) => row?.paneIds ?? []);
+     return {
+       mode: paneIds.length > 0 ? 'legacy' : 'none',
+       panes: paneIds.join(',') || '-',
+@@ -841,58 +736,58 @@ class StreamReplayState {
+   }
+ 
+   resumedPaneCount(): number {
+-    if (this.canonicalSub) {
+-      const keys = new Set<string>();
+-      for (const row of this.canonicalSub.activePanes) {
+-        keys.add(paneCursorKey(row.pane.deviceId, row.pane.paneId));
+-      }
+-      for (const row of this.canonicalSub.hotPanes) {
+-        keys.add(paneCursorKey(row.pane.deviceId, row.pane.paneId));
+-      }
+-      return keys.size;
++    const rows = this.canonicalRows();
++    if (rows) {
++      return new Set(rows.map((row) => paneCursorKey(row.pane.deviceId, row.pane.paneId))).size;
+     }
+     let count = 0;
++    for (const row of this.paneSubPayloads()) count += row ? row.paneIds.length : 1;
++    return count;
++  }
++
++  private canonicalRows(): wsBorsh.CanonicalPaneSubscription[] | null {
++    return this.canonicalSub
++      ? [...this.canonicalSub.activePanes, ...this.canonicalSub.hotPanes]
++      : null;
++  }
++
++  private paneSubPayloads(): Array<{ deviceId: string; paneIds: string[] } | null> {
++    const out: Array<{ deviceId: string; paneIds: string[] } | null> = [];
+     for (const frame of this.paneSubs.values()) {
+       try {
+         const env = wsBorsh.decodeEnvelope(frame);
+-        const payload = wsBorsh.decodePayload(wsBorsh.schema.TmuxSubscribePanesSchema, env.payload);
+-        count += payload.paneIds.length;
++        out.push(wsBorsh.decodePayload(wsBorsh.schema.TmuxSubscribePanesSchema, env.payload));
+       } catch {
+-        count += 1;
++        out.push(null);
+       }
+     }
+-    return count;
++    return out;
+   }
+ 
+   private buildLegacyHistoryRequests(): Uint8Array[] {
+     if (this.canonicalSub) return [];
+     const frames: Uint8Array[] = [];
+     const seen = new Set<string>();
+-    for (const frame of this.paneSubs.values()) {
+-      try {
+-        const env = wsBorsh.decodeEnvelope(frame);
+-        const payload = wsBorsh.decodePayload(wsBorsh.schema.TmuxSubscribePanesSchema, env.payload);
+-        for (const paneId of payload.paneIds) {
+-          const key = `${payload.deviceId}\0${paneId}`;
+-          if (seen.has(key)) continue;
+-          seen.add(key);
+-          const requestToken = new Uint8Array(16);
+-          crypto.getRandomValues(requestToken);
+-          this.outboundSeq += 1;
+-          frames.push(
+-            wsBorsh.encodeEnvelope(
+-              wsBorsh.KIND_TMUX_FETCH_PANE_HISTORY,
+-              wsBorsh.encodePayload(wsBorsh.schema.TmuxFetchPaneHistorySchema, {
+-                deviceId: payload.deviceId,
+-                paneId,
+-                requestToken,
+-              }),
+-              this.outboundSeq
+-            )
+-          );
+-        }
+-      } catch {
+-        // ignore
++    for (const row of this.paneSubPayloads()) {
++      if (!row) continue;
++      for (const paneId of row.paneIds) {
++        const key = `${row.deviceId}\0${paneId}`;
++        if (seen.has(key)) continue;
++        seen.add(key);
++        const requestToken = new Uint8Array(16);
++        crypto.getRandomValues(requestToken);
++        this.outboundSeq += 1;
++        frames.push(
++          wsBorsh.encodeEnvelope(
++            wsBorsh.KIND_TMUX_FETCH_PANE_HISTORY,
++            wsBorsh.encodePayload(wsBorsh.schema.TmuxFetchPaneHistorySchema, {
++              deviceId: row.deviceId,
++              paneId,
++              requestToken,
++            }),
++            this.outboundSeq
++          )
++        );
+       }
+     }
+     return frames;
+@@ -928,10 +823,83 @@ const pendingStreams = new Map<string, OpenedWsStream>();
+ export function takePendingForwardStream(token: string | undefined): OpenedWsStream | undefined {
+   if (!token) return undefined;
+   const stream = pendingStreams.get(token);
+-  if (stream) pendingStreams.delete(token);
++  pendingStreams.delete(token);
+   return stream;
+ }
+ 
++function pumpDead(pump: ForwardPump, signal: AbortSignal): boolean {
++  return pump.browserClosed || signal.aborted;
++}
++
++function copyUpstreamHeaders(upstream: Response): Headers {
++  const headers = new Headers();
++  let contentType = '';
++  let contentDisposition: string | null = null;
++  upstream.headers.forEach((value, key) => {
++    const lower = key.toLowerCase();
++    if (lower === X_TMEX_SET_SESSION) return;
++    if (lower === 'content-type') {
++      contentType = value;
++      return;
++    }
++    if (lower === 'content-disposition') {
++      contentDisposition = value;
++      return;
++    }
++    if (RESPONSE_ALLOW.has(lower) || lower.startsWith('x-tmex-')) headers.set(key, value);
++  });
++  const mime = baseMime(contentType);
++  if (mime && MESH_ALLOWED_MIME.has(mime)) {
++    headers.set('content-type', contentType || mime);
++    if (contentDisposition) headers.set('content-disposition', contentDisposition);
++  } else {
++    headers.set('content-type', 'application/octet-stream');
++    headers.set('content-disposition', 'attachment');
++  }
++  headers.set('content-security-policy', MESH_FORWARD_CSP);
++  headers.set('x-content-type-options', 'nosniff');
++  return headers;
++}
++
++async function applyAuthPolicy(
++  req: Request,
++  headers: Headers,
++  upstream: Response,
++  nodeId: string
++): Promise<Response | null> {
++  const parsed = parseSetSessionHeader(upstream.headers.get(X_TMEX_SET_SESSION) ?? '');
++  if (parsed) appendNodeCookie(req, headers, nodeId, parsed.sid, parsed.maxAgeSec);
++  const renewed = upstream.headers.get(X_TMEX_SESSION_RENEWED);
++  if (renewed) {
++    headers.set(X_TMEX_SESSION_RENEWED, renewed);
++    const sid = parseCookies(req.headers.get('cookie')).get(nodeSessionCookieName(nodeId));
++    const expiresAt = Number(renewed);
++    if (sid && Number.isFinite(expiresAt)) {
++      appendNodeCookie(
++        req,
++        headers,
++        nodeId,
++        sid,
++        Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
++      );
++    }
++  }
++  if (upstream.status !== 401) return null;
++  const raw = await readBodyLimited(upstream, AUTH_401_BODY_LIMIT);
++  let body: Record<string, unknown> = { code: 'NODE_LOGIN_REQUIRED', nodeId };
++  try {
++    const parsedBody = JSON.parse(raw) as unknown;
++    if (typeof parsedBody === 'object' && parsedBody !== null && !Array.isArray(parsedBody)) {
++      body = { ...(parsedBody as Record<string, unknown>), code: 'NODE_LOGIN_REQUIRED', nodeId };
++    }
++  } catch {
++    if (raw) body.message = raw;
++  }
++  for (const name of DROP_ON_401_REWRITE) headers.delete(name);
++  headers.set('content-type', 'application/json');
++  return new Response(JSON.stringify(body), { status: 401, headers });
++}
++
+ function appendNodeCookie(
+   req: Request,
+   headers: Headers,
+@@ -950,11 +918,7 @@ function filterRequestHeaders(req: Request): Record<string, string> {
+   req.headers.forEach((value, key) => {
+     const lower = key.toLowerCase();
+     if (
+-      lower === 'cookie' ||
+-      lower === 'authorization' ||
+-      lower === 'host' ||
+-      lower === 'connection' ||
+-      lower === 'upgrade' ||
++      DROP_REQUEST_HEADERS.has(lower) ||
+       lower.startsWith('proxy-') ||
+       lower.startsWith('x-forwarded-')
+     ) {
+@@ -965,58 +929,38 @@ function filterRequestHeaders(req: Request): Record<string, string> {
+   return out;
+ }
+ 
+-function stripQuery(path: string): string {
+-  const i = path.indexOf('?');
+-  return i === -1 ? path : path.slice(0, i);
+-}
+-
+ function baseMime(contentType: string): string {
+-  const trimmed = contentType.trim().toLowerCase();
+-  if (!trimmed) return '';
+-  const semi = trimmed.indexOf(';');
+-  return (semi === -1 ? trimmed : trimmed.slice(0, semi)).trim();
++  return contentType.trim().toLowerCase().split(';')[0]?.trim() ?? '';
+ }
+ 
+ async function readBodyLimited(response: Response, limit: number): Promise<string> {
+   const reader = response.body?.getReader();
+-  if (!reader) {
+-    return '';
+-  }
++  if (!reader) return '';
+   const chunks: Uint8Array[] = [];
+   let total = 0;
+   try {
+     while (true) {
+       const { done, value } = await reader.read();
+       if (done) break;
+-      if (!value || value.byteLength === 0) continue;
+-      const remaining = limit - total;
+-      if (remaining <= 0) {
++      if (!value?.byteLength) continue;
++      const take = Math.min(value.byteLength, limit - total);
++      if (take <= 0) {
+         await reader.cancel();
+         break;
+       }
+-      if (value.byteLength > remaining) {
+-        chunks.push(value.slice(0, remaining));
+-        total = limit;
++      chunks.push(take < value.byteLength ? value.subarray(0, take) : value);
++      total += take;
++      if (take < value.byteLength) {
+         await reader.cancel();
+         break;
+       }
+-      chunks.push(value);
+-      total += value.byteLength;
+     }
+   } catch {
+     try {
+       await reader.cancel();
+-    } catch {
+-      // ignore
+-    }
+-  }
+-  const out = new Uint8Array(total);
+-  let offset = 0;
+-  for (const chunk of chunks) {
+-    out.set(chunk, offset);
+-    offset += chunk.byteLength;
++    } catch {}
+   }
+-  return new TextDecoder().decode(out);
++  return new TextDecoder().decode(Buffer.concat(chunks, total));
+ }
+ 
+ function paneCursorKey(deviceId: string, paneId: string): string {
+diff --git a/apps/gateway/src/mesh/mesh-routes.ts b/apps/gateway/src/mesh/mesh-routes.ts
+index 58eaf647..64766ff1 100644
+--- a/apps/gateway/src/mesh/mesh-routes.ts
++++ b/apps/gateway/src/mesh/mesh-routes.ts
+@@ -1,7 +1,7 @@
+ import { wsBorsh } from '@tmex/shared';
+-import { decodeCertificate, encodeBase64url } from '@tmex/shared/auth';
++import { encodeBase64url } from '@tmex/shared/auth';
+ import { readJsonObjectBody } from '../api/http';
+-import { nodeSessionCookieName, parseCookies } from '../auth/cookies';
++import { parseCookies } from '../auth/cookies';
+ import type { NodeSessionStore } from '../auth/node-session-store';
+ import type { UserStore } from '../auth/user-store';
+ import type { PublicAuthNode } from './auth-routes';
+@@ -22,12 +22,7 @@ import {
+   X_TMEX_CONNECTION,
+   getMeshRequestContext,
+ } from './mesh-deps';
+-import {
+-  parseJson,
+-  pickMeshNodeName,
+-  projectNode,
+-  versionFromInventory,
+-} from './node-list-projection';
++import { type MeshNodeDto, projectMeshListNode } from './node-list-projection';
+ import {
+   type AuthenticateOk,
+   type SessionMiddlewareDeps,
+@@ -38,19 +33,7 @@ import {
+ } from './session-middleware';
+ import type { UplinkStatus } from './types';
+ 
+-export type MeshNodeDto = {
+-  id: string;
+-  name: string;
+-  publicKey: string;
+-  online: boolean;
+-  reach: 'lan' | 'relay' | null;
+-  transport: 'ws-secure' | 'relay' | 'dc' | null;
+-  version: string | null;
+-  direct_capable: boolean;
+-  inventory: unknown;
+-  loggedIn: boolean;
+-  isHub: boolean;
+-};
++export type { MeshNodeDto };
+ 
+ export type MeshRoutesDeps = {
+   roles: MeshRoles;
+@@ -151,9 +134,7 @@ export class MeshRoutes {
+       const env = wsBorsh.decodeEnvelope(bytes);
+       if (env.kind !== wsBorsh.KIND_RTC_SIGNAL) return;
+       const payload = wsBorsh.decodePayload(wsBorsh.schema.RtcSignalSchema, env.payload);
+-      if (payload.from === wsBorsh.RTC_SIGNAL_FROM_NODE) {
+-        return;
+-      }
++      if (payload.from === wsBorsh.RTC_SIGNAL_FROM_NODE) return;
+       const uid = ws.data.uid;
+       const sid = ws.data.sid;
+       this.deps.rtcSignals.send(
+@@ -166,9 +147,7 @@ export class MeshRoutes {
+         },
+         uid && sid ? { uid, sid } : undefined
+       );
+-    } catch {
+-      // drop malformed frames
+-    }
++    } catch {}
+   }
+ 
+   handleMeshSocketClose(ws: MeshServerWebSocket): void {
+@@ -187,23 +166,22 @@ export class MeshRoutes {
+     entrySid?: string;
+   }): void {
+     if (!msg.entrySid) return;
+-    try {
+-      wsBorsh.schema.assertEnrollRedeemedFields({
+-        enrollPk: msg.enrollPk,
+-        certificate: msg.certificate,
+-        certSig: msg.certSig,
+-        nodeId: msg.nodeId,
+-      });
+-    } catch {
+-      return;
+-    }
+-    const payload = wsBorsh.encodePayload(wsBorsh.schema.EnrollRedeemedSchema, {
++    const fields = {
+       enrollPk: msg.enrollPk,
+       certificate: msg.certificate,
+       certSig: msg.certSig,
+       nodeId: msg.nodeId,
+-    });
+-    const frame = wsBorsh.encodeEnvelope(wsBorsh.KIND_ENROLL_REDEEMED, payload, ++this.seq);
++    };
++    try {
++      wsBorsh.schema.assertEnrollRedeemedFields(fields);
++    } catch {
++      return;
++    }
++    const frame = wsBorsh.encodeEnvelope(
++      wsBorsh.KIND_ENROLL_REDEEMED,
++      wsBorsh.encodePayload(wsBorsh.schema.EnrollRedeemedSchema, fields),
++      ++this.seq
++    );
+     for (const ws of this.meshSockets) {
+       if (ws.data.sid !== msg.entrySid) continue;
+       try {
+@@ -228,60 +206,26 @@ export class MeshRoutes {
+     const hubNodeId = this.deps.roles.hub
+       ? this.deps.nodeId
+       : (this.deps.userStore.getHubMeta()?.nodeId ?? null);
+-    const nodes: MeshNodeDto[] = [];
+-    for (const id of new Set([this.deps.nodeId, ...certs.map((c) => c.nodeId)])) {
+-      const cert = certById.get(id);
+-      if (id !== this.deps.nodeId && !cert) continue;
+-      let publicKey = this.deps.nodePk;
+-      if (id !== this.deps.nodeId && cert) {
+-        try {
+-          publicKey = decodeCertificate(cert.certificateBytes).ed_pk;
+-        } catch {
+-          continue;
+-        }
+-      }
+-      const isSelf = id === this.deps.nodeId;
+-      const r = reach.get(id) ?? null;
+-      const peer = peerById.get(id);
+-      const inv = parseJson(peer?.inventoryJson, peer?.inventoryJson ?? null);
+-      const core = projectNode(
+-        id,
+-        pickMeshNodeName({
++    return [...new Set([this.deps.nodeId, ...certs.map((c) => c.nodeId)])]
++      .map((id) =>
++        projectMeshListNode(
+           id,
+-          isSelf,
+-          listedName: listedById.get(id),
+-          registryName: registryById.get(id),
+-          selfName: isSelf ? selfName : null,
+-        }),
+-        isSelf || hubOnline.has(id) || r === 'lan' || r === 'relay',
+-        {
+-          inventory: inv,
+-          directCapable: peer?.directCapable ?? false,
+-          version: versionFromInventory(inv),
+-        },
+-        isSelf && self
+-          ? {
+-              inventory: self.inventory,
+-              directCapable: self.direct_capable,
+-              version: self.version || undefined,
+-            }
+-          : null
+-      );
+-      nodes.push({
+-        id,
+-        name: core.name,
+-        publicKey: encodeBase64url(publicKey),
+-        online: core.online,
+-        reach: r,
+-        transport: isSelf ? null : (this.deps.peers.transportOf?.(id) ?? null),
+-        version: core.version || versionFromInventory(core.inventory),
+-        direct_capable: core.direct_capable,
+-        inventory: core.inventory,
+-        loggedIn: cookies.has(nodeSessionCookieName(isSelf ? MESH_VIA_SELF : id)),
+-        isHub: hubNodeId != null && id === hubNodeId,
+-      });
+-    }
+-    return nodes;
++          this.deps.nodeId,
++          this.deps.nodePk,
++          cookies,
++          reach,
++          hubOnline,
++          certById,
++          peerById,
++          listedById,
++          registryById,
++          selfName,
++          self,
++          hubNodeId,
++          (nid) => this.deps.peers.transportOf?.(nid) ?? null
++        )
++      )
++      .filter((n) => n != null);
+   }
+ 
+   private handleRtcConfig(): Response {
+@@ -311,41 +255,27 @@ export class MeshRoutes {
+   private async handleRtcAuthorize(req: Request, auth: AuthenticateOk): Promise<Response> {
+     if (!auth.userId) return jsonError('UNAUTHORIZED', 401);
+     if (!this.deps.rtcFingerprint) return jsonError('DIRECT_UNAVAILABLE', 503);
+-    const body = await readJsonObjectBody(req);
+-    const rtcSession = typeof body?.rtcSession === 'string' ? body.rtcSession : '';
+-    const fp = body?.fp_browser as { algorithm?: unknown; value?: unknown } | null | undefined;
+-    if (
+-      !rtcSession ||
+-      typeof fp !== 'object' ||
+-      fp === null ||
+-      typeof fp.algorithm !== 'string' ||
+-      typeof fp.value !== 'string'
+-    ) {
+-      return jsonError('MALFORMED', 400);
+-    }
++    const parsed = rtcAuthFields(await readJsonObjectBody(req), req);
++    if (!parsed) return jsonError('MALFORMED', 400);
+     if (!auth.sid) return jsonError('UNAUTHORIZED', 401);
+     const via = getMeshRequestContext(req).via || MESH_VIA_SELF;
+-    const requestedConnectionId =
+-      (typeof body?.connectionId === 'string' ? body.connectionId.trim() : '') ||
+-      req.headers.get(X_TMEX_CONNECTION)?.trim() ||
+-      null;
+     const resolved = this.deps.connectionLookup?.({
+       sid: auth.sid,
+       via,
+-      connectionId: requestedConnectionId,
++      connectionId: parsed.connectionId,
+     });
+-    if (resolved && !resolved.ok) {
+-      return jsonError(resolved.code, resolved.code === 'MULTIPLE_CONNECTIONS' ? 409 : 404, {
+-        hint: 'send connectionId from GET /api/mesh/connection or x-tmex-connection',
+-      });
+-    }
++    const fail = lookupFail(
++      resolved,
++      'send connectionId from GET /api/mesh/connection or x-tmex-connection'
++    );
++    if (fail) return fail;
+     const granted = await this.deps.rtcFingerprint.authorizeBrowser({
+-      rtcSession,
++      rtcSession: parsed.rtcSession,
+       uid: auth.userId,
+       via,
+       sid: auth.sid,
+       ...(resolved?.ok ? { connectionId: resolved.connectionId } : {}),
+-      fpBrowser: { algorithm: fp.algorithm, value: fp.value },
++      fpBrowser: parsed.fp,
+     });
+     if (!granted) return jsonError('DIRECT_UNAVAILABLE', 503);
+     return jsonBody({ nonce: encodeBase64url(granted.nonce), fp_node: granted.fpNode });
+@@ -354,26 +284,13 @@ export class MeshRoutes {
+   private handleMeshWsUpgrade(req: Request, server: MeshUpgradeServer): Response | undefined {
+     const result = authenticateRequest(req, this.sessionDeps);
+     if (!result.ok || !result.sid || !result.userId) {
+-      const upgraded = server.upgrade(req, {
+-        data: { kind: MESH_REJECT_4401_KIND },
+-      });
+-      if (!upgraded) {
+-        return jsonError('UNAUTHORIZED', 401);
+-      }
+-      return undefined;
++      const upgraded = server.upgrade(req, { data: { kind: MESH_REJECT_4401_KIND } });
++      return upgraded ? undefined : jsonError('UNAUTHORIZED', 401);
+     }
+     const ok = server.upgrade(req, {
+-      data: {
+-        kind: MESH_WS_KIND,
+-        sid: result.sid,
+-        uid: result.userId,
+-        via: MESH_VIA_SELF,
+-      },
++      data: { kind: MESH_WS_KIND, sid: result.sid, uid: result.userId, via: MESH_VIA_SELF },
+     });
+-    if (!ok) {
+-      return jsonError('upgrade_failed', 500);
+-    }
+-    return undefined;
++    return ok ? undefined : jsonError('upgrade_failed', 500);
+   }
+ 
+   private broadcastNodeEvent(event: {
+@@ -421,6 +338,37 @@ export class MeshRoutes {
+   }
+ }
+ 
++function lookupFail(
++  resolved: { ok: true; connectionId: string } | { ok: false; code: string } | undefined,
++  hint: string
++): Response | null {
++  return resolved && !resolved.ok
++    ? jsonError(resolved.code, resolved.code === 'MULTIPLE_CONNECTIONS' ? 409 : 404, { hint })
++    : null;
++}
++
++function rtcAuthFields(body: Record<string, unknown> | null, req: Request) {
++  const rtcSession = typeof body?.rtcSession === 'string' ? body.rtcSession : '';
++  const fp = body?.fp_browser as { algorithm?: unknown; value?: unknown } | undefined;
++  if (
++    !rtcSession ||
++    typeof fp !== 'object' ||
++    !fp ||
++    typeof fp.algorithm !== 'string' ||
++    typeof fp.value !== 'string'
++  ) {
++    return null;
++  }
++  return {
++    rtcSession,
++    fp: { algorithm: fp.algorithm, value: fp.value },
++    connectionId:
++      (typeof body?.connectionId === 'string' ? body.connectionId.trim() : '') ||
++      req.headers.get(X_TMEX_CONNECTION)?.trim() ||
++      null,
++  };
++}
++
+ function toBytes(message: unknown): Uint8Array | null {
+   if (message instanceof Uint8Array) return message;
+   if (message instanceof ArrayBuffer) return new Uint8Array(message);
+diff --git a/apps/gateway/src/mesh/node-list-projection.ts b/apps/gateway/src/mesh/node-list-projection.ts
+index ba0d24da..ee21310a 100644
+--- a/apps/gateway/src/mesh/node-list-projection.ts
++++ b/apps/gateway/src/mesh/node-list-projection.ts
+@@ -1,3 +1,7 @@
++import { decodeCertificate, encodeBase64url } from '@tmex/shared/auth';
++import { nodeSessionCookieName } from '../auth/cookies';
++import { MESH_VIA_SELF } from './mesh-deps';
++
+ type Meta = {
+   endpoints?: unknown;
+   inventory?: unknown;
+@@ -5,6 +9,20 @@ type Meta = {
+   version?: string | null;
+ };
+ 
++export type MeshNodeDto = {
++  id: string;
++  name: string;
++  publicKey: string;
++  online: boolean;
++  reach: 'lan' | 'relay' | null;
++  transport: 'ws-secure' | 'relay' | 'dc' | null;
++  version: string | null;
++  direct_capable: boolean;
++  inventory: unknown;
++  loggedIn: boolean;
++  isHub: boolean;
++};
++
+ export function parseJson(raw: string | null | undefined, fallback: unknown): unknown {
+   if (raw == null) return fallback;
+   try {
+@@ -62,3 +80,72 @@ export function pickMeshNodeName(input: {
+     (input.isSelf ? input.selfName?.trim() || 'self' : input.id)
+   );
+ }
++
++export function projectMeshListNode(
++  id: string,
++  selfId: string,
++  selfPk: Uint8Array,
++  cookies: Map<string, string>,
++  reach: Map<string, 'lan' | 'relay' | null>,
++  hubOnline: ReadonlySet<string>,
++  certById: Map<string, { certificateBytes: Uint8Array }>,
++  peerById: Map<string, { inventoryJson?: string | null; directCapable?: boolean }>,
++  listedById: Map<string, string>,
++  registryById: Map<string, string>,
++  selfName: string | null,
++  self: { inventory?: unknown; direct_capable: boolean; version?: string } | undefined,
++  hubNodeId: string | null,
++  transportOf?: (id: string) => 'ws-secure' | 'relay' | 'dc' | null
++): MeshNodeDto | null {
++  const isSelf = id === selfId;
++  const cert = certById.get(id);
++  let publicKey: Uint8Array | null = isSelf ? selfPk : null;
++  if (!isSelf) {
++    if (!cert) return null;
++    try {
++      publicKey = decodeCertificate(cert.certificateBytes).ed_pk;
++    } catch {
++      return null;
++    }
++  }
++  const peer = peerById.get(id);
++  if (!publicKey) return null;
++  const r = reach.get(id) ?? null;
++  const inv = parseJson(peer?.inventoryJson, peer?.inventoryJson ?? null);
++  const core = projectNode(
++    id,
++    pickMeshNodeName({
++      id,
++      isSelf,
++      listedName: listedById.get(id),
++      registryName: registryById.get(id),
++      selfName,
++    }),
++    isSelf || hubOnline.has(id) || r === 'lan' || r === 'relay',
++    {
++      inventory: inv,
++      directCapable: peer?.directCapable ?? false,
++      version: versionFromInventory(inv),
++    },
++    isSelf && self
++      ? {
++          inventory: self.inventory,
++          directCapable: self.direct_capable,
++          version: self.version || undefined,
++        }
++      : null
++  );
++  return {
++    id,
++    name: core.name,
++    publicKey: encodeBase64url(publicKey),
++    online: core.online,
++    reach: r,
++    transport: isSelf ? null : (transportOf?.(id) ?? null),
++    version: core.version || versionFromInventory(core.inventory),
++    direct_capable: core.direct_capable,
++    inventory: core.inventory,
++    loggedIn: cookies.has(nodeSessionCookieName(isSelf ? MESH_VIA_SELF : id)),
++    isHub: hubNodeId === id,
++  };
++}
+diff --git a/apps/gateway/src/mesh/stream-pump.test.ts b/apps/gateway/src/mesh/stream-pump.test.ts
+index 71e3cfde..31f44df7 100644
+--- a/apps/gateway/src/mesh/stream-pump.test.ts
++++ b/apps/gateway/src/mesh/stream-pump.test.ts
+@@ -3,6 +3,24 @@ import type { LinkStream } from '@tmex/shared/link';
+ import { pumpLink, pumpToLink } from './stream-pump';
+ 
+ describe('pumpToLink', () => {
++  test('keeps zero-length HEAD frames', async () => {
++    const src = new ReadableStream<{ bytes: Uint8Array; head?: boolean }>({
++      start(controller) {
++        controller.enqueue({ bytes: new Uint8Array(0), head: true });
++        controller.enqueue({ bytes: new Uint8Array(0) });
++        controller.close();
++      },
++    });
++    const writes: Array<{ head?: boolean } | undefined> = [];
++    await pumpToLink(src.getReader(), {
++      write: async (_bytes, opts) => {
++        writes.push(opts);
++      },
++      end: async () => {},
++    });
++    expect(writes).toEqual([{ head: true }]);
++  });
++
+   test('awaits end and reports rejection via onError', async () => {
+     const src = new ReadableStream<Uint8Array>({
+       start(controller) {
+diff --git a/apps/gateway/src/mesh/stream-pump.ts b/apps/gateway/src/mesh/stream-pump.ts
+index 34cb8c5c..4b5442df 100644
+--- a/apps/gateway/src/mesh/stream-pump.ts
++++ b/apps/gateway/src/mesh/stream-pump.ts
+@@ -17,7 +17,7 @@ export async function pumpToLink(
+       if (!value) continue;
+       const bytes = value instanceof Uint8Array ? value : value.bytes;
+       const head = !(value instanceof Uint8Array) && value.head;
+-      if (bytes.byteLength) await dst.write(bytes, head ? { head: true } : undefined);
++      if (bytes.byteLength || head) await dst.write(bytes, head ? { head: true } : undefined);
+     }
+     if (!stopped?.()) await dst.end();
+     return true;
+diff --git a/packages/app/src/tls/acme-service.ts b/packages/app/src/tls/acme-service.ts
+index 69fc8c8f..2c8e91dd 100644
+--- a/packages/app/src/tls/acme-service.ts
++++ b/packages/app/src/tls/acme-service.ts
+@@ -15,14 +15,13 @@ export const RENEWAL_BACKOFF_MAX_MS = 24 * 60 * 60 * 1000;
+ export const DNS_PROPAGATION_INTERVAL_MS = 2000;
+ export const DNS_PROPAGATION_TIMEOUT_MS = 120_000;
+ 
+-type AcmeAuthorization = {
+-  identifier: { type: string; value: string };
+-};
+-
+-type AcmeChallenge = {
+-  type: string;
+-  token: string;
+-};
++type AcmeAuthorization = { identifier: { type: string; value: string } };
++type AcmeChallenge = { type: string; token: string };
++type ChallengeFn = (
++  authz: AcmeAuthorization,
++  challenge: AcmeChallenge,
++  keyAuthorization: string
++) => Promise<unknown>;
+ 
+ export type AcmeClientLike = {
+   createAccount(data?: { contact?: string[]; termsOfServiceAgreed?: boolean }): Promise<unknown>;
+@@ -32,20 +31,13 @@ export type AcmeClientLike = {
+     email?: string;
+     termsOfServiceAgreed?: boolean;
+     challengePriority?: string[];
+-    challengeCreateFn: (
+-      authz: AcmeAuthorization,
+-      challenge: AcmeChallenge,
+-      keyAuthorization: string
+-    ) => Promise<unknown>;
+-    challengeRemoveFn: (
+-      authz: AcmeAuthorization,
+-      challenge: AcmeChallenge,
+-      keyAuthorization: string
+-    ) => Promise<unknown>;
++    skipChallengeVerification?: boolean;
++    challengeCreateFn: ChallengeFn;
++    challengeRemoveFn: ChallengeFn;
+   }): Promise<string>;
+ };
+ 
+-export type AcmeClientFactory = (opts: {
++type AcmeClientFactory = (opts: {
+   directoryUrl: string;
+   accountKey: string;
+   accountUrl?: string;
+@@ -76,7 +68,6 @@ export type AcmeIssueInput = {
+   store: TlsConfigStore;
+   challenge: AcmeHttp01Challenge;
+   dns: CloudflareDnsClient;
+-  fetch?: typeof fetch;
+   log?: (message: string) => void;
+   now?: () => number;
+   clientFactory?: AcmeClientFactory;
+@@ -87,30 +78,28 @@ export type AcmeIssueInput = {
+   sleep?: (ms: number) => Promise<void>;
+ };
+ 
++type PendingChallenges = {
++  dns: Array<{ zoneId: string; recordId: string; token: string }>;
++  http: string[];
++  failures: string[];
++};
++
++type AccountRow = { acmeAccountUrl: string | null; acmeAccountDirectory: string | null };
++
+ function asPem(value: string | Buffer): string {
+   return Buffer.isBuffer(value) ? value.toString('utf8') : value;
+ }
+ 
+-export function acmeDirectoryUrl(staging: boolean): string {
+-  return staging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
++function errMsg(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
+ }
+ 
+-function defaultClientFactory(opts: {
+-  directoryUrl: string;
+-  accountKey: string;
+-  accountUrl?: string;
+-}): AcmeClientLike {
+-  return new acme.Client({
+-    directoryUrl: opts.directoryUrl,
+-    accountKey: opts.accountKey,
+-    accountUrl: opts.accountUrl,
+-  }) as unknown as AcmeClientLike;
++export function acmeDirectoryUrl(staging: boolean): string {
++  return staging ? acme.directory.letsencrypt.staging : acme.directory.letsencrypt.production;
+ }
+ 
+ function throwIfAborted(signal?: AbortSignal): void {
+-  if (signal?.aborted) {
+-    throw new Error('acme issuance aborted');
+-  }
++  if (signal?.aborted) throw new Error('acme issuance aborted');
+ }
+ 
+ async function resolveNameserverIps(nameservers: string[]): Promise<string[]> {
+@@ -120,37 +109,37 @@ async function resolveNameserverIps(nameservers: string[]): Promise<string[]> {
+       ips.push(ns);
+       continue;
+     }
+-    try {
+-      ips.push(...(await dnsPromises.resolve4(ns)));
+-    } catch {
+-      // try AAAA
+-    }
+-    try {
+-      ips.push(...(await dnsPromises.resolve6(ns)));
+-    } catch {
+-      // skip unresolvable NS
++    for (const result of await Promise.allSettled([
++      dnsPromises.resolve4(ns),
++      dnsPromises.resolve6(ns),
++    ])) {
++      if (result.status === 'fulfilled') ips.push(...result.value);
+     }
+   }
+   return ips;
+ }
+ 
+-export const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query';
++function txtResolver(servers?: string[]): Resolver {
++  const resolver = new Resolver({ timeout: 3_000, tries: 1 });
++  if (servers) resolver.setServers(servers);
++  return resolver;
++}
++
++const DOH_ENDPOINT = 'https://cloudflare-dns.com/dns-query';
+ const RESOLVE_ATTEMPT_TIMEOUT_MS = 8_000;
+ 
+-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+-  return new Promise<T>((resolve, reject) => {
+-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+-    promise.then(
+-      (value) => {
+-        clearTimeout(timer);
+-        resolve(value);
+-      },
+-      (error) => {
+-        clearTimeout(timer);
+-        reject(error);
+-      }
+-    );
+-  });
++async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
++  let timer: ReturnType<typeof setTimeout> | undefined;
++  try {
++    return await Promise.race([
++      promise,
++      new Promise<T>((_, reject) => {
++        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
++      }),
++    ]);
++  } finally {
++    clearTimeout(timer);
++  }
+ }
+ 
+ /** UDP 53 在代理/受限网络下常不可达，先走 DNS-over-HTTPS（可过 HTTP 代理），再退到权威 NS 与系统解析器。 */
+@@ -166,19 +155,14 @@ export async function resolveTxtOverHttps(
+     headers: { accept: 'application/dns-json' },
+     signal: AbortSignal.timeout(RESOLVE_ATTEMPT_TIMEOUT_MS),
+   });
+-  if (!response.ok) {
+-    throw new Error(`doh ${response.status}`);
+-  }
++  if (!response.ok) throw new Error(`doh ${response.status}`);
+   const body = (await response.json()) as { Answer?: Array<{ type: number; data: string }> };
+   return (body.Answer ?? [])
+     .filter((answer) => answer.type === 16)
+     .map((answer) => [answer.data.replace(/^"|"$/g, '').replace(/"\s*"/g, '')]);
+ }
+ 
+-export async function defaultResolveTxt(
+-  hostname: string,
+-  nameservers?: string[]
+-): Promise<string[][]> {
++async function defaultResolveTxt(hostname: string, nameservers?: string[]): Promise<string[][]> {
+   try {
+     return await resolveTxtOverHttps(hostname);
+   } catch {
+@@ -192,10 +176,8 @@ export async function defaultResolveTxt(
+         'nameserver lookup'
+       );
+       if (ips.length > 0) {
+-        const resolver = new Resolver({ timeout: 3_000, tries: 1 });
+-        resolver.setServers(ips);
+         return await withTimeout(
+-          resolver.resolveTxt(hostname),
++          txtResolver(ips).resolveTxt(hostname),
+           RESOLVE_ATTEMPT_TIMEOUT_MS,
+           'authoritative TXT lookup'
+         );
+@@ -204,8 +186,11 @@ export async function defaultResolveTxt(
+       // fall through to the system resolver
+     }
+   }
+-  const system = new Resolver({ timeout: 3_000, tries: 1 });
+-  return withTimeout(system.resolveTxt(hostname), RESOLVE_ATTEMPT_TIMEOUT_MS, 'system TXT lookup');
++  return withTimeout(
++    txtResolver().resolveTxt(hostname),
++    RESOLVE_ATTEMPT_TIMEOUT_MS,
++    'system TXT lookup'
++  );
+ }
+ 
+ export async function waitForTxt(opts: {
+@@ -225,26 +210,137 @@ export async function waitForTxt(opts: {
+   const sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+   const resolveTxt = opts.resolveTxt ?? defaultResolveTxt;
+   const deadline = now() + timeoutMs;
+-
+   const visible = async (): Promise<boolean> => {
+     throwIfAborted(opts.signal);
+     try {
+-      const records = await resolveTxt(opts.hostname, opts.nameservers);
+-      return records.flat().includes(opts.value);
++      return (await resolveTxt(opts.hostname, opts.nameservers)).flat().includes(opts.value);
+     } catch {
+       return false;
+     }
+   };
+-
+-  if (await visible()) return;
+-  while (now() < deadline) {
+-    throwIfAborted(opts.signal);
++  while (!(await visible())) {
+     const remaining = deadline - now();
+-    if (remaining <= 0) break;
++    if (remaining <= 0) {
++      throw new Error(`dns-01 TXT ${opts.hostname} did not propagate within ${timeoutMs}ms`);
++    }
+     await sleep(Math.min(intervalMs, remaining));
+-    if (await visible()) return;
+   }
+-  throw new Error(`dns-01 TXT ${opts.hostname} did not propagate within ${timeoutMs}ms`);
++}
++
++async function openAccount(
++  input: AcmeIssueInput,
++  current: AccountRow,
++  accountKey: string,
++  directoryUrl: string,
++  email: string
++): Promise<{ client: AcmeClientLike; accountUrl: string }> {
++  const reuse = Boolean(current.acmeAccountUrl) && current.acmeAccountDirectory === directoryUrl;
++  const factory =
++    input.clientFactory ?? ((opts) => new acme.Client(opts) as unknown as AcmeClientLike);
++  const client = await factory({
++    directoryUrl,
++    accountKey,
++    accountUrl: reuse ? (current.acmeAccountUrl ?? undefined) : undefined,
++  });
++  if (!reuse) {
++    await client.createAccount({ termsOfServiceAgreed: true, contact: [`mailto:${email}`] });
++  }
++  throwIfAborted(input.signal);
++  return {
++    client,
++    accountUrl: client.getAccountUrl() || (reuse ? (current.acmeAccountUrl ?? '') : ''),
++  };
++}
++
++async function createChallenge(
++  input: AcmeIssueInput,
++  cfToken: string | null,
++  pending: PendingChallenges,
++  now: () => number,
++  authz: AcmeAuthorization,
++  challenge: AcmeChallenge,
++  keyAuthorization: string
++): Promise<void> {
++  throwIfAborted(input.signal);
++  if (challenge.type === 'http-01') {
++    input.challenge.set(challenge.token, keyAuthorization);
++    pending.http.push(challenge.token);
++    return;
++  }
++  if (challenge.type !== 'dns-01') throw new Error(`unsupported acme challenge ${challenge.type}`);
++  if (!cfToken) throw new Error('cloudflare token required for dns-01');
++  const domain = authz.identifier.value;
++  const zoneId = await input.dns.findZoneId(cfToken, domain);
++  const name = `_acme-challenge.${domain}`;
++  pending.dns.push({
++    zoneId,
++    recordId: await input.dns.createTxt(cfToken, zoneId, name, keyAuthorization),
++    token: challenge.token,
++  });
++  let nameservers: string[] | undefined;
++  try {
++    nameservers = await input.dns.getNameServers(cfToken, zoneId);
++  } catch (error) {
++    input.log?.(`acme dns-01 nameserver lookup failed, using system resolver: ${errMsg(error)}`);
++  }
++  await waitForTxt({
++    hostname: name,
++    value: keyAuthorization,
++    nameservers: nameservers?.length ? nameservers : undefined,
++    resolveTxt: input.resolveTxt,
++    intervalMs: input.dnsIntervalMs,
++    timeoutMs: input.dnsTimeoutMs,
++    sleep: input.sleep,
++    now,
++    signal: input.signal,
++  });
++}
++
++async function removeChallenge(
++  input: AcmeIssueInput,
++  cfToken: string | null,
++  pending: PendingChallenges,
++  challenge: AcmeChallenge
++): Promise<void> {
++  if (challenge.type === 'http-01') {
++    input.challenge.clear(challenge.token);
++    const idx = pending.http.indexOf(challenge.token);
++    if (idx >= 0) pending.http.splice(idx, 1);
++    return;
++  }
++  if (challenge.type !== 'dns-01') return;
++  const storedIdx = pending.dns.findIndex((item) => item.token === challenge.token);
++  const stored = storedIdx >= 0 ? pending.dns[storedIdx] : undefined;
++  if (!cfToken || !stored) return;
++  try {
++    await input.dns.deleteRecord(cfToken, stored.zoneId, stored.recordId);
++    pending.dns.splice(storedIdx, 1);
++  } catch (error) {
++    input.log?.(`acme dns-01 challengeRemoveFn failed for ${stored.recordId}: ${errMsg(error)}`);
++  }
++}
++
++async function cleanupChallenges(
++  input: AcmeIssueInput,
++  cfToken: string | null,
++  pending: PendingChallenges
++): Promise<void> {
++  while (pending.dns.length > 0) {
++    const rec = pending.dns.pop();
++    if (!rec) continue;
++    if (!cfToken) {
++      pending.failures.push(`missing cloudflare token for ${rec.recordId}`);
++      continue;
++    }
++    try {
++      await input.dns.deleteRecord(cfToken, rec.zoneId, rec.recordId);
++    } catch (error) {
++      pending.failures.push(`${rec.recordId}: ${errMsg(error)}`);
++      input.log?.(`acme dns-01 cleanup failed for ${rec.recordId}: ${errMsg(error)}`);
++    }
++  }
++  for (const token of pending.http) input.challenge.clear(token);
++  pending.http.length = 0;
+ }
+ 
+ export async function issue(input: AcmeIssueInput): Promise<AcmeIssuedMaterial> {
+@@ -259,57 +355,14 @@ export async function issue(input: AcmeIssueInput): Promise<AcmeIssuedMaterial>
+     throw new Error('acme issuance is missing domain, email, or challenge');
+   }
+   const secrets = await input.store.getPrivateMaterial();
+-  let accountKey = secrets.acmeAccountKey;
+-  if (!accountKey) {
+-    accountKey = asPem(await acme.crypto.createPrivateEcdsaKey('P-256'));
+-  }
+-  void input.fetch;
++  const accountKey =
++    secrets.acmeAccountKey ?? asPem(await acme.crypto.createPrivateEcdsaKey('P-256'));
+   const directoryUrl = acmeDirectoryUrl(Boolean(staging));
+-  const reuseAccount =
+-    Boolean(current.acmeAccountUrl) && current.acmeAccountDirectory === directoryUrl;
+-  const client = await (input.clientFactory ?? defaultClientFactory)({
+-    directoryUrl,
+-    accountKey,
+-    accountUrl: reuseAccount ? (current.acmeAccountUrl ?? undefined) : undefined,
+-  });
+-  if (!reuseAccount) {
+-    await client.createAccount({
+-      termsOfServiceAgreed: true,
+-      contact: [`mailto:${email}`],
+-    });
+-  }
+-  throwIfAborted(input.signal);
+-  const accountUrl = client.getAccountUrl() || (reuseAccount ? (current.acmeAccountUrl ?? '') : '');
+-
++  const { client, accountUrl } = await openAccount(input, current, accountKey, directoryUrl, email);
+   const leafKey = asPem(await acme.crypto.createPrivateEcdsaKey('P-256'));
+   const [, csr] = await acme.crypto.createCsr({ commonName: domain, altNames: [domain] }, leafKey);
+-  const outstandingDns: Array<{ zoneId: string; recordId: string; token: string }> = [];
+-  const httpTokens: string[] = [];
+-  const cleanupFailures: string[] = [];
+-
+-  const deleteOutstanding = async (): Promise<void> => {
+-    const cfToken = secrets.acmeCfToken;
+-    while (outstandingDns.length > 0) {
+-      const rec = outstandingDns.pop();
+-      if (!rec) continue;
+-      if (!cfToken) {
+-        cleanupFailures.push(`missing cloudflare token for ${rec.recordId}`);
+-        continue;
+-      }
+-      try {
+-        await input.dns.deleteRecord(cfToken, rec.zoneId, rec.recordId);
+-      } catch (error) {
+-        const message = error instanceof Error ? error.message : String(error);
+-        cleanupFailures.push(`${rec.recordId}: ${message}`);
+-        input.log?.(`acme dns-01 cleanup failed for ${rec.recordId}: ${message}`);
+-      }
+-    }
+-    for (const token of httpTokens) {
+-      input.challenge.clear(token);
+-    }
+-    httpTokens.length = 0;
+-  };
+-
++  const pending: PendingChallenges = { dns: [], http: [], failures: [] };
++  const cfToken = secrets.acmeCfToken;
+   let certPem: string | undefined;
+   try {
+     certPem = await client.auto({
+@@ -318,81 +371,15 @@ export async function issue(input: AcmeIssueInput): Promise<AcmeIssuedMaterial>
+       termsOfServiceAgreed: true,
+       challengePriority: [challengeType],
+       skipChallengeVerification: true,
+-      challengeCreateFn: async (authz, challenge, keyAuthorization) => {
+-        throwIfAborted(input.signal);
+-        if (challenge.type === 'http-01') {
+-          input.challenge.set(challenge.token, keyAuthorization);
+-          httpTokens.push(challenge.token);
+-          return;
+-        }
+-        if (challenge.type === 'dns-01') {
+-          const token = secrets.acmeCfToken;
+-          if (!token) {
+-            throw new Error('cloudflare token required for dns-01');
+-          }
+-          const zoneId = await input.dns.findZoneId(token, authz.identifier.value);
+-          const name = `_acme-challenge.${authz.identifier.value}`;
+-          const recordId = await input.dns.createTxt(token, zoneId, name, keyAuthorization);
+-          outstandingDns.push({ zoneId, recordId, token: challenge.token });
+-          let nameservers: string[] = [];
+-          try {
+-            nameservers = await input.dns.getNameServers(token, zoneId);
+-          } catch (error) {
+-            input.log?.(
+-              `acme dns-01 nameserver lookup failed, using system resolver: ${
+-                error instanceof Error ? error.message : String(error)
+-              }`
+-            );
+-          }
+-          await waitForTxt({
+-            hostname: name,
+-            value: keyAuthorization,
+-            nameservers: nameservers.length > 0 ? nameservers : undefined,
+-            resolveTxt: input.resolveTxt,
+-            intervalMs: input.dnsIntervalMs,
+-            timeoutMs: input.dnsTimeoutMs,
+-            sleep: input.sleep,
+-            now,
+-            signal: input.signal,
+-          });
+-          return;
+-        }
+-        throw new Error(`unsupported acme challenge ${challenge.type}`);
+-      },
+-      challengeRemoveFn: async (_authz, challenge) => {
+-        if (challenge.type === 'http-01') {
+-          input.challenge.clear(challenge.token);
+-          const idx = httpTokens.indexOf(challenge.token);
+-          if (idx >= 0) httpTokens.splice(idx, 1);
+-          return;
+-        }
+-        if (challenge.type === 'dns-01') {
+-          const cfToken = secrets.acmeCfToken;
+-          const storedIdx = outstandingDns.findIndex((item) => item.token === challenge.token);
+-          const stored = storedIdx >= 0 ? outstandingDns[storedIdx] : undefined;
+-          if (cfToken && stored) {
+-            try {
+-              await input.dns.deleteRecord(cfToken, stored.zoneId, stored.recordId);
+-              outstandingDns.splice(storedIdx, 1);
+-            } catch (error) {
+-              input.log?.(
+-                `acme dns-01 challengeRemoveFn failed for ${stored.recordId}: ${
+-                  error instanceof Error ? error.message : String(error)
+-                }`
+-              );
+-            }
+-          }
+-        }
+-      },
++      challengeCreateFn: (authz, challenge, keyAuthorization) =>
++        createChallenge(input, cfToken, pending, now, authz, challenge, keyAuthorization),
++      challengeRemoveFn: (_authz, challenge) => removeChallenge(input, cfToken, pending, challenge),
+     });
+-
+     throwIfAborted(input.signal);
+   } finally {
+-    await deleteOutstanding();
+-  }
+-  if (!certPem) {
+-    throw new Error('acme auto returned an empty certificate');
++    await cleanupChallenges(input, cfToken, pending);
+   }
++  if (!certPem) throw new Error('acme auto returned an empty certificate');
+   const parsed = parseCertificate(certPem);
+   return {
+     certPem,
+@@ -405,11 +392,11 @@ export async function issue(input: AcmeIssueInput): Promise<AcmeIssuedMaterial>
+     directoryUrl,
+     domain,
+     cleanupWarning:
+-      cleanupFailures.length > 0 ? `dns-01 cleanup failed: ${cleanupFailures.join('; ')}` : null,
++      pending.failures.length > 0 ? `dns-01 cleanup failed: ${pending.failures.join('; ')}` : null,
+   };
+ }
+ 
+-export type RenewalSchedulerOptions = {
++type RenewalSchedulerOptions = {
+   isDue: () => boolean | Promise<boolean>;
+   renew: () => Promise<void>;
+   now?: () => number;
+@@ -453,10 +440,14 @@ export class RenewalScheduler {
+     this.backoffMs = RENEWAL_BACKOFF_MIN_MS;
+   }
+ 
+-  retryAfterFailure(): void {
++  retryAfterFailure(detail?: string): void {
+     const wait = this.backoffMs;
+     this.backoffMs = Math.min(this.backoffMs * 2, RENEWAL_BACKOFF_MAX_MS);
+-    this.opts.log?.(`tls renewal failed, retry in ${wait}ms`);
++    this.opts.log?.(
++      detail
++        ? `tls renewal failed, retry in ${wait}ms: ${detail}`
++        : `tls renewal failed, retry in ${wait}ms`
++    );
+     this.arm(wait);
+   }
+ 
+@@ -487,14 +478,7 @@ export class RenewalScheduler {
+       this.backoffMs = RENEWAL_BACKOFF_MIN_MS;
+       this.arm(this.checkIntervalMs);
+     } catch (error) {
+-      const wait = this.backoffMs;
+-      this.backoffMs = Math.min(this.backoffMs * 2, RENEWAL_BACKOFF_MAX_MS);
+-      this.opts.log?.(
+-        `tls renewal failed, retry in ${wait}ms: ${
+-          error instanceof Error ? error.message : String(error)
+-        }`
+-      );
+-      this.arm(wait);
++      this.retryAfterFailure(errMsg(error));
+     }
+   }
+ }
+diff --git a/packages/app/src/tls/tls-service.ts b/packages/app/src/tls/tls-service.ts
+index 9465f0cd..be8d51a7 100644
+--- a/packages/app/src/tls/tls-service.ts
++++ b/packages/app/src/tls/tls-service.ts
+@@ -84,7 +84,7 @@ export type TlsListener = {
+   stop(): Promise<void>;
+ };
+ 
+-export type AcmeRunReason = 'apply' | 'renew' | 'scheduler' | 'startup';
++type AcmeRunReason = 'apply' | 'renew' | 'scheduler' | 'startup';
+ 
+ export type TlsServiceOptions = {
+   store: TlsConfigStore;
+@@ -102,15 +102,10 @@ export type TlsServiceOptions = {
+   clearTimeoutFn?: (id: unknown) => void;
+ };
+ 
+-type AcmeJobTuple = {
+-  domain: string;
+-  challenge: AcmeChallengeType | null;
+-  staging: boolean;
+-};
++type AcmeJobTuple = { domain: string; challenge: AcmeChallengeType | null; staging: boolean };
+ 
+ class SerialQueue {
+   private chain: Promise<unknown> = Promise.resolve();
+-
+   run<T>(fn: () => Promise<T>): Promise<T> {
+     const next = this.chain.then(fn, fn);
+     this.chain = next.then(
+@@ -121,6 +116,14 @@ class SerialQueue {
+   }
+ }
+ 
++function errMsg(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++function asTlsFailed(error: unknown): TlsApiError {
++  return error instanceof TlsApiError ? error : new TlsApiError('tls_failed', 500, errMsg(error));
++}
++
+ export class TlsService {
+   private trustProxy: boolean;
+   private restartRequired = false;
+@@ -143,9 +146,7 @@ export class TlsService {
+       opts.scheduleBackground ??
+       ((work) => {
+         void work().catch((error) => {
+-          opts.log?.(
+-            `tls background task failed: ${error instanceof Error ? error.message : String(error)}`
+-          );
++          opts.log?.(`tls background task failed: ${errMsg(error)}`);
+         });
+       });
+     this.scheduler = new RenewalScheduler({
+@@ -167,9 +168,7 @@ export class TlsService {
+ 
+   async load(): Promise<TlsConfigPublic> {
+     const fromEnv = await readTrustProxy(this.opts.envPath);
+-    if (fromEnv !== null) {
+-      this.trustProxy = fromEnv;
+-    }
++    if (fromEnv !== null) this.trustProxy = fromEnv;
+     return this.opts.store.get();
+   }
+ 
+@@ -177,22 +176,19 @@ export class TlsService {
+     await this.mutex.run(async () => {
+       await this.load();
+       const row = await this.opts.store.get();
+-      if (row.mode === 'selfsigned' || row.mode === 'acme') {
+-        await this.applyListener();
+-      } else {
+-        await this.opts.listener.apply(null);
+-      }
++      await (row.mode === 'selfsigned' || row.mode === 'acme'
++        ? this.applyListener()
++        : this.opts.listener.apply(null));
+       if (row.mode !== 'acme') return;
+       this.scheduler.start();
+-      const bindError = this.opts.listener.state().error;
+       const due = row.acmeNextRenewAt !== null && this.now() >= row.acmeNextRenewAt;
+-      const needsResume =
++      if (
+         row.acmeStatus === 'pending' ||
+         row.acmeStatus === 'error' ||
+         !row.certPem ||
+         due ||
+-        Boolean(bindError);
+-      if (needsResume) {
++        this.opts.listener.state().error
++      ) {
+         this.queueAcmeIssue('startup');
+       }
+     });
+@@ -203,14 +199,8 @@ export class TlsService {
+     let certificate: TlsStatus['certificate'] = null;
+     if (row.certPem) {
+       try {
+-        const parsed = parseCertificate(row.certPem);
+-        certificate = {
+-          subject: parsed.subject,
+-          sans: parsed.sans,
+-          notBefore: parsed.notBefore,
+-          notAfter: parsed.notAfter,
+-          issuer: parsed.issuer,
+-        };
++        const { subject, sans, notBefore, notAfter, issuer } = parseCertificate(row.certPem);
++        certificate = { subject, sans, notBefore, notAfter, issuer };
+       } catch {
+         certificate = null;
+       }
+@@ -248,10 +238,7 @@ export class TlsService {
+ 
+   async caPem(): Promise<string | null> {
+     const row = await this.opts.store.get();
+-    if (row.mode !== 'selfsigned' || !row.caCertPem) {
+-      return null;
+-    }
+-    return row.caCertPem;
++    return row.mode === 'selfsigned' && row.caCertPem ? row.caCertPem : null;
+   }
+ 
+   async applyMode(input: ApplyModeInput): Promise<TlsStatus> {
+@@ -265,18 +252,7 @@ export class TlsService {
+         throw new TlsApiError('not_applicable', 409, 'renew is not applicable in this TLS mode');
+       }
+       if (row.mode === 'selfsigned') {
+-        try {
+-          await this.issueSelfSigned(row.sans);
+-          await this.applyListener();
+-        } catch (error) {
+-          if (error instanceof TlsApiError) throw error;
+-          throw new TlsApiError(
+-            'tls_failed',
+-            500,
+-            error instanceof Error ? error.message : String(error)
+-          );
+-        }
+-        this.throwIfBindFailed();
++        await this.reissueSelfSigned(row.sans);
+         return this.status();
+       }
+       await this.opts.store.upsert({
+@@ -305,16 +281,10 @@ export class TlsService {
+           await writeTrustProxy(this.opts.envPath, input.trustProxy);
+         });
+       } catch (error) {
+-        throw new TlsApiError(
+-          'tls_failed',
+-          500,
+-          error instanceof Error ? error.message : String(error)
+-        );
++        throw new TlsApiError('tls_failed', 500, errMsg(error));
+       }
+       this.invalidateActiveWork();
+-      await this.opts.store.upsert({ mode: 'external' });
+-      this.scheduler.stop();
+-      await this.opts.listener.apply(null);
++      await this.stopTls('external');
+       this.trustProxy = input.trustProxy;
+       this.restartRequired = true;
+       return this.status();
+@@ -323,42 +293,25 @@ export class TlsService {
+     this.invalidateActiveWork();
+ 
+     if (input.mode === 'none') {
+-      await this.opts.store.upsert({ mode: 'none' });
+-      this.scheduler.stop();
+-      await this.opts.listener.apply(null);
++      await this.stopTls('none');
+       return this.status();
+     }
+ 
+     if (input.mode === 'selfsigned') {
+       const sans = validateSans(input.sans);
+-      const tlsPort = validatePort(input.tlsPort);
+-      const bindHost = validateBindHost(input.bindHost);
+       await this.opts.store.upsert({
+         mode: 'selfsigned',
+         sans,
+-        tlsPort,
+-        bindHost,
++        tlsPort: validatePort(input.tlsPort),
++        bindHost: validateBindHost(input.bindHost),
+       });
+       this.scheduler.stop();
+-      try {
+-        await this.issueSelfSigned(sans);
+-        await this.applyListener();
+-      } catch (error) {
+-        if (error instanceof TlsApiError) throw error;
+-        throw new TlsApiError(
+-          'tls_failed',
+-          500,
+-          error instanceof Error ? error.message : String(error)
+-        );
+-      }
+-      this.throwIfBindFailed();
++      await this.reissueSelfSigned(sans);
+       return this.status();
+     }
+ 
+     const domain = validateDomain(input.domain);
+     const email = validateEmail(input.email);
+-    const tlsPort = validatePort(input.tlsPort);
+-    const bindHost = validateBindHost(input.bindHost);
+     if (input.challenge !== 'http-01' && input.challenge !== 'dns-01') {
+       throw new TlsApiError('invalid_domain', 400, 'challenge must be http-01 or dns-01');
+     }
+@@ -371,11 +324,10 @@ export class TlsService {
+       );
+     }
+     const directoryUrl = acmeDirectoryUrl(Boolean(input.staging));
+-    const directoryChanged = current.acmeAccountDirectory !== directoryUrl;
+     await this.opts.store.upsert({
+       mode: 'acme',
+-      tlsPort,
+-      bindHost,
++      tlsPort: validatePort(input.tlsPort),
++      bindHost: validateBindHost(input.bindHost),
+       sans: [domain],
+       acmeDomain: domain,
+       acmeEmail: email,
+@@ -385,7 +337,7 @@ export class TlsService {
+       acmeLastError: null,
+       acmeNextRenewAt: this.now() + RENEWAL_BACKOFF_MIN_MS,
+       acmeAccountDirectory: directoryUrl,
+-      ...(directoryChanged ? { acmeAccountUrl: null } : {}),
++      ...(current.acmeAccountDirectory !== directoryUrl ? { acmeAccountUrl: null } : {}),
+       ...(input.cloudflareToken ? { acmeCfToken: input.cloudflareToken } : {}),
+     });
+     this.queueAcmeIssue('apply');
+@@ -393,6 +345,22 @@ export class TlsService {
+     return this.status();
+   }
+ 
++  private async stopTls(mode: 'none' | 'external'): Promise<void> {
++    await this.opts.store.upsert({ mode });
++    this.scheduler.stop();
++    await this.opts.listener.apply(null);
++  }
++
++  private async reissueSelfSigned(sans: string[]): Promise<void> {
++    try {
++      await this.issueSelfSigned(sans);
++      await this.applyListener();
++    } catch (error) {
++      throw asTlsFailed(error);
++    }
++    this.throwIfBindFailed();
++  }
++
+   private invalidateActiveWork(): void {
+     this.epoch += 1;
+     this.abortController.abort();
+@@ -441,19 +409,14 @@ export class TlsService {
+     const secrets = await this.opts.store.getPrivateMaterial();
+     const certDue =
+       row.certNotAfter !== null && this.now() >= row.certNotAfter - ACME_RENEW_LEAD_MS;
+-    const hasMaterial = Boolean(row.certPem) && Boolean(secrets.keyPem);
+-    const activateOnly =
+-      hasMaterial && !certDue && (reason === 'scheduler' || reason === 'startup');
+-
+-    if (activateOnly) {
+-      await this.mutex.run(async () => {
+-        if (!(await this.jobStillValid(epoch, tuple))) return;
+-        await this.applyListener();
+-        const bindError = this.opts.listener.state().error;
+-        if (bindError) {
+-          await this.persistAcmeFailure(bindError);
+-          throw new Error(bindError);
+-        }
++    if (
++      Boolean(row.certPem) &&
++      Boolean(secrets.keyPem) &&
++      !certDue &&
++      (reason === 'scheduler' || reason === 'startup')
++    ) {
++      await this.runIfJob(epoch, tuple, async () => {
++        await this.applyListenerOrFail();
+         await this.opts.store.upsert({
+           acmeStatus: 'ok',
+           acmeLastError: null,
+@@ -465,8 +428,7 @@ export class TlsService {
+       return;
+     }
+ 
+-    await this.mutex.run(async () => {
+-      if (!(await this.jobStillValid(epoch, tuple))) return;
++    await this.runIfJob(epoch, tuple, async () => {
+       await this.opts.store.upsert({
+         acmeStatus: 'pending',
+         acmeLastAttemptAt: this.now(),
+@@ -487,49 +449,64 @@ export class TlsService {
+         store: this.opts.store,
+         challenge: this.opts.challenge,
+         dns: this.dns,
+-        fetch: this.opts.fetch,
+         log: this.opts.log,
+         now: this.now,
+         signal,
+       });
+     } catch (error) {
+-      const message = error instanceof Error ? error.message : String(error);
+-      await this.mutex.run(async () => {
+-        if (!(await this.jobStillValid(epoch, tuple))) return;
+-        await this.persistAcmeFailure(message);
++      await this.runIfJob(epoch, tuple, async () => {
++        await this.persistAcmeFailure(errMsg(error));
+       });
+       throw error;
+     }
+ 
++    await this.runIfJob(
++      epoch,
++      tuple,
++      async () => {
++        await this.opts.store.upsert({
++          certPem: material.certPem,
++          keyPem: material.keyPem,
++          certNotBefore: material.notBefore,
++          certNotAfter: material.notAfter,
++          sans: [material.domain],
++          acmeAccountKey: material.accountKey,
++          acmeAccountUrl: material.accountUrl || null,
++          acmeAccountDirectory: material.directoryUrl,
++          acmeLastAttemptAt: this.now(),
++          acmeNextRenewAt: material.nextRenewAt,
++          acmeStatus: 'ok',
++          acmeLastError: material.cleanupWarning,
++        });
++        await this.applyListenerOrFail();
++        this.scheduler.resetBackoff();
++      },
++      signal,
++      () => this.opts.log?.('discarding stale acme issuance')
++    );
++  }
++
++  private async runIfJob(
++    epoch: number,
++    tuple: AcmeJobTuple,
++    fn: () => Promise<void>,
++    signal?: AbortSignal,
++    onStale?: () => void
++  ): Promise<void> {
+     await this.mutex.run(async () => {
+-      if (!(await this.jobStillValid(epoch, tuple)) || signal.aborted) {
+-        this.opts.log?.('discarding stale acme issuance');
+-        return;
+-      }
+-      await this.opts.store.upsert({
+-        certPem: material.certPem,
+-        keyPem: material.keyPem,
+-        certNotBefore: material.notBefore,
+-        certNotAfter: material.notAfter,
+-        sans: [material.domain],
+-        acmeAccountKey: material.accountKey,
+-        acmeAccountUrl: material.accountUrl || null,
+-        acmeAccountDirectory: material.directoryUrl,
+-        acmeLastAttemptAt: this.now(),
+-        acmeNextRenewAt: material.nextRenewAt,
+-        acmeStatus: 'ok',
+-        acmeLastError: material.cleanupWarning,
+-      });
+-      await this.applyListener();
+-      const bindError = this.opts.listener.state().error;
+-      if (bindError) {
+-        await this.persistAcmeFailure(bindError);
+-        throw new Error(bindError);
+-      }
+-      this.scheduler.resetBackoff();
++      if (!(await this.jobStillValid(epoch, tuple)) || signal?.aborted) return onStale?.();
++      await fn();
+     });
+   }
+ 
++  private async applyListenerOrFail(): Promise<void> {
++    await this.applyListener();
++    const error = this.opts.listener.state().error;
++    if (!error) return;
++    await this.persistAcmeFailure(error);
++    throw new Error(error);
++  }
++
+   private async jobStillValid(epoch: number, tuple: AcmeJobTuple): Promise<boolean> {
+     if (epoch !== this.epoch) return false;
+     const current = await this.opts.store.get();
+@@ -583,10 +560,7 @@ export class TlsService {
+   private async applyListener(): Promise<void> {
+     const row = await this.opts.store.get();
+     const secrets = await this.opts.store.getPrivateMaterial();
+-    if (!row.certPem || !secrets.keyPem) {
+-      await this.opts.listener.apply(null);
+-      return;
+-    }
++    if (!row.certPem || !secrets.keyPem) return this.opts.listener.apply(null);
+     await this.opts.listener.apply({
+       port: row.tlsPort,
+       host: row.bindHost,
+@@ -597,9 +571,7 @@ export class TlsService {
+ 
+   private throwIfBindFailed(): void {
+     const error = this.opts.listener.state().error;
+-    if (error) {
+-      throw new TlsApiError('port_in_use', 409, error);
+-    }
++    if (error) throw new TlsApiError('port_in_use', 409, error);
+   }
+ }
+ 
+@@ -612,9 +584,7 @@ function validatePort(value: number): number {
+ 
+ function validateBindHost(value: string): string {
+   const host = value.trim();
+-  if (!host) {
+-    throw new TlsApiError('invalid_port', 400, 'bindHost is required');
+-  }
++  if (!host) throw new TlsApiError('invalid_port', 400, 'bindHost is required');
+   return host;
+ }
+ 
+@@ -631,7 +601,7 @@ function validateSans(sans: string[]): string[] {
+ 
+ function validateDomain(value: string): string {
+   const domain = value.trim().toLowerCase();
+-  if (!domain || domain.includes('*') || isIP(domain) !== 0 || !isValidHostname(domain)) {
++  if (!domain || domain.includes('*') || isIP(domain) !== 0 || !HOSTNAME_RE.test(domain)) {
+     throw new TlsApiError('invalid_domain', 400, 'domain must be a hostname without wildcards');
+   }
+   return domain;
+@@ -639,24 +609,17 @@ function validateDomain(value: string): string {
+ 
+ function validateEmail(value: string): string {
+   const email = value.trim();
+-  if (!EMAIL_RE.test(email)) {
+-    throw new TlsApiError('invalid_email', 400, 'email is invalid');
+-  }
++  if (!EMAIL_RE.test(email)) throw new TlsApiError('invalid_email', 400, 'email is invalid');
+   return email;
+ }
+ 
+ function isValidSan(value: string): boolean {
+-  return isIP(value) !== 0 || isValidHostname(value);
+-}
+-
+-function isValidHostname(value: string): boolean {
+-  return HOSTNAME_RE.test(value);
++  return isIP(value) !== 0 || HOSTNAME_RE.test(value);
+ }
+ 
+ async function readTrustProxy(envPath: string): Promise<boolean | null> {
+   try {
+-    const values = await readEnvFile(envPath);
+-    const raw = values.TMEX_TRUST_PROXY;
++    const raw = (await readEnvFile(envPath)).TMEX_TRUST_PROXY;
+     if (raw === undefined) return null;
+     const normalized = raw.trim().toLowerCase();
+     return normalized === '1' || normalized === 'true' || normalized === 'yes';
+@@ -671,12 +634,7 @@ async function writeTrustProxy(envPath: string, trustProxy: boolean): Promise<vo
+   try {
+     existing = await readEnvFile(envPath);
+   } catch (error) {
+-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+-      throw error;
+-    }
++    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+   }
+-  await writeEnvFile(envPath, {
+-    ...existing,
+-    TMEX_TRUST_PROXY: trustProxy ? 'true' : 'false',
+-  });
++  await writeEnvFile(envPath, { ...existing, TMEX_TRUST_PROXY: trustProxy ? 'true' : 'false' });
+ }
+diff --git a/packages/panels/src/device-tree/index.ts b/packages/panels/src/device-tree/index.ts
+index ceea44e4..e9580025 100644
+--- a/packages/panels/src/device-tree/index.ts
++++ b/packages/panels/src/device-tree/index.ts
+@@ -1,5 +1,4 @@
+ export { SideBarDeviceList, type SideBarDeviceListProps } from './sidebar-device-list';
+-export { useDeviceTreeSelection } from './device-tree-navigation';
+ export type { DeviceTreeNavigation, SidebarAgentAdapter } from './agent-adapter';
+ export {
+   shouldHideSidebarNodeSection,
+diff --git a/packages/panels/src/device-tree/sidebar-device-list.tsx b/packages/panels/src/device-tree/sidebar-device-list.tsx
+index 58732437..ea26598e 100644
+--- a/packages/panels/src/device-tree/sidebar-device-list.tsx
++++ b/packages/panels/src/device-tree/sidebar-device-list.tsx
+@@ -45,8 +45,8 @@ export interface SideBarDeviceListProps {
+   emptyLabel?: string;
+   /** 宿主连接管理；未传时不渲染连接开关，展开仍走 ensureDeviceSubscribed */
+   connection?: DeviceConnectionAdapter;
+-  /** 分节退场期间要继续显示的设备（宿主锁存的上一个选中设备），替代路由选中 */
+-  pinnedDeviceId?: string;
++  /** 传了就只按这份 id 集合显示（分节退场期间宿主锁存的上一帧可见设备），不再按可见性/选中重算 */
++  pinnedDeviceIds?: readonly string[];
+ }
+ 
+ export function SideBarDeviceList({
+@@ -56,7 +56,7 @@ export function SideBarDeviceList({
+   agent,
+   emptyLabel,
+   connection,
+-  pinnedDeviceId,
++  pinnedDeviceIds,
+ }: SideBarDeviceListProps) {
+   const { t } = useTranslation();
+   const runtime = useRuntime();
+@@ -160,16 +160,18 @@ export function SideBarDeviceList({
+ 
+   // 侧边栏只展示「已选择显示」的设备（远端 node 默认全隐藏，本机默认全显示）；
+   // 规则与「选中的那台无条件保留」见 selectSidebarVisibleDevices。
+-  const visibleDevices = useMemo(
+-    () =>
+-      selectSidebarVisibleDevices(
+-        devices,
+-        sidebarDeviceVisibility,
+-        runtime.nodeId,
+-        pinnedDeviceId ?? selectedDeviceId
+-      ),
+-    [devices, selectedDeviceId, pinnedDeviceId, sidebarDeviceVisibility, runtime.nodeId]
+-  );
++  const visibleDevices = useMemo(() => {
++    if (pinnedDeviceIds) {
++      const pinned = new Set(pinnedDeviceIds);
++      return devices.filter((device) => pinned.has(device.id));
++    }
++    return selectSidebarVisibleDevices(
++      devices,
++      sidebarDeviceVisibility,
++      runtime.nodeId,
++      selectedDeviceId
++    );
++  }, [devices, selectedDeviceId, pinnedDeviceIds, sidebarDeviceVisibility, runtime.nodeId]);
+ 
+   const autoExpandedDeviceIdsRef = useRef(new Set<string>());
+ 
+diff --git a/packages/panels/src/device-tree/use-sidebar-device-stats.ts b/packages/panels/src/device-tree/use-sidebar-device-stats.ts
+index 7318bbec..1dfceef2 100644
+--- a/packages/panels/src/device-tree/use-sidebar-device-stats.ts
++++ b/packages/panels/src/device-tree/use-sidebar-device-stats.ts
+@@ -11,6 +11,8 @@ import { type SidebarDeviceStats, selectSidebarVisibleDevices } from './device-t
+ export interface SidebarDeviceStatsResult extends SidebarDeviceStats {
+   /** 设备列表请求失败：此时不能按「零设备」隐藏分节，要把加载失败/重试 UI 留给设备树。 */
+   failed: boolean;
++  /** 侧边栏实际会渲染的设备 id（分节退场时供宿主锁存） */
++  visibleIds: string[];
+ }
+ 
+ export function useSidebarDeviceStats(
+@@ -31,11 +33,12 @@ export function useSidebarDeviceStats(
+   const { nodeId } = runtime;
+   return useMemo(() => {
+     const list = devices ?? [];
+-    return {
+-      total: list.length,
+-      visible: selectSidebarVisibleDevices(list, sidebarDeviceVisibility, nodeId, selectedDeviceId)
+-        .length,
+-      failed,
+-    };
++    const visibleIds = selectSidebarVisibleDevices(
++      list,
++      sidebarDeviceVisibility,
++      nodeId,
++      selectedDeviceId
++    ).map((device) => device.id);
++    return { total: list.length, visible: visibleIds.length, failed, visibleIds };
+   }, [devices, failed, sidebarDeviceVisibility, nodeId, selectedDeviceId]);
+ }
+diff --git a/packages/shared/src/link/fragment-core.ts b/packages/shared/src/link/fragment-core.ts
+index 88099e4d..496ff599 100644
+--- a/packages/shared/src/link/fragment-core.ts
++++ b/packages/shared/src/link/fragment-core.ts
+@@ -52,7 +52,7 @@ export function fragmentBytes(
+     dv.setUint32(0, frameId >>> 0, true);
+     dv.setUint16(4, idx, true);
+     dv.setUint16(6, total, true);
+-    if (end > start) chunk.set(payload.subarray(start, end), FRAGMENT_HEADER_SIZE);
++    chunk.set(payload.subarray(start, end), FRAGMENT_HEADER_SIZE);
+     parts.push(chunk);
+   }
+   return parts;
+@@ -96,10 +96,7 @@ export class FragmentAssembler {
+ 
+   sweep(): void {
+     if (this.disposed) return;
+-    const now = this.o.now();
+-    for (const [id, frame] of this.pending) {
+-      if (frame.deadline <= now) this.drop(id);
+-    }
++    this.expire(this.o.now());
+     this.armTimer();
+   }
+ 
+@@ -107,45 +104,12 @@ export class FragmentAssembler {
+     const o = this.o;
+     try {
+       if (this.disposed) return null;
+-      if (chunk.byteLength < FRAGMENT_HEADER_SIZE) return fail('short', 'chunk-too-short');
+-      if (chunk.byteLength > o.maxMessageBytes) return fail('chunk-too-large', 'chunk-too-large');
+-      const dv = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+-      const frameId = dv.getUint32(0, true);
+-      const idx = dv.getUint16(4, true);
+-      const total = dv.getUint16(6, true);
+-      if (total === 0) return fail('total-zero', 'bad-total');
+-      if (total > o.maxTotal) {
+-        return fail('total-exceeds', `fragment total ${total} exceeds ${o.maxTotal}`);
+-      }
+-      if (idx >= total) return fail('bad-index', 'bad-index');
+-      const payloadLen = chunk.byteLength - FRAGMENT_HEADER_SIZE;
+-      if (payloadLen > o.payloadMax) {
+-        return fail('payload-exceeds', `fragment payload ${payloadLen} exceeds ${o.payloadMax}`);
+-      }
++      const head = this.readHeader(chunk, fail);
++      if (!head) return null;
++      const { frameId, idx } = head;
+       const now = o.now();
+-      for (const [id, f] of this.pending) {
+-        if (f.deadline <= now) this.drop(id);
+-      }
+-      let frame = this.pending.get(frameId);
+-      if (frame && frame.total !== total) {
+-        this.drop(frameId);
+-        frame = undefined;
+-      }
+-      if (!frame) {
+-        while (this.order.length > 0 && this.pending.size >= o.maxInFlight) {
+-          const id = this.order.shift();
+-          if (id !== undefined && this.pending.has(id)) this.drop(id);
+-        }
+-        frame = {
+-          total,
+-          received: 0,
+-          bytes: 0,
+-          chunks: new Array(total),
+-          deadline: now + o.timeoutMs,
+-        };
+-        this.pending.set(frameId, frame);
+-        this.order.push(frameId);
+-      }
++      this.expire(now);
++      const frame = this.openFrame(frameId, head.total, now);
+       if (frame.chunks[idx]) return null;
+       if (o.refreshDeadline) frame.deadline = o.now() + o.timeoutMs;
+       const piece = chunk.subarray(FRAGMENT_HEADER_SIZE).slice();
+@@ -176,6 +140,42 @@ export class FragmentAssembler {
+     }
+   }
+ 
++  private readHeader(chunk: Uint8Array, fail: (kind: FragmentFail, message: string) => null) {
++    const o = this.o;
++    if (chunk.byteLength < FRAGMENT_HEADER_SIZE) return fail('short', 'chunk-too-short');
++    if (chunk.byteLength > o.maxMessageBytes) return fail('chunk-too-large', 'chunk-too-large');
++    const dv = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
++    const idx = dv.getUint16(4, true);
++    const total = dv.getUint16(6, true);
++    const payloadLen = chunk.byteLength - FRAGMENT_HEADER_SIZE;
++    if (total === 0) return fail('total-zero', 'bad-total');
++    if (total > o.maxTotal) {
++      return fail('total-exceeds', `fragment total ${total} exceeds ${o.maxTotal}`);
++    }
++    if (idx >= total) return fail('bad-index', 'bad-index');
++    if (payloadLen > o.payloadMax) {
++      return fail('payload-exceeds', `fragment payload ${payloadLen} exceeds ${o.payloadMax}`);
++    }
++    return { frameId: dv.getUint32(0, true), idx, total };
++  }
++
++  /** 取回同一 frameId 的在途帧；total 变了或不存在则按 LRU 腾位后重建。 */
++  private openFrame(frameId: number, total: number, now: number): Pending {
++    const existing = this.pending.get(frameId);
++    if (existing?.total === total) return existing;
++    if (existing) this.drop(frameId);
++    while (this.order.length && this.pending.size >= this.o.maxInFlight) this.drop(this.order[0]);
++    const chunks: Array<Uint8Array | undefined> = new Array(total);
++    const frame = { total, received: 0, bytes: 0, chunks, deadline: now + this.o.timeoutMs };
++    this.pending.set(frameId, frame);
++    this.order.push(frameId);
++    return frame;
++  }
++
++  private expire(now: number): void {
++    for (const [id, frame] of this.pending) if (frame.deadline <= now) this.drop(id);
++  }
++
+   private drop(frameId: number): void {
+     const frame = this.pending.get(frameId);
+     if (frame) this.pendingBytes -= frame.bytes;
+@@ -190,17 +190,13 @@ export class FragmentAssembler {
+     this.clearTimer();
+     if (this.disposed || this.pending.size === 0) return;
+     let earliest = Number.POSITIVE_INFINITY;
+-    for (const frame of this.pending.values()) {
+-      if (frame.deadline < earliest) earliest = frame.deadline;
+-    }
++    for (const frame of this.pending.values()) earliest = Math.min(earliest, frame.deadline);
+     if (earliest === Number.POSITIVE_INFINITY) return;
+-    this.timer = setTimeoutFn(
+-      () => {
+-        this.timer = null;
+-        this.sweep();
+-      },
+-      Math.max(0, earliest - this.o.now())
+-    );
++    const delay = Math.max(0, earliest - this.o.now());
++    this.timer = setTimeoutFn(() => {
++      this.timer = null;
++      this.sweep();
++    }, delay);
+   }
+ 
+   private clearTimer(): void {
+diff --git a/packages/ws-client/src/direct/ice-stats.ts b/packages/ws-client/src/direct/ice-stats.ts
+index cb1a0c62..417bf993 100644
+--- a/packages/ws-client/src/direct/ice-stats.ts
++++ b/packages/ws-client/src/direct/ice-stats.ts
+@@ -20,8 +20,8 @@ function str(value: unknown): string | null {
+   return typeof value === 'string' && value.length > 0 ? value : null;
+ }
+ 
+-function candidateAddress(report: Record<string, unknown>): string | null {
+-  return str(report.address) ?? str(report.ip) ?? null;
++function candidateAddress(report: Record<string, unknown> | undefined): string | null {
++  return str(report?.address) ?? str(report?.ip);
+ }
+ 
+ /**
+@@ -38,7 +38,7 @@ function candidateAddress(report: Record<string, unknown>): string | null {
+ export function readSelectedPair(report: StatsReportLike): SelectedPairStats | null {
+   const byId = new Map<string, Record<string, unknown>>();
+   const pairs: Array<Record<string, unknown>> = [];
+-  const transports: Array<Record<string, unknown>> = [];
++  let selectedPairId: string | null = null;
+ 
+   // biome-ignore lint/complexity/noForEach: RTCStatsReport 只暴露 forEach，没有可迭代协议
+   report.forEach((entry) => {
+@@ -47,12 +47,9 @@ export function readSelectedPair(report: StatsReportLike): SelectedPairStats | n
+     if (id) byId.set(id, entry);
+     const type = str(entry.type);
+     if (type === 'candidate-pair') pairs.push(entry);
+-    if (type === 'transport') transports.push(entry);
++    if (type === 'transport') selectedPairId ??= str(entry.selectedCandidatePairId);
+   });
+ 
+-  const selectedPairId =
+-    transports.map((t) => str(t.selectedCandidatePairId)).find((v) => v !== null) ?? null;
+-
+   const pair =
+     (selectedPairId ? byId.get(selectedPairId) : undefined) ??
+     pairs.find((p) => p.nominated === true && str(p.state) === 'succeeded') ??
+@@ -60,18 +57,16 @@ export function readSelectedPair(report: StatsReportLike): SelectedPairStats | n
+     pairs.find((p) => str(p.state) === 'succeeded');
+   if (!pair) return null;
+ 
+-  const localId = str(pair.localCandidateId);
+-  const remoteId = str(pair.remoteCandidateId);
+-  const local = localId ? byId.get(localId) : undefined;
+-  const remote = remoteId ? byId.get(remoteId) : undefined;
++  const local = byId.get(str(pair.localCandidateId) ?? '');
++  const remote = byId.get(str(pair.remoteCandidateId) ?? '');
+   const rtt = pair.currentRoundTripTime;
+ 
+   return {
+-    localCandidateType: local ? str(local.candidateType) : null,
+-    remoteCandidateType: remote ? str(remote.candidateType) : null,
+-    localAddress: local ? candidateAddress(local) : null,
+-    remoteAddress: remote ? candidateAddress(remote) : null,
+-    protocol: (local ? str(local.protocol) : null) ?? str(pair.protocol),
++    localCandidateType: str(local?.candidateType),
++    remoteCandidateType: str(remote?.candidateType),
++    localAddress: candidateAddress(local),
++    remoteAddress: candidateAddress(remote),
++    protocol: str(local?.protocol) ?? str(pair.protocol),
+     rttMs: typeof rtt === 'number' && Number.isFinite(rtt) ? rtt * 1000 : null,
+   };
+ }
