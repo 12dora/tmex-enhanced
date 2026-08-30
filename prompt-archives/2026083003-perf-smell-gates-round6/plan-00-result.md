@@ -48,4 +48,7 @@ review-fe-chat/term/fe-dev/be/fe2/be2/be3。修复：render 期写 ref、未吸�
 - canvas 文本 run 批绘、DataChannel 分片双拷贝、scrollback 内存预算、locale 门控首屏、目录虚拟化：LOW/风险取舍，Z1 确认非 HIGH。
 - `hasWsSecureCandidate`/`shouldTryDc` 仍 listPeers().find；tree endpoint 2 次查询。
 - rsync 反序 200k 仍 ~1.6× 旧全量 CPU（换 90 MiB 内存），正序 ~1.5×。
-- （补充最后一批 G9/G10 审查修复后的状态于下）
+
+## 最后一批（be3 审查修复，G9/G10）
+
+bulk 上传接收队列 8 MiB 预算（无接收暂停 API，超限干净失败）+ 落盘续期看门狗；watch deadline 独立单调时钟；快照刷新协调器分相位（有限 burst 恰好两次刷新、同 tick immediate 升级）；rsync 输入序号决胜等值名；滚动尾 stream 解码；TTL/stale-generation/clearTimeout 测试补强。并发快照集成用例按新协调器语义调整。终态 gateway 2800 pass / 0 fail、tsc 21（基线）、复杂度门禁通过。
