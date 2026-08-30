@@ -1,0 +1,40 @@
+== apps/gateway
+ 2854 pass
+ 0 fail
+== packages/stores
+ 368 pass
+ 0 fail
+== packages/shared
+ 387 pass
+ 0 fail
+== packages/ws-client
+ 283 pass
+ 0 fail
+== packages/terminal-ui
+ 325 pass
+ 0 fail
+== packages/ghostty: MISSING
+== packages/panels
+ 650 pass
+ 0 fail
+== packages/api-client
+ 132 pass
+ 0 fail
+== packages/app
+ 414 pass
+ 1 fail
+== apps/fe (src/)
+ 905 pass
+ 0 fail
+== tsc error counts
+apps/gateway: 21
+apps/fe: 0
+packages/stores: 1
+packages/api-client: 5
+packages/app: 1
+packages/shared: 0
+packages/ws-client: 0
+packages/terminal-ui: 0
+BASELINE_DONE
+== packages/ghostty-terminal
+ 211 pass  0 fail 
