@@ -1,0 +1,1454 @@
+diff --git a/apps/gateway/src/agent/run.test.ts b/apps/gateway/src/agent/run.test.ts
+index a9926819..22f65d1a 100644
+--- a/apps/gateway/src/agent/run.test.ts
++++ b/apps/gateway/src/agent/run.test.ts
+@@ -739,6 +739,31 @@ describe('AgentRun 核心循环', () => {
+     expect(getAgentSessionById(harness.session.id)?.title).toBe('Check Disk Usage');
+   });
+ 
++  test('标题生成只用首条 user，不扫完整历史', async () => {
++    const mock = createMockChatServer(() =>
++      sseResponse([chunk({ role: 'assistant', content: 'ok' }), chunk({}, 'stop')])
++    );
++
++    const harness = createHarness({
++      baseUrl: mock.baseUrl,
++      title: 'New Session',
++      generatedTitle: 'From First User',
++    });
++    appendAgentMessage(harness.session.id, 'user', { role: 'user', content: 'check disk usage' });
++    appendAgentMessage(harness.session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'old' }],
++    });
++    appendAgentMessage(harness.session.id, 'user', { role: 'user', content: 'later unrelated' });
++
++    const run = new AgentRun(harness.session.id, harness.deps);
++    await run.execute();
++
++    expect(harness.titleCalls.length).toBe(1);
++    expect(harness.titleCalls[0]).toContain('check disk usage');
++    expect(harness.titleCalls[0]).not.toContain('later unrelated');
++  });
++
+   test('标题已自定义时不再生成', async () => {
+     const mock = createMockChatServer(() =>
+       sseResponse([chunk({ role: 'assistant', content: 'ok' }), chunk({}, 'stop')])
+diff --git a/apps/gateway/src/agent/run.ts b/apps/gateway/src/agent/run.ts
+index 9e5e4637..6e22dc5e 100644
+--- a/apps/gateway/src/agent/run.ts
++++ b/apps/gateway/src/agent/run.ts
+@@ -10,13 +10,19 @@ import {
+   type AgentSessionRecord,
+   appendAgentMessage,
+   getAgentSessionById,
++  getFirstAgentUserMessage,
+   getMaxAgentMessageSeq,
+-  listAgentMessages,
++  listAgentMessagesForWindow,
+   updateAgentSession,
+ } from '../db/agent';
+ import { t } from '../i18n';
+ import type { PaneEmulator } from '../tmux-client/pane-emulator';
+-import { type BuiltRunRequest, buildRunRequest, buildRunTools } from './build-run-request';
++import {
++  type BuiltRunRequest,
++  MESSAGE_WINDOW_CHAR_BUDGET,
++  buildRunRequest,
++  buildRunTools,
++} from './build-run-request';
+ import {
+   type AgentStopReason,
+   type RunOnceDecision,
+@@ -285,7 +291,9 @@ export class AgentRun {
+       createFetchUrlTool: this.deps.createFetchUrlTool,
+     });
+     return buildRunRequest({
+-      messages: listAgentMessages(this.sessionId).map((record) => record.content as ModelMessage),
++      messages: listAgentMessagesForWindow(this.sessionId, MESSAGE_WINDOW_CHAR_BUDGET).map(
++        (record) => record.content as ModelMessage
++      ),
+       resolvedModel,
+       tools,
+       paneId: session.paneId,
+@@ -405,9 +413,10 @@ export class AgentRun {
+     session: AgentSessionRecord,
+     model: LanguageModel
+   ): Promise<void> {
++    const firstUser = getFirstAgentUserMessage(this.sessionId);
+     await maybeGenerateSessionTitle({
+       currentTitle: session.title,
+-      messages: listAgentMessages(this.sessionId),
++      messages: firstUser ? [firstUser] : [],
+       generate: (prompt) => this.deps.generateTitle(model, prompt),
+       sessionId: this.sessionId,
+       apply: (title) => {
+diff --git a/apps/gateway/src/auth/user-store.test.ts b/apps/gateway/src/auth/user-store.test.ts
+index 5d9af3fb..c7470582 100644
+--- a/apps/gateway/src/auth/user-store.test.ts
++++ b/apps/gateway/src/auth/user-store.test.ts
+@@ -163,8 +163,11 @@ describe('UserStore', () => {
+         listVersion: 4,
+       });
+       expect(store.listPeers()[0]?.listVersion).toBe(4);
++      expect(store.getPeer('node-b')?.listVersion).toBe(4);
++      expect(store.getPeer('missing')).toBeNull();
+       store.deletePeer('node-b');
+       expect(store.listPeers()).toHaveLength(0);
++      expect(store.getPeer('node-b')).toBeNull();
+     } finally {
+       close();
+     }
+diff --git a/apps/gateway/src/auth/user-store.ts b/apps/gateway/src/auth/user-store.ts
+index 15a19c5f..5a4dc29a 100644
+--- a/apps/gateway/src/auth/user-store.ts
++++ b/apps/gateway/src/auth/user-store.ts
+@@ -355,6 +355,15 @@ export class UserStore {
+     return this.db.select().from(peerCache).all().map(toPeer);
+   }
+ 
++  getPeer(nodeId: string): PeerCacheRecord | null {
++    const row = this.db.select().from(peerCache).where(eq(peerCache.nodeId, nodeId)).get();
++    return row ? toPeer(row) : null;
++  }
++
++  touchPeerLastSeenAt(nodeId: string, lastSeenAt: number): void {
++    this.db.update(peerCache).set({ lastSeenAt }).where(eq(peerCache.nodeId, nodeId)).run();
++  }
++
+   upsertPeer(input: UpsertPeerCacheInput): void {
+     this.db
+       .insert(peerCache)
+diff --git a/apps/gateway/src/db/agent-message-window.test.ts b/apps/gateway/src/db/agent-message-window.test.ts
+new file mode 100644
+index 00000000..1a06fc39
+--- /dev/null
++++ b/apps/gateway/src/db/agent-message-window.test.ts
+@@ -0,0 +1,162 @@
++import { beforeAll, describe, expect, test } from 'bun:test';
++import { resolve } from 'node:path';
++import type { ModelMessage } from 'ai';
++import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
++import { applyMessageWindow } from '../agent/build-run-request';
++import {
++  appendAgentMessage,
++  createAgentSession,
++  getFirstAgentUserMessage,
++  listAgentMessages,
++  listAgentMessagesForWindow,
++} from './agent';
++import { getDb as getOrmDb } from './client';
++
++beforeAll(() => {
++  migrate(getOrmDb(), { migrationsFolder: resolve(import.meta.dir, '../../drizzle') });
++});
++
++function toMessages(records: Array<{ content: unknown }>): ModelMessage[] {
++  return records.map((record) => record.content as ModelMessage);
++}
++
++function windowedEqualsFull(sessionId: string, budget: number, pageSize = 3): void {
++  const fullRows = listAgentMessages(sessionId);
++  const windowRows = listAgentMessagesForWindow(sessionId, budget, { pageSize, lengthMargin: 32 });
++  expect(applyMessageWindow(toMessages(windowRows), budget)).toEqual(
++    applyMessageWindow(toMessages(fullRows), budget)
++  );
++}
++
++describe('listAgentMessagesForWindow', () => {
++  test('短历史：与全量加载滑窗结果相同，且加载全部行', () => {
++    const session = createAgentSession({ title: 'short', modelId: 'm' });
++    appendAgentMessage(session.id, 'user', { role: 'user', content: 'hi' });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'hello' }],
++    });
++    const full = listAgentMessages(session.id);
++    const windowed = listAgentMessagesForWindow(session.id, 10_000, { pageSize: 2 });
++    expect(windowed.map((row) => row.id)).toEqual(full.map((row) => row.id));
++    windowedEqualsFull(session.id, 10_000, 2);
++  });
++
++  test('超预算：与全量加载滑窗结果相同，且少加载前缀行', () => {
++    const session = createAgentSession({ title: 'over-budget', modelId: 'm' });
++    for (let i = 0; i < 6; i++) {
++      appendAgentMessage(session.id, 'user', {
++        role: 'user',
++        content: `old-${i}:${'x'.repeat(600)}`,
++      });
++      appendAgentMessage(session.id, 'assistant', {
++        role: 'assistant',
++        content: [{ type: 'text', text: `old-a-${i}` }],
++      });
++    }
++    appendAgentMessage(session.id, 'user', { role: 'user', content: 'second' });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'new' }],
++    });
++    const budget = 400;
++    const full = listAgentMessages(session.id);
++    const windowed = listAgentMessagesForWindow(session.id, budget, {
++      pageSize: 2,
++      lengthMargin: 32,
++    });
++    expect(windowed.length).toBeLessThan(full.length);
++    expect(windowed[0]?.seq).toBeGreaterThan(full[0]?.seq ?? -1);
++    windowedEqualsFull(session.id, budget, 2);
++    const kept = applyMessageWindow(toMessages(windowed), budget);
++    expect(kept[0]).toEqual({ role: 'user', content: 'second' });
++    expect(kept).toEqual(toMessages(full).slice(-2));
++  });
++
++  test('截断点落在 tool-call/tool-result 对内时，滑窗仍与全量一致且不拆对', () => {
++    const session = createAgentSession({ title: 'tool-boundary', modelId: 'm' });
++    appendAgentMessage(session.id, 'user', { role: 'user', content: 'x'.repeat(600) });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'tool-call', toolCallId: 'call_a', toolName: 'read_screen', input: {} }],
++    });
++    appendAgentMessage(session.id, 'tool', {
++      role: 'tool',
++      content: [
++        {
++          type: 'tool-result',
++          toolCallId: 'call_a',
++          toolName: 'read_screen',
++          output: { type: 'text', value: 'y'.repeat(600) },
++        },
++      ],
++    });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'step one done' }],
++    });
++    appendAgentMessage(session.id, 'user', { role: 'user', content: 'second question' });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'second answer' }],
++    });
++    appendAgentMessage(session.id, 'user', { role: 'user', content: 'third question' });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'third answer' }],
++    });
++
++    const budget = 400;
++    const full = listAgentMessages(session.id);
++    const windowed = listAgentMessagesForWindow(session.id, budget, {
++      pageSize: 3,
++      lengthMargin: 32,
++    });
++    expect(windowed.length).toBeLessThan(full.length);
++    windowedEqualsFull(session.id, budget, 3);
++
++    const kept = applyMessageWindow(toMessages(windowed), budget);
++    expect(kept).toEqual(toMessages(full).slice(4));
++    const toolCallIds = new Set(
++      kept
++        .filter((message) => message.role === 'assistant' && Array.isArray(message.content))
++        .flatMap((message) => message.content as Array<{ type: string; toolCallId?: string }>)
++        .filter((part) => part.type === 'tool-call')
++        .map((part) => part.toolCallId)
++    );
++    for (const message of kept) {
++      if (message.role !== 'tool') continue;
++      for (const part of message.content as Array<{ type: string; toolCallId?: string }>) {
++        if (part.type === 'tool-result') {
++          expect(toolCallIds.has(part.toolCallId)).toBe(true);
++        }
++      }
++    }
++  });
++});
++
++describe('getFirstAgentUserMessage', () => {
++  test('返回 seq 最早的 user，忽略更早的 assistant', () => {
++    const session = createAgentSession({ title: 'first-user', modelId: 'm' });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'ignore' }],
++    });
++    const first = appendAgentMessage(session.id, 'user', { role: 'user', content: 'alpha' });
++    appendAgentMessage(session.id, 'user', { role: 'user', content: 'omega' });
++    expect(getFirstAgentUserMessage(session.id)?.id).toBe(first.id);
++    expect(getFirstAgentUserMessage(session.id)?.content).toEqual({
++      role: 'user',
++      content: 'alpha',
++    });
++  });
++
++  test('没有 user 时返回 null', () => {
++    const session = createAgentSession({ title: 'no-user', modelId: 'm' });
++    appendAgentMessage(session.id, 'assistant', {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'only' }],
++    });
++    expect(getFirstAgentUserMessage(session.id)).toBeNull();
++  });
++});
+diff --git a/apps/gateway/src/db/agent.ts b/apps/gateway/src/db/agent.ts
+index b60b7367..9a3f7a0f 100644
+--- a/apps/gateway/src/db/agent.ts
++++ b/apps/gateway/src/db/agent.ts
+@@ -1,4 +1,4 @@
+-import { and, asc, desc, eq, gt, isNull, max, sql } from 'drizzle-orm';
++import { and, asc, desc, eq, gt, gte, isNull, lt, max, sql } from 'drizzle-orm';
+ import { getDb as getOrmDb } from './client';
+ import {
+   type AgentConfirmationStatus,
+@@ -253,6 +253,85 @@ export function listAgentMessages(
+   return orm.select().from(agentMessages).where(conditions).orderBy(asc(agentMessages.seq)).all();
+ }
+ 
++export const AGENT_MESSAGE_WINDOW_PAGE_SIZE = 200;
++
++export function listAgentMessagesForWindow(
++  sessionId: string,
++  charBudget: number,
++  options: { pageSize?: number; lengthMargin?: number } = {}
++): AgentMessageRecord[] {
++  const pageSize = Math.max(1, options.pageSize ?? AGENT_MESSAGE_WINDOW_PAGE_SIZE);
++  const lengthMargin = options.lengthMargin ?? Math.max(1024, Math.ceil(charBudget * 0.1));
++  const orm = getOrmDb();
++  // SQL length 从新到旧累加到预算+余量，并继续到一条 user，避免 suffix 从 tool 对中间起头。
++  let remaining = charBudget + lengthMargin;
++  let seenUser = false;
++  let oldestSeq: number | null = null;
++  let cursorSeq: number | undefined;
++
++  while (true) {
++    const conditions =
++      cursorSeq === undefined
++        ? eq(agentMessages.sessionId, sessionId)
++        : and(eq(agentMessages.sessionId, sessionId), lt(agentMessages.seq, cursorSeq));
++    const page = orm
++      .select({
++        seq: agentMessages.seq,
++        role: agentMessages.role,
++        contentLen: sql<number>`length(${agentMessages.content})`.mapWith(Number),
++      })
++      .from(agentMessages)
++      .where(conditions)
++      .orderBy(desc(agentMessages.seq))
++      .limit(pageSize)
++      .all();
++    if (page.length === 0) {
++      break;
++    }
++
++    let stop = false;
++    for (const row of page) {
++      remaining -= row.contentLen;
++      if (row.role === 'user') {
++        seenUser = true;
++      }
++      oldestSeq = row.seq;
++      cursorSeq = row.seq;
++      if (remaining <= 0 && seenUser) {
++        stop = true;
++        break;
++      }
++    }
++    if (stop || page.length < pageSize) {
++      break;
++    }
++  }
++
++  if (oldestSeq === null) {
++    return [];
++  }
++
++  return orm
++    .select()
++    .from(agentMessages)
++    .where(and(eq(agentMessages.sessionId, sessionId), gte(agentMessages.seq, oldestSeq)))
++    .orderBy(asc(agentMessages.seq))
++    .all();
++}
++
++export function getFirstAgentUserMessage(sessionId: string): AgentMessageRecord | null {
++  const orm = getOrmDb();
++  return (
++    orm
++      .select()
++      .from(agentMessages)
++      .where(and(eq(agentMessages.sessionId, sessionId), eq(agentMessages.role, 'user')))
++      .orderBy(asc(agentMessages.seq))
++      .limit(1)
++      .get() ?? null
++  );
++}
++
+ export function getMaxAgentMessageSeq(sessionId: string): number {
+   const orm = getOrmDb();
+   const row = orm
+diff --git a/apps/gateway/src/hub/uplink-server.test.ts b/apps/gateway/src/hub/uplink-server.test.ts
+index 33783975..8ad999e9 100644
+--- a/apps/gateway/src/hub/uplink-server.test.ts
++++ b/apps/gateway/src/hub/uplink-server.test.ts
+@@ -36,8 +36,7 @@ import {
+ } from './hub-test-helpers';
+ import { NodeRegistry } from './node-registry';
+ import type { HubKeyLogSource } from './types';
+-import type { UplinkCtlMessage } from './uplink-protocol';
+-import { KEY_LOG_PAGE_MAX_BYTES } from './uplink-protocol';
++import { KEY_LOG_PAGE_MAX_BYTES, type UplinkCtlMessage, decodeUplinkCtl } from './uplink-protocol';
+ import {
+   HUB_CTL_QUEUE_MAX,
+   HUB_KEY_LOG_REQ_BURST,
+@@ -91,6 +90,7 @@ async function authNode(
+   nodeLink: LinkSession;
+   hubLink: LinkSession;
+   inbox: CtlInbox;
++  list: UplinkCtlMessage;
+ }> {
+   const seeded = seedAdmittedNode(store, userId, opts);
+   const [nodeLink, hubLink] = createInMemoryLinkPair();
+@@ -115,6 +115,7 @@ async function authNode(
+     nodeLink,
+     hubLink,
+     inbox,
++    list,
+   };
+ }
+ 
+@@ -131,6 +132,26 @@ async function takeUntil(
+   throw new Error(`did not receive ${t}`);
+ }
+ 
++function tapCtlSend(link: LinkSession): Uint8Array[] {
++  const sent: Uint8Array[] = [];
++  const orig = link.ctl.send.bind(link.ctl);
++  link.ctl.send = (bytes: Uint8Array) => {
++    sent.push(bytes);
++    orig(bytes);
++  };
++  return sent;
++}
++
++function nodeListPayloads(sent: Uint8Array[]): Uint8Array[] {
++  return sent.filter((bytes) => {
++    try {
++      return decodeUplinkCtl(bytes).t === 'node.list';
++    } catch {
++      return false;
++    }
++  });
++}
++
+ describe('UplinkServer', () => {
+   test('node.list 带 hub {nodeId, publicUrl}', async () => {
+     const { db, close } = createMigratedAuthDb();
+@@ -155,8 +176,7 @@ describe('UplinkServer', () => {
+         authTimeoutMs: 60_000,
+       });
+       const node = await authNode(server, userStore, user.id);
+-      await server.broadcastNodeList(user.id);
+-      const listed = await takeUntil(node.inbox, 'node.list');
++      const listed = node.list;
+       expect(listed.t).toBe('node.list');
+       if (listed.t === 'node.list') {
+         expect(listed.hub).toEqual({
+@@ -199,8 +219,7 @@ describe('UplinkServer', () => {
+         authTimeoutMs: 60_000,
+       });
+       const node = await authNode(server, userStore, user.id, { name: 'node-a' });
+-      await server.broadcastNodeList(user.id);
+-      const listed = await takeUntil(node.inbox, 'node.list');
++      const listed = node.list;
+       expect(listed.t).toBe('node.list');
+       if (listed.t !== 'node.list') throw new Error('expected list');
+       expect(listed.hub).toEqual({
+@@ -695,8 +714,8 @@ describe('UplinkServer', () => {
+         expect(ack.ok).toBe(true);
+         expect(ack.id).toBe('dup-2');
+       }
+-      const update = await takeUntil(b.inbox, 'node.list');
+-      expect(update.t).toBe('node.list');
++      await new Promise((r) => setTimeout(r, 30));
++      expect(b.inbox.drain().some((msg) => msg.t === 'node.list')).toBe(false);
+       server.stop();
+     } finally {
+       close();
+@@ -1613,4 +1632,53 @@ describe('UplinkServer', () => {
+       close();
+     }
+   });
++
++  test('broadcastNodeList encodes once and reuses bytes across N links', async () => {
++    const { db, close } = createMigratedAuthDb();
++    try {
++      const { userStore, keyLogSource } = createHubTestStack(db);
++      const user = seedUser(userStore);
++      const { server } = makeServer(db, userStore, keyLogSource);
++      const a = await authNode(server, userStore, user.id, { name: 'a' });
++      const b = await authNode(server, userStore, user.id, { name: 'b' });
++      const c = await authNode(server, userStore, user.id, { name: 'c' });
++      a.inbox.drain();
++      b.inbox.drain();
++      c.inbox.drain();
++      const taps = [a, b, c].map((n) => tapCtlSend(n.hubLink));
++      sendCtl(a.nodeLink, {
++        t: 'node.status',
++        version: '2.0.0',
++        tmux: false,
++        direct_capable: false,
++        inventory: { panes: 4 },
++        endpoints: [],
++      });
++      await takeUntil(b.inbox, 'node.list');
++      const lists = taps.flatMap(nodeListPayloads);
++      expect(lists).toHaveLength(3);
++      expect(lists.every((bytes) => bytes === lists[0])).toBe(true);
++      server.stop();
++    } finally {
++      close();
++    }
++  });
++
++  test('broadcastNodeList skips send when the projected list is unchanged', async () => {
++    const { db, close } = createMigratedAuthDb();
++    try {
++      const { userStore, keyLogSource } = createHubTestStack(db);
++      const user = seedUser(userStore);
++      const { server } = makeServer(db, userStore, keyLogSource);
++      const node = await authNode(server, userStore, user.id);
++      const sent = tapCtlSend(node.hubLink);
++      await server.broadcastNodeList(user.id);
++      expect(nodeListPayloads(sent)).toHaveLength(0);
++      await server.broadcastNodeList(user.id);
++      expect(nodeListPayloads(sent)).toHaveLength(0);
++      server.stop();
++    } finally {
++      close();
++    }
++  });
+ });
+diff --git a/apps/gateway/src/hub/uplink-server.ts b/apps/gateway/src/hub/uplink-server.ts
+index 93ac253d..c1897995 100644
+--- a/apps/gateway/src/hub/uplink-server.ts
++++ b/apps/gateway/src/hub/uplink-server.ts
+@@ -425,6 +425,8 @@ export class UplinkServer {
+   private readonly ctlQueues = new WeakMap<LinkSession, CtlQueueState>();
+   private readonly rtcSessions = new Map<string, RtcSessionRegistration>();
+   private listVersion = 0;
++  private readonly lastNodeListFp = new Map<string, Uint8Array>();
++  private readonly lastNodeListSent = new Map<string, Uint8Array>();
+   private stopped = false;
+   private readonly inflightCtl = new Set<Promise<void>>();
+   private readonly keyLogReqLimiter: KeyLogReqLimiter;
+@@ -549,16 +551,26 @@ export class UplinkServer {
+     return true;
+   }
+ 
+-  async broadcastNodeList(userId: string): Promise<void> {
+-    if (this.stopped) return;
++  async broadcastNodeList(userId: string): Promise<boolean> {
++    if (this.stopped) return false;
+     try {
+       const msg = await this.buildNodeList(userId);
+-      if (this.stopped) return;
++      if (this.stopped) return false;
++      const fingerprint = encodeUplinkCtl({ ...msg, version: 0 });
++      const prev = this.lastNodeListFp.get(userId);
++      if (prev && bytesEqual(prev, fingerprint)) return false;
++      this.listVersion += 1;
++      msg.version = this.listVersion;
++      const bytes = encodeUplinkCtl(msg);
++      this.lastNodeListFp.set(userId, fingerprint);
++      this.lastNodeListSent.set(userId, bytes);
+       for (const entry of this.registry.listForBroadcast(userId)) {
+-        this.send(entry.link, msg);
++        this.sendBytes(entry.link, bytes);
+       }
++      return true;
+     } catch {
+       // broadcast is best-effort after persist/ack
++      return false;
+     }
+   }
+ 
+@@ -600,6 +612,8 @@ export class UplinkServer {
+     this.accepted.clear();
+     this.authTimers.clear();
+     this.rtcSessions.clear();
++    this.lastNodeListFp.clear();
++    this.lastNodeListSent.clear();
+     this.keyLogReqLimiter.clear();
+     this.keyLogReqLogs.clear();
+     this.authRejectLogs.clear();
+@@ -642,8 +656,12 @@ export class UplinkServer {
+   }
+ 
+   private send(link: LinkSession, msg: UplinkCtlMessage): void {
++    this.sendBytes(link, encodeUplinkCtl(msg));
++  }
++
++  private sendBytes(link: LinkSession, bytes: Uint8Array): void {
+     try {
+-      link.ctl.send(encodeUplinkCtl(msg));
++      link.ctl.send(bytes);
+     } catch {
+       // a dead uplink must never throw out of persist/ack
+     }
+@@ -807,7 +825,10 @@ export class UplinkServer {
+     this.live.set(link, live);
+     this.startHeartbeat(live);
+     this.send(link, { t: 'auth.ok' });
+-    await this.broadcastNodeList(userId);
++    if (!(await this.broadcastNodeList(userId))) {
++      const cached = this.lastNodeListSent.get(userId);
++      if (cached) this.sendBytes(link, cached);
++    }
+   }
+ 
+   private async handleNodeStatus(
+@@ -1277,7 +1298,7 @@ export class UplinkServer {
+   }
+ 
+   private async buildNodeList(userId: string): Promise<NodeListMessage> {
+-    this.listVersion += 1;
++    const version = Math.max(1, this.listVersion);
+     const head = await this.keyLogSource.head(userId);
+     const online = new Map(
+       this.registry.listForBroadcast(userId).map((n) => [n.nodeId, n] as const)
+@@ -1307,7 +1328,7 @@ export class UplinkServer {
+         nodeId: hubNodeId,
+         publicUrl: this.config.publicUrl,
+         now: this.now(),
+-        listVersion: this.listVersion,
++        listVersion: version,
+       });
+       const existing = nodes.find((n) => n.id === hubNodeId);
+       upsertById(
+@@ -1328,7 +1349,7 @@ export class UplinkServer {
+     }
+     return {
+       t: 'node.list',
+-      version: this.listVersion,
++      version,
+       key_log_head: { seq: seqToWire(head.seq), hash: bytesToB64url(head.hash) },
+       rtc: { stun: this.config.stun, turn: this.config.turn ?? null },
+       nodes,
+diff --git a/apps/gateway/src/mesh/forwarder.test.ts b/apps/gateway/src/mesh/forwarder.test.ts
+index edccf507..3c4a6b39 100644
+--- a/apps/gateway/src/mesh/forwarder.test.ts
++++ b/apps/gateway/src/mesh/forwarder.test.ts
+@@ -4,6 +4,7 @@ import type { LinkSession } from '@tmex/shared/link';
+ import {
+   FakePeers,
+   FakeStreams,
++  FakeWs,
+   NODE_ID,
+   asResponse,
+   bootMesh,
+@@ -11,7 +12,7 @@ import {
+   challengeAndLogin,
+   dummyServer,
+ } from './auth-routes.test';
+-import { getSelfRewrite } from './forwarder';
++import { expirePendingForwardStream, getSelfRewrite, pendingForwardStreamCount } from './forwarder';
+ import {
+   MESH_FORWARD_CSP,
+   MESH_FORWARD_WS_KIND,
+@@ -288,6 +289,81 @@ describe('forwarder', () => {
+     }
+   });
+ 
++  test('browser close before forward WS open drops the pending remote stream', async () => {
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dummyLink);
++    const streams = new FakeStreams();
++    const mesh = await bootMesh({ peers, streams });
++    try {
++      let data: { kind?: string; token?: string } | undefined;
++      const server = {
++        upgrade(_req: Request, opts?: { data?: unknown }) {
++          data = opts?.data as typeof data;
++          return true;
++        },
++      };
++      const prior = pendingForwardStreamCount();
++      const upgrade = await mesh.runtime.handleRequest(
++        new Request(`http://localhost/n/${OTHER}/ws`, {
++          headers: { cookie: `tmex_s_${OTHER}=remote-sid` },
++        }),
++        server
++      );
++      expect(upgrade).toBeUndefined();
++      expect(pendingForwardStreamCount()).toBe(prior + 1);
++      const remote = streams.lastWs;
++      expect(remote?.closedOnce).toBe(false);
++      const ws = {
++        data: data ?? { kind: MESH_FORWARD_WS_KIND },
++        send() {
++          return 0;
++        },
++        close() {},
++      } as MeshServerWebSocket;
++      mesh.runtime.handleWebSocket.close(ws);
++      expect(pendingForwardStreamCount()).toBe(prior);
++      expect(remote?.closedOnce).toBe(true);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('pending stream expiry is identity-checked', async () => {
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dummyLink);
++    const streams = new FakeStreams();
++    const mesh = await bootMesh({ peers, streams });
++    try {
++      let data: { kind?: string; token?: string } | undefined;
++      const server = {
++        upgrade(_req: Request, opts?: { data?: unknown }) {
++          data = opts?.data as typeof data;
++          return true;
++        },
++      };
++      const prior = pendingForwardStreamCount();
++      await mesh.runtime.handleRequest(
++        new Request(`http://localhost/n/${OTHER}/ws`, {
++          headers: { cookie: `tmex_s_${OTHER}=remote-sid` },
++        }),
++        server
++      );
++      const token = data?.token;
++      const remote = streams.lastWs;
++      if (!remote || typeof token !== 'string') throw new Error('expected pending stream');
++      const other = new FakeWs();
++      expirePendingForwardStream(token, other);
++      expect(pendingForwardStreamCount()).toBe(prior + 1);
++      expect(remote.closedOnce).toBe(false);
++      expect(other.closedOnce).toBe(false);
++      expirePendingForwardStream(token, remote);
++      expect(pendingForwardStreamCount()).toBe(prior);
++      expect(remote.closedOnce).toBe(true);
++    } finally {
++      mesh.close();
++    }
++  });
++
+   test('/n/:id/ws without cookie closes 4401', async () => {
+     const peers = new FakePeers();
+     peers.links.set(OTHER, dummyLink);
+@@ -592,6 +668,74 @@ describe('forwarder', () => {
+     }
+   });
+ 
++  test('malformed canonical PaneData does not patch the failover cursor', async () => {
++    const dcLink = { id: 'dc' } as unknown as LinkSession;
++    const relayLink = { id: 'relay' } as unknown as LinkSession;
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dcLink);
++    peers.transport.set(OTHER, 'dc');
++    const streams = new FakeStreams();
++    const mesh = await bootMesh({ peers, streams, sleep: async () => {} });
++    try {
++      const { ws } = await openForwardWs(mesh.runtime, peers, streams, OTHER);
++      const epoch = new Uint8Array(16).fill(7);
++      const pane = { deviceId: 'dev-1', serverEpoch: epoch, paneId: '%1' };
++      mesh.runtime.handleWebSocket.message(ws, encodeHelloFrame());
++      mesh.runtime.handleWebSocket.message(
++        ws,
++        wsBorsh.encodeEnvelope(
++          wsBorsh.KIND_CANONICAL_COMMAND,
++          wsBorsh.encodeCanonicalCommandPayload({
++            SetPaneSubscriptions: {
++              generation: 3n,
++              activePanes: [{ pane, cursor: { paneEpoch: epoch, terminalSeq: 10n } }],
++              hotPanes: [],
++            },
++          }),
++          4
++        )
++      );
++      const valid = wsBorsh.encodeCanonicalEventPayload({
++        PaneData: {
++          pane,
++          paneEpoch: epoch,
++          seqStart: 39n,
++          seqEnd: 40n,
++          data: new Uint8Array([1]),
++        },
++      });
++      const malformed = valid.slice();
++      new DataView(malformed.buffer, malformed.byteOffset, malformed.byteLength).setBigUint64(
++        malformed.byteLength - 1 - 4 - 8,
++        99n,
++        true
++      );
++      streams.lastWs?.pushFromRemote(
++        wsBorsh.encodeEnvelope(wsBorsh.KIND_CANONICAL_EVENT, malformed, 8)
++      );
++      peers.links.set(OTHER, relayLink);
++      peers.transport.set(OTHER, 'relay');
++      streams.lastWs?.close(1011, 'reset');
++      await waitUntil(() => streams.wsOpens.length === 2, 2_000);
++      const replayed = streams.wsOpens[1]?.ws.sent ?? [];
++      const commandFrame = replayed.find((frame) => {
++        try {
++          return wsBorsh.decodeEnvelope(frame).kind === wsBorsh.KIND_CANONICAL_COMMAND;
++        } catch {
++          return false;
++        }
++      });
++      expect(commandFrame).toBeDefined();
++      const decoded = wsBorsh.decodeCanonicalCommandPayload(
++        wsBorsh.decodeEnvelope(commandFrame as Uint8Array).payload
++      );
++      if (!('SetPaneSubscriptions' in decoded.command)) throw new Error('expected subscribe');
++      expect(decoded.command.SetPaneSubscriptions.activePanes[0]?.cursor?.terminalSeq).toBe(10n);
++    } finally {
++      mesh.close();
++    }
++  });
++
+   test('subscribe change sent mid-failover wins on the new link without generation conflict', async () => {
+     const dcLink = { id: 'dc' } as unknown as LinkSession;
+     const relayLink = { id: 'relay' } as unknown as LinkSession;
+diff --git a/apps/gateway/src/mesh/forwarder.ts b/apps/gateway/src/mesh/forwarder.ts
+index b03716f7..a92b167b 100644
+--- a/apps/gateway/src/mesh/forwarder.ts
++++ b/apps/gateway/src/mesh/forwarder.ts
+@@ -168,7 +168,10 @@ export class Forwarder {
+   handleForwardSocketClose(ws: MeshServerWebSocket, code?: number, reason?: string): void {
+     const pump = this.pumps.get(ws);
+     this.pumps.delete(ws);
+-    if (!pump) return;
++    if (!pump) {
++      discardPendingStream(ws.data?.token);
++      return;
++    }
+     pump.browserClosed = true;
+     pump.failoverAbort?.abort();
+     pump.helloWait?.();
+@@ -544,6 +547,7 @@ export class Forwarder {
+       stream.close();
+       return jsonError('upgrade_failed', 500);
+     }
++    if (pendingStreams.get(token) === stream) armPendingExpiry(token, stream);
+     return undefined;
+   }
+ 
+@@ -663,14 +667,16 @@ class StreamReplayState {
+     }
+     if (env.kind !== wsBorsh.KIND_CANONICAL_EVENT) return env.kind;
+     try {
+-      const event = wsBorsh.decodeCanonicalEventPayload(env.payload).event;
+-      if (!('PaneData' in event)) return env.kind;
+-      const paneData = event.PaneData;
+-      this.paneCursors.set(paneCursorKey(paneData.pane.deviceId, paneData.pane.paneId), {
+-        pane: paneData.pane,
+-        paneEpoch: paneData.paneEpoch,
+-        terminalSeq: paneData.seqEnd,
+-      });
++      const header = wsBorsh.peekCanonicalPaneDataHeader(env.payload);
++      if (header) {
++        this.paneCursors.set(paneCursorKey(header.pane.deviceId, header.pane.paneId), {
++          pane: header.pane,
++          paneEpoch: header.paneEpoch,
++          terminalSeq: header.seqEnd,
++        });
++        return env.kind;
++      }
++      wsBorsh.decodeCanonicalEventPayload(env.payload);
+     } catch {}
+     return env.kind;
+   }
+@@ -867,14 +873,56 @@ class StreamReplayState {
+ }
+ 
+ const pendingStreams = new Map<string, OpenedWsStream>();
++const pendingExpiry = new Map<string, ReturnType<typeof setTimeout>>();
++const PENDING_FORWARD_STREAM_TTL_MS = 15_000;
++
++export function pendingForwardStreamCount(): number {
++  return pendingStreams.size;
++}
+ 
+ export function takePendingForwardStream(token: string | undefined): OpenedWsStream | undefined {
+   if (!token) return undefined;
+   const stream = pendingStreams.get(token);
+   pendingStreams.delete(token);
++  clearPendingExpiry(token);
+   return stream;
+ }
+ 
++function discardPendingStream(token: string | undefined): void {
++  if (!token) return;
++  const stream = pendingStreams.get(token);
++  pendingStreams.delete(token);
++  clearPendingExpiry(token);
++  if (!stream) return;
++  try {
++    stream.close();
++  } catch {}
++}
++
++function clearPendingExpiry(token: string): void {
++  const timer = pendingExpiry.get(token);
++  if (timer === undefined) return;
++  clearTimeout(timer);
++  pendingExpiry.delete(token);
++}
++
++function armPendingExpiry(token: string, stream: OpenedWsStream): void {
++  const timer = setTimeout(() => {
++    expirePendingForwardStream(token, stream);
++  }, PENDING_FORWARD_STREAM_TTL_MS);
++  timer.unref?.();
++  pendingExpiry.set(token, timer);
++}
++
++export function expirePendingForwardStream(token: string, stream: OpenedWsStream): void {
++  if (pendingStreams.get(token) !== stream) return;
++  pendingStreams.delete(token);
++  clearPendingExpiry(token);
++  try {
++    stream.close();
++  } catch {}
++}
++
+ function pumpDead(pump: ForwardPump, signal: AbortSignal): boolean {
+   return pump.browserClosed || signal.aborted;
+ }
+diff --git a/apps/gateway/src/mesh/peer-manager.test.ts b/apps/gateway/src/mesh/peer-manager.test.ts
+index c2c40348..c292d63d 100644
+--- a/apps/gateway/src/mesh/peer-manager.test.ts
++++ b/apps/gateway/src/mesh/peer-manager.test.ts
+@@ -7,6 +7,8 @@ import { defaultScheduler, encodeJsonBytes } from './ctl';
+ import {
+   PEER_DC_UPGRADE_RETRY_DELAYS_MS,
+   PEER_DC_UPGRADE_RETRY_TAIL_MS,
++  PEER_RETIRE_MAX_MS,
++  PEER_RETIRE_MIN_MS,
+   PEER_RTC_WAKE_COOLDOWN_MS,
+   PEER_RTC_WAKE_NONCE_CACHE,
+   PEER_RTC_WAKE_VERIFY_BURST,
+@@ -2626,4 +2628,246 @@ describe('PeerManager', () => {
+     expect(post[0]?.transport).toBeNull();
+     expect(post[0]?.rttMs).toBeNull();
+   });
++
++  test('node.status upserts when projection changes and skips upgrade when unchanged', async () => {
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new UserStore(db);
++    seedUser(store);
++    const self = seedNodeIdentity(store, 'user-1');
++    const peer = seedNodeIdentity(store, 'user-1');
++    store.upsertPeer({
++      nodeId: peer.nodeId,
++      name: 'studio',
++      endpointsJson: '[]',
++      inventoryJson: '{}',
++      directCapable: false,
++      lastSeenAt: 1,
++      listVersion: 1,
++    });
++    const scheduler = new ImmediateScheduler();
++    const manager = new PeerManager({
++      identity: self,
++      userStore: store,
++      uplink: dummyUplink(self, store),
++      peerPort: 0,
++      startServer: false,
++      scheduler,
++    });
++    fixtures.push({ close, stop: () => manager.stop() });
++    const [local, remote] = createInMemoryLinkPair();
++    echoQuiesceCaps(remote);
++    expect(manager.adoptLink(peer.nodeId, local, 'ws-secure', self.nodeId)).toBe(local);
++    await waitUntil(() => manager.quiesceCapableOf(peer.nodeId));
++
++    let upserts = 0;
++    let upgrades = 0;
++    const origUpsert = store.upsertPeer.bind(store);
++    store.upsertPeer = (input) => {
++      upserts += 1;
++      origUpsert(input);
++    };
++    const origNotify = manager.notifyPeerEndpointsChanged.bind(manager);
++    manager.notifyPeerEndpointsChanged = (nodeId?: string) => {
++      upgrades += 1;
++      origNotify(nodeId);
++    };
++
++    const status = {
++      t: 'node.status',
++      endpoints: ['ws://10.0.0.9:39001/peer'],
++      inventory: { version: '1.0.0' },
++      direct_capable: true,
++    };
++    remote.ctl.send(encodeJsonBytes(status));
++    await waitUntil(() => store.getPeer(peer.nodeId)?.directCapable === true);
++    expect(upserts).toBe(1);
++    expect(upgrades).toBe(1);
++    const afterChange = store.getPeer(peer.nodeId);
++    expect(afterChange?.inventoryJson).toContain('1.0.0');
++    expect(afterChange?.lastSeenAt).toBe(scheduler.nowMs);
++
++    scheduler.nowMs += 50;
++    upserts = 0;
++    upgrades = 0;
++    remote.ctl.send(encodeJsonBytes(status));
++    await waitUntil(() => store.getPeer(peer.nodeId)?.lastSeenAt === scheduler.nowMs);
++    expect(upserts).toBe(0);
++    expect(upgrades).toBe(0);
++    const afterSame = store.getPeer(peer.nodeId);
++    expect(afterSame?.endpointsJson).toBe(afterChange?.endpointsJson);
++    expect(afterSame?.inventoryJson).toBe(afterChange?.inventoryJson);
++    expect(afterSame?.directCapable).toBe(true);
++    expect(afterSame?.lastSeenAt).toBe(scheduler.nowMs);
++  });
++
++  test('idle deadline is a one-shot idleMs timer', async () => {
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new UserStore(db);
++    seedUser(store);
++    const self = seedNodeIdentity(store, 'user-1');
++    const peer = seedNodeIdentity(store, 'user-1');
++    const scheduler = new ImmediateScheduler();
++    const idleMs = 5_000;
++    const manager = new PeerManager({
++      identity: self,
++      userStore: store,
++      uplink: dummyUplink(self, store),
++      peerPort: 0,
++      startServer: false,
++      idleMs,
++      scheduler,
++    });
++    fixtures.push({ close, stop: () => manager.stop() });
++    const [local] = createInMemoryLinkPair();
++    expect(manager.adoptLink(peer.nodeId, local, 'relay', self.nodeId)).toBe(local);
++    const idleTimers = scheduler.intervals.filter((row) => !row.cleared && row.ms === idleMs);
++    expect(idleTimers).toHaveLength(1);
++    expect(scheduler.intervals.some((row) => !row.cleared && row.ms === 1_000)).toBe(false);
++    scheduler.nowMs += idleMs - 1;
++    scheduler.tickIntervals();
++    expect(manager.listReach().get(peer.nodeId)).toBe('relay');
++    scheduler.nowMs += 1;
++    scheduler.tickIntervals();
++    await waitUntil(() => manager.listReach().get(peer.nodeId) !== 'relay');
++  });
++
++  test('parked inbound uses a one-shot max deadline', async () => {
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new UserStore(db);
++    seedUser(store);
++    const self = seedNodeIdentity(store, 'user-1');
++    const peer = seedNodeIdentity(store, 'user-1');
++    store.upsertPeer({
++      nodeId: peer.nodeId,
++      name: 'peer',
++      endpointsJson: '[]',
++      inventoryJson: '{}',
++      directCapable: false,
++      lastSeenAt: Date.now(),
++      listVersion: 1,
++    });
++    const scheduler = new ImmediateScheduler();
++    const manager = new PeerManager({
++      identity: self,
++      userStore: store,
++      uplink: dummyUplink(self, store),
++      peerPort: 0,
++      startServer: false,
++      scheduler,
++    });
++    fixtures.push({ close, stop: () => manager.stop() });
++    const [liveA, liveB] = createInMemoryLinkPair();
++    fixtures.push({ close: () => liveB.close('test') });
++    expect(manager.adoptLink(peer.nodeId, liveA, 'relay', self.nodeId)).toBe(liveA);
++    const [parkA, parkB] = createInMemoryLinkPair();
++    fixtures.push({ close: () => parkB.close('test') });
++    expect(manager.adoptLink(peer.nodeId, parkA, 'ws-secure', peer.nodeId, '203.0.113.10')).toBe(
++      liveA
++    );
++    const parkTimers = scheduler.intervals.filter(
++      (row) => !row.cleared && row.ms === PEER_RETIRE_MAX_MS
++    );
++    expect(parkTimers).toHaveLength(1);
++    const parkedClosed = parkA.closed;
++    scheduler.nowMs += PEER_RETIRE_MAX_MS - 1;
++    scheduler.tickIntervals();
++    expect(manager.transportOf(peer.nodeId)).toBe('relay');
++    scheduler.nowMs += 1;
++    scheduler.tickIntervals();
++    expect((await parkedClosed).reason).toBe('park-timeout');
++    expect(manager.transportOf(peer.nodeId)).toBe('relay');
++  });
++
++  test('retiring peer finishes on the min deadline when quiet', async () => {
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new UserStore(db);
++    seedUser(store);
++    const self = seedNodeIdentity(store, 'user-1');
++    const peer = seedNodeIdentity(store, 'user-1');
++    store.upsertPeer({
++      nodeId: peer.nodeId,
++      name: 'peer',
++      endpointsJson: '[]',
++      inventoryJson: '{}',
++      directCapable: false,
++      lastSeenAt: Date.now(),
++      listVersion: 1,
++    });
++    const scheduler = new ImmediateScheduler();
++    const manager = new PeerManager({
++      identity: self,
++      userStore: store,
++      uplink: dummyUplink(self, store),
++      peerPort: 0,
++      startServer: false,
++      scheduler,
++    });
++    fixtures.push({ close, stop: () => manager.stop() });
++    const [liveA, liveB] = createInMemoryLinkPair();
++    echoQuiesceCaps(liveB);
++    expect(manager.adoptLink(peer.nodeId, liveA, 'ws-secure', self.nodeId)).toBe(liveA);
++    await waitUntil(() => manager.quiesceCapableOf(peer.nodeId));
++    const [nextA, nextB] = createInMemoryLinkPair();
++    fixtures.push({ close: () => nextB.close('test') });
++    echoQuiesceCaps(nextB);
++    const retired = liveA.closed;
++    expect(manager.adoptLink(peer.nodeId, nextA, 'dc', self.nodeId, '10.0.0.8')).toBe(nextA);
++    const retireTimers = scheduler.intervals.filter(
++      (row) => !row.cleared && row.ms === PEER_RETIRE_MIN_MS
++    );
++    expect(retireTimers).toHaveLength(1);
++    scheduler.nowMs += PEER_RETIRE_MIN_MS - 1;
++    scheduler.tickIntervals();
++    let done = false;
++    void retired.then(() => {
++      done = true;
++    });
++    await new Promise((r) => setTimeout(r, 10));
++    expect(done).toBe(false);
++    scheduler.nowMs += 1;
++    scheduler.tickIntervals();
++    expect((await retired).reason).toBe('replaced');
++  });
++
++  test('retiring peer finishes immediately after mutual quiesce acks', async () => {
++    const { db, close } = createMigratedAuthDb();
++    fixtures.push({ close });
++    const store = new UserStore(db);
++    seedUser(store);
++    const self = seedNodeIdentity(store, 'user-1');
++    const peer = seedNodeIdentity(store, 'user-1');
++    store.upsertPeer({
++      nodeId: peer.nodeId,
++      name: 'peer',
++      endpointsJson: '[]',
++      inventoryJson: '{}',
++      directCapable: false,
++      lastSeenAt: Date.now(),
++      listVersion: 1,
++    });
++    const manager = new PeerManager({
++      identity: self,
++      userStore: store,
++      uplink: dummyUplink(self, store),
++      peerPort: 0,
++      startServer: false,
++    });
++    fixtures.push({ close, stop: () => manager.stop() });
++    const [liveA, liveB] = createInMemoryLinkPair();
++    echoQuiesceCaps(liveB);
++    expect(manager.adoptLink(peer.nodeId, liveA, 'ws-secure', self.nodeId)).toBe(liveA);
++    await waitUntil(() => manager.quiesceCapableOf(peer.nodeId));
++    const [nextA, nextB] = createInMemoryLinkPair();
++    fixtures.push({ close: () => nextB.close('test') });
++    echoQuiesceCaps(nextB);
++    const retired = liveA.closed;
++    expect(manager.adoptLink(peer.nodeId, nextA, 'dc', self.nodeId, '10.0.0.8')).toBe(nextA);
++    liveB.ctl.send(encodeJsonBytes({ t: 'link.quiesce.ack' }));
++    liveB.ctl.send(encodeJsonBytes({ t: 'link.quiesce' }));
++    expect((await retired).reason).toBe('replaced');
++  });
+ });
+diff --git a/apps/gateway/src/mesh/peer-manager.ts b/apps/gateway/src/mesh/peer-manager.ts
+index 4ee60e1d..f1aefca2 100644
+--- a/apps/gateway/src/mesh/peer-manager.ts
++++ b/apps/gateway/src/mesh/peer-manager.ts
+@@ -1662,6 +1662,7 @@ export class PeerManager {
+     live.lastStreamAt = this.scheduler.now();
+     live.zeroStreamsSince = 0;
+     this.clearIdle(live);
++    if (live.retiring) this.armRetireTimer(live);
+     void stream.closed.then(() => {
+       live.streams = Math.max(0, live.streams - 1);
+       live.lastStreamAt = this.scheduler.now();
+@@ -1669,6 +1670,7 @@ export class PeerManager {
+       if (live.streams > 0) return;
+       if (live.retiring) {
+         this.maybeFinishRetire(live);
++        if (live.retiring && !live.finishRetired) this.armRetireTimer(live);
+         return;
+       }
+       if (this.live.get(live.peerNodeId) === live) this.armIdle(live);
+@@ -1754,22 +1756,35 @@ export class PeerManager {
+   private async applyPeerStatus(live: LivePeer, msg: Record<string, unknown>): Promise<void> {
+     if (!this.isTrusted(live.peerNodeId)) return;
+     const peerNodeId = live.peerNodeId;
+-    const existing = this.userStore.listPeers().find((row) => row.nodeId === peerNodeId);
+-    this.userStore.upsertPeer({
+-      nodeId: peerNodeId,
+-      name: existing?.name ?? peerNodeId,
+-      endpointsJson: jsonText(
+-        sanitizeEndpoints(msg.endpoints ?? existing?.endpointsJson ?? [], this.server?.port)
+-      ),
+-      inventoryJson: jsonText(msg.inventory ?? existing?.inventoryJson ?? {}),
+-      directCapable:
+-        typeof msg.direct_capable === 'boolean'
+-          ? msg.direct_capable
+-          : (existing?.directCapable ?? false),
+-      lastSeenAt: this.scheduler.now(),
+-      listVersion: existing?.listVersion ?? 0,
+-    });
+-    this.notifyPeerEndpointsChanged(peerNodeId);
++    const existing = this.userStore.getPeer(peerNodeId);
++    const endpointsJson = jsonText(
++      sanitizeEndpoints(msg.endpoints ?? existing?.endpointsJson ?? [], this.server?.port)
++    );
++    const inventoryJson = jsonText(msg.inventory ?? existing?.inventoryJson ?? {});
++    const directCapable =
++      typeof msg.direct_capable === 'boolean'
++        ? msg.direct_capable
++        : (existing?.directCapable ?? false);
++    const lastSeenAt = this.scheduler.now();
++    const changed =
++      !existing ||
++      existing.endpointsJson !== endpointsJson ||
++      existing.inventoryJson !== inventoryJson ||
++      existing.directCapable !== directCapable;
++    if (changed) {
++      this.userStore.upsertPeer({
++        nodeId: peerNodeId,
++        name: existing?.name ?? peerNodeId,
++        endpointsJson,
++        inventoryJson,
++        directCapable,
++        lastSeenAt,
++        listVersion: existing?.listVersion ?? 0,
++      });
++      this.notifyPeerEndpointsChanged(peerNodeId);
++    } else {
++      this.userStore.touchPeerLastSeenAt(peerNodeId, lastSeenAt);
++    }
+     const head = isRecord(msg.key_log_head) ? msg.key_log_head : null;
+     if (!head || !this.keyLogApplier) return;
+     try {
+@@ -1921,7 +1936,7 @@ export class PeerManager {
+           this.dropPeer(live.peerNodeId, 'idle');
+         }
+       },
+-      Math.min(this.idleMs, 1_000)
++      Math.max(1, this.idleMs)
+     );
+   }
+ 
+@@ -2030,12 +2045,15 @@ export class PeerManager {
+       timer: null,
+       remoteAddress,
+     };
+-    parked.timer = this.scheduler.interval(() => {
+-      if (this.parked.get(peerNodeId) !== parked) return;
+-      if (this.scheduler.now() - parked.at >= PEER_RETIRE_MAX_MS) {
+-        this.dropParked(peerNodeId, 'park-timeout');
+-      }
+-    }, 250);
++    parked.timer = this.scheduler.interval(
++      () => {
++        if (this.parked.get(peerNodeId) !== parked) return;
++        if (this.scheduler.now() - parked.at >= PEER_RETIRE_MAX_MS) {
++          this.dropParked(peerNodeId, 'park-timeout');
++        }
++      },
++      Math.max(1, PEER_RETIRE_MAX_MS - (this.scheduler.now() - parkedAt))
++    );
+     void session.closed.then(() => {
+       const cur = this.parked.get(peerNodeId);
+       if (cur?.session === session) {
+@@ -2110,13 +2128,31 @@ export class PeerManager {
+     }
+     set.add(prev);
+     this.sendPeerCtl(prev, { t: 'link.quiesce' });
+-    prev.retireTimer?.clear();
+-    prev.retireTimer = this.scheduler.interval(() => {
+-      this.maybeFinishRetire(prev, reason);
+-    }, 250);
++    this.armRetireTimer(prev, reason);
+     this.maybeFinishRetire(prev, reason);
+   }
+ 
++  private nextRetireDelayMs(live: LivePeer): number {
++    const now = this.scheduler.now();
++    let due = live.retiredAt + PEER_RETIRE_MAX_MS;
++    if (live.streams === 0 && live.zeroStreamsSince > 0) {
++      due = Math.min(
++        due,
++        Math.max(live.retiredAt + PEER_RETIRE_MIN_MS, live.zeroStreamsSince + PEER_RETIRE_QUIET_MS)
++      );
++    }
++    return Math.max(1, due - now);
++  }
++
++  private armRetireTimer(live: LivePeer, reason = 'replaced'): void {
++    live.retireTimer?.clear();
++    live.retireTimer = null;
++    if (!live.retiring || live.finishRetired) return;
++    live.retireTimer = this.scheduler.interval(() => {
++      this.maybeFinishRetire(live, reason);
++    }, this.nextRetireDelayMs(live));
++  }
++
+   private maybeFinishRetire(live: LivePeer, reason = 'replaced'): void {
+     if (!live.retiring || live.finishRetired) return;
+     if (live.streams > 0) return;
+diff --git a/apps/gateway/src/ws/canonical/frame-sizer.test.ts b/apps/gateway/src/ws/canonical/frame-sizer.test.ts
+index fb292530..12a5941d 100644
+--- a/apps/gateway/src/ws/canonical/frame-sizer.test.ts
++++ b/apps/gateway/src/ws/canonical/frame-sizer.test.ts
+@@ -309,6 +309,27 @@ describe('canonical frame sizer', () => {
+     expect(other).toBe(first - 1);
+   });
+ 
++  test('cycling unique pane identities does not grow the size cache unboundedly', () => {
++    const sizer = new CanonicalFrameSizer(1024);
++    for (let index = 0; index < 10_000; index += 1) {
++      sizer.maxPaneDataBytes(
++        {
++          deviceId: `device-${index}`,
++          serverEpoch: PANE.serverEpoch,
++          paneId: `%${index}`,
++        },
++        PANE_EPOCH
++      );
++    }
++    const cache = sizer as unknown as { maxDataByKey: Map<string, number> };
++    expect(cache.maxDataByKey.size).toBeLessThan(32);
++
++    const ascii = sizer.maxPaneDataBytes({ ...PANE, deviceId: 'ab' }, PANE_EPOCH);
++    const cjk = sizer.maxPaneDataBytes({ ...PANE, deviceId: '设备' }, PANE_EPOCH);
++    expect(cjk).toBeLessThan(ascii);
++    expect(sizer.maxPaneDataBytes({ ...PANE, deviceId: '窗口' }, PANE_EPOCH)).toBe(cjk);
++  });
++
+   test('max data bytes respect the canonical payload cap even when the sizer cap is larger', () => {
+     const sizer = new CanonicalFrameSizer(1024 * 1024);
+     const maxPane = sizer.maxPaneDataBytes(PANE, PANE_EPOCH);
+diff --git a/apps/gateway/src/ws/canonical/frame-sizer.ts b/apps/gateway/src/ws/canonical/frame-sizer.ts
+index adc2773c..dac52680 100644
+--- a/apps/gateway/src/ws/canonical/frame-sizer.ts
++++ b/apps/gateway/src/ws/canonical/frame-sizer.ts
+@@ -5,6 +5,14 @@ import { canonicalEventPayloadBytes } from './encoded-size';
+ import type { CanonicalEvent, CanonicalPaneTarget } from './types';
+ 
+ const EMPTY = new Uint8Array();
++const UTF8 = new TextEncoder();
++
++function utf8ByteLength(value: string): number {
++  for (let index = 0; index < value.length; index += 1) {
++    if ((value.charCodeAt(index) ?? 0) > 0x7f) return UTF8.encode(value).byteLength;
++  }
++  return value.length;
++}
+ 
+ export class CanonicalFrameSizer {
+   private readonly maxDataByKey = new Map<string, number>();
+@@ -19,7 +27,7 @@ export class CanonicalFrameSizer {
+   }
+ 
+   maxPaneDataBytes(target: CanonicalPaneTarget, paneEpoch: Uint8Array): number {
+-    const key = `PaneData\0${target.deviceId}\0${target.paneId}\0${target.serverEpoch.byteLength}\0${paneEpoch.byteLength}`;
++    const key = `PaneData\0${utf8ByteLength(target.deviceId)}\0${utf8ByteLength(target.paneId)}\0${target.serverEpoch.byteLength}\0${paneEpoch.byteLength}`;
+     return this.cachedMaxData(key, () =>
+       this.maxDataForEmpty({
+         PaneData: {
+diff --git a/packages/shared/src/ws-borsh/canonical-state.ts b/packages/shared/src/ws-borsh/canonical-state.ts
+index 7506e08c..65aa3686 100644
+--- a/packages/shared/src/ws-borsh/canonical-state.ts
++++ b/packages/shared/src/ws-borsh/canonical-state.ts
+@@ -3,6 +3,7 @@ import { assertCanonicalEncoding } from './canonical-scan';
+ import { assertCanonicalEventSemantics } from './canonical-state-validation';
+ import {
+   ERROR_FRAME_TOO_LARGE,
++  ERROR_INVALID_FRAME,
+   ERROR_PAYLOAD_DECODE_FAILED,
+   ERROR_UNSUPPORTED_PROTOCOL,
+   WsBorshError,
+@@ -361,3 +362,65 @@ export function decodeCanonicalEventPayload(payload: Uint8Array): CanonicalEvent
+   assertCanonicalEventSemantics(decoded.event);
+   return decoded;
+ }
++
++const PANE_DATA_VARIANT = 3;
++const TEXT_DECODER = new TextDecoder();
++
++export type CanonicalPaneDataHeader = {
++  pane: CanonicalPaneTarget;
++  paneEpoch: Uint8Array;
++  seqStart: bigint;
++  seqEnd: bigint;
++};
++
++export function peekCanonicalPaneDataHeader(payload: Uint8Array): CanonicalPaneDataHeader | null {
++  assertCanonicalPayloadBounded(payload);
++  if (payload.byteLength < 3) {
++    throw new WsBorshError(ERROR_PAYLOAD_DECODE_FAILED, false, 'invalid canonical event');
++  }
++  const protocolVersion = (payload[0] ?? 0) | ((payload[1] ?? 0) << 8);
++  if (protocolVersion !== CANONICAL_STATE_PROTOCOL_VERSION) {
++    throw new WsBorshError(ERROR_UNSUPPORTED_PROTOCOL, false);
++  }
++  if (payload[2] !== PANE_DATA_VARIANT) return null;
++  assertCanonicalEncoding(CanonicalEventEnvelopeSchema, payload);
++  return readValidatedPaneDataHeader(payload);
++}
++
++function readU32Le(bytes: Uint8Array, offset: number): number {
++  return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0, true);
++}
++
++function readU64Le(bytes: Uint8Array, offset: number): bigint {
++  return new DataView(bytes.buffer, bytes.byteOffset + offset, 8).getBigUint64(0, true);
++}
++
++function readValidatedPaneDataHeader(payload: Uint8Array): CanonicalPaneDataHeader {
++  let offset = 3;
++  const deviceLen = readU32Le(payload, offset);
++  offset += 4;
++  const deviceId = TEXT_DECODER.decode(payload.subarray(offset, offset + deviceLen));
++  offset += deviceLen;
++  const serverEpoch = payload.slice(offset, offset + 16);
++  offset += 16;
++  const paneLen = readU32Le(payload, offset);
++  offset += 4;
++  const paneId = TEXT_DECODER.decode(payload.subarray(offset, offset + paneLen));
++  offset += paneLen;
++  const paneEpoch = payload.slice(offset, offset + 16);
++  offset += 16;
++  const seqStart = readU64Le(payload, offset);
++  offset += 8;
++  const seqEnd = readU64Le(payload, offset);
++  offset += 8;
++  const dataLen = readU32Le(payload, offset);
++  if (seqEnd < seqStart || seqEnd - seqStart !== BigInt(dataLen)) {
++    throw new WsBorshError(ERROR_INVALID_FRAME, false, 'PaneData sequence range mismatch');
++  }
++  return {
++    pane: { deviceId, serverEpoch, paneId },
++    paneEpoch,
++    seqStart,
++    seqEnd,
++  };
++}

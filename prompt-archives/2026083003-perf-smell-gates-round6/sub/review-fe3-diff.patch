@@ -1,0 +1,808 @@
+diff --git a/apps/fe/src/lazy-chunk.test.tsx b/apps/fe/src/lazy-chunk.test.tsx
+new file mode 100644
+index 00000000..4419ca71
+--- /dev/null
++++ b/apps/fe/src/lazy-chunk.test.tsx
+@@ -0,0 +1,40 @@
++// 按需 chunk 的失败兜底：import() 被拒时不能抛穿渲染，也不能永远停在 Suspense 骨架上，
++// 而要落到路由页那张重试卡片上。无 DOM 测试环境，用 react-dom/server 静态渲染，
++// 因此按 lazy 的两段式渲染：首帧出 fallback，等 promise settle 后再渲染一次。
++
++import { describe, expect, test } from 'bun:test';
++import { Suspense } from 'react';
++import { renderToStaticMarkup } from 'react-dom/server';
++
++import { lazyChunk } from './lazy-chunk';
++
++function render(node: React.ReactNode): string {
++  return renderToStaticMarkup(
++    <Suspense fallback={<span data-testid="pending" />}>{node}</Suspense>
++  );
++}
++
++describe('lazyChunk', () => {
++  test('加载成功时渲染目标组件', async () => {
++    const Ok = lazyChunk(async () => ({ label }: { label: string }) => (
++      <p data-testid="ok">{label}</p>
++    ));
++    expect(render(<Ok label="hi" />)).toContain('data-testid="pending"');
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    const html = render(<Ok label="hi" />);
++    expect(html).toContain('data-testid="ok"');
++    expect(html).toContain('hi');
++  });
++
++  test('import 被拒时渲染重试卡片，而不是抛出或卡在骨架上', async () => {
++    const Broken = lazyChunk<Record<string, never>>(() =>
++      Promise.reject(new Error('Failed to fetch dynamically imported module'))
++    );
++    expect(render(<Broken />)).toContain('data-testid="pending"');
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    const html = render(<Broken />);
++    expect(html).toContain('data-testid="page-load-error"');
++    expect(html).toContain('data-testid="page-load-retry"');
++    expect(html).not.toContain('data-testid="pending"');
++  });
++});
+diff --git a/apps/fe/src/lazy-chunk.tsx b/apps/fe/src/lazy-chunk.tsx
+new file mode 100644
+index 00000000..bf0a38d9
+--- /dev/null
++++ b/apps/fe/src/lazy-chunk.tsx
+@@ -0,0 +1,64 @@
++// 按需 chunk 的加载失败兜底。React.lazy 会把 reject 永久缓存成 Rejected 并在渲染期一直抛，
++// 应用里没有错误边界接得住（react-dom/server 也不支持错误边界），发版后旧 chunk 404 就是白屏。
++// 这里把失败在 loader 里就地换成路由页那张重试卡片，重试重新走一次 import()；
++// 连续失败到上限改成整页刷新——浏览器会把失败的模块 URL 记进 module map，
++// 只有重新拿 index.html 才能指到新版 chunk。
++
++import { PageLoadFallback } from '@/PageLoadFallback';
++import { type ComponentType, type LazyExoticComponent, lazy, useState } from 'react';
++
++export type ChunkLoader<P> = () => Promise<ComponentType<P>>;
++
++/** 就地重试上限，超过后重试按钮改成整页刷新 */
++export const MAX_CHUNK_RETRIES = 2;
++
++// 重试成功后的模块按 loader 记一份：lazy 已经把「失败」定死了，不缓存的话
++// 切走再切回来又会看到重试卡片。
++const RECOVERED = new Map<ChunkLoader<never>, ComponentType<never>>();
++
++export function lazyChunk<P extends object>(
++  load: ChunkLoader<P>
++): LazyExoticComponent<ComponentType<P>> {
++  return lazy(() =>
++    load().then<{ default: ComponentType<P> }, { default: ComponentType<P> }>(
++      (component) => ({ default: component }),
++      () => ({ default: (props: P) => <ChunkRetry load={load} componentProps={props} /> })
++    )
++  );
++}
++
++function ChunkRetry<P extends object>({
++  load,
++  componentProps,
++}: {
++  load: ChunkLoader<P>;
++  componentProps: P;
++}) {
++  const key = load as ChunkLoader<never>;
++  const [loaded, setLoaded] = useState<ComponentType<P> | null>(
++    () => (RECOVERED.get(key) as ComponentType<P> | undefined) ?? null
++  );
++  const [attempts, setAttempts] = useState(0);
++
++  if (loaded) {
++    const Loaded = loaded;
++    return <Loaded {...componentProps} />;
++  }
++
++  const retry = () => {
++    if (attempts >= MAX_CHUNK_RETRIES) {
++      window.location.reload();
++      return;
++    }
++    setAttempts((n) => n + 1);
++    void load().then((component) => {
++      RECOVERED.set(key, component as ComponentType<never>);
++      setLoaded(() => component);
++    }, noop);
++  };
++
++  return <PageLoadFallback onRetry={retry} />;
++}
++
++/** 重试失败继续留在重试卡片上，不需要额外处理 */
++function noop(): void {}
+diff --git a/apps/fe/src/pages/FilePage.tsx b/apps/fe/src/pages/FilePage.tsx
+index 339fd06a..47a745dc 100644
+--- a/apps/fe/src/pages/FilePage.tsx
++++ b/apps/fe/src/pages/FilePage.tsx
+@@ -2,11 +2,12 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
+ import type { FileCategory, FileStatResponse } from '@tmex/shared';
+ import { basename, dirname } from '@tmex/shared';
+ import { Download, ExternalLink, FileWarning, Loader2, RotateCw } from 'lucide-react';
+-import { type ReactNode, Suspense, lazy, useMemo } from 'react';
++import { type ReactNode, Suspense, useMemo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { useParams } from 'react-router';
+ 
+ import i18n from '@/i18n';
++import { lazyChunk } from '@/lazy-chunk';
+ import {
+   type ApiClient,
+   type FileApiError,
+@@ -25,8 +26,8 @@ import { IconTooltip } from '@tmex/ui/icon-tooltip';
+ 
+ // Markdown 渲染链（react-markdown + katex + mermaid 等）约 137 KiB gzip，只有 markdown 文件用得到，
+ // 代码 / 纯文本预览不该为它买单。
+-const MarkdownPreview = lazy(() =>
+-  import('@tmex/panels/markdown').then((m) => ({ default: m.MarkdownPreview }))
++const MarkdownPreview = lazyChunk(() =>
++  import('@tmex/panels/markdown').then((m) => m.MarkdownPreview)
+ );
+ 
+ function useFileRef(ref?: string): FileRef | null {
+diff --git a/apps/fe/src/pages/LoginPage.tsx b/apps/fe/src/pages/LoginPage.tsx
+index 7ec53288..3953104b 100644
+--- a/apps/fe/src/pages/LoginPage.tsx
++++ b/apps/fe/src/pages/LoginPage.tsx
+@@ -289,9 +289,3 @@ export const PageTitle = () => {
+   const { t } = useTranslation();
+   return <>{t('auth.login.title')}</>;
+ };
+-
+-/** 供 F4-2 的路由表挂载：`{ path: 'login', element: <LoginPage /> }`。 */
+-export const loginRoute = {
+-  path: 'login',
+-  moduleLoader: () => import('./LoginPage'),
+-} as const;
+diff --git a/apps/fe/src/pages/SettingsPage.tsx b/apps/fe/src/pages/SettingsPage.tsx
+index 170debce..ffacdffd 100644
+--- a/apps/fe/src/pages/SettingsPage.tsx
++++ b/apps/fe/src/pages/SettingsPage.tsx
+@@ -10,11 +10,12 @@ import {
+   Settings as SettingsIcon,
+   Sparkles,
+ } from 'lucide-react';
+-import { Suspense, lazy, useState } from 'react';
++import { Suspense, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { useSearchParams } from 'react-router';
+ import { toast } from 'sonner';
+ 
++import { lazyChunk } from '@/lazy-chunk';
+ import { parseApiError } from '@tmex/api-client';
+ import { useRuntime } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+@@ -34,28 +35,24 @@ import { Tabs, TabsList, TabsTrigger, pillTabTriggerClassName } from '@tmex/ui/t
+ import { useSiteSettingsForm } from './settings/use-site-settings-form';
+ 
+ // 每个标签页独立成块：进设置页只下载当前标签的代码，切换过一次后 React.lazy 缓存模块，之后切换是同步的。
+-const GeneralSettingsTab = lazy(() =>
+-  import('./settings/general-settings-tab').then((m) => ({ default: m.GeneralSettingsTab }))
++const GeneralSettingsTab = lazyChunk(() =>
++  import('./settings/general-settings-tab').then((m) => m.GeneralSettingsTab)
+ );
+-const DevicesAndFilesTab = lazy(() =>
+-  import('./settings/devices-and-files-tab').then((m) => ({ default: m.DevicesAndFilesTab }))
++const DevicesAndFilesTab = lazyChunk(() =>
++  import('./settings/devices-and-files-tab').then((m) => m.DevicesAndFilesTab)
+ );
+-const NodesTab = lazy(() =>
+-  import('./settings/nodes/nodes-tab').then((m) => ({ default: m.NodesTab }))
++const NodesTab = lazyChunk(() => import('./settings/nodes/nodes-tab').then((m) => m.NodesTab));
++const NotificationSettingsTab = lazyChunk(() =>
++  import('./settings/notification-settings-tab').then((m) => m.NotificationSettingsTab)
+ );
+-const NotificationSettingsTab = lazy(() =>
+-  import('./settings/notification-settings-tab').then((m) => ({
+-    default: m.NotificationSettingsTab,
+-  }))
++const AISettingsTab = lazyChunk(() =>
++  import('./settings/ai-settings-tab').then((m) => m.AISettingsTab)
+ );
+-const AISettingsTab = lazy(() =>
+-  import('./settings/ai-settings-tab').then((m) => ({ default: m.AISettingsTab }))
++const TerminalSettingsTab = lazyChunk(() =>
++  import('@tmex/panels/settings/terminal').then((m) => m.TerminalSettingsTab)
+ );
+-const TerminalSettingsTab = lazy(() =>
+-  import('@tmex/panels/settings/terminal').then((m) => ({ default: m.TerminalSettingsTab }))
+-);
+-const RemoteAccessTab = lazy(() =>
+-  import('./settings/remote-access/remote-access-tab').then((m) => ({ default: m.RemoteAccessTab }))
++const RemoteAccessTab = lazyChunk(() =>
++  import('./settings/remote-access/remote-access-tab').then((m) => m.RemoteAccessTab)
+ );
+ 
+ export type SettingsTab =
+diff --git a/packages/panels/src/device-folders/device-folder-tree.tsx b/packages/panels/src/device-folders/device-folder-tree.tsx
+index 4829e0bf..5466bb07 100644
+--- a/packages/panels/src/device-folders/device-folder-tree.tsx
++++ b/packages/panels/src/device-folders/device-folder-tree.tsx
+@@ -114,7 +114,8 @@ interface TreeContextValue {
+   containers: Map<string, DeviceFolderContainer>;
+   foldersById: Map<string, DeviceFolder>;
+   itemCounts: Map<string, number>;
+-  layout: DeviceFolderLayout;
++  /** 有 placement 的节点 id：没有 placement 的节点还挂在根层的默认位置上 */
++  placedNodeIds: ReadonlySet<string>;
+   expandedOf: (folderId: string) => boolean;
+   dropContainerId: string | null;
+   /** 跨容器拖拽时占位条插在哪；同容器重排为 null */
+@@ -153,8 +154,8 @@ function NodeItem({
+   containerId: string;
+   folderId: string | null;
+ }) {
+-  const { renderNode, nodeDraggable, dragDisabled, layout } = useTree();
+-  const implicit = !layout.placements.some((placement) => placement.nodeId === nodeId);
++  const { renderNode, nodeDraggable, dragDisabled, placedNodeIds } = useTree();
++  const implicit = !placedNodeIds.has(nodeId);
+   if (nodeDraggable && !nodeDraggable(nodeId, { folderId })) {
+     const content = renderNode(nodeId, { folderId, implicit, dragDisabled, dragControls: null });
+     if (content === null || content === undefined || content === false) return null;
+@@ -355,6 +356,10 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+     () => listContainers(layout, implicitRootNodeIds),
+     [layout, implicitRootNodeIds]
+   );
++  const placedNodeIds = useMemo<ReadonlySet<string>>(
++    () => new Set(layout.placements.map((placement) => placement.nodeId)),
++    [layout.placements]
++  );
+   const folderElementIds = useMemo(() => rootFolderElementIds(layout), [layout]);
+   const foldersById = useMemo(
+     () => new Map(layout.folders.map((folder) => [folder.id, folder])),
+@@ -367,8 +372,11 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+   useImperativeHandle(ref, () => ({ startNewFolder: () => setCreatingFolder(true) }), []);
+ 
+   const activeDrop = useMemo(
+-    () => (activeId && overId ? resolveDrop(activeId, overId, layout, implicitRootNodeIds) : null),
+-    [activeId, overId, layout, implicitRootNodeIds]
++    () =>
++      activeId && overId
++        ? resolveDrop(activeId, overId, layout, implicitRootNodeIds, containers)
++        : null,
++    [activeId, overId, layout, implicitRootNodeIds, containers]
+   );
+   const dropContainerId = dropTargetContainerId(activeDrop);
+   // 指针停在所有分组之外的空白：整棵树高亮，示意松手会移到最外层
+@@ -376,12 +384,12 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+     activeId !== null && overId === dropZoneId(ROOT_CONTAINER_ID) && activeDrop !== null;
+   // 目标分组还收着的时候不插占位条：内容区没挂载，插了也看不见（等自动展开之后再说）
+   const placeholder = useMemo(() => {
+-    const next = previewPlaceholder(layout, implicitRootNodeIds, activeDrop);
++    const next = previewPlaceholder(layout, implicitRootNodeIds, activeDrop, containers);
+     if (!next) return null;
+     const folderId = containerFolderId(next.containerId);
+     if (folderId && expanded[folderId] === false) return null;
+     return next;
+-  }, [layout, implicitRootNodeIds, activeDrop, expanded]);
++  }, [layout, implicitRootNodeIds, activeDrop, expanded, containers]);
+ 
+   // 拖过折叠的分组停留一会儿就自动展开，方便往里放
+   const autoExpandRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+@@ -404,10 +412,10 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       setOverId(null);
+       // 指针离开整棵树（含拖出窗口）：取消，不动布局
+       if (disabled || dropId === null) return;
+-      const drop = resolveDrop(dragId, dropId, layout, implicitRootNodeIds);
++      const drop = resolveDrop(dragId, dropId, layout, implicitRootNodeIds, containers);
+       if (drop) onDrop(drop);
+     },
+-    [disabled, layout, implicitRootNodeIds, onDrop]
++    [disabled, layout, implicitRootNodeIds, containers, onDrop]
+   );
+ 
+   const actions = useMemo<TreeContextValue['actions']>(
+@@ -439,7 +447,7 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       containers,
+       foldersById,
+       itemCounts,
+-      layout,
++      placedNodeIds,
+       expandedOf,
+       dropContainerId,
+       placeholder,
+@@ -455,7 +463,7 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       containers,
+       foldersById,
+       itemCounts,
+-      layout,
++      placedNodeIds,
+       expandedOf,
+       dropContainerId,
+       placeholder,
+diff --git a/packages/panels/src/device-folders/folder-tree-model.test.ts b/packages/panels/src/device-folders/folder-tree-model.test.ts
+index 486221bd..8090d818 100644
+--- a/packages/panels/src/device-folders/folder-tree-model.test.ts
++++ b/packages/panels/src/device-folders/folder-tree-model.test.ts
+@@ -432,3 +432,51 @@ describe('containerItemIds', () => {
+     ).toEqual(nodeIds);
+   });
+ });
++
++describe('复用外部容器模型', () => {
++  const implicit = ['self'];
++
++  test('传入的容器模型与默认自建的结果一致（节点 / 分组头 / 放置区三类落点）', () => {
++    const layout = sampleLayout();
++    const containers = listContainers(layout, implicit);
++    for (const overId of [
++      'node:n1',
++      'node:n2',
++      'folder:a',
++      'folder:b',
++      dropZoneId('folder:b'),
++      bodyDropZoneId('folder:b'),
++      dropZoneId(ROOT_CONTAINER_ID),
++      'bogus',
++    ]) {
++      expect(resolveDrop('node:self', overId, layout, implicit, containers)).toEqual(
++        resolveDrop('node:self', overId, layout, implicit)
++      );
++    }
++  });
++
++  test('resolveDrop 只按传入的容器模型定位节点', () => {
++    const layout = sampleLayout();
++    // 少了隐式节点的模型：self 不在任何容器里，落到 n1 上仍解析为 a 分组的 0 号位
++    const withoutImplicit = listContainers(layout, []);
++    expect(resolveDrop('node:self', 'node:n1', layout, implicit, withoutImplicit)).toEqual({
++      kind: 'node',
++      nodeId: 'self',
++      targetFolderId: 'a',
++      index: 0,
++    });
++    // 同一个模型里 self 不在根容器：落到根落点条上不再判为原地移动
++    expect(
++      resolveDrop('node:self', dropZoneId(ROOT_CONTAINER_ID), layout, implicit, withoutImplicit)
++    ).toEqual({ kind: 'node', nodeId: 'self', targetFolderId: null, index: null });
++  });
++
++  test('previewPlaceholder 复用传入的容器模型', () => {
++    const layout = sampleLayout();
++    const containers = listContainers(layout, implicit);
++    const drop = resolveDrop('node:self', 'node:n1', layout, implicit, containers);
++    expect(previewPlaceholder(layout, implicit, drop, containers)).toEqual(
++      previewPlaceholder(layout, implicit, drop)
++    );
++  });
++});
+diff --git a/packages/panels/src/device-folders/folder-tree-model.ts b/packages/panels/src/device-folders/folder-tree-model.ts
+index eb97092a..0d0fa1ef 100644
+--- a/packages/panels/src/device-folders/folder-tree-model.ts
++++ b/packages/panels/src/device-folders/folder-tree-model.ts
+@@ -160,7 +160,9 @@ export function resolveDrop(
+   activeId: string,
+   overId: string,
+   layout: DeviceFolderLayout,
+-  implicit: readonly string[] = []
++  implicit: readonly string[] = [],
++  // 宿主（DeviceFolderTree）每次渲染只建一次容器模型，直接传进来复用
++  containers: Map<string, DeviceFolderContainer> = listContainers(layout, implicit)
+ ): DeviceFolderDrop | null {
+   if (activeId === overId) return null;
+   const activeFolderId = parseFolderElementId(activeId);
+@@ -183,7 +185,6 @@ export function resolveDrop(
+ 
+   const activeNodeId = parseNodeElementId(activeId);
+   if (activeNodeId === null) return null;
+-  const containers = listContainers(layout, implicit);
+ 
+   let targetContainerId: string;
+   let index: number | null;
+@@ -229,11 +230,11 @@ export interface DeviceFolderPlaceholder {
+ export function previewPlaceholder(
+   layout: DeviceFolderLayout,
+   implicit: readonly string[],
+-  drop: DeviceFolderDrop | null
++  drop: DeviceFolderDrop | null,
++  containers: Map<string, DeviceFolderContainer> = listContainers(layout, implicit)
+ ): DeviceFolderPlaceholder | null {
+   if (!drop || drop.kind !== 'node') return null;
+   const containerId = folderContainerId(drop.targetFolderId);
+-  const containers = listContainers(layout, implicit);
+   if (!containers.has(containerId)) return null;
+   const from = locateNode(containers, nodeElementId(drop.nodeId));
+   if (from?.containerId === containerId) return null;
+diff --git a/packages/panels/src/device-management/use-device-management-state.ts b/packages/panels/src/device-management/use-device-management-state.ts
+index 6017f028..f2b20f73 100644
+--- a/packages/panels/src/device-management/use-device-management-state.ts
++++ b/packages/panels/src/device-management/use-device-management-state.ts
+@@ -11,6 +11,7 @@ import { staggerItemStyle } from '@tmex/ui/motion';
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
++import { reorderDevicesOptimistically } from '../device-tree/device-reorder';
+ import { sortDevices } from '../device-tree/device-tree-selectors';
+ 
+ /** 首屏逐项入场的延迟档位上限（35ms/档），超出的卡片与最后一档同时进场 */
+@@ -98,13 +99,9 @@ export function useDeviceManagementState({
+       await queryClient.cancelQueries({ queryKey: devicesQueryKey });
+       const previous = queryClient.getQueryData<DevicesResponse>(devicesQueryKey);
+       if (previous) {
+-        const byId = new Map(previous.devices.map((device) => [device.id, device]));
+-        const reordered = deviceIds.flatMap((id, index) => {
+-          const device = byId.get(id);
+-          return device ? [{ ...device, sortOrder: index }] : [];
++        queryClient.setQueryData(devicesQueryKey, {
++          devices: reorderDevicesOptimistically(previous.devices, deviceIds),
+         });
+-        const rest = previous.devices.filter((device) => !deviceIds.includes(device.id));
+-        queryClient.setQueryData(devicesQueryKey, { devices: [...reordered, ...rest] });
+       }
+       return { previous };
+     },
+diff --git a/packages/panels/src/device-tree/device-reorder.test.ts b/packages/panels/src/device-tree/device-reorder.test.ts
+new file mode 100644
+index 00000000..e2339687
+--- /dev/null
++++ b/packages/panels/src/device-tree/device-reorder.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, test } from 'bun:test';
++import { reorderDevicesOptimistically } from './device-reorder';
++
++interface Row {
++  id: string;
++  sortOrder: number;
++  name?: string;
++}
++
++function rows(...ids: string[]): Row[] {
++  return ids.map((id, index) => ({ id, sortOrder: index, name: `n-${id}` }));
++}
++
++describe('reorderDevicesOptimistically', () => {
++  test('按请求顺序重排并重写 sortOrder', () => {
++    const next = reorderDevicesOptimistically(rows('a', 'b', 'c'), ['c', 'a', 'b']);
++
++    expect(next.map((row) => [row.id, row.sortOrder])).toEqual([
++      ['c', 0],
++      ['a', 1],
++      ['b', 2],
++    ]);
++  });
++
++  test('未在请求里的设备保持原相对顺序追加在后面', () => {
++    const next = reorderDevicesOptimistically(rows('a', 'b', 'c', 'd'), ['c', 'a']);
++
++    expect(next.map((row) => row.id)).toEqual(['c', 'a', 'b', 'd']);
++    expect(next.map((row) => row.sortOrder)).toEqual([0, 1, 1, 3]);
++  });
++
++  test('未知 id 被丢弃，且不会挤掉已有设备的槽位号', () => {
++    const next = reorderDevicesOptimistically(rows('a', 'b'), ['ghost', 'b', 'a']);
++
++    expect(next.map((row) => [row.id, row.sortOrder])).toEqual([
++      ['b', 1],
++      ['a', 2],
++    ]);
++  });
++
++  test('不修改入参，其余字段原样保留', () => {
++    const input = rows('a', 'b');
++    const next = reorderDevicesOptimistically(input, ['b', 'a']);
++
++    expect(input.map((row) => [row.id, row.sortOrder])).toEqual([
++      ['a', 0],
++      ['b', 1],
++    ]);
++    expect(next[0]?.name).toBe('n-b');
++    expect(next[0]).not.toBe(input[1]);
++  });
++
++  test('空请求列表原样返回', () => {
++    const next = reorderDevicesOptimistically(rows('a', 'b'), []);
++
++    expect(next.map((row) => [row.id, row.sortOrder])).toEqual([
++      ['a', 0],
++      ['b', 1],
++    ]);
++  });
++});
+diff --git a/packages/panels/src/device-tree/device-reorder.ts b/packages/panels/src/device-tree/device-reorder.ts
+new file mode 100644
+index 00000000..cda034a2
+--- /dev/null
++++ b/packages/panels/src/device-tree/device-reorder.ts
+@@ -0,0 +1,16 @@
++/**
++ * 设备重排的乐观更新（侧栏与设备管理面板共用）：认识的 id 依次排在前面并重写 `sortOrder`
++ * （取该 id 在 `deviceIds` 里的下标），其余设备保持原相对顺序追加在后面，未知 id 丢弃。
++ */
++export function reorderDevicesOptimistically<T extends { id: string; sortOrder: number }>(
++  devices: readonly T[],
++  deviceIds: readonly string[]
++): T[] {
++  const byId = new Map(devices.map((device) => [device.id, device]));
++  const requested = new Set(deviceIds);
++  const reordered = deviceIds.flatMap((id, index) => {
++    const device = byId.get(id);
++    return device ? [{ ...device, sortOrder: index }] : [];
++  });
++  return [...reordered, ...devices.filter((device) => !requested.has(device.id))];
++}
+diff --git a/packages/panels/src/device-tree/sidebar-device-list.tsx b/packages/panels/src/device-tree/sidebar-device-list.tsx
+index ea26598e..7bdbeaa6 100644
+--- a/packages/panels/src/device-tree/sidebar-device-list.tsx
++++ b/packages/panels/src/device-tree/sidebar-device-list.tsx
+@@ -15,6 +15,7 @@ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
+ import type { DeviceConnectionAdapter } from '../device-connection';
+ import type { SidebarAgentAdapter } from './agent-adapter';
++import { reorderDevicesOptimistically } from './device-reorder';
+ import { DeviceRow } from './device-row';
+ import { useDeviceTreeDialogs } from './device-tree-dialogs';
+ import { SortableVerticalList } from './device-tree-dnd';
+@@ -132,15 +133,9 @@ export function SideBarDeviceList({
+       await queryClient.cancelQueries({ queryKey });
+       const previous = queryClient.getQueryData<{ devices: DeviceListItem[] }>(queryKey);
+       if (previous) {
+-        const byId = new Map(previous.devices.map((d) => [d.id, d]));
+-        const reordered = deviceIds
+-          .map((id, index) => {
+-            const d = byId.get(id);
+-            return d ? { ...d, sortOrder: index } : undefined;
+-          })
+-          .filter((d): d is DeviceListItem => d !== undefined);
+-        const rest = previous.devices.filter((d) => !deviceIds.includes(d.id));
+-        queryClient.setQueryData(queryKey, { devices: [...reordered, ...rest] });
++        queryClient.setQueryData(queryKey, {
++          devices: reorderDevicesOptimistically(previous.devices, deviceIds),
++        });
+       }
+       return { previous };
+     },
+diff --git a/packages/panels/src/markdown/markdown-preview.test.ts b/packages/panels/src/markdown/markdown-preview.test.ts
+deleted file mode 100644
+index c3f15364..00000000
+--- a/packages/panels/src/markdown/markdown-preview.test.ts
++++ /dev/null
+@@ -1,40 +0,0 @@
+-import { describe, expect, it } from 'bun:test';
+-import { resolveImgSrc } from './markdown-preview';
+-
+-const resolver = (absPath: string) =>
+-  `/api/files/raw?rootId=r1&path=${encodeURIComponent(absPath)}`;
+-
+-describe('resolveImgSrc', () => {
+-  it('外链与 data URI 原样返回', () => {
+-    expect(resolveImgSrc('https://cdn.example.com/a.png', '/docs', resolver)).toBe(
+-      'https://cdn.example.com/a.png'
+-    );
+-    expect(resolveImgSrc('//cdn.example.com/a.png', '/docs', resolver)).toBe(
+-      '//cdn.example.com/a.png'
+-    );
+-    expect(resolveImgSrc('data:image/png;base64,AA', '/docs', resolver)).toBe(
+-      'data:image/png;base64,AA'
+-    );
+-  });
+-
+-  it('未注入 resolver 时不改写本地 src', () => {
+-    expect(resolveImgSrc('./img/a.png', '/docs', null)).toBe('./img/a.png');
+-    expect(resolveImgSrc('/abs/a.png', '/docs', null)).toBe('/abs/a.png');
+-  });
+-
+-  it('相对路径基于 basePath 归一后交给 resolver', () => {
+-    expect(resolveImgSrc('./img/a.png', '/docs', (p) => p)).toBe('/docs/img/a.png');
+-    expect(resolveImgSrc('../assets/a.png', '/docs/guide', (p) => p)).toBe('/docs/assets/a.png');
+-    expect(resolveImgSrc('a.png', '/docs/', (p) => p)).toBe('/docs/a.png');
+-  });
+-
+-  it('绝对路径归一后交给 resolver', () => {
+-    expect(resolveImgSrc('/docs//img/./a.png', '/docs', (p) => p)).toBe('/docs/img/a.png');
+-  });
+-
+-  it('resolver 决定最终 URL（宿主注入 rootId）', () => {
+-    expect(resolveImgSrc('./a.png', '/docs', resolver)).toBe(
+-      '/api/files/raw?rootId=r1&path=%2Fdocs%2Fa.png'
+-    );
+-  });
+-});
+diff --git a/packages/panels/src/markdown/markdown-preview.test.tsx b/packages/panels/src/markdown/markdown-preview.test.tsx
+new file mode 100644
+index 00000000..2df35b8f
+--- /dev/null
++++ b/packages/panels/src/markdown/markdown-preview.test.tsx
+@@ -0,0 +1,77 @@
++import { describe, expect, it } from 'bun:test';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { MarkdownPreview, resolveImgSrc, skipsAutoDetect } from './markdown-preview';
++
++const resolver = (absPath: string) =>
++  `/api/files/raw?rootId=r1&path=${encodeURIComponent(absPath)}`;
++
++describe('resolveImgSrc', () => {
++  it('外链与 data URI 原样返回', () => {
++    expect(resolveImgSrc('https://cdn.example.com/a.png', '/docs', resolver)).toBe(
++      'https://cdn.example.com/a.png'
++    );
++    expect(resolveImgSrc('//cdn.example.com/a.png', '/docs', resolver)).toBe(
++      '//cdn.example.com/a.png'
++    );
++    expect(resolveImgSrc('data:image/png;base64,AA', '/docs', resolver)).toBe(
++      'data:image/png;base64,AA'
++    );
++  });
++
++  it('未注入 resolver 时不改写本地 src', () => {
++    expect(resolveImgSrc('./img/a.png', '/docs', null)).toBe('./img/a.png');
++    expect(resolveImgSrc('/abs/a.png', '/docs', null)).toBe('/abs/a.png');
++  });
++
++  it('相对路径基于 basePath 归一后交给 resolver', () => {
++    expect(resolveImgSrc('./img/a.png', '/docs', (p) => p)).toBe('/docs/img/a.png');
++    expect(resolveImgSrc('../assets/a.png', '/docs/guide', (p) => p)).toBe('/docs/assets/a.png');
++    expect(resolveImgSrc('a.png', '/docs/', (p) => p)).toBe('/docs/a.png');
++  });
++
++  it('绝对路径归一后交给 resolver', () => {
++    expect(resolveImgSrc('/docs//img/./a.png', '/docs', (p) => p)).toBe('/docs/img/a.png');
++  });
++
++  it('resolver 决定最终 URL（宿主注入 rootId）', () => {
++    expect(resolveImgSrc('./a.png', '/docs', resolver)).toBe(
++      '/api/files/raw?rootId=r1&path=%2Fdocs%2Fa.png'
++    );
++  });
++});
++
++// 自动语言识别护栏：未标语言的大代码块不能再走 highlightAuto，否则 1 MiB 就是十秒量级的主线程停顿。
++describe('MarkdownPreview 自动识别护栏', () => {
++  const render = (source: string) =>
++    renderToStaticMarkup(<MarkdownPreview source={source} basePath="/docs" />);
++
++  it('小的未标语言代码块仍然自动识别', () => {
++    const html = render('```\nconst a = 1;\n```\n');
++    expect(html).toContain('hljs-');
++  });
++
++  it('显式语言的大代码块仍然高亮', () => {
++    const html = render(`\`\`\`ts\n${'const a = 1;\n'.repeat(6000)}\`\`\`\n`);
++    expect(html).toContain('hljs-keyword');
++  });
++
++  // 护栏前同一份输入要 ~9 s（全靠 highlightAuto），护栏后只剩 react-markdown 自身的解析开销（~140 ms）。
++  it('1 MiB 未标语言代码块跳过识别，不再有秒级停顿', () => {
++    const source = `\`\`\`\n${'lorem ipsum dolor sit amet 0123456789\n'.repeat(28000)}\`\`\`\n`;
++    expect(source.length).toBeGreaterThan(1024 * 1024);
++    const started = performance.now();
++    const html = render(source);
++    const elapsed = performance.now() - started;
++    expect(html).toContain('no-highlight');
++    expect(html).not.toContain('hljs-');
++    // 跳过识别拿不到 language-* class，但它仍是 fenced 块，不能退化成 inline code 的药丸样式。
++    expect(html).not.toContain('px-1.5 py-0.5');
++    expect(elapsed).toBeLessThan(500);
++  });
++
++  it('阈值：块超 64 KiB 或整篇超 256 KiB 都跳过识别', () => {
++    expect(skipsAutoDetect(1024, 1024)).toBe(false);
++    expect(skipsAutoDetect(64 * 1024 + 1, 1024)).toBe(true);
++    expect(skipsAutoDetect(1024, 256 * 1024 + 1)).toBe(true);
++  });
++});
+diff --git a/packages/panels/src/markdown/markdown-preview.tsx b/packages/panels/src/markdown/markdown-preview.tsx
+index f3519722..9959c5d6 100644
+--- a/packages/panels/src/markdown/markdown-preview.tsx
++++ b/packages/panels/src/markdown/markdown-preview.tsx
+@@ -33,6 +33,43 @@ export function resolveImgSrc(
+   return resolver(normalizePosixPath(`${base}${src}`));
+ }
+ 
++/**
++ * highlightAuto 要拿所有语法各跑一遍，代价随体积暴涨（1 MiB 未标语言的块要十秒量级，直接冻住主线程）。
++ * 超限的未标语言代码块打上 no-highlight，rehype-highlight 会整块跳过；显式 ```lang 的块不受影响，
++ * 走的是快两个数量级的 hljs.highlight。块级阈值与 CodeViewer 的自动识别护栏一致，
++ * 文档级阈值挡住「成百上千个小块累加」这种块级阈值看不见的情况。
++ */
++const AUTO_DETECT_BLOCK_LIMIT = 64 * 1024;
++const AUTO_DETECT_DOC_LIMIT = 256 * 1024;
++
++export function skipsAutoDetect(blockLength: number, docLength: number): boolean {
++  return blockLength > AUTO_DETECT_BLOCK_LIMIT || docLength > AUTO_DETECT_DOC_LIMIT;
++}
++
++interface MdastNode {
++  type: string;
++  lang?: string | null;
++  value?: string;
++  data?: { hProperties?: Record<string, unknown> };
++  children?: MdastNode[];
++}
++
++/** remark 阶段给超限的未标语言代码块挂上 no-highlight（经 data.hProperties 落到 `<code>` 上）。 */
++function guardAutoDetect(docLength: number) {
++  return () => (tree: MdastNode) => {
++    const walk = (node: MdastNode): void => {
++      if (node.type === 'code') {
++        if (!node.lang && skipsAutoDetect((node.value ?? '').length, docLength)) {
++          node.data = { ...node.data, hProperties: { className: ['no-highlight'] } };
++        }
++        return;
++      }
++      for (const child of node.children ?? []) walk(child);
++    };
++    walk(tree);
++  };
++}
++
+ function buildComponents(basePath: string, resolver: ImgUrlResolver | null): Components {
+   return {
+     a: ({ node: _node, ...props }) => (
+@@ -63,8 +100,9 @@ function buildComponents(basePath: string, resolver: ImgUrlResolver | null): Com
+         return <MermaidBlock code={String(children).replace(/\n$/, '')} />;
+       }
+       // fenced 代码块（rehype-highlight 会附加 hljs / language-* class），
+-      // inline code 没有 language-* 也不会被 hljs 处理。
+-      if (lang) {
++      // inline code 没有 language-* 也不会被 hljs 处理；
++      // 被护栏打上 no-highlight 的块拿不到 language-*，但它仍然是 fenced 块。
++      if (lang || className?.includes('no-highlight')) {
+         return (
+           <code {...props} className={cn('font-mono text-[13px]', className)}>
+             {children}
+@@ -131,7 +169,7 @@ export function MarkdownPreview({
+   return (
+     <div className={cn('min-w-0 text-sm', className)}>
+       <ReactMarkdown
+-        remarkPlugins={[remarkGfm, remarkMath]}
++        remarkPlugins={[remarkGfm, remarkMath, guardAutoDetect(source.length)]}
+         rehypePlugins={[rehypeKatex, [rehypeHighlight, { detect: true }]]}
+         components={components}
+       >
+diff --git a/packages/stores/src/tmux.ts b/packages/stores/src/tmux.ts
+index f07a6747..b19da009 100644
+--- a/packages/stores/src/tmux.ts
++++ b/packages/stores/src/tmux.ts
+@@ -15,6 +15,14 @@ export type { DeviceInitialErrorInput, TmuxState } from './tmux-state';
+ 
+ const CONNECT_DEDUP_WINDOW_MS = 500;
+ 
++/** 乐观重排：认识的 id 按请求顺序排在前面，其余条目保持原相对顺序追加在后；未知 id 丢弃 */
++function reorderById<T extends { id: string }>(items: readonly T[], ids: readonly string[]): T[] {
++  const byId = new Map(items.map((item) => [item.id, item] as const));
++  const requested = new Set(ids);
++  const known = ids.map((id) => byId.get(id)).filter((item) => item !== undefined);
++  return [...known, ...items.filter((item) => !requested.has(item.id))];
++}
++
+ export interface TmuxStoreDeps {
+   getUI: () => UIStore;
+   getSite: () => SiteStore;
+@@ -278,14 +286,11 @@ export function createTmuxStore(
+           const snapshot = prev.snapshots[deviceId];
+           const session = snapshot?.session;
+           if (!session) return {};
+-          const byId = new Map(session.windows.map((w) => [w.id, w] as const));
+-          const requested = new Set(windowIds);
+-          const known = windowIds.map((id) => byId.get(id)).filter((w) => w !== undefined);
+-          const rest = session.windows.filter((w) => !requested.has(w.id));
++          const windows = reorderById(session.windows, windowIds);
+           return {
+             snapshots: {
+               ...prev.snapshots,
+-              [deviceId]: { ...snapshot, session: { ...session, windows: [...known, ...rest] } },
++              [deviceId]: { ...snapshot, session: { ...session, windows } },
+             },
+           };
+         });
+@@ -357,14 +362,9 @@ export function createTmuxStore(
+           const snapshot = prev.snapshots[deviceId];
+           const session = snapshot?.session;
+           if (!session) return {};
+-          const requested = new Set(paneIds);
+-          const windows = session.windows.map((w) => {
+-            if (w.id !== windowId) return w;
+-            const byId = new Map(w.panes.map((p) => [p.id, p] as const));
+-            const known = paneIds.map((id) => byId.get(id)).filter((p) => p !== undefined);
+-            const rest = w.panes.filter((p) => !requested.has(p.id));
+-            return { ...w, panes: [...known, ...rest] };
+-          });
++          const windows = session.windows.map((w) =>
++            w.id === windowId ? { ...w, panes: reorderById(w.panes, paneIds) } : w
++          );
+           return {
+             snapshots: {
+               ...prev.snapshots,

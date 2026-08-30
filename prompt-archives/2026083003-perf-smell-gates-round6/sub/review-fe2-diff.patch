@@ -1,0 +1,1872 @@
+diff --git a/apps/fe/src/auth/index.ts b/apps/fe/src/auth/index.ts
+index 4a2851b1..1ac868e1 100644
+--- a/apps/fe/src/auth/index.ts
++++ b/apps/fe/src/auth/index.ts
+@@ -1,6 +1,7 @@
+ // mesh 身份相关的前端入口。F4-2/F4-3 从这里取 `NodeLoginButton` / `hasSessionKey` / `loginToNode`。
+ 
+ export * from './session-key-store';
++export * from './session-login';
+ export * from './login-errors';
+ export * from './use-node-login';
+ export * from './use-session-key';
+diff --git a/apps/fe/src/auth/session-key-store.test.ts b/apps/fe/src/auth/session-key-store.test.ts
+index 37409d62..d1dcb5df 100644
+--- a/apps/fe/src/auth/session-key-store.test.ts
++++ b/apps/fe/src/auth/session-key-store.test.ts
+@@ -18,15 +18,17 @@ import {
+ import {
+   clearSessionKey,
+   ensureNodeLogin,
+-  establishSessionFromPasskey,
+-  establishSessionFromSeed,
+   getSessionKey,
+   hasSessionKey,
++  resetNodeLoginsForTest,
++} from './session-key-store';
++import {
++  establishSessionFromPasskey,
++  establishSessionFromSeed,
+   loginSelf,
+   loginToNode,
+-  resetNodeLoginsForTest,
+   selectPasskeyCredential,
+-} from './session-key-store';
++} from './session-login';
+ 
+ const UID = 'alice';
+ /** node id 一律是规范的 32 位小写 hex（`assertNodeId` 只接受这种形态）。 */
+@@ -383,6 +385,25 @@ describe('ensureNodeLogin', () => {
+   });
+ });
+ 
++describe('常驻模块的静态依赖', () => {
++  test('只动态加载 ./session-login，不静态拖入 argon2 / 椭圆曲线（否则会回到首屏 chunk）', async () => {
++    const scan = async (file: string) =>
++      new Bun.Transpiler({ loader: file.endsWith('x') ? 'tsx' : 'ts' }).scanImports(
++        await Bun.file(`${import.meta.dir}/${file}`).text()
++      );
++    const store = await scan('session-key-store.ts');
++    expect(store.find((entry) => entry.path === './session-login')?.kind).toBe('dynamic-import');
++    expect(store.map((entry) => entry.path)).not.toContain('@tmex/shared/auth');
++
++    // 侧边栏 / 路由边界这两条常驻入口也只能碰 store，不能直接引实现。
++    for (const file of ['NodeLoginButton.tsx', 'use-node-login.ts']) {
++      const paths = (await scan(file)).map((entry) => entry.path);
++      expect(paths).not.toContain('./session-login');
++      expect(paths).not.toContain('@tmex/shared/auth');
++    }
++  });
++});
++
+ describe('selectPasskeyCredential', () => {
+   const A = { id: 'cred-a' };
+   const B = { id: 'cred-b' };
+diff --git a/apps/fe/src/auth/session-key-store.ts b/apps/fe/src/auth/session-key-store.ts
+index 62190283..3522238b 100644
+--- a/apps/fe/src/auth/session-key-store.ts
++++ b/apps/fe/src/auth/session-key-store.ts
+@@ -5,34 +5,13 @@
+ //   * seed（= 根钥私钥）在派生出根钥与 k_totp 之后立即清零，根钥对象随即丢弃。
+ //   * sk_sess 只能签 login，不得签任何 user_key_log 记录。
+ //   * TOTP 只在 delegation.method === 'root' 且用户开了 TOTP 时随登录下发。
++//
++// 这里只有常驻的状态与订阅，**不 import argon2 / 椭圆曲线**；建立会话与签名的实现在
++// `./session-login`，由 `ensureNodeLogin()` 在真的要登录时才 `import()` 进来。
+ 
+ import { markLoggedIn } from '@/node/mesh-nodes';
+-import { SELF_NODE_ID } from '@tmex/api-client';
+-import type {
+-  AuthApi,
+-  MeshNode,
+-  PasskeySummary,
+-  PublicKeyCredentialDescriptorJSON,
+-} from '@tmex/api-client/auth/index';
+-import { defaultAuthApi } from '@tmex/api-client/auth/index';
+-import { startAuthentication } from '@tmex/api-client/auth/index';
++import type { AuthApi, MeshNode } from '@tmex/api-client/auth/index';
+ import type { Delegation } from '@tmex/shared/auth';
+-import {
+-  buildLogin,
+-  buildPasskeyDelegation,
+-  bytesEqual,
+-  createDelegation,
+-  decodeBase64url,
+-  deriveSeed,
+-  deriveTotpKey,
+-  encodeBase64url,
+-  encodeDelegation,
+-  encodeLogin,
+-  encodePasskeyAssertion,
+-  generateEd25519KeyPair,
+-  rootKeyFromSeed,
+-  signLogin,
+-} from '@tmex/shared/auth';
+ 
+ type SessionKeyMethod = 'root' | 'passkey';
+ 
+@@ -48,7 +27,7 @@ export interface SessionKeyInfo {
+   credentialId: string | null;
+ }
+ 
+-interface SessionKeySecrets {
++export interface SessionKeySecrets {
+   info: SessionKeyInfo;
+   sessSk: Uint8Array;
+   sessPk: Uint8Array;
+@@ -69,7 +48,7 @@ export type LoginFailureCode =
+   | 'NODE_LIST_FAILED'
+   | (string & {});
+ 
+-type LoginNodeResult = { ok: true } | { ok: false; code: LoginFailureCode };
++export type LoginNodeResult = { ok: true } | { ok: false; code: LoginFailureCode };
+ 
+ // ---------------------------------------------------------------------------
+ // 状态
+@@ -110,15 +89,11 @@ export function hasSessionKey(): boolean {
+   return getSessionKey() !== null;
+ }
+ 
+-function wipe(bytes: Uint8Array | null | undefined): void {
+-  bytes?.fill(0);
+-}
+-
+ export function clearSessionKey(): void {
+   if (!current) return;
+-  wipe(current.sessSk);
+-  wipe(current.delegationSig);
+-  wipe(current.kTotp);
++  current.sessSk.fill(0);
++  current.delegationSig.fill(0);
++  current.kTotp?.fill(0);
+   current.totpCode = null;
+   current = null;
+   notifyState();
+@@ -133,386 +108,23 @@ export function setTotpCode(code: string): void {
+   if (current) current.totpCode = code;
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// 建立会话钥
+-// ---------------------------------------------------------------------------
+-
+-interface EstablishFromSeedOptions {
+-  uid: string;
+-  entryNodeId: string;
+-  rootEpoch: number;
+-  hasTotp: boolean;
+-  totpCode?: string;
+-  now?: number;
++/** 仅供 `./session-login` 读内存里的私钥材料。 */
++export function readSessionSecrets(): SessionKeySecrets | null {
++  return current;
+ }
+ 
+-/**
+- * 由 seed（argon2id 输出）建立会话钥。
+- * **调用后 `seed` 会被清零**——调用方不得再使用该数组。
+- */
+-export function establishSessionFromSeed(
+-  seed: Uint8Array,
+-  opts: EstablishFromSeedOptions
+-): SessionKeyInfo {
+-  const now = opts.now ?? Date.now();
+-  const rootKey = rootKeyFromSeed(seed);
+-  const sess = generateEd25519KeyPair();
+-  const signed = createDelegation(rootKey, { uid: opts.uid, sessPk: sess.publicKey, now });
+-  const kTotp = opts.hasTotp ? deriveTotpKey(seed, opts.uid, opts.rootEpoch) : null;
+-
+-  // 根钥用完即弃：清零我们持有的 seed 与 rootKey 内部副本。
+-  wipe(seed);
+-  wipe(rootKey.seed);
+-
++/** 接管一份新会话的所有权：旧会话就地清零，之后由 `clearSessionKey()` 负责清零新的。 */
++export function adoptSessionSecrets(secrets: SessionKeySecrets): SessionKeyInfo {
+   clearSessionKey();
+-  current = {
+-    info: {
+-      uid: opts.uid,
+-      entryNodeId: opts.entryNodeId,
+-      method: 'root',
+-      issuedAt: Number(signed.delegation.issued_at),
+-      expiresAt: Number(signed.delegation.exp),
+-      hasTotp: opts.hasTotp,
+-      credentialId: null,
+-    },
+-    sessSk: sess.secretKey,
+-    sessPk: sess.publicKey,
+-    delegation: signed.delegation,
+-    delegationBytes: signed.bytes,
+-    delegationSig: signed.sig,
+-    kTotp,
+-    totpCode: opts.totpCode ?? null,
+-  };
++  current = secrets;
+   notifyState();
+-  return current.info;
+-}
+-
+-interface EstablishFromPasswordOptions extends EstablishFromSeedOptions {
+-  password: string;
+-  kdfParams: { salt: string; memory_kib: number; iterations: number; parallelism: number };
+-}
+-
+-export async function establishSessionFromPassword(
+-  opts: EstablishFromPasswordOptions
+-): Promise<SessionKeyInfo> {
+-  const seed = await deriveSeed(opts.password, {
+-    salt: decodeBase64url(opts.kdfParams.salt),
+-    memory_kib: opts.kdfParams.memory_kib,
+-    iterations: opts.kdfParams.iterations,
+-    parallelism: opts.kdfParams.parallelism,
+-  });
+-  return establishSessionFromSeed(seed, opts);
+-}
+-
+-interface EstablishFromPasskeyOptions {
+-  uid: string;
+-  entryNodeId: string;
+-  /** 指定用哪一把；不给则按当前 origin / RP 过滤后再选。 */
+-  credentialId?: string;
+-  api?: AuthApi;
+-  now?: number;
+-  /** 当前 origin（测试注入）；缺省读 `location.origin`。 */
+-  origin?: string;
+-  /** 已知的 passkey 元数据（含注册 origin）；缺省尝试 `GET /api/auth/passkeys`。 */
+-  passkeys?: PasskeySummary[] | null;
+-  /** 会话密钥对生成器（测试注入）：拿到同一把 `sk_sess` 才能断言失败时它被清零。 */
+-  generateSessionKeyPair?: () => { publicKey: Uint8Array; secretKey: Uint8Array };
+-}
+-
+-class PasskeyCredentialUnknownError extends Error {
+-  readonly code = 'PASSKEY_CREDENTIAL_UNKNOWN';
+-  constructor() {
+-    super('no passkey credential available for this entry');
+-    this.name = 'PasskeyCredentialUnknownError';
+-  }
+-}
+-
+-function currentOrigin(override?: string): string {
+-  if (override) return override;
+-  return (globalThis as { location?: { origin?: string } }).location?.origin ?? '';
+-}
+-
+-/**
+- * 凭证选择结果。
+- *
+- * - `bind`：已经能唯一确定凭证，直接写进 delegation，只做一次仪式；
+- * - `browser`：**不由前端挑**，把这份列表原样交给 WebAuthn，让浏览器 / 认证器选；
+- * - `none`：当前 origin 一把可用的都没有。
+- */
+-type PasskeySelection =
+-  | { kind: 'bind'; credentialId: string }
+-  | { kind: 'browser'; allowCredentials: PublicKeyCredentialDescriptorJSON[] }
+-  | { kind: 'none' };
+-
+-/**
+- * 决定这次断言用哪把凭证。
+- *
+- * **绝不回退到 `allowCredentials[0]`**：用户在 node A、node B 各注册过 passkey 时，从 B 登录
+- * 若 A 的凭证排在前面，盲取第一把会把仪式锁死在属于 A 的凭证上并以 `NotAllowedError` 失败
+- * （见 F4-1 / F4-fix 评审 Major）。取而代之：
+- *
+- * - 有可信 origin 元数据（登录后的 `/api/auth/passkeys`）→ 只留 `origin` **精确相等**的，
+- *   没有 rp_id 回退；一把也不剩就是 `none`。
+- * - 没有元数据（登录前通常没有会话，拉不到列表）→ 交给浏览器：后端已按精确 origin 过滤过
+- *   登录 options，列表里每一把都能用，由认证器决定用户手上到底有哪一把。
+- *   只剩一把时退化成 `bind`（那不是「挑」，本来就只有一个候选），省掉一次探测仪式。
+- */
+-export function selectPasskeyCredential(input: {
+-  allowCredentials?: PublicKeyCredentialDescriptorJSON[];
+-  passkeys?: PasskeySummary[] | null;
+-  origin: string;
+-  preferredId?: string;
+-}): PasskeySelection {
+-  const rows = (input.allowCredentials ?? []).filter((row) => Boolean(row.id));
+-  if (rows.length === 0) return { kind: 'none' };
+-  if (input.preferredId) {
+-    return rows.some((row) => row.id === input.preferredId)
+-      ? { kind: 'bind', credentialId: input.preferredId }
+-      : { kind: 'none' };
+-  }
+-
+-  const known = input.passkeys ?? null;
+-  if (known && known.length > 0) {
+-    const byId = new Map(known.map((row) => [row.credential_id, row]));
+-    const sameOrigin = rows.filter((row) => byId.get(row.id)?.origin === input.origin);
+-    if (sameOrigin.length === 1) return { kind: 'bind', credentialId: sameOrigin[0].id };
+-    if (sameOrigin.length > 1) return { kind: 'browser', allowCredentials: sameOrigin };
+-    // 有元数据但没有一把属于当前 origin：宁可报「本入口没有可用 passkey」，
+-    // 也不要拿别的 origin 的凭证去发起注定失败的仪式。
+-    if (rows.some((row) => byId.has(row.id))) return { kind: 'none' };
+-  }
+-  if (rows.length === 1) return { kind: 'bind', credentialId: rows[0].id };
+-  return { kind: 'browser', allowCredentials: rows };
+-}
+-
+-/**
+- * passkey 路径：delegation 里必须先写死 credential_id（challenge = sha256(borsh(delegation))），
+- * 而凭证列表只有 entry 知道——所以先用一个探测 delegation 换回 `allowCredentials`，
+- * 选定凭证后再用最终 delegation 换一次 options。
+- * 断言整体以 Borsh `PasskeyAssertion` 编码作为 `delegation_sig`。
+- *
+- * 凭证由 `selectPasskeyCredential()` 决定，前端**不做**「取第一把」这种猜测。候选不唯一且没有
+- * 可信 origin 元数据时（登录前多半如此），先把服务端那份 `allowCredentials` **原样**交给
+- * WebAuthn 做一次探测仪式，由浏览器 / 认证器选出用户手上真正有的那把，再用它绑定最终
+- * delegation 做正式仪式——协议要求 challenge 覆盖 credential_id，这一步换不掉。
+- * 单候选（后端按精确 origin 过滤后的常态）只做一次仪式。
+- *
+- * `sk_sess` 从生成起就在 `try/finally` 里：用户取消仪式、options 请求失败、origin 选不出凭证，
+- * 都会立刻清零，只有成功交给全局 session store 才转移所有权（见 F4-fix 评审 Minor）。
+- */
+-export async function establishSessionFromPasskey(
+-  opts: EstablishFromPasskeyOptions
+-): Promise<SessionKeyInfo> {
+-  const api = opts.api ?? defaultAuthApi;
+-  const now = opts.now ?? Date.now();
+-  const sess = (opts.generateSessionKeyPair ?? generateEd25519KeyPair)();
+-  let owned = false;
+-
+-  try {
+-    const buildFor = (credentialId: string) =>
+-      buildPasskeyDelegation({ uid: opts.uid, sessPk: sess.publicKey, now, credentialId });
+-
+-    let credentialId = opts.credentialId ?? '';
+-    let delegation = buildFor(credentialId);
+-    let options = await api.passkeyLoginOptions(
+-      opts.uid,
+-      encodeBase64url(encodeDelegation(delegation))
+-    );
+-    if (!credentialId) {
+-      // 登录前通常没有会话，`/api/auth/passkeys` 会失败——那时只能信后端的 origin 过滤。
+-      let passkeys = opts.passkeys ?? null;
+-      if (passkeys === null && opts.passkeys === undefined) {
+-        passkeys = await api.listPasskeys().catch(() => null);
+-      }
+-      const selection = selectPasskeyCredential({
+-        allowCredentials: options.allowCredentials,
+-        passkeys,
+-        origin: currentOrigin(opts.origin),
+-      });
+-      if (selection.kind === 'none') throw new PasskeyCredentialUnknownError();
+-      if (selection.kind === 'browser') {
+-        // 探测仪式：列表原样下发，浏览器选谁我们就绑谁。这份断言签的是探测 delegation
+-        // （credential_id 为空），服务端一定拒绝，拿来当凭证也没用。
+-        const probe = await startAuthentication({
+-          ...options,
+-          allowCredentials: selection.allowCredentials,
+-        });
+-        credentialId = probe.id;
+-      } else {
+-        credentialId = selection.credentialId;
+-      }
+-      delegation = buildFor(credentialId);
+-      options = await api.passkeyLoginOptions(
+-        opts.uid,
+-        encodeBase64url(encodeDelegation(delegation))
+-      );
+-    }
+-    // 只允许用 delegation 里绑定的那把凭证，否则断言与 credential_id 对不上。
+-    const assertion = await startAuthentication({
+-      ...options,
+-      allowCredentials: [{ id: credentialId }],
+-    });
+-    if (assertion.id !== credentialId) {
+-      throw new Error('passkey assertion credential mismatch');
+-    }
+-
+-    const delegationBytes = encodeDelegation(delegation);
+-    const delegationSig = encodePasskeyAssertion({
+-      credential_id: assertion.id,
+-      client_data_json: decodeBase64url(assertion.response.clientDataJSON),
+-      authenticator_data: decodeBase64url(assertion.response.authenticatorData),
+-      signature: decodeBase64url(assertion.response.signature),
+-    });
+-
+-    clearSessionKey();
+-    current = {
+-      info: {
+-        uid: opts.uid,
+-        entryNodeId: opts.entryNodeId,
+-        method: 'passkey',
+-        issuedAt: Number(delegation.issued_at),
+-        expiresAt: Number(delegation.exp),
+-        hasTotp: false,
+-        credentialId,
+-      },
+-      sessSk: sess.secretKey,
+-      sessPk: sess.publicKey,
+-      delegation,
+-      delegationBytes,
+-      delegationSig,
+-      kTotp: null,
+-      totpCode: null,
+-    };
+-    // 所有权已交给 session store（`clearSessionKey()` 负责它的清零）。
+-    owned = true;
+-    notifyState();
+-    return current.info;
+-  } finally {
+-    if (!owned) sess.secretKey.fill(0);
+-  }
++  return secrets.info;
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// 登录
++// 按需的单 node 登录
+ // ---------------------------------------------------------------------------
+ 
+-interface LoginToNodeOptions {
+-  api?: AuthApi;
+-  /** 已知的 node 行（避免 fan-out 时每个 node 各拉一次列表）。 */
+-  node?: MeshNode;
+-  /**
+-   * entry 自身的第一次登录：`/api/mesh/nodes` 需要会话，此时还拿不到自己的公钥，
+-   * 只能先登录、再用新会话拉列表回头核对（`verifySelfPublicKey`）。仅 `self` 允许。
+-   */
+-  selfBootstrap?: boolean;
+-}
+-
+-/** self bootstrap 登录时用过的 nodePk，登录后必须与 mesh 列表里的公钥核对。 */
+-let selfChallengePk: Uint8Array | null = null;
+-
+-/** 需要 TOTP 但码不在内存里 → null（回 TOTP_REQUIRED，一个请求都不发）；不需要 TOTP → undefined。 */
+-function resolveTotp(session: SessionKeyInfo) {
+-  if (session.method !== 'root' || !session.hasTotp) return undefined;
+-  if (!current?.kTotp || !current.totpCode) return null;
+-  return { code: current.totpCode, k_totp: encodeBase64url(current.kTotp) };
+-}
+-
+-const pinnedPkOk = (targetPk: Uint8Array, node: MeshNode | undefined): boolean =>
+-  !node || bytesEqual(targetPk, decodeBase64url(node.publicKey));
+-
+-/**
+- * 对单台 node 执行设计 §2「登录」的 1–3 步。
+- * 第 1 步拿到的 `nodePk` 必须与 `/api/mesh/nodes` 中该 node 的公钥一致，
+- * 否则（失陷 hub 掉包公钥）立即中止，不签任何东西。
+- */
+-export async function loginToNode(
+-  nodeId: string,
+-  { api = defaultAuthApi, node: knownNode, selfBootstrap }: LoginToNodeOptions = {}
+-): Promise<LoginNodeResult> {
+-  const session = getSessionKey();
+-  if (!current || !session) return { ok: false, code: 'NO_SESSION_KEY' };
+-
+-  let node = knownNode;
+-  if (!node && !(selfBootstrap && nodeId === SELF_NODE_ID)) {
+-    const nodes = await api.listNodes().catch(() => null);
+-    if (!nodes) return { ok: false, code: 'NETWORK_ERROR' };
+-    node = nodes.find((item) => item.id === nodeId);
+-    if (!node) return { ok: false, code: 'UNKNOWN_NODE' };
+-  }
+-
+-  const totp = resolveTotp(session);
+-  if (totp === null) return { ok: false, code: 'TOTP_REQUIRED' };
+-
+-  const challenge = await api.challenge(nodeId, session.uid).catch(() => null);
+-  if (!challenge) return { ok: false, code: 'NETWORK_ERROR' };
+-
+-  const targetPk = decodeBase64url(challenge.nodePk);
+-  if (!pinnedPkOk(targetPk, node)) return { ok: false, code: 'NODE_PK_MISMATCH' };
+-  if (!node) selfChallengePk = targetPk;
+-
+-  const login = buildLogin({
+-    challengeId: challenge.challenge_id,
+-    nonce: decodeBase64url(challenge.nonce),
+-    target: nodeId,
+-    targetPk,
+-    uid: session.uid,
+-    entry: session.entryNodeId,
+-  });
+-  const body = {
+-    login: encodeBase64url(encodeLogin(login)),
+-    sig: encodeBase64url(signLogin(current.sessSk, login)),
+-    delegation: encodeBase64url(current.delegationBytes),
+-    delegation_sig: encodeBase64url(current.delegationSig),
+-    totp,
+-  };
+-  const result = await api.login(nodeId, body).catch(() => null);
+-  if (!result) return { ok: false, code: 'NETWORK_ERROR' };
+-  return result.ok ? { ok: true } : { ok: false, code: result.code };
+-}
+-
+-// ---------------------------------------------------------------------------
+-// entry 自身登录 + 按需的单 node 登录
+-// ---------------------------------------------------------------------------
+-
+-interface LoginSelfOptions {
+-  api?: AuthApi;
+-}
+-
+-/**
+- * 只登录 entry 自身（`self`），登录成功即可进入本机 UI。
+- *
+- * 仍然要拉一次 `/api/mesh/nodes`：mesh 列表里的 `publicKey` 来自 hub 签发的证书，而第 1 步
+- * challenge 里的 `nodePk` 来自这台机器当场持有的钥，两者必须一致——entry 出示的不是被签发过
+- * 的那把钥时（掉包 / 配置错乱）立刻丢弃会话钥，不让用户带着一个不可信的会话继续。
+- * 这一次请求也是唯一挡在跳转前面的等待，**不做任何 fan-out**：其余 node 由
+- * `ensureNodeLogin()` 在真正用到时再登录。
+- */
+-export async function loginSelf(opts: LoginSelfOptions = {}): Promise<LoginNodeResult> {
+-  const api = opts.api ?? defaultAuthApi;
+-  const selfResult = await loginToNode(SELF_NODE_ID, { api, selfBootstrap: true });
+-  if (!selfResult.ok) {
+-    clearTotpCode();
+-    return selfResult;
+-  }
+-
+-  const nodes = await api.listNodes().catch(() => null);
+-  // 一次性 TOTP 码用完即弃：它只在 ±30s 内有效，留着也救不了后面的懒登录，
+-  // 而 k_totp（服务端 TOTP 密文的解密钥）保留在内存里，用户下次输入新码时直接可用。
+-  clearTotpCode();
+-  if (!nodes) return { ok: false, code: 'NODE_LIST_FAILED' };
+-
+-  const selfRow = nodes.find((node) => node.id === current?.info.entryNodeId);
+-  const pinnedPk = selfChallengePk;
+-  selfChallengePk = null;
+-  if (pinnedPk && !pinnedPkOk(pinnedPk, selfRow)) {
+-    clearSessionKey();
+-    return { ok: false, code: 'NODE_PK_MISMATCH' };
+-  }
+-
+-  markLoggedIn(SELF_NODE_ID);
+-  return { ok: true };
+-}
+-
+ interface EnsureNodeLoginOptions {
+   api?: AuthApi;
+   /** 已知的 node 行，省掉 `loginToNode` 内部再拉一次 `/api/mesh/nodes`。 */
+@@ -527,7 +139,7 @@ const nodeLoginsInFlight = new Map<string, Promise<LoginNodeResult>>();
+  *
+  * 幂等靠两点：同一 nodeId 的并发调用共享在途 Promise；成功后 mesh store 的 `loggedIn` 立刻
+  * 变 true，调用方（侧边栏 / 路由边界）据此不再触发。会话钥不在内存时直接返回
+- * `NO_SESSION_KEY`，由调用方退回「登录此节点」按钮 → `/login?node=`。
++ * `NO_SESSION_KEY`（不加载签名实现），由调用方退回「登录此节点」按钮 → `/login?node=`。
+  *
+  * 开了 TOTP 的密码会话：node 端每次登录都要校验一次 TOTP，而浏览器只持有 k_totp、生成不了
+  * 新码，所以这里会返回 `TOTP_REQUIRED`，同样退回登录页让用户当场输码。
+@@ -540,7 +152,8 @@ export function ensureNodeLogin(
+   if (existing) return existing;
+   if (!hasSessionKey()) return Promise.resolve({ ok: false, code: 'NO_SESSION_KEY' });
+ 
+-  const task = loginToNode(nodeId, opts)
++  const task = import('./session-login')
++    .then((mod) => mod.loginToNode(nodeId, opts))
+     .then((result) => {
+       if (result.ok) markLoggedIn(nodeId);
+       return result;
+diff --git a/apps/fe/src/auth/session-login.ts b/apps/fe/src/auth/session-login.ts
+new file mode 100644
+index 00000000..05e1760f
+--- /dev/null
++++ b/apps/fe/src/auth/session-login.ts
+@@ -0,0 +1,409 @@
++// 会话钥的建立与登录签名实现：argon2id 派生、Ed25519 delegation/login 签名、passkey 仪式。
++// 这些依赖（hash-wasm、@noble/curves、WebAuthn 客户端）都只在用户真的登录时才用到，
++// 因此本模块**不进常驻路径**——`session-key-store.ensureNodeLogin()` 与登录页各自按需加载。
++
++import { SELF_NODE_ID } from '@tmex/api-client';
++import type {
++  AuthApi,
++  MeshNode,
++  PasskeySummary,
++  PublicKeyCredentialDescriptorJSON,
++} from '@tmex/api-client/auth/index';
++import { defaultAuthApi, startAuthentication } from '@tmex/api-client/auth/index';
++import {
++  buildLogin,
++  buildPasskeyDelegation,
++  bytesEqual,
++  createDelegation,
++  decodeBase64url,
++  deriveSeed,
++  deriveTotpKey,
++  encodeBase64url,
++  encodeDelegation,
++  encodeLogin,
++  encodePasskeyAssertion,
++  generateEd25519KeyPair,
++  rootKeyFromSeed,
++  signLogin,
++} from '@tmex/shared/auth';
++
++import { markLoggedIn } from '@/node/mesh-nodes';
++import type { LoginNodeResult, SessionKeyInfo } from './session-key-store';
++import {
++  adoptSessionSecrets,
++  clearSessionKey,
++  clearTotpCode,
++  getSessionKey,
++  readSessionSecrets,
++} from './session-key-store';
++
++// ---------------------------------------------------------------------------
++// 建立会话钥
++// ---------------------------------------------------------------------------
++
++interface EstablishFromSeedOptions {
++  uid: string;
++  entryNodeId: string;
++  rootEpoch: number;
++  hasTotp: boolean;
++  totpCode?: string;
++  now?: number;
++}
++
++/**
++ * 由 seed（argon2id 输出）建立会话钥。
++ * **调用后 `seed` 会被清零**——调用方不得再使用该数组。
++ */
++export function establishSessionFromSeed(
++  seed: Uint8Array,
++  opts: EstablishFromSeedOptions
++): SessionKeyInfo {
++  const now = opts.now ?? Date.now();
++  const rootKey = rootKeyFromSeed(seed);
++  const sess = generateEd25519KeyPair();
++  const signed = createDelegation(rootKey, { uid: opts.uid, sessPk: sess.publicKey, now });
++  const kTotp = opts.hasTotp ? deriveTotpKey(seed, opts.uid, opts.rootEpoch) : null;
++
++  // 根钥用完即弃：清零我们持有的 seed 与 rootKey 内部副本。
++  seed.fill(0);
++  rootKey.seed.fill(0);
++
++  return adoptSessionSecrets({
++    info: {
++      uid: opts.uid,
++      entryNodeId: opts.entryNodeId,
++      method: 'root',
++      issuedAt: Number(signed.delegation.issued_at),
++      expiresAt: Number(signed.delegation.exp),
++      hasTotp: opts.hasTotp,
++      credentialId: null,
++    },
++    sessSk: sess.secretKey,
++    sessPk: sess.publicKey,
++    delegation: signed.delegation,
++    delegationBytes: signed.bytes,
++    delegationSig: signed.sig,
++    kTotp,
++    totpCode: opts.totpCode ?? null,
++  });
++}
++
++interface EstablishFromPasswordOptions extends EstablishFromSeedOptions {
++  password: string;
++  kdfParams: { salt: string; memory_kib: number; iterations: number; parallelism: number };
++}
++
++export async function establishSessionFromPassword(
++  opts: EstablishFromPasswordOptions
++): Promise<SessionKeyInfo> {
++  const seed = await deriveSeed(opts.password, {
++    salt: decodeBase64url(opts.kdfParams.salt),
++    memory_kib: opts.kdfParams.memory_kib,
++    iterations: opts.kdfParams.iterations,
++    parallelism: opts.kdfParams.parallelism,
++  });
++  return establishSessionFromSeed(seed, opts);
++}
++
++interface EstablishFromPasskeyOptions {
++  uid: string;
++  entryNodeId: string;
++  /** 指定用哪一把；不给则按当前 origin / RP 过滤后再选。 */
++  credentialId?: string;
++  api?: AuthApi;
++  now?: number;
++  /** 当前 origin（测试注入）；缺省读 `location.origin`。 */
++  origin?: string;
++  /** 已知的 passkey 元数据（含注册 origin）；缺省尝试 `GET /api/auth/passkeys`。 */
++  passkeys?: PasskeySummary[] | null;
++  /** 会话密钥对生成器（测试注入）：拿到同一把 `sk_sess` 才能断言失败时它被清零。 */
++  generateSessionKeyPair?: () => { publicKey: Uint8Array; secretKey: Uint8Array };
++}
++
++class PasskeyCredentialUnknownError extends Error {
++  readonly code = 'PASSKEY_CREDENTIAL_UNKNOWN';
++  constructor() {
++    super('no passkey credential available for this entry');
++    this.name = 'PasskeyCredentialUnknownError';
++  }
++}
++
++function currentOrigin(override?: string): string {
++  if (override) return override;
++  return (globalThis as { location?: { origin?: string } }).location?.origin ?? '';
++}
++
++/**
++ * 凭证选择结果。
++ *
++ * - `bind`：已经能唯一确定凭证，直接写进 delegation，只做一次仪式；
++ * - `browser`：**不由前端挑**，把这份列表原样交给 WebAuthn，让浏览器 / 认证器选；
++ * - `none`：当前 origin 一把可用的都没有。
++ */
++type PasskeySelection =
++  | { kind: 'bind'; credentialId: string }
++  | { kind: 'browser'; allowCredentials: PublicKeyCredentialDescriptorJSON[] }
++  | { kind: 'none' };
++
++/**
++ * 决定这次断言用哪把凭证。
++ *
++ * **绝不回退到 `allowCredentials[0]`**：用户在 node A、node B 各注册过 passkey 时，从 B 登录
++ * 若 A 的凭证排在前面，盲取第一把会把仪式锁死在属于 A 的凭证上并以 `NotAllowedError` 失败
++ * （见 F4-1 / F4-fix 评审 Major）。取而代之：
++ *
++ * - 有可信 origin 元数据（登录后的 `/api/auth/passkeys`）→ 只留 `origin` **精确相等**的，
++ *   没有 rp_id 回退；一把也不剩就是 `none`。
++ * - 没有元数据（登录前通常没有会话，拉不到列表）→ 交给浏览器：后端已按精确 origin 过滤过
++ *   登录 options，列表里每一把都能用，由认证器决定用户手上到底有哪一把。
++ *   只剩一把时退化成 `bind`（那不是「挑」，本来就只有一个候选），省掉一次探测仪式。
++ */
++export function selectPasskeyCredential(input: {
++  allowCredentials?: PublicKeyCredentialDescriptorJSON[];
++  passkeys?: PasskeySummary[] | null;
++  origin: string;
++  preferredId?: string;
++}): PasskeySelection {
++  const rows = (input.allowCredentials ?? []).filter((row) => Boolean(row.id));
++  if (rows.length === 0) return { kind: 'none' };
++  if (input.preferredId) {
++    return rows.some((row) => row.id === input.preferredId)
++      ? { kind: 'bind', credentialId: input.preferredId }
++      : { kind: 'none' };
++  }
++
++  const known = input.passkeys ?? null;
++  if (known && known.length > 0) {
++    const byId = new Map(known.map((row) => [row.credential_id, row]));
++    const sameOrigin = rows.filter((row) => byId.get(row.id)?.origin === input.origin);
++    if (sameOrigin.length === 1) return { kind: 'bind', credentialId: sameOrigin[0].id };
++    if (sameOrigin.length > 1) return { kind: 'browser', allowCredentials: sameOrigin };
++    // 有元数据但没有一把属于当前 origin：宁可报「本入口没有可用 passkey」，
++    // 也不要拿别的 origin 的凭证去发起注定失败的仪式。
++    if (rows.some((row) => byId.has(row.id))) return { kind: 'none' };
++  }
++  if (rows.length === 1) return { kind: 'bind', credentialId: rows[0].id };
++  return { kind: 'browser', allowCredentials: rows };
++}
++
++/**
++ * passkey 路径：delegation 里必须先写死 credential_id（challenge = sha256(borsh(delegation))），
++ * 而凭证列表只有 entry 知道——所以先用一个探测 delegation 换回 `allowCredentials`，
++ * 选定凭证后再用最终 delegation 换一次 options。
++ * 断言整体以 Borsh `PasskeyAssertion` 编码作为 `delegation_sig`。
++ *
++ * 凭证由 `selectPasskeyCredential()` 决定，前端**不做**「取第一把」这种猜测。候选不唯一且没有
++ * 可信 origin 元数据时（登录前多半如此），先把服务端那份 `allowCredentials` **原样**交给
++ * WebAuthn 做一次探测仪式，由浏览器 / 认证器选出用户手上真正有的那把，再用它绑定最终
++ * delegation 做正式仪式——协议要求 challenge 覆盖 credential_id，这一步换不掉。
++ * 单候选（后端按精确 origin 过滤后的常态）只做一次仪式。
++ *
++ * `sk_sess` 从生成起就在 `try/finally` 里：用户取消仪式、options 请求失败、origin 选不出凭证，
++ * 都会立刻清零，只有成功交给全局 session store 才转移所有权（见 F4-fix 评审 Minor）。
++ */
++export async function establishSessionFromPasskey(
++  opts: EstablishFromPasskeyOptions
++): Promise<SessionKeyInfo> {
++  const api = opts.api ?? defaultAuthApi;
++  const now = opts.now ?? Date.now();
++  const sess = (opts.generateSessionKeyPair ?? generateEd25519KeyPair)();
++  let owned = false;
++
++  try {
++    const buildFor = (credentialId: string) =>
++      buildPasskeyDelegation({ uid: opts.uid, sessPk: sess.publicKey, now, credentialId });
++
++    let credentialId = opts.credentialId ?? '';
++    let delegation = buildFor(credentialId);
++    let options = await api.passkeyLoginOptions(
++      opts.uid,
++      encodeBase64url(encodeDelegation(delegation))
++    );
++    if (!credentialId) {
++      // 登录前通常没有会话，`/api/auth/passkeys` 会失败——那时只能信后端的 origin 过滤。
++      let passkeys = opts.passkeys ?? null;
++      if (passkeys === null && opts.passkeys === undefined) {
++        passkeys = await api.listPasskeys().catch(() => null);
++      }
++      const selection = selectPasskeyCredential({
++        allowCredentials: options.allowCredentials,
++        passkeys,
++        origin: currentOrigin(opts.origin),
++      });
++      if (selection.kind === 'none') throw new PasskeyCredentialUnknownError();
++      if (selection.kind === 'browser') {
++        // 探测仪式：列表原样下发，浏览器选谁我们就绑谁。这份断言签的是探测 delegation
++        // （credential_id 为空），服务端一定拒绝，拿来当凭证也没用。
++        const probe = await startAuthentication({
++          ...options,
++          allowCredentials: selection.allowCredentials,
++        });
++        credentialId = probe.id;
++      } else {
++        credentialId = selection.credentialId;
++      }
++      delegation = buildFor(credentialId);
++      options = await api.passkeyLoginOptions(
++        opts.uid,
++        encodeBase64url(encodeDelegation(delegation))
++      );
++    }
++    // 只允许用 delegation 里绑定的那把凭证，否则断言与 credential_id 对不上。
++    const assertion = await startAuthentication({
++      ...options,
++      allowCredentials: [{ id: credentialId }],
++    });
++    if (assertion.id !== credentialId) {
++      throw new Error('passkey assertion credential mismatch');
++    }
++
++    const info = adoptSessionSecrets({
++      info: {
++        uid: opts.uid,
++        entryNodeId: opts.entryNodeId,
++        method: 'passkey',
++        issuedAt: Number(delegation.issued_at),
++        expiresAt: Number(delegation.exp),
++        hasTotp: false,
++        credentialId,
++      },
++      sessSk: sess.secretKey,
++      sessPk: sess.publicKey,
++      delegation,
++      delegationBytes: encodeDelegation(delegation),
++      delegationSig: encodePasskeyAssertion({
++        credential_id: assertion.id,
++        client_data_json: decodeBase64url(assertion.response.clientDataJSON),
++        authenticator_data: decodeBase64url(assertion.response.authenticatorData),
++        signature: decodeBase64url(assertion.response.signature),
++      }),
++      kTotp: null,
++      totpCode: null,
++    });
++    // 所有权已交给 session store（`clearSessionKey()` 负责它的清零）。
++    owned = true;
++    return info;
++  } finally {
++    if (!owned) sess.secretKey.fill(0);
++  }
++}
++
++// ---------------------------------------------------------------------------
++// 登录
++// ---------------------------------------------------------------------------
++
++interface LoginToNodeOptions {
++  api?: AuthApi;
++  /** 已知的 node 行（避免 fan-out 时每个 node 各拉一次列表）。 */
++  node?: MeshNode;
++  /**
++   * entry 自身的第一次登录：`/api/mesh/nodes` 需要会话，此时还拿不到自己的公钥，
++   * 只能先登录、再用新会话拉列表回头核对（`verifySelfPublicKey`）。仅 `self` 允许。
++   */
++  selfBootstrap?: boolean;
++}
++
++/** self bootstrap 登录时用过的 nodePk，登录后必须与 mesh 列表里的公钥核对。 */
++let selfChallengePk: Uint8Array | null = null;
++
++/** 需要 TOTP 但码不在内存里 → null（回 TOTP_REQUIRED，一个请求都不发）；不需要 TOTP → undefined。 */
++function resolveTotp(session: SessionKeyInfo) {
++  if (session.method !== 'root' || !session.hasTotp) return undefined;
++  const secrets = readSessionSecrets();
++  if (!secrets?.kTotp || !secrets.totpCode) return null;
++  return { code: secrets.totpCode, k_totp: encodeBase64url(secrets.kTotp) };
++}
++
++const pinnedPkOk = (targetPk: Uint8Array, node: MeshNode | undefined): boolean =>
++  !node || bytesEqual(targetPk, decodeBase64url(node.publicKey));
++
++/**
++ * 对单台 node 执行设计 §2「登录」的 1–3 步。
++ * 第 1 步拿到的 `nodePk` 必须与 `/api/mesh/nodes` 中该 node 的公钥一致，
++ * 否则（失陷 hub 掉包公钥）立即中止，不签任何东西。
++ */
++export async function loginToNode(
++  nodeId: string,
++  { api = defaultAuthApi, node: knownNode, selfBootstrap }: LoginToNodeOptions = {}
++): Promise<LoginNodeResult> {
++  const session = getSessionKey();
++  const secrets = readSessionSecrets();
++  if (!secrets || !session) return { ok: false, code: 'NO_SESSION_KEY' };
++
++  let node = knownNode;
++  if (!node && !(selfBootstrap && nodeId === SELF_NODE_ID)) {
++    const nodes = await api.listNodes().catch(() => null);
++    if (!nodes) return { ok: false, code: 'NETWORK_ERROR' };
++    node = nodes.find((item) => item.id === nodeId);
++    if (!node) return { ok: false, code: 'UNKNOWN_NODE' };
++  }
++
++  const totp = resolveTotp(session);
++  if (totp === null) return { ok: false, code: 'TOTP_REQUIRED' };
++
++  const challenge = await api.challenge(nodeId, session.uid).catch(() => null);
++  if (!challenge) return { ok: false, code: 'NETWORK_ERROR' };
++
++  const targetPk = decodeBase64url(challenge.nodePk);
++  if (!pinnedPkOk(targetPk, node)) return { ok: false, code: 'NODE_PK_MISMATCH' };
++  if (!node) selfChallengePk = targetPk;
++
++  const login = buildLogin({
++    challengeId: challenge.challenge_id,
++    nonce: decodeBase64url(challenge.nonce),
++    target: nodeId,
++    targetPk,
++    uid: session.uid,
++    entry: session.entryNodeId,
++  });
++  const body = {
++    login: encodeBase64url(encodeLogin(login)),
++    sig: encodeBase64url(signLogin(secrets.sessSk, login)),
++    delegation: encodeBase64url(secrets.delegationBytes),
++    delegation_sig: encodeBase64url(secrets.delegationSig),
++    totp,
++  };
++  const result = await api.login(nodeId, body).catch(() => null);
++  if (!result) return { ok: false, code: 'NETWORK_ERROR' };
++  return result.ok ? { ok: true } : { ok: false, code: result.code };
++}
++
++interface LoginSelfOptions {
++  api?: AuthApi;
++}
++
++/**
++ * 只登录 entry 自身（`self`），登录成功即可进入本机 UI。
++ *
++ * 仍然要拉一次 `/api/mesh/nodes`：mesh 列表里的 `publicKey` 来自 hub 签发的证书，而第 1 步
++ * challenge 里的 `nodePk` 来自这台机器当场持有的钥，两者必须一致——entry 出示的不是被签发过
++ * 的那把钥时（掉包 / 配置错乱）立刻丢弃会话钥，不让用户带着一个不可信的会话继续。
++ * 这一次请求也是唯一挡在跳转前面的等待，**不做任何 fan-out**：其余 node 由
++ * `ensureNodeLogin()` 在真正用到时再登录。
++ */
++export async function loginSelf(opts: LoginSelfOptions = {}): Promise<LoginNodeResult> {
++  const api = opts.api ?? defaultAuthApi;
++  const selfResult = await loginToNode(SELF_NODE_ID, { api, selfBootstrap: true });
++  if (!selfResult.ok) {
++    clearTotpCode();
++    return selfResult;
++  }
++
++  const nodes = await api.listNodes().catch(() => null);
++  // 一次性 TOTP 码用完即弃：它只在 ±30s 内有效，留着也救不了后面的懒登录，
++  // 而 k_totp（服务端 TOTP 密文的解密钥）保留在内存里，用户下次输入新码时直接可用。
++  clearTotpCode();
++  if (!nodes) return { ok: false, code: 'NODE_LIST_FAILED' };
++
++  const entryNodeId = readSessionSecrets()?.info.entryNodeId;
++  const selfRow = nodes.find((node) => node.id === entryNodeId);
++  const pinnedPk = selfChallengePk;
++  selfChallengePk = null;
++  if (pinnedPk && !pinnedPkOk(pinnedPk, selfRow)) {
++    clearSessionKey();
++    return { ok: false, code: 'NODE_PK_MISMATCH' };
++  }
++
++  markLoggedIn(SELF_NODE_ID);
++  return { ok: true };
++}
+diff --git a/apps/fe/src/main.test.ts b/apps/fe/src/main.test.ts
+new file mode 100644
+index 00000000..2c5ebf1f
+--- /dev/null
++++ b/apps/fe/src/main.test.ts
+@@ -0,0 +1,13 @@
++// 首屏 entry 的静态依赖守卫：main.tsx 只用 terminal-ui 的键盘避让 hook，
++// 从包根引会把 Ghostty 终端整条图拖进 entry chunk（约 140 KiB raw）。
++
++import { describe, expect, test } from 'bun:test';
++
++describe('main.tsx 的静态依赖', () => {
++  test('键盘避让只从窄子路径引，不碰 @tmex/terminal-ui 包根', async () => {
++    const source = await Bun.file(`${import.meta.dir}/main.tsx`).text();
++    const paths = new Bun.Transpiler({ loader: 'tsx' }).scanImports(source).map((e) => e.path);
++    expect(paths).toContain('@tmex/terminal-ui/hooks/use-keyboard-avoidance');
++    expect(paths).not.toContain('@tmex/terminal-ui');
++  });
++});
+diff --git a/apps/fe/src/main.tsx b/apps/fe/src/main.tsx
+index 00d2d4f4..bbe30f44 100644
+--- a/apps/fe/src/main.tsx
++++ b/apps/fe/src/main.tsx
+@@ -26,7 +26,7 @@ import { SettingsEventsInit } from '@tmex/panels/settings/events';
+ import { WatchEventsInit } from '@tmex/panels/watch';
+ import { SELF_NODE_ID, useNodeRuntime } from '@tmex/stores';
+ import { RuntimeProvider, useSiteStore, useUIStore } from '@tmex/stores/react';
+-import { useKeyboardAvoidance } from '@tmex/terminal-ui';
++import { useKeyboardAvoidance } from '@tmex/terminal-ui/hooks/use-keyboard-avoidance';
+ import { applyThemePreset, isThemePreset } from '@tmex/theme';
+ import { SidebarInset, SidebarProvider, useSidebar } from '@tmex/ui/sidebar';
+ 
+diff --git a/apps/fe/src/pages/LoginPage.tsx b/apps/fe/src/pages/LoginPage.tsx
+index 7fe63d4b..7ec53288 100644
+--- a/apps/fe/src/pages/LoginPage.tsx
++++ b/apps/fe/src/pages/LoginPage.tsx
+@@ -14,11 +14,13 @@ import {
+   clearSessionKey,
+   clearTotpCode,
+   ensureNodeLogin,
++  setTotpCode,
++} from '@/auth/session-key-store';
++import {
+   establishSessionFromPasskey,
+   establishSessionFromPassword,
+   loginSelf,
+-  setTotpCode,
+-} from '@/auth/session-key-store';
++} from '@/auth/session-login';
+ import { useAuthMode } from '@/auth/use-session-key';
+ import { Brand } from '@/components/brand';
+ import type { AuthApi, AuthModeResponse } from '@tmex/api-client/auth/index';
+diff --git a/packages/panels/src/agent/messages/tool-call-card.test.tsx b/packages/panels/src/agent/messages/tool-call-card.test.tsx
+new file mode 100644
+index 00000000..5b57ac5b
+--- /dev/null
++++ b/packages/panels/src/agent/messages/tool-call-card.test.tsx
+@@ -0,0 +1,110 @@
++import { describe, expect, test } from 'bun:test';
++import { I18N_RESOURCES } from '@tmex/shared';
++import type { UiToolCall } from '@tmex/stores';
++import i18next from 'i18next';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
++
++import { ToolDetailsBody, extractToolImages, previewEnd } from './tool-call-card';
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++function call(toolName: string, output: unknown): UiToolCall {
++  return {
++    toolCallId: 'tc-1',
++    toolName,
++    input: { command: 'ls' },
++    output,
++    isError: false,
++    denied: false,
++    resolved: true,
++  };
++}
++
++function renderDetails(toolCall: UiToolCall): string {
++  return renderToStaticMarkup(
++    <I18nextProvider i18n={i18n}>
++      <ToolDetailsBody call={toolCall} view={undefined} />
++    </I18nextProvider>
++  );
++}
++
++describe('previewEnd', () => {
++  test('短文本不截断', () => {
++    expect(previewEnd('')).toBe(0);
++    expect(previewEnd('abc\ndef')).toBe(7);
++  });
++
++  test('按 64 KiB 截断', () => {
++    expect(previewEnd('x'.repeat(200 * 1024))).toBe(64 * 1024);
++  });
++
++  test('行数先到时按第 2000 行末尾截断', () => {
++    const text = 'a\n'.repeat(5000);
++    expect(previewEnd(text)).toBe(4000);
++    expect(text.slice(0, previewEnd(text)).split('\n')).toHaveLength(2001);
++  });
++
++  test('字符上限先到时不看行数', () => {
++    // 每行 100 字符，2000 行远超 64 KiB
++    const text = `${'a'.repeat(99)}\n`.repeat(2000);
++    expect(previewEnd(text)).toBe(64 * 1024);
++  });
++});
++
++describe('ToolDetailsBody 输出预览', () => {
++  test('500 KiB 输出只挂载有界预览并给出提示与复制入口', () => {
++    const html = renderDetails(call('run_command', 'B'.repeat(500 * 1024)));
++    expect(html.length).toBeLessThan(100 * 1024);
++    expect(html).toContain('data-testid="agent-tool-preview-note"');
++    expect(html).toContain('仅显示前 65536 个字符（共 512000）');
++    expect(html).toContain('复制完整输出');
++    expect(html).not.toContain('B'.repeat(64 * 1024 + 1));
++  });
++
++  test('小输出原样渲染且不显示提示', () => {
++    const html = renderDetails(call('run_command', 'hello world'));
++    expect(html).toContain('hello world');
++    expect(html).not.toContain('data-testid="agent-tool-preview-note"');
++    expect(html).not.toContain('复制完整输出');
++  });
++});
++
++describe('extractToolImages', () => {
++  const dataUri = `data:image/png;base64,${'A'.repeat(512)}`;
++
++  test('data URI 与图片 URL 对任何工具都识别', () => {
++    expect(extractToolImages(call('run_command', dataUri))).toEqual([dataUri]);
++    expect(extractToolImages(call('run_command', { image: 'https://a.example/x.png' }))).toEqual([
++      'https://a.example/x.png',
++    ]);
++  });
++
++  test('裸 base64 只对出图工具生效', () => {
++    const raw = 'A'.repeat(1024);
++    expect(extractToolImages(call('image_generation', { result: raw }))).toEqual([
++      `data:image/png;base64,${raw}`,
++    ]);
++    expect(extractToolImages(call('run_command', { result: raw }))).toEqual([]);
++  });
++
++  test('超过 512 KiB 的值跳过探测', () => {
++    expect(extractToolImages(call('image_generation', 'A'.repeat(512 * 1024 + 1)))).toEqual([]);
++    expect(
++      extractToolImages(call('run_command', `data:image/png;base64,${'A'.repeat(512 * 1024)}`))
++    ).toEqual([]);
++  });
++
++  test('未完成/出错/被拒的调用不探测', () => {
++    expect(extractToolImages({ ...call('run_command', dataUri), resolved: false })).toEqual([]);
++    expect(extractToolImages({ ...call('run_command', dataUri), isError: true })).toEqual([]);
++    expect(extractToolImages({ ...call('run_command', dataUri), denied: true })).toEqual([]);
++  });
++});
+diff --git a/packages/panels/src/agent/messages/tool-call-card.tsx b/packages/panels/src/agent/messages/tool-call-card.tsx
+index ddcea27a..6e71e2ff 100644
+--- a/packages/panels/src/agent/messages/tool-call-card.tsx
++++ b/packages/panels/src/agent/messages/tool-call-card.tsx
+@@ -16,7 +16,7 @@ import {
+   WrenchIcon,
+   XIcon,
+ } from 'lucide-react';
+-import { createContext, memo, useContext, useState } from 'react';
++import { createContext, memo, useContext, useMemo, useState } from 'react';
+ import type { ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+@@ -46,8 +46,25 @@ function callErrorText(call: UiToolCall): string | null {
+ 
+ const DetailsExpandedContext = createContext(false);
+ 
++const PREVIEW_MAX_CHARS = 64 * 1024;
++const PREVIEW_MAX_LINES = 2000;
++
++/** 挂进 DOM 的预览长度：64 KiB 与 2000 行取先到者；完整串只留在内存里供复制 */
++export function previewEnd(text: string): number {
++  const cap = Math.min(text.length, PREVIEW_MAX_CHARS);
++  let index = 0;
++  for (let line = 0; line < PREVIEW_MAX_LINES; line++) {
++    const next = text.indexOf('\n', index);
++    if (next < 0 || next >= cap) return cap;
++    index = next + 1;
++  }
++  return index;
++}
++
+ function CollapsedText({ label, text }: { label: string; text: string }) {
++  const { t } = useTranslation();
+   const defaultOpen = useContext(DetailsExpandedContext);
++  const end = previewEnd(text);
+   return (
+     <Collapsible defaultOpen={defaultOpen}>
+       <CollapsibleTrigger className="text-muted-foreground hover:text-foreground group flex items-center gap-1 text-xs">
+@@ -56,8 +73,22 @@ function CollapsedText({ label, text }: { label: string; text: string }) {
+       </CollapsibleTrigger>
+       <CollapsibleContent>
+         <pre className="bg-muted mt-1 max-h-64 overflow-auto rounded-md p-2 font-mono text-xs whitespace-pre-wrap break-all">
+-          {text}
++          {end < text.length ? text.slice(0, end) : text}
+         </pre>
++        {end < text.length && (
++          <div className="text-muted-foreground mt-1 flex flex-wrap items-center gap-2 text-xs">
++            <span data-testid="agent-tool-preview-note">
++              {t('agent.tool.previewNote', { shown: end, total: text.length })}
++            </span>
++            <Button
++              size="xs"
++              variant="ghost"
++              onClick={() => void navigator.clipboard?.writeText(text)}
++            >
++              {t('agent.tool.copyFull')}
++            </Button>
++          </div>
++        )}
+       </CollapsibleContent>
+     </Collapsible>
+   );
+@@ -215,24 +246,29 @@ function FetchUrlBody({ call }: { call: UiToolCall }) {
+ const BASE64_IMAGE_RE = /^[A-Za-z0-9+/]{256,}={0,2}$/;
+ const IMAGE_URL_RE = /^https?:\/\/\S+\.(png|jpe?g|webp|gif)(\?\S*)?$/i;
+ 
+-function asImageSrc(value: unknown): string | null {
++/** 超过该长度的值不再探测：整串拷贝与正则的代价远超收益 */
++const IMAGE_VALUE_MAX_CHARS = 512 * 1024;
++
++function asImageSrc(value: unknown, allowBareBase64: boolean): string | null {
+   if (typeof value !== 'string' || value.length === 0) return null;
++  if (value.length > IMAGE_VALUE_MAX_CHARS) return null;
+   if (value.startsWith('data:image/')) return value;
+   if (IMAGE_URL_RE.test(value)) return value;
++  if (!allowBareBase64) return null;
+   // 裸 base64（如 OpenAI image_generation 的 { result }）默认按 png 处理
+-  if (BASE64_IMAGE_RE.test(value.replace(/\s/g, ''))) {
+-    return `data:image/png;base64,${value.replace(/\s/g, '')}`;
+-  }
+-  return null;
++  const compact = value.replace(/\s/g, '');
++  return BASE64_IMAGE_RE.test(compact) ? `data:image/png;base64,${compact}` : null;
+ }
+ 
+ /** 通用：从 tool output 探测可内联渲染的图片（image_generation 的 result / image / images 等字段） */
+-function extractToolImages(call: UiToolCall): string[] {
++export function extractToolImages(call: UiToolCall): string[] {
+   if (!call.resolved || call.isError || call.denied) return [];
++  // 裸 base64 猜测只对出图工具开放，普通工具的长输出不做全串扫描
++  const allowBareBase64 = call.toolName.toLowerCase().includes('image');
+   const images: string[] = [];
+   const visit = (value: unknown, depth: number): void => {
+     if (images.length >= 8 || depth > 3) return;
+-    const src = asImageSrc(value);
++    const src = asImageSrc(value, allowBareBase64);
+     if (src) {
+       images.push(src);
+       return;
+@@ -388,6 +424,20 @@ function ToolApproval({
+   );
+ }
+ 
++/** 仅在弹窗打开时挂载：图片探测按 call 记忆，不随每次重渲染重扫 output */
++export function ToolDetailsBody({ call, view }: { call: UiToolCall; view: ToolView | undefined }) {
++  const images = useMemo(() => extractToolImages(call), [call]);
++  const Body = view?.Body;
++  return (
++    <div className="text-muted-foreground flex flex-col gap-3 overflow-auto text-xs">
++      <DetailsExpandedContext.Provider value={true}>
++        {Body ? <Body call={call} /> : <GenericBody call={call} hideOutput={images.length > 0} />}
++        <ToolImages images={images} />
++      </DetailsExpandedContext.Provider>
++    </div>
++  );
++}
++
+ function ToolDetailsDialog({
+   call,
+   view,
+@@ -403,8 +453,6 @@ function ToolDetailsDialog({
+   open: boolean;
+   onOpenChange: (open: boolean) => void;
+ }) {
+-  const images = extractToolImages(call);
+-  const Body = view?.Body;
+   return (
+     <Dialog open={open} onOpenChange={onOpenChange}>
+       <DialogContent className="flex max-h-[80vh] max-w-2xl flex-col gap-3 overflow-hidden sm:max-w-2xl">
+@@ -414,16 +462,7 @@ function ToolDetailsDialog({
+             <span>{label}</span>
+           </DialogTitle>
+         </DialogHeader>
+-        <div className="text-muted-foreground flex flex-col gap-3 overflow-auto text-xs">
+-          <DetailsExpandedContext.Provider value={true}>
+-            {Body ? (
+-              <Body call={call} />
+-            ) : (
+-              <GenericBody call={call} hideOutput={images.length > 0} />
+-            )}
+-            <ToolImages images={images} />
+-          </DetailsExpandedContext.Provider>
+-        </div>
++        <ToolDetailsBody call={call} view={view} />
+       </DialogContent>
+     </Dialog>
+   );
+diff --git a/packages/stores/src/agent-history-budget.test.ts b/packages/stores/src/agent-history-budget.test.ts
+new file mode 100644
+index 00000000..3d4e3fac
+--- /dev/null
++++ b/packages/stores/src/agent-history-budget.test.ts
+@@ -0,0 +1,242 @@
++// 非活跃会话历史的保留预算：打开大量会话后内存不应随打开次数线性增长。
++
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
++
++import { ApiClient, type FetchLike } from '@tmex/api-client';
++import { noopNotificationSink } from '@tmex/notifications';
++import type { AgentMessageDto, AgentSessionDto } from '@tmex/shared';
++
++import { createAgentStore } from './agent';
++import {
++  HISTORY_SESSION_BUDGET,
++  HISTORY_SIZE_BUDGET,
++  selectEvictableHistories,
++} from './agent-history-budget';
++import { type AgentStateData, createInitialAgentStateData } from './agent-state';
++import type { RuntimeCore } from './runtime';
++import { installWindowStorage } from './test-utils';
++
++const SESSION_COUNT = 200;
++const HISTORY_TEXT = 'x'.repeat(1024);
++
++function makeSession(id: string, index: number): AgentSessionDto {
++  return {
++    id,
++    title: id,
++    nodeId: null,
++    deviceId: 'd1',
++    paneId: '%1',
++    providerId: null,
++    modelId: 'model',
++    systemPrompt: null,
++    writeMode: 'confirm',
++    useProviderWebSearch: false,
++    providerHostedTools: [],
++    allowControlChars: false,
++    originPaneTitle: null,
++    originProcessName: null,
++    status: 'idle',
++    lastError: null,
++    maxStepsPerTurn: 10,
++    createdAt: '2026-01-01T00:00:00.000Z',
++    updatedAt: `2026-01-01T00:00:${String(index % 60).padStart(2, '0')}.000Z`,
++  };
++}
++
++function makeMessage(sessionId: string, text = HISTORY_TEXT): AgentMessageDto {
++  return {
++    id: `${sessionId}-m0`,
++    sessionId,
++    seq: 0,
++    role: 'assistant',
++    content: { text },
++    createdAt: '2026-01-01T00:00:00.000Z',
++  };
++}
++
++interface StoreHarness {
++  store: ReturnType<typeof createAgentStore>;
++  messageUrls: string[];
++  setRemote: (sessions: AgentSessionDto[]) => void;
++}
++
++function createStoreHarness(sessions: AgentSessionDto[]): StoreHarness {
++  let remote = sessions;
++  const messageUrls: string[] = [];
++
++  const transport: FetchLike = async (url) => {
++    const json = (body: unknown) =>
++      new Response(JSON.stringify(body), {
++        status: 200,
++        headers: { 'content-type': 'application/json' },
++      });
++    if (url === '/api/agent/sessions') return json({ sessions: remote });
++    const match = /^\/api\/agent\/sessions\/([^/?]+)\/messages/.exec(url);
++    if (match) {
++      messageUrls.push(url);
++      return json({ messages: [makeMessage(match[1])] });
++    }
++    throw new Error(`unexpected request ${url}`);
++  };
++
++  const core = {
++    client: { send: () => {}, connect: () => {}, onMessage: () => () => {} },
++    apiClient: new ApiClient('', transport),
++    notifications: noopNotificationSink,
++    t: (key: string) => key,
++    storagePrefix: `history-budget-${Math.random()}-`,
++  } as unknown as RuntimeCore;
++
++  return {
++    store: createAgentStore(core),
++    messageUrls,
++    setRemote: (next) => {
++      remote = next;
++    },
++  };
++}
++
++/** 放行在途的历史请求：loadHistory 由 setActiveSession 异步触发，不返回句柄 */
++function flush(): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, 0));
++}
++
++let restoreGlobals: (() => void) | null = null;
++
++beforeEach(() => {
++  restoreGlobals = installWindowStorage();
++});
++
++afterEach(() => {
++  restoreGlobals?.();
++  restoreGlobals = null;
++});
++
++describe('非活跃历史的保留预算（真实 store）', () => {
++  test('依次打开 200 个会话后，保留的历史数组不超过预算', async () => {
++    const sessions = Array.from({ length: SESSION_COUNT }, (_, i) => makeSession(`s${i}`, i));
++    const harness = createStoreHarness(sessions);
++    await harness.store.getState().loadSessions();
++
++    for (const session of sessions) {
++      harness.store.getState().setActiveSession(session.id);
++      await flush();
++    }
++
++    const state = harness.store.getState();
++    const retained = Object.keys(state.messages);
++    // 预算之外还多留一份：最后激活的会话本身固定保留
++    expect(retained.length).toBeLessThanOrEqual(HISTORY_SESSION_BUDGET + 1);
++    expect(retained).toContain(`s${SESSION_COUNT - 1}`);
++    // 侧栏读的是会话元数据，不受历史淘汰影响
++    expect(Object.keys(state.sessions).length).toBe(SESSION_COUNT);
++    expect(state.sessionOrder.length).toBe(SESSION_COUNT);
++    for (const sessionId of retained) {
++      expect(state.historyLoaded[sessionId]).toBe(true);
++    }
++  });
++
++  test('被淘汰的会话重新打开时全量重拉一次历史', async () => {
++    const sessions = Array.from({ length: 20 }, (_, i) => makeSession(`s${i}`, i));
++    const harness = createStoreHarness(sessions);
++    await harness.store.getState().loadSessions();
++
++    for (const session of sessions) {
++      harness.store.getState().setActiveSession(session.id);
++      await flush();
++    }
++
++    expect(harness.store.getState().messages.s0).toBeUndefined();
++    expect(harness.store.getState().historyLoaded.s0).toBeUndefined();
++    const before = harness.messageUrls.filter((url) => url.includes('/s0/messages')).length;
++    expect(before).toBe(1);
++
++    harness.store.getState().setActiveSession('s0');
++    await flush();
++
++    const s0Urls = harness.messageUrls.filter((url) => url.includes('/s0/messages'));
++    expect(s0Urls.length).toBe(2);
++    // 历史已清空，重拉必须是全量（不带 afterSeq），否则只会补回半截
++    expect(s0Urls[1]).not.toContain('afterSeq');
++    expect(harness.store.getState().messages.s0?.length).toBe(1);
++  });
++
++  test('列表刷新为空后不残留任何会话态', async () => {
++    const sessions = Array.from({ length: 20 }, (_, i) => makeSession(`s${i}`, i));
++    const harness = createStoreHarness(sessions);
++    await harness.store.getState().loadSessions();
++
++    for (const session of sessions) {
++      harness.store.getState().setActiveSession(session.id);
++      await flush();
++    }
++    harness.store.setState({
++      inProgress: { s19: { texts: [], reasonings: [], toolCalls: [], staleBarrier: false } },
++      queued: { s19: [{ id: 'q1', sessionId: 's19', seq: 1, text: 'hi', createdAt: '' }] },
++    });
++
++    harness.setRemote([]);
++    await harness.store.getState().loadSessions();
++
++    const state = harness.store.getState();
++    expect(Object.keys(state.sessions)).toEqual([]);
++    expect(Object.keys(state.messages)).toEqual([]);
++    expect(Object.keys(state.historyLoaded)).toEqual([]);
++    expect(Object.keys(state.inProgress)).toEqual([]);
++    expect(Object.keys(state.queued)).toEqual([]);
++    expect(Object.keys(state.pendingConfirmations)).toEqual([]);
++    expect(state.activeSessionIdByNode.self).toBeNull();
++  });
++});
++
++function stateWith(
++  ids: readonly string[],
++  patch: Partial<AgentStateData> = {},
++  text = HISTORY_TEXT
++): AgentStateData {
++  const base = createInitialAgentStateData();
++  for (const [index, id] of ids.entries()) {
++    base.sessions[id] = makeSession(id, index);
++    base.messages[id] = [makeMessage(id, text)];
++    base.historyLoaded[id] = true;
++  }
++  return { ...base, ...patch };
++}
++
++describe('selectEvictableHistories', () => {
++  test('当前会话与忙碌会话不被淘汰', () => {
++    const ids = Array.from({ length: HISTORY_SESSION_BUDGET + 4 }, (_, i) => `s${i}`);
++    const state = stateWith(ids, {
++      activeSessionIdByNode: { self: 's0', 'node:a': 's1' },
++      queued: { s2: [{ id: 'q1', sessionId: 's2', seq: 1, text: 'hi', createdAt: '' }] },
++    });
++    state.sessions.s3 = { ...makeSession('s3', 3), status: 'running' };
++
++    const evicted = selectEvictableHistories(state, []);
++
++    expect(evicted).not.toContain('s0');
++    expect(evicted).not.toContain('s1');
++    expect(evicted).not.toContain('s2');
++    expect(evicted).not.toContain('s3');
++    expect(evicted.length).toBe(ids.length - 4 - HISTORY_SESSION_BUDGET);
++  });
++
++  test('按最近激活顺序保留，最久未激活的先淘汰', () => {
++    const ids = Array.from({ length: HISTORY_SESSION_BUDGET + 2 }, (_, i) => `s${i}`);
++    const recent = [...ids].reverse();
++
++    const evicted = selectEvictableHistories(stateWith(ids), recent);
++
++    expect(evicted.sort()).toEqual(['s0', 's1']);
++  });
++
++  test('体积预算先于份数预算触发', () => {
++    const ids = ['s0', 's1', 's2'];
++    const huge = 'x'.repeat(HISTORY_SIZE_BUDGET / 2 + 1);
++
++    const evicted = selectEvictableHistories(stateWith(ids, {}, huge), ids);
++
++    // 两份就已超出体积预算，份数远未到上限也要淘汰
++    expect(evicted).toEqual(['s1', 's2']);
++  });
++});
+diff --git a/packages/stores/src/agent-history-budget.ts b/packages/stores/src/agent-history-budget.ts
+new file mode 100644
+index 00000000..4a761511
+--- /dev/null
++++ b/packages/stores/src/agent-history-budget.ts
+@@ -0,0 +1,71 @@
++// 非活跃会话历史的保留预算：只留最近激活的若干份，超预算的历史清空，重新打开时全量重拉。
++
++import type { AgentMessageDto } from '@tmex/shared';
++import type { AgentStateData } from './agent-state';
++
++/** 保留的非活跃历史份数上限 */
++export const HISTORY_SESSION_BUDGET = 8;
++/** 保留的非活跃历史体积上限（消息 content 序列化后的字符数） */
++export const HISTORY_SIZE_BUDGET = 4 * 1024 * 1024;
++
++// 体积按数组引用缓存：合并消息会换新数组，未变的会话不重复序列化
++const historySizes = new WeakMap<AgentMessageDto[], number>();
++
++function historySize(messages: AgentMessageDto[]): number {
++  const cached = historySizes.get(messages);
++  if (cached !== undefined) return cached;
++  let size = 0;
++  for (const message of messages) {
++    size += JSON.stringify(message.content).length;
++  }
++  historySizes.set(messages, size);
++  return size;
++}
++
++/** 运行中、有流式段、有排队消息或待确认的会话不参与淘汰 */
++function isBusy(state: AgentStateData, sessionId: string): boolean {
++  const status = state.sessions[sessionId]?.status;
++  const inProgress = state.inProgress[sessionId];
++  return (
++    status === 'running' ||
++    status === 'waiting_confirmation' ||
++    (inProgress?.texts.length ?? 0) > 0 ||
++    (inProgress?.reasonings.length ?? 0) > 0 ||
++    (inProgress?.toolCalls.length ?? 0) > 0 ||
++    (state.queued[sessionId]?.length ?? 0) > 0 ||
++    (state.pendingConfirmations[sessionId]?.length ?? 0) > 0
++  );
++}
++
++function recentRank(recent: readonly string[], sessionId: string): number {
++  const index = recent.indexOf(sessionId);
++  return index === -1 ? recent.length : index;
++}
++
++/**
++ * 选出应清空历史的会话：各 node 的当前会话与忙碌会话固定保留，
++ * 其余按 `recent`（最近激活在前）保留到份数或体积预算用尽为止。
++ */
++export function selectEvictableHistories(
++  state: AgentStateData,
++  recent: readonly string[]
++): string[] {
++  const active = new Set<string | null>(Object.values(state.activeSessionIdByNode));
++  const candidates = Object.entries(state.messages).filter(
++    (entry): entry is [string, AgentMessageDto[]] =>
++      entry[1] !== undefined && !active.has(entry[0]) && !isBusy(state, entry[0])
++  );
++  candidates.sort(([a], [b]) => recentRank(recent, a) - recentRank(recent, b));
++
++  const evicted: string[] = [];
++  let size = 0;
++  for (const [index, [id, messages]] of candidates.entries()) {
++    // 一旦开始淘汰，更久未激活的一律淘汰，不必再量体积
++    if (evicted.length === 0 && index < HISTORY_SESSION_BUDGET) {
++      size += historySize(messages);
++      if (size <= HISTORY_SIZE_BUDGET) continue;
++    }
++    evicted.push(id);
++  }
++  return evicted;
++}
+diff --git a/packages/stores/src/agent-persist-gate.test.ts b/packages/stores/src/agent-persist-gate.test.ts
+new file mode 100644
+index 00000000..1555d57a
+--- /dev/null
++++ b/packages/stores/src/agent-persist-gate.test.ts
+@@ -0,0 +1,105 @@
++// 流式 delta flush 不应触发同步的 localStorage 写：persist 的两个偏好字段没变就不落盘。
++
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
++
++import { noopNotificationSink } from '@tmex/notifications';
++
++import { createAgentStore } from './agent';
++import { createAgentDeltaBuffer } from './agent-delta-buffer';
++import type { AgentDataSetState } from './agent-state';
++import type { RuntimeCore } from './runtime';
++import { createMemoryStorage } from './test-utils';
++
++const FLUSHES = 100;
++
++let writes = 0;
++let restore: (() => void) | null = null;
++
++function installCountingStorage(): void {
++  const memory = createMemoryStorage();
++  const counting: Storage = {
++    get length() {
++      return memory.length;
++    },
++    clear: () => memory.clear(),
++    getItem: (key) => memory.getItem(key),
++    key: (index) => memory.key(index),
++    removeItem: (key) => memory.removeItem(key),
++    setItem: (key, value) => {
++      writes += 1;
++      memory.setItem(key, value);
++    },
++  };
++  const localStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
++  const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
++  const win = (globalThis.window ?? {}) as Window & typeof globalThis;
++  const previousWindowStorage = win.localStorage;
++  (win as unknown as { localStorage: Storage }).localStorage = counting;
++  Object.defineProperty(globalThis, 'localStorage', { value: counting, configurable: true });
++  Object.defineProperty(globalThis, 'window', { value: win, configurable: true });
++
++  restore = () => {
++    (win as unknown as { localStorage: Storage | undefined }).localStorage = previousWindowStorage;
++    if (localStorageDescriptor) {
++      Object.defineProperty(globalThis, 'localStorage', localStorageDescriptor);
++    } else {
++      Reflect.deleteProperty(globalThis, 'localStorage');
++    }
++    if (windowDescriptor) {
++      Object.defineProperty(globalThis, 'window', windowDescriptor);
++    } else {
++      Reflect.deleteProperty(globalThis, 'window');
++    }
++  };
++}
++
++function fakeCore(): RuntimeCore {
++  return {
++    client: { send: () => {}, connect: () => {}, onMessage: () => () => {} },
++    apiClient: {},
++    notifications: noopNotificationSink,
++    t: (key: string) => key,
++    storagePrefix: 'persist-gate-test-',
++  } as unknown as RuntimeCore;
++}
++
++beforeEach(() => {
++  writes = 0;
++  installCountingStorage();
++});
++
++afterEach(() => {
++  restore?.();
++  restore = null;
++});
++
++describe('agent persist 写盘门控', () => {
++  test('100 次 delta flush 不产生任何 setItem', () => {
++    const store = createAgentStore(fakeCore());
++    store.setState({ activeSessionIdByNode: { self: 's1' } });
++    const baseline = writes;
++    expect(baseline).toBeGreaterThan(0);
++
++    const deltas = createAgentDeltaBuffer(store.setState as unknown as AgentDataSetState);
++    for (let i = 0; i < FLUSHES; i += 1) {
++      deltas.append('s1', 'texts', 'm1', `chunk-${i} `);
++      deltas.flush();
++    }
++
++    expect(store.getState().inProgress.s1?.texts[0]?.text).toContain(`chunk-${FLUSHES - 1}`);
++    expect(writes).toBe(baseline);
++  });
++
++  test('持久化字段真的变化时仍会落盘', () => {
++    const store = createAgentStore(fakeCore());
++    const before = writes;
++    store.getState().setDefaultWriteMode('auto');
++    expect(writes).toBe(before + 1);
++
++    // 同值再设一次不重复写
++    store.getState().setDefaultWriteMode('auto');
++    expect(writes).toBe(before + 1);
++
++    expect(localStorage.getItem('persist-gate-test-tmex-agent')).toContain('"auto"');
++  });
++});
+diff --git a/packages/stores/src/agent-session-crud-actions.ts b/packages/stores/src/agent-session-crud-actions.ts
+index 87314b15..a5e77172 100644
+--- a/packages/stores/src/agent-session-crud-actions.ts
++++ b/packages/stores/src/agent-session-crud-actions.ts
+@@ -10,6 +10,7 @@ import {
+   updateAgentSession,
+ } from '@tmex/api-client';
+ import type { AgentSessionDto } from '@tmex/shared';
++import { selectEvictableHistories } from './agent-history-budget';
+ import { agentNodeKey } from './agent-node-state';
+ import { type AgentSessionActionsDeps, reportActionError } from './agent-session-deps';
+ import { mergeFetchedSessions, withSessionOrder } from './agent-session-map';
+@@ -71,12 +72,12 @@ export async function createSessionRequest(
+   }
+ }
+ 
+-function withoutKey<T>(
++function dropKeys<T>(
+   record: Record<string, T | undefined>,
+-  key: string
++  keys: readonly string[]
+ ): Record<string, T | undefined> {
+   const next = { ...record };
+-  delete next[key];
++  for (const key of keys) delete next[key];
+   return next;
+ }
+ 
+@@ -159,29 +160,68 @@ function pruneMissingActiveSessions(deps: AgentSessionActionsDeps): void {
+   set({ activeSessionIdByNode: next });
+ }
+ 
+-function pruneSessionState(prev: AgentState, sessionId: string): Partial<AgentState> {
++function pruneSessionState(prev: AgentState, sessionIds: readonly string[]): Partial<AgentState> {
+   return {
+-    ...withSessionOrder(withoutKey(prev.sessions, sessionId)),
+-    messages: withoutKey(prev.messages, sessionId),
+-    historyLoaded: withoutKey(prev.historyLoaded, sessionId),
+-    inProgress: withoutKey(prev.inProgress, sessionId),
+-    pendingConfirmations: withoutKey(prev.pendingConfirmations, sessionId),
+-    queued: withoutKey(prev.queued, sessionId),
++    ...withSessionOrder(dropKeys(prev.sessions, sessionIds)),
++    messages: dropKeys(prev.messages, sessionIds),
++    historyLoaded: dropKeys(prev.historyLoaded, sessionIds),
++    inProgress: dropKeys(prev.inProgress, sessionIds),
++    pendingConfirmations: dropKeys(prev.pendingConfirmations, sessionIds),
++    queued: dropKeys(prev.queued, sessionIds),
+   };
+ }
+ 
+ export function createAgentSessionCrudActions(
+   deps: AgentSessionActionsDeps
+ ): AgentSessionCrudActions {
+-  const { apiClient, notifications, set, get, subscribe, unsubscribe, clearSessionRuntime } = deps;
++  const {
++    apiClient,
++    notifications,
++    set,
++    get,
++    history,
++    subscribe,
++    unsubscribe,
++    clearSessionRuntime,
++  } = deps;
+ 
+   // 列表拉取的 in-flight 去重：StrictMode 双 effect 与快速切 tab 会并发触发
+   let loadingSessions: Promise<void> | null = null;
++  // 最近激活在前：非活跃会话的历史按此顺序淘汰
++  const recentSessions: string[] = [];
+ 
+   function reportError(error: unknown): void {
+     reportActionError(notifications, error);
+   }
+ 
++  function forgetRecent(sessionIds: readonly string[]): void {
++    for (const sessionId of sessionIds) {
++      const index = recentSessions.indexOf(sessionId);
++      if (index >= 0) recentSessions.splice(index, 1);
++    }
++  }
++
++  /** 会话已不存在（本端删除或别端删除）时的统一清理；订阅只存在于选中会话，由选中态清理负责退订 */
++  function forgetSessions(sessionIds: readonly string[]): void {
++    if (sessionIds.length === 0) return;
++    for (const sessionId of sessionIds) clearSessionRuntime(sessionId);
++    forgetRecent(sessionIds);
++    set((prev) => pruneSessionState(prev, sessionIds));
++  }
++
++  /** 清空超出预算的非活跃历史；historyLoaded 一并复位，重新打开时全量重拉 */
++  function evictHistories(): void {
++    const evicted = selectEvictableHistories(get(), recentSessions);
++    if (evicted.length === 0) return;
++    // 在途的历史请求令牌一并作废，否则其响应会把半截历史写回来
++    for (const sessionId of evicted) history.clearSession(sessionId);
++    forgetRecent(evicted);
++    set((prev) => ({
++      messages: dropKeys(prev.messages, evicted),
++      historyLoaded: dropKeys(prev.historyLoaded, evicted),
++    }));
++  }
++
+   const patchSession: PatchSession = async (sessionId, patch, errorFallback) => {
+     try {
+       const session = await updateAgentSession(sessionId, patch, errorFallback, apiClient);
+@@ -198,12 +238,16 @@ export function createAgentSessionCrudActions(
+     const before = get().sessions;
+     try {
+       const sessionList = await fetchAgentSessions(apiClient);
++      const previous = get().sessions;
+       set((prev) => ({
+         ...withSessionOrder(mergeFetchedSessions(before, prev.sessions, sessionList)),
+         sessionsLoaded: true,
+       }));
+       // 持久化的选中会话可能已被别端删除
+       pruneMissingActiveSessions(deps);
++      // 别端删除的会话走与本端删除相同的清理，否则历史/队列态会一直留在内存里
++      const current = get().sessions;
++      forgetSessions(Object.keys(previous).filter((id) => previous[id] && !current[id]));
+     } catch (error) {
+       console.error('[agent] loadSessions failed:', error);
+     }
+@@ -255,10 +299,14 @@ export function createAgentSessionCrudActions(
+ 
+       if (sessionId) {
+         subscribe(sessionId);
++        const index = recentSessions.indexOf(sessionId);
++        if (index >= 0) recentSessions.splice(index, 1);
++        recentSessions.unshift(sessionId);
+         if (!get().historyLoaded[sessionId]) {
+           void get().loadHistory(sessionId);
+         }
+       }
++      evictHistories();
+     },
+ 
+     async createSession(deviceId, paneId, options) {
+@@ -273,8 +321,7 @@ export function createAgentSessionCrudActions(
+       try {
+         await deleteAgentSession(sessionId, apiClient);
+         clearActiveSession(deps, sessionId);
+-        clearSessionRuntime(sessionId);
+-        set((prev) => pruneSessionState(prev, sessionId));
++        forgetSessions([sessionId]);
+         return true;
+       } catch (error) {
+         reportError(error);

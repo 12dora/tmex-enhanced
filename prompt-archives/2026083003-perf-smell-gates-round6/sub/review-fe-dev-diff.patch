@@ -1,0 +1,1084 @@
+diff --git a/apps/fe/src/components/device-status-store.ts b/apps/fe/src/components/device-status-store.ts
+new file mode 100644
+index 00000000..1df7ff9a
+--- /dev/null
++++ b/apps/fe/src/components/device-status-store.ts
+@@ -0,0 +1,74 @@
++// 连接态的按设备分发：适配器身份恒定（见 `DeviceConnectionAdapter.subscribe`），
++// 一台设备的状态变化只唤醒订阅了这台设备的行 / 卡片，不再让整棵设备树重渲染。
++//
++// 快照在 provider 的渲染期写入（读取立刻可见、SSR 也拿得到最新值），通知留到提交后
++// （`notifyChanged`）——渲染期通知别的组件 setState 是非法的。
++
++import type { DeviceConnectionStatus } from '@tmex/panels';
++import {
++  type DeviceConnectionSnapshot,
++  deriveDeviceConnectionStatus,
++  isDeviceConnected,
++} from './device-connection-status';
++
++interface DeviceStatusEntry {
++  status: DeviceConnectionStatus;
++  intentionallyDisconnected: boolean;
++  listeners: Set<() => void>;
++}
++
++export class DeviceStatusStore {
++  private snapshot: DeviceConnectionSnapshot;
++  private readonly entries = new Map<string, DeviceStatusEntry>();
++
++  constructor(snapshot: DeviceConnectionSnapshot) {
++    this.snapshot = snapshot;
++  }
++
++  setSnapshot = (snapshot: DeviceConnectionSnapshot): void => {
++    this.snapshot = snapshot;
++  };
++
++  isConnected = (deviceId: string): boolean =>
++    isDeviceConnected(this.snapshot.deviceConnected, deviceId);
++
++  status = (deviceId: string): DeviceConnectionStatus =>
++    deriveDeviceConnectionStatus(deviceId, this.snapshot);
++
++  isIntentionallyDisconnected = (deviceId: string): boolean =>
++    this.snapshot.intentionallyDisconnected.has(deviceId);
++
++  subscribe = (deviceId: string, listener: () => void): (() => void) => {
++    const entry = this.entries.get(deviceId) ?? this.track(deviceId);
++    entry.listeners.add(listener);
++    return () => {
++      const current = this.entries.get(deviceId);
++      if (!current) return;
++      current.listeners.delete(listener);
++      if (current.listeners.size === 0) this.entries.delete(deviceId);
++    };
++  };
++
++  /** 提交后调用：只唤醒推导值真的变了的那几台设备 */
++  notifyChanged = (): void => {
++    for (const [deviceId, entry] of this.entries) {
++      const status = this.status(deviceId);
++      const intentionallyDisconnected = this.isIntentionallyDisconnected(deviceId);
++      if (status === entry.status && intentionallyDisconnected === entry.intentionallyDisconnected)
++        continue;
++      entry.status = status;
++      entry.intentionallyDisconnected = intentionallyDisconnected;
++      for (const listener of [...entry.listeners]) listener();
++    }
++  };
++
++  private track(deviceId: string): DeviceStatusEntry {
++    const entry: DeviceStatusEntry = {
++      status: this.status(deviceId),
++      intentionallyDisconnected: this.isIntentionallyDisconnected(deviceId),
++      listeners: new Set<() => void>(),
++    };
++    this.entries.set(deviceId, entry);
++    return entry;
++  }
++}
+diff --git a/apps/fe/src/components/global-device-provider.tsx b/apps/fe/src/components/global-device-provider.tsx
+index 398cd654..a7307acb 100644
+--- a/apps/fe/src/components/global-device-provider.tsx
++++ b/apps/fe/src/components/global-device-provider.tsx
+@@ -9,6 +9,7 @@ import {
+   useContext,
+   useEffect,
+   useMemo,
++  useRef,
+   useSyncExternalStore,
+ } from 'react';
+ import { useTranslation } from 'react-i18next';
+@@ -16,8 +17,6 @@ import { matchPath, useLocation } from 'react-router';
+ import {
+   type DeviceRuntimeSlices,
+   createDeviceConnectionSnapshot,
+-  deriveDeviceConnectionStatus,
+-  isDeviceConnected,
+   runPendingSettlement,
+   shouldEnsureDeviceSubscription,
+   shouldEnsureRouteDeviceSubscription,
+@@ -31,6 +30,7 @@ import {
+   pendingConnectionRequests,
+   reconcileDeviceSubscriptions,
+ } from './device-intent-store';
++import { DeviceStatusStore } from './device-status-store';
+ 
+ export type { DeviceIdStorage } from './device-connection-persistence';
+ export {
+@@ -234,24 +234,41 @@ function useIntentActions(
+   return { connect, disconnect };
+ }
+ 
+-function useDeviceConnectionAdapter(
++/**
++ * 连接态的读取源。快照在渲染期写入（读取立刻可见），变更通知留到提交后按设备派发，
++ * 适配器与 context 值因此身份恒定：一台设备的状态变化不再让所有行 / 卡片重渲染。
++ */
++function useDeviceStatusStore(
+   intentionallyDisconnected: ReadonlySet<string>,
+   slices: DeviceRuntimeSlices,
+-  pending: PendingConnectionSnapshot,
++  pending: PendingConnectionSnapshot
++): DeviceStatusStore {
++  const snapshot = createDeviceConnectionSnapshot(intentionallyDisconnected, slices, pending);
++  const storeRef = useRef<DeviceStatusStore | null>(null);
++  if (storeRef.current === null) storeRef.current = new DeviceStatusStore(snapshot);
++  const store = storeRef.current;
++  store.setSnapshot(snapshot);
++  useEffect(store.notifyChanged);
++  return store;
++}
++
++function useDeviceConnectionAdapter(
++  store: DeviceStatusStore,
+   intentActions: Pick<DeviceConnectionAdapter, 'connect' | 'disconnect'>
+ ): DeviceConnectionAdapter {
+   const { connect, disconnect } = intentActions;
+ 
+-  return useMemo<DeviceConnectionAdapter>(() => {
+-    const snapshot = createDeviceConnectionSnapshot(intentionallyDisconnected, slices, pending);
+-    return {
+-      isConnected: (deviceId) => isDeviceConnected(slices.deviceConnected, deviceId),
+-      status: (deviceId) => deriveDeviceConnectionStatus(deviceId, snapshot),
+-      isIntentionallyDisconnected: (deviceId) => intentionallyDisconnected.has(deviceId),
++  return useMemo<DeviceConnectionAdapter>(
++    () => ({
++      isConnected: store.isConnected,
++      status: store.status,
++      isIntentionallyDisconnected: store.isIntentionallyDisconnected,
++      subscribe: store.subscribe,
+       connect,
+       disconnect,
+-    };
+-  }, [intentionallyDisconnected, slices, pending, connect, disconnect]);
++    }),
++    [store, connect, disconnect]
++  );
+ }
+ 
+ /**
+@@ -312,12 +329,8 @@ export function GlobalDeviceProvider({ children }: GlobalDeviceProviderProps) {
+ 
+   usePendingSettlement(pendingStore, pending, intent.disconnected, slices);
+   const intentActions = useIntentActions(intentStore, pendingStore, actions);
+-  const connection = useDeviceConnectionAdapter(
+-    intent.disconnected,
+-    slices,
+-    pending,
+-    intentActions
+-  );
++  const statusStore = useDeviceStatusStore(intent.disconnected, slices, pending);
++  const connection = useDeviceConnectionAdapter(statusStore, intentActions);
+ 
+   const value = useMemo(
+     () => ({ ensureDeviceSubscribed, connection }),
+diff --git a/apps/fe/src/main.tsx b/apps/fe/src/main.tsx
+index be1cc7f8..00d2d4f4 100644
+--- a/apps/fe/src/main.tsx
++++ b/apps/fe/src/main.tsx
+@@ -22,7 +22,7 @@ import { appNodeRuntimes, nodeQueryClient } from '@/node/node-runtimes';
+ import { PageWrapper } from '@/page-wrapper';
+ import { installSessionInterceptor } from '@tmex/api-client/auth/index';
+ import { ConnectionIndicator } from '@tmex/panels';
+-import { SettingsEventsInit } from '@tmex/panels/settings';
++import { SettingsEventsInit } from '@tmex/panels/settings/events';
+ import { WatchEventsInit } from '@tmex/panels/watch';
+ import { SELF_NODE_ID, useNodeRuntime } from '@tmex/stores';
+ import { RuntimeProvider, useSiteStore, useUIStore } from '@tmex/stores/react';
+diff --git a/apps/fe/src/pages/FilePage.test.tsx b/apps/fe/src/pages/FilePage.test.tsx
+index 1762ab85..4706ee4a 100644
+--- a/apps/fe/src/pages/FilePage.test.tsx
++++ b/apps/fe/src/pages/FilePage.test.tsx
+@@ -83,7 +83,11 @@ describe('FilePage 媒体 URL 带 node 前缀', () => {
+     );
+   });
+ 
+-  test('markdown 图片 resolver 带 node 前缀', () => {
++  test('markdown 图片 resolver 带 node 前缀', async () => {
++    // MarkdownPreview 是 lazy 的：首帧只出 Suspense fallback，等模块解析完再渲染一次。
++    const first = renderFilePage('0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a', 'r1', '/doc.md', 'markdown');
++    expect(first).not.toContain('data-markdown-image');
++    await new Promise((resolve) => setTimeout(resolve, 0));
+     const markup = renderFilePage('0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a', 'r1', '/doc.md', 'markdown');
+     expect(markup).toContain(
+       '/n/0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a/api/files/raw?rootId=r1&amp;path=img%2Fa.png'
+diff --git a/apps/fe/src/pages/FilePage.tsx b/apps/fe/src/pages/FilePage.tsx
+index 83146f73..339fd06a 100644
+--- a/apps/fe/src/pages/FilePage.tsx
++++ b/apps/fe/src/pages/FilePage.tsx
+@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
+ import type { FileCategory, FileStatResponse } from '@tmex/shared';
+ import { basename, dirname } from '@tmex/shared';
+ import { Download, ExternalLink, FileWarning, Loader2, RotateCw } from 'lucide-react';
+-import { type ReactNode, useMemo } from 'react';
++import { type ReactNode, Suspense, lazy, useMemo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { useParams } from 'react-router';
+ 
+@@ -18,12 +18,17 @@ import { formatBytes } from '@tmex/api-client';
+ import { fileRawUrl } from '@tmex/api-client';
+ import { CodeViewer } from '@tmex/panels/code-viewer';
+ import { startTransferToast } from '@tmex/panels/files';
+-import { MarkdownPreview } from '@tmex/panels/markdown';
+ import { type AppRuntime, type FileRef, decodeFileRef } from '@tmex/stores';
+ import { useRuntime } from '@tmex/stores/react';
+ import { Button } from '@tmex/ui/button';
+ import { IconTooltip } from '@tmex/ui/icon-tooltip';
+ 
++// Markdown 渲染链（react-markdown + katex + mermaid 等）约 137 KiB gzip，只有 markdown 文件用得到，
++// 代码 / 纯文本预览不该为它买单。
++const MarkdownPreview = lazy(() =>
++  import('@tmex/panels/markdown').then((m) => ({ default: m.MarkdownPreview }))
++);
++
+ function useFileRef(ref?: string): FileRef | null {
+   return useMemo(() => (ref ? decodeFileRef(ref) : null), [ref]);
+ }
+@@ -217,12 +222,21 @@ function TextView({
+   if (category === 'markdown') {
+     return (
+       <div className="h-full overflow-auto px-4 py-4 md:px-6">
+-        <MarkdownPreview
+-          source={content}
+-          basePath={dirname(path)}
+-          urlResolver={(imgPath) => fileRawUrl(nodeId, rootId, imgPath)}
+-          className="mx-auto max-w-3xl"
+-        />
++        <Suspense
++          fallback={
++            <CenteredMessage
++              icon={<Loader2 className="size-6 animate-spin motion-reduce:animate-none" />}
++              text={t('common.loading')}
++            />
++          }
++        >
++          <MarkdownPreview
++            source={content}
++            basePath={dirname(path)}
++            urlResolver={(imgPath) => fileRawUrl(nodeId, rootId, imgPath)}
++            className="mx-auto max-w-3xl"
++          />
++        </Suspense>
+       </div>
+     );
+   }
+diff --git a/apps/fe/src/pages/SettingsPage.test.tsx b/apps/fe/src/pages/SettingsPage.test.tsx
+index b1e2772d..ae0bb5fd 100644
+--- a/apps/fe/src/pages/SettingsPage.test.tsx
++++ b/apps/fe/src/pages/SettingsPage.test.tsx
+@@ -47,6 +47,13 @@ function render(entry = '/settings'): string {
+   );
+ }
+ 
++// 各标签面板是 React.lazy：首帧只出 Suspense fallback，等模块解析完再渲染一次才有面板。
++async function renderResolved(entry = '/settings'): Promise<string> {
++  render(entry);
++  await new Promise((resolve) => setTimeout(resolve, 0));
++  return render(entry);
++}
++
+ describe('SettingsPage 标签栏', () => {
+   test('七个标签都在，「节点」排在设备与文件与通知之间', () => {
+     const html = render();
+@@ -73,21 +80,25 @@ describe('SettingsPage 标签栏', () => {
+     expect(html).toContain('settings.tabGroup.remoteAccess');
+   });
+ 
+-  test('面板互斥：默认标签下只挂通用面板，NodesTab / 远程访问都不渲染', () => {
+-    const html = render();
++  test('面板互斥：默认标签下只挂通用面板，NodesTab / 远程访问都不渲染', async () => {
++    const html = await renderResolved();
+     expect(html).toContain('data-testid="general-settings-tab"');
+     expect(html).not.toContain('data-testid="settings-nodes-tab"');
+     expect(html).not.toContain('data-testid="settings-remote-access-tab"');
+   });
+ 
+-  test('`?tab=` 选中对应标签的面板（用有替身的「通知」面板验证深链）', () => {
+-    const html = render('/settings?tab=notifications');
++  test('`?tab=` 选中对应标签的面板（用有替身的「通知」面板验证深链）', async () => {
++    // 未加载过的标签首帧只有 Suspense fallback，说明面板确实被拆成了独立分块。
++    expect(render('/settings?tab=notifications')).not.toContain(
++      'data-testid="notification-settings-tab"'
++    );
++    const html = await renderResolved('/settings?tab=notifications');
+     expect(html).toContain('data-testid="notification-settings-tab"');
+     expect(html).not.toContain('data-testid="general-settings-tab"');
+   });
+ 
+-  test('`?tab=` 不是合法标签时退回「通用」', () => {
+-    const html = render('/settings?tab=bogus');
++  test('`?tab=` 不是合法标签时退回「通用」', async () => {
++    const html = await renderResolved('/settings?tab=bogus');
+     expect(html).toContain('data-testid="general-settings-tab"');
+   });
+ });
+diff --git a/apps/fe/src/pages/SettingsPage.tsx b/apps/fe/src/pages/SettingsPage.tsx
+index 15b8fe4e..d8a72bf7 100644
+--- a/apps/fe/src/pages/SettingsPage.tsx
++++ b/apps/fe/src/pages/SettingsPage.tsx
+@@ -2,6 +2,7 @@ import { useMutation } from '@tanstack/react-query';
+ import {
+   Bell,
+   Globe,
++  Loader2,
+   Monitor,
+   Network,
+   RotateCcw,
+@@ -9,13 +10,12 @@ import {
+   Settings as SettingsIcon,
+   Sparkles,
+ } from 'lucide-react';
+-import { useState } from 'react';
++import { Suspense, lazy, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { useSearchParams } from 'react-router';
+ import { toast } from 'sonner';
+ 
+ import { parseApiError } from '@tmex/api-client';
+-import { TerminalSettingsTab } from '@tmex/panels/settings';
+ import { useRuntime } from '@tmex/stores/react';
+ import { cn } from '@tmex/ui';
+ import {
+@@ -31,14 +31,33 @@ import {
+ import { Button } from '@tmex/ui/button';
+ import { Reveal } from '@tmex/ui/motion';
+ import { Tabs, TabsList, TabsTrigger, pillTabTriggerClassName } from '@tmex/ui/tabs';
+-import { AISettingsTab } from './settings/ai-settings-tab';
+-import { DevicesAndFilesTab } from './settings/devices-and-files-tab';
+-import { GeneralSettingsTab } from './settings/general-settings-tab';
+-import { NodesTab } from './settings/nodes/nodes-tab';
+-import { NotificationSettingsTab } from './settings/notification-settings-tab';
+-import { RemoteAccessTab } from './settings/remote-access/remote-access-tab';
+ import { useSiteSettingsForm } from './settings/use-site-settings-form';
+ 
++// 每个标签页独立成块：进设置页只下载当前标签的代码，切换过一次后 React.lazy 缓存模块，之后切换是同步的。
++const GeneralSettingsTab = lazy(() =>
++  import('./settings/general-settings-tab').then((m) => ({ default: m.GeneralSettingsTab }))
++);
++const DevicesAndFilesTab = lazy(() =>
++  import('./settings/devices-and-files-tab').then((m) => ({ default: m.DevicesAndFilesTab }))
++);
++const NodesTab = lazy(() =>
++  import('./settings/nodes/nodes-tab').then((m) => ({ default: m.NodesTab }))
++);
++const NotificationSettingsTab = lazy(() =>
++  import('./settings/notification-settings-tab').then((m) => ({
++    default: m.NotificationSettingsTab,
++  }))
++);
++const AISettingsTab = lazy(() =>
++  import('./settings/ai-settings-tab').then((m) => ({ default: m.AISettingsTab }))
++);
++const TerminalSettingsTab = lazy(() =>
++  import('@tmex/panels/settings').then((m) => ({ default: m.TerminalSettingsTab }))
++);
++const RemoteAccessTab = lazy(() =>
++  import('./settings/remote-access/remote-access-tab').then((m) => ({ default: m.RemoteAccessTab }))
++);
++
+ export type SettingsTab =
+   | 'general'
+   | 'devicesAndFiles'
+@@ -165,19 +184,27 @@ export default function SettingsPage() {
+           多数标签页返回的是 Fragment，卡片之间的间距原本由外层 gap 提供——包一层就必须
+           把同样的 gap 补回来，否则卡片会贴在一起。 */}
+       <Reveal key={activeTab} className="flex min-w-0 flex-col gap-4 sm:gap-6">
+-        {activeTab === 'general' && <GeneralSettingsTab form={form} />}
++        <Suspense
++          fallback={
++            <div className="flex min-h-40 items-center justify-center text-muted-foreground">
++              <Loader2 className="size-5 animate-spin motion-reduce:animate-none" />
++            </div>
++          }
++        >
++          {activeTab === 'general' && <GeneralSettingsTab form={form} />}
+ 
+-        {activeTab === 'devicesAndFiles' && <DevicesAndFilesTab />}
++          {activeTab === 'devicesAndFiles' && <DevicesAndFilesTab />}
+ 
+-        {activeTab === 'nodes' && <NodesTab />}
++          {activeTab === 'nodes' && <NodesTab />}
+ 
+-        {activeTab === 'notifications' && <NotificationSettingsTab form={form} />}
++          {activeTab === 'notifications' && <NotificationSettingsTab form={form} />}
+ 
+-        {activeTab === 'ai' && <AISettingsTab />}
++          {activeTab === 'ai' && <AISettingsTab />}
+ 
+-        {activeTab === 'terminal' && <TerminalSettingsTab />}
++          {activeTab === 'terminal' && <TerminalSettingsTab />}
+ 
+-        {activeTab === 'remoteAccess' && <RemoteAccessTab />}
++          {activeTab === 'remoteAccess' && <RemoteAccessTab />}
++        </Suspense>
+       </Reveal>
+     </div>
+   );
+diff --git a/packages/panels/package.json b/packages/panels/package.json
+index 7604ca4c..390919d2 100644
+--- a/packages/panels/package.json
++++ b/packages/panels/package.json
+@@ -12,6 +12,7 @@
+     "./code-viewer": "./src/code-viewer/index.ts",
+     "./watch": "./src/watch/index.ts",
+     "./settings": "./src/settings/index.ts",
++    "./settings/events": "./src/settings/settings-events-init.tsx",
+     "./device-tree": "./src/device-tree/index.ts",
+     "./device-console": "./src/device-console/index.ts",
+     "./device-management": "./src/device-management/index.ts",
+diff --git a/packages/panels/src/code-viewer/code-viewer.test.tsx b/packages/panels/src/code-viewer/code-viewer.test.tsx
+new file mode 100644
+index 00000000..7279b8d8
+--- /dev/null
++++ b/packages/panels/src/code-viewer/code-viewer.test.tsx
+@@ -0,0 +1,35 @@
++// 高亮体积护栏：未知语言超过 64 KiB、已知语言超过 512 KiB 时只渲染转义纯文本，
++// 避免 highlightAuto 在大文件上把主线程卡住数秒。
++
++import { describe, expect, test } from 'bun:test';
++import { renderToStaticMarkup } from 'react-dom/server';
++
++import { CodeViewer } from './code-viewer';
++
++function render(code: string, fileName: string): string {
++  return renderToStaticMarkup(<CodeViewer code={code} fileName={fileName} />);
++}
++
++const SNIPPET = 'const a = 1; // <tag>\n';
++
++describe('CodeViewer 高亮护栏', () => {
++  test('未知扩展名的小文件仍走自动识别', () => {
++    expect(render(SNIPPET, 'notes.unknownext')).toContain('hljs-');
++  });
++
++  test('未知扩展名超过 64 KiB 时渲染转义纯文本', () => {
++    const html = render(SNIPPET.repeat(4000), 'notes.unknownext');
++    expect(html).not.toContain('hljs-');
++    expect(html).toContain('&lt;tag&gt;');
++  });
++
++  test('已知语言在 64 KiB 以上仍然高亮', () => {
++    expect(render(SNIPPET.repeat(4000), 'a.ts')).toContain('hljs-keyword');
++  });
++
++  test('已知语言超过 512 KiB 时渲染转义纯文本', () => {
++    const html = render(SNIPPET.repeat(30_000), 'a.ts');
++    expect(html).not.toContain('hljs-keyword');
++    expect(html).toContain('&lt;tag&gt;');
++  });
++});
+diff --git a/packages/panels/src/code-viewer/code-viewer.tsx b/packages/panels/src/code-viewer/code-viewer.tsx
+index 50878fbb..411f044e 100644
+--- a/packages/panels/src/code-viewer/code-viewer.tsx
++++ b/packages/panels/src/code-viewer/code-viewer.tsx
+@@ -98,13 +98,21 @@ function resolveLanguage(fileName: string): string | undefined {
+   return EXT_TO_LANG[lower.slice(dot + 1)];
+ }
+ 
++// highlightAuto 要拿全部语法各跑一遍，代价随体积暴涨（1 MiB 未知文本 ~7.7 s，直接冻住主线程），
++// 所以只对小文件做自动识别；已知语言的 hljs.highlight 快两个数量级（2 MiB TS ~33 ms），阈值放宽即可。
++// 网关放行的文本上限是 2 MiB，两条线以上一律渲染转义纯文本。
++const AUTO_DETECT_LIMIT = 64 * 1024;
++const HIGHLIGHT_LIMIT = 512 * 1024;
++
+ function highlightCode(code: string, fileName: string): string {
+   const lang = resolveLanguage(fileName);
+   try {
+     if (lang && hljs.getLanguage(lang)) {
+-      return hljs.highlight(code, { language: lang }).value;
++      return code.length > HIGHLIGHT_LIMIT
++        ? escapeHtml(code)
++        : hljs.highlight(code, { language: lang }).value;
+     }
+-    return hljs.highlightAuto(code).value;
++    return code.length > AUTO_DETECT_LIMIT ? escapeHtml(code) : hljs.highlightAuto(code).value;
+   } catch {
+     return escapeHtml(code);
+   }
+diff --git a/packages/panels/src/device-connection.ts b/packages/panels/src/device-connection.ts
+index 37c64694..44679956 100644
+--- a/packages/panels/src/device-connection.ts
++++ b/packages/panels/src/device-connection.ts
+@@ -1,3 +1,5 @@
++import { useCallback, useSyncExternalStore } from 'react';
++
+ export type DeviceConnectionStatus =
+   | 'connected'
+   | 'connecting'
+@@ -12,4 +14,43 @@ export interface DeviceConnectionAdapter {
+   isIntentionallyDisconnected(deviceId: string): boolean;
+   connect(deviceId: string): void;
+   disconnect(deviceId: string): void;
++  /**
++   * 按设备订阅连接态变化。适配器本身身份恒定（否则每次状态变化都会击穿所有行 / 卡片的
++   * `React.memo`），状态改由这条订阅推给关心它的那一台设备。
++   */
++  subscribe(deviceId: string, onChange: () => void): () => void;
++}
++
++const NO_UNSUBSCRIBE = () => undefined;
++
++function useDeviceConnectionSubscribe(
++  connection: DeviceConnectionAdapter | undefined,
++  deviceId: string
++): (onChange: () => void) => () => void {
++  return useCallback(
++    (onChange: () => void) => connection?.subscribe(deviceId, onChange) ?? NO_UNSUBSCRIBE,
++    [connection, deviceId]
++  );
++}
++
++/** 只订阅本设备连接态的读取；宿主没接连接管理时为 undefined（调用方各自兜底） */
++export function useDeviceConnectionStatus(
++  connection: DeviceConnectionAdapter | undefined,
++  deviceId: string
++): DeviceConnectionStatus | undefined {
++  const subscribe = useDeviceConnectionSubscribe(connection, deviceId);
++  const read = useCallback(() => connection?.status(deviceId), [connection, deviceId]);
++  return useSyncExternalStore(subscribe, read, read);
++}
++
++export function useDeviceIntentionallyDisconnected(
++  connection: DeviceConnectionAdapter | undefined,
++  deviceId: string
++): boolean {
++  const subscribe = useDeviceConnectionSubscribe(connection, deviceId);
++  const read = useCallback(
++    () => connection?.isIntentionallyDisconnected(deviceId) ?? false,
++    [connection, deviceId]
++  );
++  return useSyncExternalStore(subscribe, read, read);
+ }
+diff --git a/packages/panels/src/device-console/device-console.tsx b/packages/panels/src/device-console/device-console.tsx
+index 09c2f039..6da6e463 100644
+--- a/packages/panels/src/device-console/device-console.tsx
++++ b/packages/panels/src/device-console/device-console.tsx
+@@ -12,7 +12,10 @@ import type { TerminalRef } from '@tmex/terminal-ui';
+ import { resolveTerminalTheme } from '@tmex/theme';
+ import { useCallback, useMemo, useRef } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import type { DeviceConnectionAdapter } from '../device-connection';
++import {
++  type DeviceConnectionAdapter,
++  useDeviceIntentionallyDisconnected,
++} from '../device-connection';
+ import { CommandInputCollapse } from './command-input-collapse';
+ import { EditorInputPanel } from './editor-input-panel';
+ import { TerminalStage } from './terminal-stage';
+@@ -85,8 +88,9 @@ export function DeviceConsole({
+   const targets = useConsoleTargets({ deviceId, windowId, resolvedPaneId, devicesQueryKey });
+   const { windows, selectedWindow, selectedPane, deviceConnected, isReconnecting } = targets;
+ 
+-  const isIntentionallyDisconnected = Boolean(
+-    deviceId && connection?.isIntentionallyDisconnected(deviceId)
++  const isIntentionallyDisconnected = useDeviceIntentionallyDisconnected(
++    connection,
++    deviceId ?? ''
+   );
+ 
+   const prepareResources = useCallback(
+diff --git a/packages/panels/src/device-folders/device-folder-tree.tsx b/packages/panels/src/device-folders/device-folder-tree.tsx
+index f21dbe35..4829e0bf 100644
+--- a/packages/panels/src/device-folders/device-folder-tree.tsx
++++ b/packages/panels/src/device-folders/device-folder-tree.tsx
+@@ -122,7 +122,9 @@ interface TreeContextValue {
+   dragDisabled: boolean;
+   creatingFolder: boolean;
+   renamingFolderId: string | null;
+-  props: DeviceFolderTreeProps;
++  renderNode: DeviceFolderTreeProps['renderNode'];
++  nodeDraggable: DeviceFolderTreeProps['nodeDraggable'];
++  nodeLabel: DeviceFolderTreeProps['nodeLabel'];
+   actions: {
+     toggle: (folderId: string, expanded: boolean) => void;
+     startRename: (folderId: string) => void;
+@@ -151,23 +153,16 @@ function NodeItem({
+   containerId: string;
+   folderId: string | null;
+ }) {
+-  const { props, dragDisabled, layout } = useTree();
++  const { renderNode, nodeDraggable, dragDisabled, layout } = useTree();
+   const implicit = !layout.placements.some((placement) => placement.nodeId === nodeId);
+-  if (props.nodeDraggable && !props.nodeDraggable(nodeId, { folderId })) {
+-    const content = props.renderNode(nodeId, {
+-      folderId,
+-      implicit,
+-      dragDisabled,
+-      dragControls: null,
+-    });
++  if (nodeDraggable && !nodeDraggable(nodeId, { folderId })) {
++    const content = renderNode(nodeId, { folderId, implicit, dragDisabled, dragControls: null });
+     if (content === null || content === undefined || content === false) return null;
+     return <div data-testid={`device-folder-item-node:${nodeId}`}>{content}</div>;
+   }
+   return (
+     <DeviceFolderNodeShell nodeId={nodeId} containerId={containerId} disabled={dragDisabled}>
+-      {(dragControls) =>
+-        props.renderNode(nodeId, { folderId, implicit, dragDisabled, dragControls })
+-      }
++      {(dragControls) => renderNode(nodeId, { folderId, implicit, dragDisabled, dragControls })}
+     </DeviceFolderNodeShell>
+   );
+ }
+@@ -270,7 +265,7 @@ function FolderNode({ folder }: { folder: DeviceFolder }) {
+  */
+ function DragPreview({ activeId }: { activeId: string }) {
+   const { t } = useTranslation();
+-  const { foldersById, itemCounts, props } = useTree();
++  const { foldersById, itemCounts, nodeLabel } = useTree();
+   const folderId = parseFolderElementId(activeId);
+   const folder = folderId ? foldersById.get(folderId) : undefined;
+   const nodeId = folderId === null ? parseNodeElementId(activeId) : null;
+@@ -295,7 +290,7 @@ function DragPreview({ activeId }: { activeId: string }) {
+           <span className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
+             <Server className="size-4" />
+           </span>
+-          <span className="min-w-0 flex-1 truncate font-medium">{props.nodeLabel(nodeId)}</span>
++          <span className="min-w-0 flex-1 truncate font-medium">{nodeLabel(nodeId)}</span>
+         </>
+       ) : null}
+     </div>
+@@ -334,6 +329,9 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+   const {
+     layout,
+     implicitRootNodeIds,
++    renderNode,
++    nodeDraggable,
++    nodeLabel,
+     expanded,
+     onExpandedChange,
+     onDrop,
+@@ -448,7 +446,9 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       dragDisabled: disabled,
+       creatingFolder,
+       renamingFolderId,
+-      props,
++      renderNode,
++      nodeDraggable,
++      nodeLabel,
+       actions,
+     }),
+     [
+@@ -462,7 +462,9 @@ export function DeviceFolderTree(props: DeviceFolderTreeProps) {
+       disabled,
+       creatingFolder,
+       renamingFolderId,
+-      props,
++      renderNode,
++      nodeDraggable,
++      nodeLabel,
+       actions,
+     ]
+   );
+diff --git a/packages/panels/src/device-management/device-card-connect-toggle.tsx b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+index adb71d2f..962c89b5 100644
+--- a/packages/panels/src/device-management/device-card-connect-toggle.tsx
++++ b/packages/panels/src/device-management/device-card-connect-toggle.tsx
+@@ -10,7 +10,11 @@ import { Button } from '@tmex/ui/button';
+ import { Loader2 } from 'lucide-react';
+ import { useEffect, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
++import {
++  type DeviceConnectionAdapter,
++  type DeviceConnectionStatus,
++  useDeviceConnectionStatus,
++} from '../device-connection';
+ import { deviceStatusDotClass } from '../device-tree/device-connection-control';
+ 
+ type DeviceConnectAction = 'connect' | 'disconnect' | 'pending';
+@@ -58,11 +62,8 @@ export function DeviceCardConnectToggle({
+   useEffect(() => {
+     if (!offline) setAttemptedWhileOffline(false);
+   }, [offline]);
+-  const status = displayedConnectionStatus(
+-    connection.status(deviceId),
+-    offline,
+-    attemptedWhileOffline
+-  );
++  const liveStatus = useDeviceConnectionStatus(connection, deviceId) ?? 'disconnected';
++  const status = displayedConnectionStatus(liveStatus, offline, attemptedWhileOffline);
+   const action = deviceConnectAction(status);
+   const label =
+     action === 'disconnect'
+diff --git a/packages/panels/src/device-management/device-card.test.tsx b/packages/panels/src/device-management/device-card.test.tsx
+index c5f86578..53d9df5f 100644
+--- a/packages/panels/src/device-management/device-card.test.tsx
++++ b/packages/panels/src/device-management/device-card.test.tsx
+@@ -70,6 +70,7 @@ function stubConnection(status: DeviceConnectionStatus): DeviceConnectionAdapter
+     isIntentionallyDisconnected: () => status === 'disconnected',
+     connect: () => undefined,
+     disconnect: () => undefined,
++    subscribe: () => () => undefined,
+   };
+ }
+ 
+@@ -114,6 +115,11 @@ function renderCard(options: {
+   return html;
+ }
+ 
++/** 记忆化是「无关设备的更新不重渲染整页卡片」的前提，别被顺手拆掉 */
++test('卡片是 memo 组件', () => {
++  expect((DeviceCard as unknown as { $$typeof: symbol }).$$typeof).toBe(Symbol.for('react.memo'));
++});
++
+ function occurrences(html: string, text: string): number {
+   return html.split(text).length - 1;
+ }
+diff --git a/packages/panels/src/device-management/device-card.tsx b/packages/panels/src/device-management/device-card.tsx
+index 679c03bb..803afe3c 100644
+--- a/packages/panels/src/device-management/device-card.tsx
++++ b/packages/panels/src/device-management/device-card.tsx
+@@ -42,7 +42,7 @@ import {
+   WifiOff,
+   Zap,
+ } from 'lucide-react';
+-import { type CSSProperties, type ReactNode, useState } from 'react';
++import { type CSSProperties, type ReactNode, memo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Link } from 'react-router';
+ import { toast } from 'sonner';
+@@ -246,7 +246,7 @@ function SidebarVisibilityToggle({
+   );
+ }
+ 
+-export function DeviceCard({
++export const DeviceCard = memo(function DeviceCard({
+   device,
+   onEdit,
+   onDelete,
+@@ -414,4 +414,4 @@ export function DeviceCard({
+       )}
+     </>
+   );
+-}
++});
+diff --git a/packages/panels/src/device-management/device-grid.tsx b/packages/panels/src/device-management/device-grid.tsx
+index 8e35f2ed..b0e45ae4 100644
+--- a/packages/panels/src/device-management/device-grid.tsx
++++ b/packages/panels/src/device-management/device-grid.tsx
+@@ -19,7 +19,7 @@ import { CSS } from '@dnd-kit/utilities';
+ import type { Device } from '@tmex/shared';
+ import { cn } from '@tmex/ui';
+ import { GripVertical } from 'lucide-react';
+-import type { CSSProperties } from 'react';
++import { type CSSProperties, memo, useMemo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { DeviceCardHost, type DeviceCardHostProps } from './device-card-host';
+ import type { useDeviceManagementState } from './use-device-management-state';
+@@ -29,7 +29,8 @@ const HANDLE_CLASS =
+ 
+ type CardProps = Omit<DeviceCardHostProps, 'device' | 'dragHandle' | 'style' | 'className'>;
+ 
+-function SortableDeviceCard({
++// 记忆化 + 上面稳定下来的 card：一台设备的状态变化不再重渲染整页卡片
++const SortableDeviceCard = memo(function SortableDeviceCard({
+   device,
+   disabled,
+   style,
+@@ -83,7 +84,7 @@ function SortableDeviceCard({
+       <DeviceCardHost device={device} dragHandle={dragHandle} {...card} />
+     </div>
+   );
+-}
++});
+ 
+ export function DeviceGrid({
+   state,
+@@ -98,6 +99,12 @@ export function DeviceGrid({
+     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+   );
+   const { devices, deviceIds, reorderDisabled } = state;
++  // 宿主每次渲染都新建 card 字面量；按字段锁住引用，卡片的 memo 才拦得住
++  const { queryKey, nodeContext, connection, offline } = card;
++  const cardProps = useMemo<CardProps>(
++    () => ({ queryKey, nodeContext, connection, offline }),
++    [queryKey, nodeContext, connection, offline]
++  );
+ 
+   return (
+     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={state.onDragEnd}>
+@@ -117,7 +124,7 @@ export function DeviceGrid({
+               device={device}
+               disabled={reorderDisabled}
+               style={state.staggerStyle(device.id, index)}
+-              card={card}
++              card={cardProps}
+             />
+           ))}
+         </div>
+diff --git a/packages/panels/src/device-tree/device-row.test.tsx b/packages/panels/src/device-tree/device-row.test.tsx
+index d21503fe..a7225412 100644
+--- a/packages/panels/src/device-tree/device-row.test.tsx
++++ b/packages/panels/src/device-tree/device-row.test.tsx
+@@ -12,6 +12,7 @@ import i18next from 'i18next';
+ import { renderToStaticMarkup } from 'react-dom/server';
+ import { I18nextProvider } from 'react-i18next';
+ import { MemoryRouter } from 'react-router';
++import type { DeviceConnectionAdapter, DeviceConnectionStatus } from '../device-connection';
+ import { DeviceRow } from './device-row';
+ import { SortableVerticalList } from './device-tree-dnd';
+ 
+@@ -38,7 +39,26 @@ const DEVICE: Device = {
+ 
+ let storageSeq = 0;
+ 
+-function renderRow(options: { isExpanded: boolean; isSelected?: boolean }): string {
++/** 只认「本设备」的连接适配器：行必须按设备读它，不能拿整表 */
++function stubConnection(
++  statusByDevice: Record<string, DeviceConnectionStatus>,
++  intentionallyDisconnected: readonly string[] = []
++): DeviceConnectionAdapter {
++  return {
++    status: (deviceId) => statusByDevice[deviceId] ?? 'disconnected',
++    isConnected: (deviceId) => statusByDevice[deviceId] === 'connected',
++    isIntentionallyDisconnected: (deviceId) => intentionallyDisconnected.includes(deviceId),
++    connect: () => undefined,
++    disconnect: () => undefined,
++    subscribe: () => () => undefined,
++  };
++}
++
++function renderRow(options: {
++  isExpanded: boolean;
++  isSelected?: boolean;
++  connection?: DeviceConnectionAdapter;
++}): string {
+   const runtime = createAppRuntime({
+     nodeId: 'self',
+     storagePrefix: `device-row-test-${storageSeq++}:`,
+@@ -63,6 +83,7 @@ function renderRow(options: { isExpanded: boolean; isSelected?: boolean }): stri
+                 onWindowClick={() => undefined}
+                 onWatchPane={() => undefined}
+                 nav={{ navigateToPane: () => undefined }}
++                connection={options.connection}
+               />
+             </SortableVerticalList>
+           </RuntimeProvider>
+@@ -103,6 +124,25 @@ describe('DeviceRow 子树的展开态', () => {
+     expect(renderRow({ isExpanded: true })).not.toContain('tmex-reveal');
+   });
+ 
++  test('连接态按设备从适配器读取，不看别台设备', () => {
++    const html = renderRow({
++      isExpanded: false,
++      connection: stubConnection({ [DEVICE.id]: 'reconnecting', 'dev-other': 'connected' }),
++    });
++
++    expect(html).toContain(`data-testid="device-online-status-${DEVICE.id}"`);
++    expect(html).toContain('data-status="reconnecting"');
++  });
++
++  test('主动断开的设备即使展开也不渲染子树', () => {
++    const html = renderRow({
++      isExpanded: true,
++      connection: stubConnection({ [DEVICE.id]: 'disconnected' }, [DEVICE.id]),
++    });
++
++    expect(html).not.toContain(`data-testid="device-tree-${DEVICE.id}"`);
++  });
++
+   test('选中指示条常驻，只切透明度，未选中时也在 DOM 里', () => {
+     const selected = indicatorTag(renderRow({ isExpanded: false, isSelected: true }));
+     const idle = indicatorTag(renderRow({ isExpanded: false, isSelected: false }));
+diff --git a/packages/panels/src/device-tree/device-row.tsx b/packages/panels/src/device-tree/device-row.tsx
+index 1660c6ca..d04a40fc 100644
+--- a/packages/panels/src/device-tree/device-row.tsx
++++ b/packages/panels/src/device-tree/device-row.tsx
+@@ -1,6 +1,10 @@
+ import { cn } from '@tmex/ui';
+ import { Collapsible, CollapsibleContent } from '@tmex/ui/collapsible';
+ import { memo } from 'react';
++import {
++  useDeviceConnectionStatus,
++  useDeviceIntentionallyDisconnected,
++} from '../device-connection';
+ import { DeviceRowHeader } from './device-row-header';
+ import { useSortableRow } from './device-tree-dnd';
+ import type { DeviceRowProps } from './device-tree-row-props';
+@@ -17,9 +21,10 @@ export const DeviceRow = memo(function DeviceRow(props: DeviceRowProps) {
+   // 只订阅本设备的切片：别的设备推快照/改连接态时这一行不会重渲染
+   const windows = useDeviceWindows(deviceId);
+   const isOnline = useDeviceOnline(deviceId);
++  const connectionStatus = useDeviceConnectionStatus(connection, deviceId);
++  const isIntentionallyDisconnected = useDeviceIntentionallyDisconnected(connection, deviceId);
+ 
+-  const status = connection?.status(deviceId) ?? (isOnline ? 'connected' : 'disconnected');
+-  const isIntentionallyDisconnected = connection?.isIntentionallyDisconnected(deviceId) ?? false;
++  const status = connectionStatus ?? (isOnline ? 'connected' : 'disconnected');
+   const showTree = isExpanded && !isIntentionallyDisconnected;
+ 
+   return (
+diff --git a/packages/panels/src/device-tree/device-tree-navigation.test.ts b/packages/panels/src/device-tree/device-tree-navigation.test.ts
+index 87500f0c..e4a41fc5 100644
+--- a/packages/panels/src/device-tree/device-tree-navigation.test.ts
++++ b/packages/panels/src/device-tree/device-tree-navigation.test.ts
+@@ -301,6 +301,24 @@ describe('createPendingNavigationSlot', () => {
+     expect(slot.get()).toBeNull();
+   });
+ 
++  // 目标设备 id 只有靠这条回调才能跟上槽位，订阅方才敢只订那一台的快照
++  test('onChange reports every write, clear and ttl expiry', () => {
++    const { timers, fire } = fakeTimers();
++    const seen: Array<string | null> = [];
++    const slot = createPendingNavigationSlot({
++      timers,
++      onChange: (next) => seen.push(next?.deviceId ?? null),
++    });
++
++    slot.set(pending);
++    slot.set({ deviceId: 'dev-2', windowId: '@5', at: 1 });
++    fire(2);
++    slot.set(pending);
++    slot.clear();
++
++    expect(seen).toEqual(['dev-1', 'dev-2', null, 'dev-1', null]);
++  });
++
+   test('dispose clears the timer so an unmounted tree never fires', () => {
+     const { timers, scheduled } = fakeTimers();
+     const slot = createPendingNavigationSlot({ timers });
+diff --git a/packages/panels/src/device-tree/device-tree-navigation.ts b/packages/panels/src/device-tree/device-tree-navigation.ts
+index e6c5f58a..e9d9f685 100644
+--- a/packages/panels/src/device-tree/device-tree-navigation.ts
++++ b/packages/panels/src/device-tree/device-tree-navigation.ts
+@@ -8,7 +8,7 @@ import {
+ } from '@tmex/stores';
+ import { useRuntime, useTmuxStore } from '@tmex/stores/react';
+ import { useSidebar } from '@tmex/ui/sidebar';
+-import { useCallback, useEffect, useMemo, useRef } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { matchPath, useLocation, useNavigate } from 'react-router';
+ import type { DeviceTreeNavigation } from './agent-adapter';
+ 
+@@ -141,6 +141,8 @@ export interface PendingNavigationTimers {
+ export interface PendingNavigationSlotOptions {
+   ttlMs?: number;
+   timers?: PendingNavigationTimers;
++  /** 写入 / 清空 / 过期都会回调；订阅方据此只订目标设备那一份快照 */
++  onChange?: (pending: PendingNavigation | null) => void;
+ }
+ 
+ /**
+@@ -174,20 +176,24 @@ export function createPendingNavigationSlot(
+     timers.clearTimer(handle);
+     handle = null;
+   };
++  const commit = (next: PendingNavigation | null) => {
++    pending = next;
++    options.onChange?.(next);
++  };
+ 
+   return {
+     get: () => pending,
+     set: (next) => {
+       cancelTimer();
+-      pending = next;
++      commit(next);
+       handle = timers.setTimer(() => {
+         handle = null;
+-        pending = null;
++        commit(null);
+       }, ttlMs);
+     },
+     clear: () => {
+       cancelTimer();
+-      pending = null;
++      commit(null);
+     },
+     dispose: () => {
+       cancelTimer();
+@@ -196,14 +202,23 @@ export function createPendingNavigationSlot(
+   };
+ }
+ 
+-function usePendingNavigationSlot(): PendingNavigationSlot {
++/** 除槽位本身外还给出「目标设备 id」这一位状态，供调用方按设备订阅快照 */
++function usePendingNavigationSlot(): {
++  slot: PendingNavigationSlot;
++  targetDeviceId: string | null;
++} {
++  const [targetDeviceId, setTargetDeviceId] = useState<string | null>(null);
+   const slotRef = useRef<PendingNavigationSlot | null>(null);
+-  if (slotRef.current === null) slotRef.current = createPendingNavigationSlot();
++  if (slotRef.current === null) {
++    slotRef.current = createPendingNavigationSlot({
++      onChange: (pending) => setTargetDeviceId(pending?.deviceId ?? null),
++    });
++  }
+   const slot = slotRef.current;
+ 
+   useEffect(() => () => slot.dispose(), [slot]);
+ 
+-  return slot;
++  return { slot, targetDeviceId };
+ }
+ 
+ export function useDeviceTreeSelection(): DeviceTreeSelection {
+@@ -232,11 +247,14 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+   const { isMobile, setOpenMobile } = useSidebar();
+   const { host, nodeId } = useRuntime();
+   const selectWindow = useTmuxStore((state) => state.selectWindow);
+-  const snapshots = useTmuxStore((state) => state.snapshots);
+   const { pathname } = useLocation();
+   const patterns = useMemo(() => deviceTreeRoutePatterns(host), [host]);
+ 
+-  const pendingNavigation = usePendingNavigationSlot();
++  const { slot: pendingNavigation, targetDeviceId } = usePendingNavigationSlot();
++  // 只订 pending 目标那一台的窗口列表：别的设备推快照不会重跑下面的落定 effect
++  const targetWindows = useTmuxStore((state) =>
++    targetDeviceId ? state.snapshots[targetDeviceId]?.session?.windows : undefined
++  );
+ 
+   // 路由离开目标设备即作废 pending：普通 NavLink 跳转不会经过 navigateToPane，
+   // 否则 TTL 内到货的快照会把用户从新页面拽回旧 pane
+@@ -275,7 +293,7 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+   useEffect(() => {
+     const outcome = resolvePendingNavigation(
+       pendingNavigation.get(),
+-      (deviceId) => snapshots[deviceId]?.session?.windows,
++      (deviceId) => (deviceId === targetDeviceId ? targetWindows : undefined),
+       Date.now()
+     );
+     if (outcome.status === 'expired') {
+@@ -285,7 +303,7 @@ export function useDeviceTreeNavigationApi(): DeviceTreeNavigationApi {
+     if (outcome.status !== 'ready') return;
+     pendingNavigation.clear();
+     navigateToPane(outcome.deviceId, outcome.windowId, outcome.paneId);
+-  }, [snapshots, navigateToPane, pendingNavigation]);
++  }, [targetDeviceId, targetWindows, navigateToPane, pendingNavigation]);
+ 
+   const navigateToWindow = useCallback(
+     (deviceId: string, windowId: string, panes: TmuxPane[]) => {
+diff --git a/packages/panels/src/settings/version-tab-sections.tsx b/packages/panels/src/settings/version-tab-sections.tsx
+index 67a60b6a..d88dbbd4 100644
+--- a/packages/panels/src/settings/version-tab-sections.tsx
++++ b/packages/panels/src/settings/version-tab-sections.tsx
+@@ -16,8 +16,13 @@ import {
+ } from '@tmex/ui/alert-dialog';
+ import { Button } from '@tmex/ui/button';
+ import { AlertTriangle, Download, Loader2, RefreshCw } from 'lucide-react';
++import { Suspense, lazy } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { MarkdownPreview } from '../markdown/markdown-preview';
++
++// 变更日志才用得到 Markdown 渲染链（约 137 KiB gzip），设置页其余部分不该为它买单。
++const MarkdownPreview = lazy(() =>
++  import('../markdown/markdown-preview').then((m) => ({ default: m.MarkdownPreview }))
++);
+ 
+ function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
+   return (
+@@ -130,7 +135,9 @@ export function ChangelogSection({
+       <div className="text-sm font-semibold">{t('settings.version.changelog')}</div>
+       <div className="rounded-lg border border-border bg-card px-4 py-3">
+         {changelog ? (
+-          <MarkdownPreview source={changelog} basePath="/" />
++          <Suspense fallback={<Loader2 className="h-4 w-4 animate-spin" />}>
++            <MarkdownPreview source={changelog} basePath="/" />
++          </Suspense>
+         ) : (
+           <div className="text-sm text-muted-foreground">
+             {t('settings.version.changelogUnavailable')}

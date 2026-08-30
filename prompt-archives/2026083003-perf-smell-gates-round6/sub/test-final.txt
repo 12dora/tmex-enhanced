@@ -1,0 +1,10 @@
+packages/shared:  376 pass  0 fail  tsc=0
+packages/ws-client:  268 pass  0 fail  tsc=0
+packages/stores:  334 pass  0 fail  tsc=1
+packages/panels:  629 pass  0 fail  tsc=0
+packages/ui:  47 pass  0 fail  tsc=0
+packages/terminal-ui:  323 pass  0 fail  tsc=0
+packages/ghostty-terminal:  202 pass  0 fail  tsc=0
+packages/api-client:  132 pass  0 fail  tsc=5
+packages/app:  414 pass  1 fail  tsc=1
+apps/fe:  883 pass  0 fail  tsc=0

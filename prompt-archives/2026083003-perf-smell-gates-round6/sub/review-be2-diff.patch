@@ -1,0 +1,3065 @@
+diff --git a/apps/gateway/src/api/device-routes.test.ts b/apps/gateway/src/api/device-routes.test.ts
+new file mode 100644
+index 00000000..230fd617
+--- /dev/null
++++ b/apps/gateway/src/api/device-routes.test.ts
+@@ -0,0 +1,112 @@
++import { beforeAll, describe, expect, spyOn, test } from 'bun:test';
++import type { Device } from '@tmex/shared';
++import type { Server } from 'bun';
++import { createDevice, updateDeviceRuntimeStatus } from '../db';
++import { getSqliteClient } from '../db/client';
++import * as devicesDb from '../db/devices';
++import { runMigrations } from '../db/migrate';
++import { handleApiRequest } from './index';
++
++const PREFIX = 'r3-api-dev-';
++const fakeServer = {} as Server<unknown>;
++
++beforeAll(() => {
++  runMigrations();
++  const now = new Date().toISOString();
++  for (let i = 0; i < 100; i++) {
++    const id = `${PREFIX}${String(i).padStart(3, '0')}`;
++    createDevice({
++      id,
++      name: `r3-${i}`,
++      type: 'local',
++      session: 'tmex',
++      authMode: 'auto',
++      sortOrder: i,
++      createdAt: now,
++      updatedAt: now,
++    });
++  }
++  updateDeviceRuntimeStatus(`${PREFIX}000`, {
++    lastSeenAt: '2026-06-13T12:00:00.000Z',
++    tmuxAvailable: true,
++    lastError: 'late',
++    lastErrorType: 'ssh',
++  });
++});
++
++async function captureSql<T>(fn: () => T | Promise<T>): Promise<{ result: T; sqls: string[] }> {
++  const db = getSqliteClient();
++  const orig = db.prepare.bind(db);
++  const sqls: string[] = [];
++  db.prepare = ((sql: string) => {
++    sqls.push(sql);
++    return orig(sql);
++  }) as typeof db.prepare;
++  try {
++    return { result: await fn(), sqls };
++  } finally {
++    db.prepare = orig;
++  }
++}
++
++describe('GET /api/devices query batching', () => {
++  test('100 台设备 ≤ 3 次查询，缺状态行用默认值，shape 含 runtime 字段', async () => {
++    const statusSpy = spyOn(devicesDb, 'getDeviceRuntimeStatus');
++    const { result, sqls } = await captureSql(() =>
++      handleApiRequest(new Request('http://localhost/api/devices'), fakeServer)
++    );
++    const response = await result;
++    expect(response.status).toBe(200);
++    expect(sqls.filter((sql) => /^\s*select\b/i.test(sql)).length).toBeLessThanOrEqual(3);
++    expect(statusSpy).toHaveBeenCalledTimes(0);
++    statusSpy.mockRestore();
++
++    const body = (await response.json()) as {
++      devices: Array<
++        Device & {
++          lastSeenAt: string | null;
++          lastError: string | null;
++          lastErrorType: string | null;
++          tmuxAvailable: boolean;
++        }
++      >;
++    };
++    const ours = body.devices.filter((d) => d.id.startsWith(PREFIX));
++    expect(ours).toHaveLength(100);
++    const first = ours.find((d) => d.id === `${PREFIX}000`);
++    const rest = ours.find((d) => d.id === `${PREFIX}001`);
++    expect(first?.lastSeenAt).toBe('2026-06-13T12:00:00.000Z');
++    expect(first?.tmuxAvailable).toBe(true);
++    expect(first?.lastError).toBe('late');
++    expect(first?.lastErrorType).toBe('ssh');
++    expect(rest?.lastSeenAt).toBeNull();
++    expect(rest?.tmuxAvailable).toBe(false);
++    expect(rest?.lastError).toBeNull();
++    expect(rest?.lastErrorType).toBeNull();
++  });
++
++  test('reorder 响应同样批量带 runtime 状态且查询 ≤ 3', async () => {
++    const ids = Array.from({ length: 100 }, (_, i) => `${PREFIX}${String(i).padStart(3, '0')}`);
++    const statusSpy = spyOn(devicesDb, 'getDeviceRuntimeStatus');
++    const { result, sqls } = await captureSql(() =>
++      handleApiRequest(
++        new Request('http://localhost/api/devices/order', {
++          method: 'PUT',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ deviceIds: ids }),
++        }),
++        fakeServer
++      )
++    );
++    const response = await result;
++    expect(response.status).toBe(200);
++    const selects = sqls.filter((sql) => /^\s*select\b/i.test(sql));
++    expect(selects.length).toBeLessThanOrEqual(3);
++    expect(statusSpy).toHaveBeenCalledTimes(0);
++    statusSpy.mockRestore();
++    const body = (await response.json()) as {
++      devices: Array<{ id: string; tmuxAvailable: boolean }>;
++    };
++    expect(body.devices.filter((d) => d.id.startsWith(PREFIX))).toHaveLength(100);
++  });
++});
+diff --git a/apps/gateway/src/api/device-routes.ts b/apps/gateway/src/api/device-routes.ts
+index de74e751..3c8f18ed 100644
+--- a/apps/gateway/src/api/device-routes.ts
++++ b/apps/gateway/src/api/device-routes.ts
+@@ -10,6 +10,7 @@ import {
+   reorderDevices,
+   updateDevice,
+ } from '../db';
++import { listDevicesWithRuntimeStatus } from '../db/devices';
+ import { t } from '../i18n';
+ import { connectionAlertNotifier } from '../push/connection-alerts';
+ import { pushSupervisor } from '../push/supervisor';
+@@ -51,9 +52,15 @@ function enrichDeviceWithRuntime(device: Device): Device & {
+   };
+ }
+ 
++function listEnrichedDevices() {
++  if (getAllDevices().length === 0) {
++    return [];
++  }
++  return listDevicesWithRuntimeStatus();
++}
++
+ async function handleGetDevices(): Promise<Response> {
+-  const devices = getAllDevices().map(enrichDeviceWithRuntime);
+-  return json({ devices });
++  return json({ devices: listEnrichedDevices() });
+ }
+ 
+ async function handleGetDevice(id: string): Promise<Response> {
+@@ -144,7 +151,7 @@ async function handleReorderDevices(req: Request): Promise<Response> {
+ 
+   reorderDevices(body.deviceIds as string[]);
+   broadcastSettingsUpdate('devices');
+-  return json({ devices: getAllDevices().map(enrichDeviceWithRuntime) });
++  return json({ devices: listEnrichedDevices() });
+ }
+ 
+ async function handleDeleteDevice(id: string): Promise<Response> {
+diff --git a/apps/gateway/src/api/file-browser-routes.test.ts b/apps/gateway/src/api/file-browser-routes.test.ts
+new file mode 100644
+index 00000000..e6ead4a1
+--- /dev/null
++++ b/apps/gateway/src/api/file-browser-routes.test.ts
+@@ -0,0 +1,70 @@
++import { afterEach, describe, expect, spyOn, test } from 'bun:test';
++import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import * as deviceStorage from '../files/device-storage';
++import { fileBrowserRoutes } from './file-browser-routes';
++import { dispatchRoutes } from './route';
++
++function dispatch(req: Request) {
++  const pathname = new URL(req.url).pathname;
++  return dispatchRoutes(req, pathname, fileBrowserRoutes, { path: pathname });
++}
++
++describe('GET /api/files/raw streams the temp file', () => {
++  const spies: Array<ReturnType<typeof spyOn>> = [];
++  const dirs: string[] = [];
++
++  afterEach(() => {
++    for (const spy of spies) spy.mockRestore();
++    spies.length = 0;
++    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
++    dirs.length = 0;
++  });
++
++  function tempRaw(bytes: string, name = 'pic.png') {
++    const dir = mkdtempSync(join(tmpdir(), 'tmex-rfile-test-'));
++    dirs.push(dir);
++    const tmpPath = join(dir, 'f');
++    writeFileSync(tmpPath, bytes);
++    return {
++      tmpPath,
++      size: Buffer.byteLength(bytes),
++      name,
++      mime: 'image/png',
++      cleanup: () => {
++        rmSync(dir, { recursive: true, force: true });
++      },
++    };
++  }
++
++  test('streams bytes, sets content headers, cleans up after EOF', async () => {
++    const raw = tempRaw('PNGDATA', 'a.png');
++    spies.push(
++      spyOn(deviceStorage, 'readRawFile').mockResolvedValue({ ok: true, data: { ...raw } })
++    );
++    const res = (await dispatch(
++      new Request('http://localhost/api/files/raw?rootId=r1&path=%2Fa.png&download=1')
++    )) as Response;
++    expect(res.status).toBe(200);
++    expect(res.headers.get('Content-Type')).toBe('image/png');
++    expect(res.headers.get('Content-Length')).toBe(String(raw.size));
++    expect(res.headers.get('Content-Disposition')).toContain('filename="a.png"');
++    expect(await res.text()).toBe('PNGDATA');
++    expect(existsSync(raw.tmpPath)).toBe(false);
++  });
++
++  test('cancel cleans up the temp file', async () => {
++    const raw = tempRaw('ABCDEF');
++    spies.push(
++      spyOn(deviceStorage, 'readRawFile').mockResolvedValue({ ok: true, data: { ...raw } })
++    );
++    const res = (await dispatch(
++      new Request('http://localhost/api/files/raw?rootId=r1&path=%2Fa.png')
++    )) as Response;
++    expect(res.status).toBe(200);
++    expect(existsSync(raw.tmpPath)).toBe(true);
++    await res.body?.cancel();
++    expect(existsSync(raw.tmpPath)).toBe(false);
++  });
++});
+diff --git a/apps/gateway/src/api/file-browser-routes.ts b/apps/gateway/src/api/file-browser-routes.ts
+index 8f151927..67785097 100644
+--- a/apps/gateway/src/api/file-browser-routes.ts
++++ b/apps/gateway/src/api/file-browser-routes.ts
+@@ -1,7 +1,7 @@
+ import { listDirectory, readRawFile, readTextFile, statFile } from '../files/device-storage';
+ import { browseDirectory } from '../files/directory-browse';
+ import { t } from '../i18n';
+-import { codeError } from './file-http';
++import { codeError, streamTempFile } from './file-http';
+ import { json } from './http';
+ import { type ApiRoute, route } from './route';
+ 
+@@ -49,16 +49,21 @@ async function handleRaw(url: URL): Promise<Response> {
+   const result = await readRawFile(rootId, path);
+   if (!result.ok) return codeError(result.code, result.detail);
+ 
++  const { tmpPath, size, name, mime, cleanup } = result.data;
++  const body = streamTempFile(tmpPath, cleanup);
++  if (!body) return codeError('unknown');
++
+   const headers: Record<string, string> = {
+-    'Content-Type': result.data.mime ?? 'application/octet-stream',
++    'Content-Type': mime ?? 'application/octet-stream',
++    'Content-Length': String(size),
+   };
+   const download = url.searchParams.get('download');
+   if (download === '1' || download === 'true') {
+-    const encoded = encodeURIComponent(result.data.name);
+-    const ascii = result.data.name.replace(/["\\\r\n]/g, '_');
++    const encoded = encodeURIComponent(name);
++    const ascii = name.replace(/["\\\r\n]/g, '_');
+     headers['Content-Disposition'] = `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+   }
+-  return new Response(result.data.data, { status: 200, headers });
++  return new Response(body, { status: 200, headers });
+ }
+ 
+ export const fileBrowserRoutes: ApiRoute[] = [
+diff --git a/apps/gateway/src/api/file-transfer-routes.test.ts b/apps/gateway/src/api/file-transfer-routes.test.ts
+new file mode 100644
+index 00000000..a76b3ca6
+--- /dev/null
++++ b/apps/gateway/src/api/file-transfer-routes.test.ts
+@@ -0,0 +1,112 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { readFileSync } from 'node:fs';
++import {
++  createUploadSession,
++  getUploadSession,
++  removeUploadSession,
++} from '../files/transfer-session';
++import { filesRoutes } from './files';
++import { dispatchRoutes } from './route';
++
++const CHUNK_SIZE = 8 * 1024 * 1024;
++
++function dispatch(req: Request) {
++  const pathname = new URL(req.url).pathname;
++  return dispatchRoutes(req, pathname, filesRoutes, { path: pathname });
++}
++
++describe('PUT /api/files/upload/:id bounded body', () => {
++  const ids: string[] = [];
++  afterEach(() => {
++    for (const id of ids) removeUploadSession(id);
++    ids.length = 0;
++  });
++
++  function session(size: number) {
++    const s = createUploadSession({ rootId: 'r', destDir: '/d', name: 'a.bin', size });
++    ids.push(s.id);
++    return s;
++  }
++
++  test('oversize Content-Length vs chunk size → 413 without reading the body', async () => {
++    const s = session(CHUNK_SIZE * 2);
++    let read = false;
++    const req = new Request(`http://localhost/api/files/upload/${s.id}?offset=0`, {
++      method: 'PUT',
++      headers: { 'Content-Length': String(CHUNK_SIZE + 1) },
++    });
++    req.arrayBuffer = async () => {
++      read = true;
++      return new ArrayBuffer(0);
++    };
++    req.bytes = async () => {
++      read = true;
++      return new Uint8Array();
++    };
++    req.text = async () => {
++      read = true;
++      return '';
++    };
++    const res = (await dispatch(req)) as Response;
++    expect(res.status).toBe(413);
++    expect(await res.json()).toEqual({ error: 'too_large', code: 'too_large' });
++    expect(read).toBe(false);
++    expect(getUploadSession(s.id)?.received).toBe(0);
++  });
++
++  test('oversize Content-Length vs remaining declared size → 413 without reading', async () => {
++    const s = session(10);
++    let read = false;
++    const req = new Request(`http://localhost/api/files/upload/${s.id}?offset=0`, {
++      method: 'PUT',
++      headers: { 'Content-Length': '11' },
++    });
++    req.arrayBuffer = async () => {
++      read = true;
++      return new ArrayBuffer(0);
++    };
++    const res = (await dispatch(req)) as Response;
++    expect(res.status).toBe(413);
++    expect(read).toBe(false);
++    expect(getUploadSession(s.id)?.received).toBe(0);
++  });
++
++  test('body longer than Content-Length → 413 and session unchanged', async () => {
++    const s = session(100);
++    const body = new Uint8Array(20).fill(7);
++    const req = new Request(`http://localhost/api/files/upload/${s.id}?offset=0`, {
++      method: 'PUT',
++      headers: { 'Content-Length': '10' },
++      body,
++    });
++    const res = (await dispatch(req)) as Response;
++    expect(res.status).toBe(413);
++    expect(await res.json()).toEqual({ error: 'too_large', code: 'too_large' });
++    expect(getUploadSession(s.id)?.received).toBe(0);
++    expect(readFileSync(s.tmpPath).byteLength).toBe(0);
++  });
++
++  test('happy path: sequential chunks written asynchronously, received matches bytes', async () => {
++    const s = session(6);
++    const first = (await dispatch(
++      new Request(`http://localhost/api/files/upload/${s.id}?offset=0`, {
++        method: 'PUT',
++        body: new Uint8Array([1, 2, 3]),
++      })
++    )) as Response;
++    expect(first.status).toBe(200);
++    expect(await first.json()).toEqual({ received: 3 });
++    expect(getUploadSession(s.id)?.received).toBe(3);
++    expect(readFileSync(s.tmpPath)).toEqual(Buffer.from([1, 2, 3]));
++
++    const second = (await dispatch(
++      new Request(`http://localhost/api/files/upload/${s.id}?offset=3`, {
++        method: 'PUT',
++        body: new Uint8Array([4, 5, 6]),
++      })
++    )) as Response;
++    expect(second.status).toBe(200);
++    expect(await second.json()).toEqual({ received: 6 });
++    expect(readFileSync(s.tmpPath)).toEqual(Buffer.from([1, 2, 3, 4, 5, 6]));
++  });
++});
+diff --git a/apps/gateway/src/api/file-transfer-routes.ts b/apps/gateway/src/api/file-transfer-routes.ts
+index 0a78a5a2..87c7d132 100644
+--- a/apps/gateway/src/api/file-transfer-routes.ts
++++ b/apps/gateway/src/api/file-transfer-routes.ts
+@@ -6,7 +6,7 @@ import {
+   statFile,
+ } from '../files/device-storage';
+ import {
+-  appendUploadChunk,
++  appendUploadChunkAsync,
+   createDownloadSession,
+   createUploadSession,
+   getDownloadSession,
+@@ -54,11 +54,57 @@ async function handleUploadInit(req: Request): Promise<Response> {
+   return json({ uploadId: session.id, chunkSize: UPLOAD_CHUNK_SIZE });
+ }
+ 
++async function readBodyCapped(
++  req: Request,
++  cap: number
++): Promise<{ ok: true; bytes: Uint8Array } | { ok: false }> {
++  if (!req.body) return { ok: true, bytes: new Uint8Array(0) };
++  const reader = req.body.getReader();
++  const chunks: Uint8Array[] = [];
++  let total = 0;
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    if (!value || value.byteLength === 0) continue;
++    total += value.byteLength;
++    if (total > cap) {
++      await reader.cancel().catch(() => {});
++      return { ok: false };
++    }
++    chunks.push(value);
++  }
++  if (chunks.length === 0) return { ok: true, bytes: new Uint8Array(0) };
++  if (chunks.length === 1) return { ok: true, bytes: chunks[0] };
++  const out = new Uint8Array(total);
++  let offset = 0;
++  for (const chunk of chunks) {
++    out.set(chunk, offset);
++    offset += chunk.byteLength;
++  }
++  return { ok: true, bytes: out };
++}
++
+ async function handleUploadChunk(req: Request, id: string, url: URL): Promise<Response> {
+   const offset = parseNonNegativeSafeInt(url.searchParams.get('offset'));
+   if (offset === null) return json({ error: t('apiError.invalidRequest') }, 400);
+-  const bytes = new Uint8Array(await req.arrayBuffer());
+-  const res = appendUploadChunk(id, offset, bytes);
++  const session = getUploadSession(id);
++  if (!session) return codeError('not_found');
++  if (offset !== session.received) return json({ error: t('apiError.invalidRequest') }, 409);
++
++  const remaining = session.size - session.received;
++  const hardCap = remaining < UPLOAD_CHUNK_SIZE ? remaining : UPLOAD_CHUNK_SIZE;
++  const contentLengthRaw = req.headers.get('Content-Length');
++  let cap = hardCap;
++  if (contentLengthRaw !== null) {
++    const contentLength = parseNonNegativeSafeInt(contentLengthRaw);
++    if (contentLength === null) return json({ error: t('apiError.invalidRequest') }, 400);
++    if (contentLength > hardCap) return codeError('too_large');
++    cap = contentLength;
++  }
++
++  const body = await readBodyCapped(req, cap);
++  if (!body.ok) return codeError('too_large');
++  const res = await appendUploadChunkAsync(id, offset, body.bytes);
+   if (!res.ok) {
+     if (res.reason === 'not_found') return codeError('not_found');
+     if (res.reason === 'too_large') return codeError('too_large');
+diff --git a/apps/gateway/src/api/tmux-tree.test.ts b/apps/gateway/src/api/tmux-tree.test.ts
+index 91249a78..bf65d796 100644
+--- a/apps/gateway/src/api/tmux-tree.test.ts
++++ b/apps/gateway/src/api/tmux-tree.test.ts
+@@ -1,12 +1,9 @@
+-import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
+-import type { Server } from 'bun';
++import { afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+ import type { StateSnapshotPayload } from '@tmex/shared';
+-import {
+-  createDevice,
+-  ensureSiteSettingsInitialized,
+-  setPaneOrder,
+-  setWindowOrder,
+-} from '../db';
++import type { Server } from 'bun';
++import { createDevice, ensureSiteSettingsInitialized, setPaneOrder, setWindowOrder } from '../db';
++import { getSqliteClient } from '../db/client';
++import * as devicesDb from '../db/devices';
+ import { runMigrations } from '../db/migrate';
+ import { type TreeOverlayBridge, registerTreeOverlayBridge } from '../settings/broadcaster';
+ import { registerSnapshotLookup } from '../tmux/snapshot-directory';
+@@ -76,7 +73,10 @@ function makeSnapshot(deviceId: string): StateSnapshotPayload {
+   };
+ }
+ 
+-function registerFakeNames(names: { windows: Record<string, string>; panes: Record<string, string> }) {
++function registerFakeNames(names: {
++  windows: Record<string, string>;
++  panes: Record<string, string>;
++}) {
+   const bridge: TreeOverlayBridge = {
+     reorderWindows: () => {},
+     reorderPanes: () => {},
+@@ -190,4 +190,46 @@ describe('GET /api/tmux/tree', () => {
+     const body = (await response.json()) as { devices: TreeDeviceJson[] };
+     expect(body.devices.find((d) => d.deviceId === DEVICE_A)?.session).not.toBeNull();
+   });
++
++  test('100 台设备树查询 ≤ 3 次 SQL，缺 tree-order 行用空默认值', async () => {
++    const prefix = 'r3-tree-q-';
++    const now = new Date().toISOString();
++    for (let i = 0; i < 100; i++) {
++      createDevice({
++        id: `${prefix}${String(i).padStart(3, '0')}`,
++        name: `tree-q-${i}`,
++        type: 'local',
++        authMode: 'auto',
++        session: 'tmex',
++        sortOrder: 1000 + i,
++        createdAt: now,
++        updatedAt: now,
++      });
++    }
++    setWindowOrder(`${prefix}000`, ['@9']);
++
++    const orderSpy = spyOn(devicesDb, 'getDeviceTreeOrder');
++    const db = getSqliteClient();
++    const orig = db.prepare.bind(db);
++    const sqls: string[] = [];
++    db.prepare = ((sql: string) => {
++      sqls.push(sql);
++      return orig(sql);
++    }) as typeof db.prepare;
++    try {
++      const { status, json } = await call('GET', '/api/tmux/tree');
++      expect(status).toBe(200);
++      expect(sqls.filter((sql) => /^\s*select\b/i.test(sql)).length).toBeLessThanOrEqual(3);
++      expect(orderSpy).toHaveBeenCalledTimes(0);
++      const devices = json.devices as TreeDeviceJson[];
++      const ordered = devices.find((d) => d.deviceId === `${prefix}000`);
++      const empty = devices.find((d) => d.deviceId === `${prefix}001`);
++      expect(ordered?.deviceName).toBe('tree-q-0');
++      expect(empty?.deviceName).toBe('tree-q-1');
++      expect(empty?.session).toBeNull();
++    } finally {
++      orderSpy.mockRestore();
++      db.prepare = orig;
++    }
++  });
+ });
+diff --git a/apps/gateway/src/api/tmux-tree.ts b/apps/gateway/src/api/tmux-tree.ts
+index 555c952b..27336a25 100644
+--- a/apps/gateway/src/api/tmux-tree.ts
++++ b/apps/gateway/src/api/tmux-tree.ts
+@@ -1,5 +1,6 @@
+ import type { StateSnapshotPayload, TmuxSession } from '@tmex/shared';
+-import { getAllDevices, getDeviceById, getDeviceTreeOrder } from '../db';
++import { getAllDevices, getDeviceById } from '../db';
++import { getDeviceTreeOrders } from '../db/devices';
+ import { t } from '../i18n';
+ import { pushSupervisor } from '../push/supervisor';
+ import { getTreeOverlayBridge } from '../settings/broadcaster';
+@@ -28,7 +29,11 @@ export function handleTmuxTreeApiRequest(
+   return null;
+ }
+ 
+-function resolveDeviceTree(deviceId: string, deviceName: string): DeviceTreeEntry {
++function resolveDeviceTree(
++  deviceId: string,
++  deviceName: string,
++  order: { windows: string[]; panes: Record<string, string[]> }
++): DeviceTreeEntry {
+   const snapshot: StateSnapshotPayload | null =
+     getDeviceSnapshot(deviceId) ?? pushSupervisor.getLastSnapshot(deviceId);
+ 
+@@ -36,7 +41,7 @@ function resolveDeviceTree(deviceId: string, deviceName: string): DeviceTreeEntr
+     return { deviceId, deviceName, session: null };
+   }
+ 
+-  const ordered = applyDeviceTreeOverlay(snapshot, getDeviceTreeOrder(deviceId));
++  const ordered = applyDeviceTreeOverlay(snapshot, order);
+   const names = getTreeOverlayBridge()?.getCustomNames(deviceId) ?? { windows: {}, panes: {} };
+   const named = applyCustomNamesOverlay(ordered, names);
+   return { deviceId, deviceName, session: named.session };
+@@ -48,9 +53,23 @@ async function handleGetTmuxTree(deviceId: string | null): Promise<Response> {
+     if (!device) {
+       return json({ error: t('apiError.deviceNotFound') }, 404);
+     }
+-    return json({ devices: [resolveDeviceTree(device.id, device.name)] });
++    const orders = getDeviceTreeOrders([device.id]);
++    return json({
++      devices: [
++        resolveDeviceTree(
++          device.id,
++          device.name,
++          orders.get(device.id) ?? { windows: [], panes: {} }
++        ),
++      ],
++    });
+   }
+ 
+-  const devices = getAllDevices().map((device) => resolveDeviceTree(device.id, device.name));
+-  return json({ devices });
++  const devices = getAllDevices();
++  const orders = getDeviceTreeOrders(devices.map((device) => device.id));
++  return json({
++    devices: devices.map((device) =>
++      resolveDeviceTree(device.id, device.name, orders.get(device.id) ?? { windows: [], panes: {} })
++    ),
++  });
+ }
+diff --git a/apps/gateway/src/db/devices.test.ts b/apps/gateway/src/db/devices.test.ts
+new file mode 100644
+index 00000000..9aaedf3c
+--- /dev/null
++++ b/apps/gateway/src/db/devices.test.ts
+@@ -0,0 +1,120 @@
++import { beforeAll, describe, expect, test } from 'bun:test';
++import { resolve } from 'node:path';
++import type { Device } from '@tmex/shared';
++import { eq } from 'drizzle-orm';
++import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
++import { getDb as getOrmDb, getSqliteClient } from './client';
++import {
++  createDevice,
++  getDeviceRuntimeStatus,
++  getDeviceTreeOrder,
++  getDeviceTreeOrders,
++  listDevicesWithRuntimeStatus,
++  setWindowOrder,
++  updateDeviceRuntimeStatus,
++} from './devices';
++import { deviceRuntimeStatus } from './schema';
++
++beforeAll(() => {
++  migrate(getOrmDb(), { migrationsFolder: resolve(import.meta.dir, '../../drizzle') });
++});
++
++function makeDevice(id: string, name: string): Device {
++  const now = new Date().toISOString();
++  return {
++    id,
++    name,
++    type: 'local',
++    session: 'tmex',
++    authMode: 'auto',
++    sortOrder: 0,
++    createdAt: now,
++    updatedAt: now,
++  };
++}
++
++function captureSql(fn: () => void): string[] {
++  const db = getSqliteClient();
++  const orig = db.prepare.bind(db);
++  const sqls: string[] = [];
++  db.prepare = ((sql: string) => {
++    sqls.push(sql);
++    return orig(sql);
++  }) as typeof db.prepare;
++  try {
++    fn();
++    return sqls;
++  } finally {
++    db.prepare = orig;
++  }
++}
++
++describe('listDevicesWithRuntimeStatus', () => {
++  test('left join 一次查出状态，缺行时用默认值', () => {
++    const withStatus = 'r3-join-status';
++    const missingStatus = 'r3-join-missing';
++    createDevice(makeDevice(withStatus, 'with-status'));
++    createDevice(makeDevice(missingStatus, 'missing-status'));
++    updateDeviceRuntimeStatus(withStatus, {
++      lastSeenAt: '2026-06-13T12:00:00.000Z',
++      tmuxAvailable: true,
++      lastError: 'boom',
++      lastErrorType: 'ssh',
++    });
++    getOrmDb()
++      .delete(deviceRuntimeStatus)
++      .where(eq(deviceRuntimeStatus.deviceId, missingStatus))
++      .run();
++
++    const sqls = captureSql(() => {
++      const rows = listDevicesWithRuntimeStatus();
++      const found = rows.find((d) => d.id === withStatus);
++      const missing = rows.find((d) => d.id === missingStatus);
++      expect(found?.lastSeenAt).toBe('2026-06-13T12:00:00.000Z');
++      expect(found?.tmuxAvailable).toBe(true);
++      expect(found?.lastError).toBe('boom');
++      expect(found?.lastErrorType).toBe('ssh');
++      expect(missing?.lastSeenAt).toBeNull();
++      expect(missing?.tmuxAvailable).toBe(false);
++      expect(missing?.lastError).toBeNull();
++      expect(missing?.lastErrorType).toBeNull();
++    });
++
++    expect(sqls.filter((sql) => /^\s*select\b/i.test(sql))).toHaveLength(1);
++    expect(getDeviceRuntimeStatus(withStatus).tmuxAvailable).toBe(true);
++  });
++});
++
++describe('getDeviceTreeOrders', () => {
++  test('IN 批量查询，缺行时返回空 windows/panes', () => {
++    const withOrder = 'r3-tree-order';
++    const withoutOrder = 'r3-tree-empty';
++    createDevice(makeDevice(withOrder, 'ordered'));
++    createDevice(makeDevice(withoutOrder, 'unordered'));
++    setWindowOrder(withOrder, ['@2', '@1']);
++
++    const sqls = captureSql(() => {
++      const map = getDeviceTreeOrders([withOrder, withoutOrder, 'no-such-device']);
++      expect(map.get(withOrder)).toEqual({
++        deviceId: withOrder,
++        windows: ['@2', '@1'],
++        panes: {},
++      });
++      expect(map.get(withoutOrder)).toEqual({
++        deviceId: withoutOrder,
++        windows: [],
++        panes: {},
++      });
++      expect(map.get('no-such-device')).toEqual({
++        deviceId: 'no-such-device',
++        windows: [],
++        panes: {},
++      });
++    });
++
++    expect(sqls.filter((sql) => /^\s*select\b/i.test(sql))).toHaveLength(1);
++    expect(sqls[0]?.toLowerCase()).toContain(' in ');
++    expect(getDeviceTreeOrder(withOrder).windows).toEqual(['@2', '@1']);
++    expect(getDeviceTreeOrders([])).toEqual(new Map());
++  });
++});
+diff --git a/apps/gateway/src/db/devices.ts b/apps/gateway/src/db/devices.ts
+index d45d0976..da5d4f57 100644
+--- a/apps/gateway/src/db/devices.ts
++++ b/apps/gateway/src/db/devices.ts
+@@ -1,6 +1,6 @@
+ import { hostname } from 'node:os';
+ import type { Device, DeviceRuntimeStatus } from '@tmex/shared';
+-import { asc, count, desc, eq, max } from 'drizzle-orm';
++import { asc, count, desc, eq, inArray, max } from 'drizzle-orm';
+ import { getDb as getOrmDb } from './client';
+ import { removeDeviceFolderPlacementsForDevice } from './device-folders';
+ import { getGatewayKv, setGatewayKv } from './kv';
+@@ -10,6 +10,67 @@ import type { DeviceTreeOrderRecord } from './types';
+ 
+ export type { DeviceTreeOrderRecord };
+ 
++export type DeviceWithRuntime = Device & {
++  lastSeenAt: string | null;
++  lastError: string | null;
++  lastErrorType: string | null;
++  tmuxAvailable: boolean;
++};
++
++function defaultRuntimeStatus(deviceId: string): DeviceRuntimeStatus {
++  return {
++    deviceId,
++    lastSeenAt: null,
++    tmuxAvailable: false,
++    lastError: null,
++    lastErrorType: null,
++  };
++}
++
++function runtimeFromRow(
++  row: typeof deviceRuntimeStatus.$inferSelect | null | undefined,
++  deviceId: string
++): DeviceRuntimeStatus {
++  if (!row) {
++    return defaultRuntimeStatus(deviceId);
++  }
++  return {
++    deviceId: row.deviceId,
++    lastSeenAt: row.lastSeenAt,
++    tmuxAvailable: row.tmuxAvailable,
++    lastError: row.lastError,
++    lastErrorType: row.lastErrorType,
++  };
++}
++
++function defaultTreeOrder(deviceId: string): DeviceTreeOrderRecord {
++  return { deviceId, windows: [], panes: {} };
++}
++
++function treeOrderFromRow(
++  row: typeof deviceTreeOrder.$inferSelect | null | undefined,
++  deviceId: string
++): DeviceTreeOrderRecord {
++  if (!row) {
++    return defaultTreeOrder(deviceId);
++  }
++  return {
++    deviceId: row.deviceId,
++    windows: Array.isArray(row.windows) ? row.windows : [],
++    panes: row.panes && typeof row.panes === 'object' ? row.panes : {},
++  };
++}
++
++function attachRuntime(device: Device, status: DeviceRuntimeStatus): DeviceWithRuntime {
++  return {
++    ...device,
++    lastSeenAt: status.lastSeenAt,
++    lastError: status.lastError,
++    lastErrorType: status.lastErrorType,
++    tmuxAvailable: status.tmuxAvailable,
++  };
++}
++
+ export const DEFAULT_LOCAL_DEVICE_SEED_KEY = 'default_local_device_seeded';
+ 
+ /**
+@@ -113,6 +174,22 @@ export function getAllDevices(): Device[] {
+     .map(toDevice);
+ }
+ 
++export function listDevicesWithRuntimeStatus(): DeviceWithRuntime[] {
++  const orm = getOrmDb();
++  return orm
++    .select({
++      device: devices,
++      status: deviceRuntimeStatus,
++    })
++    .from(devices)
++    .leftJoin(deviceRuntimeStatus, eq(deviceRuntimeStatus.deviceId, devices.id))
++    .orderBy(asc(devices.sortOrder), desc(devices.createdAt))
++    .all()
++    .map(({ device, status }) =>
++      attachRuntime(toDevice(device), runtimeFromRow(status, device.id))
++    );
++}
++
+ export function reorderDevices(orderedIds: string[]): void {
+   const orm = getOrmDb();
+   const now = new Date().toISOString();
+@@ -182,16 +259,27 @@ export function getDeviceTreeOrder(deviceId: string): DeviceTreeOrderRecord {
+     .from(deviceTreeOrder)
+     .where(eq(deviceTreeOrder.deviceId, deviceId))
+     .get();
++  return treeOrderFromRow(row, deviceId);
++}
+ 
+-  if (!row) {
+-    return { deviceId, windows: [], panes: {} };
++export function getDeviceTreeOrders(deviceIds: string[]): Map<string, DeviceTreeOrderRecord> {
++  const result = new Map<string, DeviceTreeOrderRecord>();
++  for (const id of deviceIds) {
++    result.set(id, defaultTreeOrder(id));
+   }
+-
+-  return {
+-    deviceId: row.deviceId,
+-    windows: Array.isArray(row.windows) ? row.windows : [],
+-    panes: row.panes && typeof row.panes === 'object' ? row.panes : {},
+-  };
++  if (deviceIds.length === 0) {
++    return result;
++  }
++  const orm = getOrmDb();
++  const rows = orm
++    .select()
++    .from(deviceTreeOrder)
++    .where(inArray(deviceTreeOrder.deviceId, deviceIds))
++    .all();
++  for (const row of rows) {
++    result.set(row.deviceId, treeOrderFromRow(row, row.deviceId));
++  }
++  return result;
+ }
+ 
+ export function setWindowOrder(deviceId: string, windowIds: string[]): void {
+@@ -229,24 +317,7 @@ export function getDeviceRuntimeStatus(deviceId: string): DeviceRuntimeStatus {
+     .from(deviceRuntimeStatus)
+     .where(eq(deviceRuntimeStatus.deviceId, deviceId))
+     .get();
+-
+-  if (!row) {
+-    return {
+-      deviceId,
+-      lastSeenAt: null,
+-      tmuxAvailable: false,
+-      lastError: null,
+-      lastErrorType: null,
+-    };
+-  }
+-
+-  return {
+-    deviceId: row.deviceId,
+-    lastSeenAt: row.lastSeenAt,
+-    tmuxAvailable: row.tmuxAvailable,
+-    lastError: row.lastError,
+-    lastErrorType: row.lastErrorType,
+-  };
++  return runtimeFromRow(row, deviceId);
+ }
+ 
+ export function updateDeviceRuntimeStatus(
+diff --git a/apps/gateway/src/db/watch-upsert.test.ts b/apps/gateway/src/db/watch-upsert.test.ts
+new file mode 100644
+index 00000000..aec22333
+--- /dev/null
++++ b/apps/gateway/src/db/watch-upsert.test.ts
+@@ -0,0 +1,86 @@
++import { beforeAll, describe, expect, test } from 'bun:test';
++import { resolve } from 'node:path';
++import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
++import { getDb as getOrmDb, getSqliteClient } from './client';
++import { createDevice } from './index';
++import {
++  createWatchRule,
++  getWatchRuleState,
++  upsertWatchRuleState,
++  writeWatchRuleState,
++} from './watch';
++
++beforeAll(() => {
++  migrate(getOrmDb(), { migrationsFolder: resolve(import.meta.dir, '../../drizzle') });
++  const now = new Date().toISOString();
++  createDevice({
++    id: 'watch-upsert-device',
++    name: 'watch-upsert',
++    type: 'local',
++    session: 'tmex',
++    authMode: 'auto',
++    sortOrder: 0,
++    createdAt: now,
++    updatedAt: now,
++  });
++});
++
++function captureSql(fn: () => void): string[] {
++  const db = getSqliteClient();
++  const orig = db.prepare.bind(db);
++  const sqls: string[] = [];
++  db.prepare = ((sql: string) => {
++    sqls.push(sql);
++    return orig(sql);
++  }) as typeof db.prepare;
++  try {
++    fn();
++    return sqls;
++  } finally {
++    db.prepare = orig;
++  }
++}
++
++describe('writeWatchRuleState', () => {
++  test('写入后可读到状态，且不发 SELECT', () => {
++    const rule = createWatchRule({
++      name: 'no-read upsert',
++      deviceId: 'watch-upsert-device',
++      paneId: '%1',
++      triggerType: 'match',
++      pattern: 'x',
++    });
++
++    const sqls = captureSql(() => {
++      writeWatchRuleState(rule.id, {
++        lastSampledAt: '2026-06-13T12:00:00.000Z',
++        lastValue: '42',
++        consecutiveErrors: 0,
++        lastError: null,
++      });
++    });
++
++    expect(sqls.some((sql) => /^\s*select\b/i.test(sql))).toBe(false);
++    expect(sqls.some((sql) => /^\s*insert\b/i.test(sql))).toBe(true);
++    expect(getWatchRuleState(rule.id)?.lastValue).toBe('42');
++    expect(writeWatchRuleState(rule.id, { lastValue: '43' })).toBeUndefined();
++    expect(getWatchRuleState(rule.id)?.lastValue).toBe('43');
++  });
++
++  test('upsertWatchRuleState 仍回读行给需要返回值的调用方', () => {
++    const rule = createWatchRule({
++      name: 'readback upsert',
++      deviceId: 'watch-upsert-device',
++      paneId: '%2',
++      triggerType: 'match',
++      pattern: 'x',
++    });
++
++    const sqls = captureSql(() => {
++      const row = upsertWatchRuleState(rule.id, { lastValue: 'keep' });
++      expect(row.lastValue).toBe('keep');
++    });
++
++    expect(sqls.some((sql) => /^\s*select\b/i.test(sql))).toBe(true);
++  });
++});
+diff --git a/apps/gateway/src/db/watch.ts b/apps/gateway/src/db/watch.ts
+index 51bf0bb6..a5540fcc 100644
+--- a/apps/gateway/src/db/watch.ts
++++ b/apps/gateway/src/db/watch.ts
+@@ -186,10 +186,10 @@ export function getWatchRuleState(ruleId: string): WatchRuleStateRecord | null {
+   return orm.select().from(watchRuleState).where(eq(watchRuleState.ruleId, ruleId)).get() ?? null;
+ }
+ 
+-export function upsertWatchRuleState(
++export function writeWatchRuleState(
+   ruleId: string,
+   updates: Partial<Omit<WatchRuleStateRecord, 'ruleId'>>
+-): WatchRuleStateRecord {
++): void {
+   const orm = getOrmDb();
+   const setValues: Partial<typeof watchRuleState.$inferInsert> = {};
+ 
+@@ -214,14 +214,21 @@ export function upsertWatchRuleState(
+       .values({ ruleId })
+       .onConflictDoNothing({ target: watchRuleState.ruleId })
+       .run();
+-  } else {
+-    orm
+-      .insert(watchRuleState)
+-      .values({ ruleId, ...setValues })
+-      .onConflictDoUpdate({ target: watchRuleState.ruleId, set: setValues })
+-      .run();
++    return;
+   }
+ 
++  orm
++    .insert(watchRuleState)
++    .values({ ruleId, ...setValues })
++    .onConflictDoUpdate({ target: watchRuleState.ruleId, set: setValues })
++    .run();
++}
++
++export function upsertWatchRuleState(
++  ruleId: string,
++  updates: Partial<Omit<WatchRuleStateRecord, 'ruleId'>>
++): WatchRuleStateRecord {
++  writeWatchRuleState(ruleId, updates);
+   const state = getWatchRuleState(ruleId);
+   if (!state) {
+     throw new Error('failed to upsert watch rule state');
+diff --git a/apps/gateway/src/files/device-storage.ts b/apps/gateway/src/files/device-storage.ts
+index e44dbcda..3f5fa2d9 100644
+--- a/apps/gateway/src/files/device-storage.ts
++++ b/apps/gateway/src/files/device-storage.ts
+@@ -18,6 +18,7 @@ import {
+   RsyncMissingLocalError,
+   type RsyncProgress,
+   classifyRsyncFailure,
++  createListOnlyCollector,
+   parseListOnly,
+   runRsync,
+ } from './rsync';
+@@ -121,15 +122,6 @@ function entryToDto(entry: RsyncEntry, parentPath: string): FileEntryDto {
+   };
+ }
+ 
+-function sortEntries(entries: FileEntryDto[]): void {
+-  entries.sort((a, b) => {
+-    const ad = a.type === 'dir' ? 0 : 1;
+-    const bd = b.type === 'dir' ? 0 : 1;
+-    if (ad !== bd) return ad - bd;
+-    return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+-  });
+-}
+-
+ function looksBinary(buf: Buffer): boolean {
+   const len = Math.min(buf.length, 8192);
+   for (let i = 0; i < len; i++) {
+@@ -158,10 +150,12 @@ export async function listDirectory(
+   return withNormalizedRsync(rootId, inputPath, async ({ spec, path }) => {
+     const listPath = path.endsWith('/') ? path : `${path}/`;
+     let res: Awaited<ReturnType<typeof runRsync>>;
++    const collector = createListOnlyCollector(MAX_ENTRIES);
+     try {
+       res = await runRsync(rsyncListArgs(spec, listPath), {
+         env: spec.env,
+         timeoutMs: LIST_TIMEOUT_MS,
++        onStdoutLine: (line) => collector.accept(line),
+       });
+     } catch (error) {
+       if (error instanceof RsyncMissingLocalError) return fail('rsync_missing_local');
+@@ -169,12 +163,12 @@ export async function listDirectory(
+     }
+     if (res.exitCode !== 0) return fail(classifyRsyncFailure(res.exitCode, res.stderr), res.stderr);
+ 
+-    const parsed = parseListOnly(res.stdout);
+-    const truncated = parsed.length > MAX_ENTRIES;
+-    const slice = truncated ? parsed.slice(0, MAX_ENTRIES) : parsed;
+-    const entries = slice.map((e) => entryToDto(e, path));
+-    sortEntries(entries);
+-    return ok({ path, entries, truncated });
++    const parsed = collector.snapshot();
++    return ok({
++      path,
++      entries: parsed.entries.map((e) => entryToDto(e, path)),
++      truncated: parsed.truncated,
++    });
+   });
+ }
+ 
+@@ -221,12 +215,19 @@ export async function statFile(
+   });
+ }
+ 
+-async function copyToBuffer(
++async function copyToTempFile(
+   spec: RsyncDeviceSpec,
+   normPath: string
+-): Promise<FileOpResult<Buffer>> {
++): Promise<FileOpResult<{ tmpPath: string; size: number; cleanup: () => void }>> {
+   const dir = mkdtempSync(join(tmpdir(), 'tmex-rfile-'));
+   const dest = join(dir, 'f');
++  const cleanup = () => {
++    try {
++      rmSync(dir, { recursive: true, force: true });
++    } catch {
++      // best-effort
++    }
++  };
+   try {
+     let res: Awaited<ReturnType<typeof runRsync>>;
+     try {
+@@ -235,17 +236,38 @@ async function copyToBuffer(
+         timeoutMs: COPY_TIMEOUT_MS,
+       });
+     } catch (error) {
++      cleanup();
+       if (error instanceof RsyncMissingLocalError) return fail('rsync_missing_local');
+       throw error;
+     }
+-    if (res.exitCode !== 0) return fail(classifyRsyncFailure(res.exitCode, res.stderr), res.stderr);
+-    return ok(readFileSync(dest));
+-  } finally {
++    if (res.exitCode !== 0) {
++      cleanup();
++      return fail(classifyRsyncFailure(res.exitCode, res.stderr), res.stderr);
++    }
++    let size = 0;
+     try {
+-      rmSync(dir, { recursive: true, force: true });
++      size = statSync(dest).size;
+     } catch {
+-      // best-effort
++      cleanup();
++      return fail('unknown');
+     }
++    return ok({ tmpPath: dest, size, cleanup });
++  } catch (error) {
++    cleanup();
++    throw error;
++  }
++}
++
++async function copyToBuffer(
++  spec: RsyncDeviceSpec,
++  normPath: string
++): Promise<FileOpResult<Buffer>> {
++  const copied = await copyToTempFile(spec, normPath);
++  if (!copied.ok) return copied;
++  try {
++    return ok(readFileSync(copied.data.tmpPath));
++  } finally {
++    copied.data.cleanup();
+   }
+ }
+ 
+@@ -278,9 +300,11 @@ export async function readTextFile(
+ }
+ 
+ export interface RawFileData {
+-  data: Uint8Array<ArrayBuffer>;
++  tmpPath: string;
++  size: number;
+   name: string;
+   mime: string | null;
++  cleanup: () => void;
+ }
+ 
+ export async function readRawFile(
+@@ -293,12 +317,21 @@ export async function readRawFile(
+     if (st.data.type === 'dir') return fail('is_directory');
+     if (st.data.size != null && st.data.size > RAW_MAX_BYTES) return fail('too_large');
+ 
+-    const buf = await copyToBuffer(spec, path);
+-    if (!buf.ok) return buf;
+-    if (buf.data.length > RAW_MAX_BYTES) return fail('too_large');
++    const copied = await copyToTempFile(spec, path);
++    if (!copied.ok) return copied;
++    if (copied.data.size > RAW_MAX_BYTES) {
++      copied.data.cleanup();
++      return fail('too_large');
++    }
+ 
+     const name = posixBasename(path);
+-    return ok<RawFileData>({ data: new Uint8Array(buf.data), name, mime: mimeOf(name) });
++    return ok<RawFileData>({
++      tmpPath: copied.data.tmpPath,
++      size: copied.data.size,
++      name,
++      mime: mimeOf(name),
++      cleanup: copied.data.cleanup,
++    });
+   });
+ }
+ 
+diff --git a/apps/gateway/src/files/rsync.test.ts b/apps/gateway/src/files/rsync.test.ts
+index bc22f416..d1a2825d 100644
+--- a/apps/gateway/src/files/rsync.test.ts
++++ b/apps/gateway/src/files/rsync.test.ts
+@@ -1,5 +1,13 @@
+ import { describe, expect, test } from 'bun:test';
+-import { classifyRsyncFailure, parseListOnly, parseRsyncProgress, unescapeOctal } from './rsync';
++import { MAX_ENTRIES } from './categorize';
++import {
++  classifyRsyncFailure,
++  compareListEntry,
++  parseListOnly,
++  parseListOnlyBounded,
++  parseRsyncProgress,
++  unescapeOctal,
++} from './rsync';
+ 
+ describe('unescapeOctal', () => {
+   test('pure ASCII unchanged', () => {
+@@ -135,8 +143,7 @@ describe('parseListOnly', () => {
+   });
+ 
+   test('handles escaped symlink names with arrow', () => {
+-    const out =
+-      'lrwxrwxrwx           10 2024/01/15 10:30:00 \\344\\270\\211 -> /etc/hosts';
++    const out = 'lrwxrwxrwx           10 2024/01/15 10:30:00 \\344\\270\\211 -> /etc/hosts';
+     const entries = parseListOnly(out);
+     expect(entries).toHaveLength(1);
+     expect(entries[0].type).toBe('symlink');
+@@ -152,6 +159,40 @@ describe('parseListOnly', () => {
+     const entries = parseListOnly(out);
+     expect(entries.map((e) => e.name)).toEqual(['三申机型2022-演示流程设计.md', 'テスト.txt']);
+   });
++
++  test('bounded parse keeps dirs-first then name page, matching full sort+cap', () => {
++    const out = [
++      '-rw-r--r--            1 2026/06/14 15:06:34 z.txt',
++      '-rw-r--r--            1 2026/06/14 15:06:34 a.txt',
++      'drwxr-xr-x           64 2026/06/14 15:06:34 sub',
++    ].join('\n');
++    const bounded = parseListOnlyBounded(out, 2);
++    expect(bounded.truncated).toBe(true);
++    expect(bounded.entries.map((e) => e.name)).toEqual(['sub', 'a.txt']);
++    expect(bounded.retained).toBe(3);
++  });
++
++  test('200k synthetic lines: same page as full parse+sort, retained ≤ MAX_ENTRIES+1', () => {
++    const lines: string[] = ['drwxr-xr-x          160 2026/06/14 15:06:34 .'];
++    for (let i = 0; i < 200_000; i++) {
++      const n = String(199_999 - i).padStart(6, '0');
++      lines.push(`-rw-r--r--            5 2026/06/14 15:06:34 f${n}.txt`);
++    }
++    lines.push('drwxr-xr-x           64 2026/06/14 15:06:34 zdir');
++    lines.push('drwxr-xr-x           64 2026/06/14 15:06:34 adir');
++    const stdout = lines.join('\n');
++
++    const all = parseListOnly(stdout);
++    const expected = all.slice().sort(compareListEntry).slice(0, MAX_ENTRIES);
++    const bounded = parseListOnlyBounded(stdout, MAX_ENTRIES);
++
++    expect(all.length).toBe(200_002);
++    expect(bounded.truncated).toBe(true);
++    expect(bounded.entries).toEqual(expected);
++    expect(bounded.entries[0]?.name).toBe('adir');
++    expect(bounded.entries[1]?.name).toBe('zdir');
++    expect(bounded.retained).toBe(MAX_ENTRIES + 1);
++  });
+ });
+ 
+ describe('parseRsyncProgress', () => {
+diff --git a/apps/gateway/src/files/rsync.ts b/apps/gateway/src/files/rsync.ts
+index ca96ba13..e68bfe12 100644
+--- a/apps/gateway/src/files/rsync.ts
++++ b/apps/gateway/src/files/rsync.ts
+@@ -91,6 +91,29 @@ async function readStdoutWithProgress(
+   return full;
+ }
+ 
++async function readStdoutLines(
++  stream: ReadableStream<Uint8Array>,
++  onLine: (line: string) => void
++): Promise<string> {
++  const reader = stream.getReader();
++  const decoder = new TextDecoder();
++  let buf = '';
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    buf += decoder.decode(value, { stream: true });
++    let nl = buf.indexOf('\n');
++    while (nl >= 0) {
++      onLine(buf.slice(0, nl));
++      buf = buf.slice(nl + 1);
++      nl = buf.indexOf('\n');
++    }
++  }
++  buf += decoder.decode();
++  if (buf) onLine(buf);
++  return '';
++}
++
+ export async function runRsync(
+   argv: string[],
+   opts: {
+@@ -101,6 +124,8 @@ export async function runRsync(
+     onProgress?: (p: RsyncProgress) => void;
+     // 空闲超时（仅 onProgress 模式生效）：无任何 stdout 数据持续该时长则判超时 kill
+     idleTimeoutMs?: number;
++    // 提供时：按行消费 stdout，不累积全文（list-only 有界解析）
++    onStdoutLine?: (line: string) => void;
+   } = {}
+ ): Promise<RsyncResult> {
+   const streaming = typeof opts.onProgress === 'function';
+@@ -158,7 +183,9 @@ export async function runRsync(
+           opts.onProgress!,
+           resetIdle
+         )
+-      : new Response(proc.stdout as ReadableStream<Uint8Array>).text();
++      : opts.onStdoutLine
++        ? readStdoutLines(proc.stdout as ReadableStream<Uint8Array>, opts.onStdoutLine)
++        : new Response(proc.stdout as ReadableStream<Uint8Array>).text();
+     const [stdout, stderr, exitCode] = await Promise.all([
+       stdoutPromise,
+       new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+@@ -192,6 +219,126 @@ function typeFromPerms(perms: string): RsyncEntry['type'] {
+   }
+ }
+ 
++const LIST_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
++
++export function compareListEntry(
++  a: Pick<RsyncEntry, 'type' | 'name'>,
++  b: Pick<RsyncEntry, 'type' | 'name'>
++): number {
++  const ad = a.type === 'dir' ? 0 : 1;
++  const bd = b.type === 'dir' ? 0 : 1;
++  if (ad !== bd) return ad - bd;
++  return LIST_COLLATOR.compare(a.name, b.name);
++}
++
++function parseListOnlyLine(rawLine: string): RsyncEntry | null {
++  const line = rawLine.replace(/\r$/, '');
++  const m = LIST_RE.exec(line);
++  if (!m) return null;
++
++  const type = typeFromPerms(m[1]);
++  let name = unescapeOctal(m[9]);
++  if (type === 'symlink') {
++    const arrow = name.indexOf(' -> ');
++    if (arrow >= 0) name = name.slice(0, arrow);
++  }
++  if (name === '' || name === '.' || name === '..') return null;
++
++  const sizeNum = Number.parseInt(m[2].replace(/,/g, ''), 10);
++  const size = type === 'dir' ? null : Number.isNaN(sizeNum) ? null : sizeNum;
++  const modifiedAt = `${m[3]}-${m[4]}-${m[5]}T${m[6]}:${m[7]}:${m[8]}`;
++  return { name, type, size, modifiedAt };
++}
++
++export function createListOnlyCollector(maxEntries: number): {
++  accept: (line: string) => void;
++  readonly retained: number;
++  snapshot: () => { entries: RsyncEntry[]; truncated: boolean; retained: number };
++} {
++  const keep = maxEntries + 1;
++  const heap: RsyncEntry[] = [];
++  let overflow = false;
++
++  const worse = (a: RsyncEntry, b: RsyncEntry) => compareListEntry(a, b) > 0;
++
++  const bubbleUp = (start: number) => {
++    let i = start;
++    while (i > 0) {
++      const p = (i - 1) >> 1;
++      if (!worse(heap[i], heap[p])) break;
++      const tmp = heap[i];
++      heap[i] = heap[p];
++      heap[p] = tmp;
++      i = p;
++    }
++  };
++
++  const bubbleDown = (start: number) => {
++    let i = start;
++    for (;;) {
++      const left = i * 2 + 1;
++      const right = left + 1;
++      let worst = i;
++      if (left < heap.length && worse(heap[left], heap[worst])) worst = left;
++      if (right < heap.length && worse(heap[right], heap[worst])) worst = right;
++      if (worst === i) break;
++      const tmp = heap[i];
++      heap[i] = heap[worst];
++      heap[worst] = tmp;
++      i = worst;
++    }
++  };
++
++  return {
++    accept(line: string) {
++      const entry = parseListOnlyLine(line);
++      if (!entry) return;
++      if (heap.length < keep) {
++        heap.push(entry);
++        bubbleUp(heap.length - 1);
++        return;
++      }
++      if (compareListEntry(entry, heap[0]) >= 0) {
++        overflow = true;
++        return;
++      }
++      heap[0] = entry;
++      bubbleDown(0);
++      overflow = true;
++    },
++    get retained() {
++      return heap.length;
++    },
++    snapshot() {
++      const sorted = heap.slice().sort(compareListEntry);
++      const truncated = overflow || sorted.length > maxEntries;
++      return {
++        entries: truncated ? sorted.slice(0, maxEntries) : sorted,
++        truncated,
++        retained: heap.length,
++      };
++    },
++  };
++}
++
++export function parseListOnlyBounded(
++  stdout: string,
++  maxEntries: number
++): { entries: RsyncEntry[]; truncated: boolean; retained: number } {
++  const collector = createListOnlyCollector(maxEntries);
++  for (const line of stdout.split('\n')) collector.accept(line);
++  return collector.snapshot();
++}
++
++export function parseListOnly(stdout: string): RsyncEntry[] {
++  const entries: RsyncEntry[] = [];
++  for (const rawLine of stdout.split('\n')) {
++    const entry = parseListOnlyLine(rawLine);
++    if (entry) entries.push(entry);
++  }
++  return entries;
++}
++
+ // 将 GNU rsync（LC_ALL=C）的八进制转义序列还原为原始 UTF-8 字符。
+ // 连续的 \NNN 字节先收集再统一 UTF-8 解码，避免多字节字符被截断。
+ // \\ 还原为单个 \；不合法的转义（非 [0-7] 或值 > 255）原样保留。
+@@ -226,7 +373,7 @@ export function unescapeOctal(input: string): string {
+     if (i + 3 < input.length) {
+       const digits = input.slice(i + 1, i + 4);
+       if (/^[0-7]{3}$/.test(digits)) {
+-        const val = parseInt(digits, 8);
++        const val = Number.parseInt(digits, 8);
+         if (val <= 255) {
+           pendingBytes.push(val);
+           i += 4;
+@@ -244,30 +391,6 @@ export function unescapeOctal(input: string): string {
+   return result.join('');
+ }
+ 
+-export function parseListOnly(stdout: string): RsyncEntry[] {
+-  const entries: RsyncEntry[] = [];
+-  for (const rawLine of stdout.split('\n')) {
+-    const line = rawLine.replace(/\r$/, '');
+-    const m = LIST_RE.exec(line);
+-    if (!m) continue;
+-
+-    const type = typeFromPerms(m[1]);
+-    let name = unescapeOctal(m[9]);
+-    if (type === 'symlink') {
+-      const arrow = name.indexOf(' -> ');
+-      if (arrow >= 0) name = name.slice(0, arrow);
+-    }
+-    if (name === '' || name === '.' || name === '..') continue;
+-
+-    const sizeNum = Number.parseInt(m[2].replace(/,/g, ''), 10);
+-    const size = type === 'dir' ? null : Number.isNaN(sizeNum) ? null : sizeNum;
+-    const modifiedAt = `${m[3]}-${m[4]}-${m[5]}T${m[6]}:${m[7]}:${m[8]}`;
+-    entries.push({ name, type, size, modifiedAt });
+-  }
+-  return entries;
+-}
+-
+-// 根据退出码 + stderr 推断错误类别。
+ export function classifyRsyncFailure(exitCode: number, stderr: string): FileErrorCode {
+   const s = stderr.toLowerCase();
+ 
+diff --git a/apps/gateway/src/files/transfer-session.test.ts b/apps/gateway/src/files/transfer-session.test.ts
+index a6215c8d..3b441e3c 100644
+--- a/apps/gateway/src/files/transfer-session.test.ts
++++ b/apps/gateway/src/files/transfer-session.test.ts
+@@ -1,9 +1,10 @@
+ import { describe, expect, test } from 'bun:test';
+-import { existsSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
++import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync } from 'node:fs';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import {
+   appendUploadChunk,
++  appendUploadChunkAsync,
+   createUploadSession,
+   getUploadSession,
+   removeUploadSession,
+@@ -46,6 +47,21 @@ describe('upload session chunking', () => {
+     });
+   });
+ 
++  test('appendUploadChunkAsync writes then advances received', async () => {
++    const s = createUploadSession({ rootId: 'r', destDir: '/d', name: 'a.txt', size: 4 });
++    const pending = appendUploadChunkAsync(s.id, 0, new Uint8Array([9, 8]));
++    expect(pending).toBeInstanceOf(Promise);
++    expect(await pending).toEqual({ ok: true, received: 2 });
++    expect(getUploadSession(s.id)?.received).toBe(2);
++    expect(readFileSync(s.tmpPath)).toEqual(Buffer.from([9, 8]));
++    expect(await appendUploadChunkAsync(s.id, 2, new Uint8Array([7, 6]))).toEqual({
++      ok: true,
++      received: 4,
++    });
++    expect(readFileSync(s.tmpPath)).toEqual(Buffer.from([9, 8, 7, 6]));
++    removeUploadSession(s.id);
++  });
++
+   test('sweepOrphanTransferTemps 仅清理超期的传输临时目录', () => {
+     const oldDir = mkdtempSync(join(tmpdir(), 'tmex-up-'));
+     const freshDir = mkdtempSync(join(tmpdir(), 'tmex-dl-'));
+diff --git a/apps/gateway/src/files/transfer-session.ts b/apps/gateway/src/files/transfer-session.ts
+index bd77db30..39ca0e97 100644
+--- a/apps/gateway/src/files/transfer-session.ts
++++ b/apps/gateway/src/files/transfer-session.ts
+@@ -1,6 +1,7 @@
+ // 上传会话状态：分块上传期间在内存维护 session + 本机临时文件。
+ // 纯状态管理（不含 rsync）。清理三重保障：每次操作的显式清理 + 周期 GC + 启动孤儿扫描。
+ import { appendFileSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
++import { open } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ 
+@@ -111,15 +112,47 @@ export type AppendResult =
+   | { ok: true; received: number }
+   | { ok: false; reason: 'not_found' | 'bad_offset' | 'too_large' };
+ 
+-// 顺序追加 chunk：offset 必须等于已收字节数；不得超出声明 size。
+-export function appendUploadChunk(id: string, offset: number, bytes: Uint8Array): AppendResult {
++function prepareAppend(
++  id: string,
++  offset: number,
++  byteLength: number
++):
++  | { ok: true; session: UploadSession }
++  | { ok: false; reason: 'not_found' | 'bad_offset' | 'too_large' } {
+   const s = sessions.get(id);
+   if (!s) return { ok: false, reason: 'not_found' };
+   if (offset !== s.received) return { ok: false, reason: 'bad_offset' };
+-  if (s.received + bytes.byteLength > s.size) return { ok: false, reason: 'too_large' };
+-  appendFileSync(s.tmpPath, bytes);
+-  s.received += bytes.byteLength;
+-  return { ok: true, received: s.received };
++  if (s.received + byteLength > s.size) return { ok: false, reason: 'too_large' };
++  return { ok: true, session: s };
++}
++
++function advanceReceived(session: UploadSession, byteLength: number): AppendResult {
++  session.received += byteLength;
++  return { ok: true, received: session.received };
++}
++
++// 顺序追加 chunk：offset 必须等于已收字节数；不得超出声明 size。
++export function appendUploadChunk(id: string, offset: number, bytes: Uint8Array): AppendResult {
++  const prepared = prepareAppend(id, offset, bytes.byteLength);
++  if (!prepared.ok) return prepared;
++  appendFileSync(prepared.session.tmpPath, bytes);
++  return advanceReceived(prepared.session, bytes.byteLength);
++}
++
++export async function appendUploadChunkAsync(
++  id: string,
++  offset: number,
++  bytes: Uint8Array
++): Promise<AppendResult> {
++  const prepared = prepareAppend(id, offset, bytes.byteLength);
++  if (!prepared.ok) return prepared;
++  const fh = await open(prepared.session.tmpPath, 'a');
++  try {
++    await fh.write(bytes);
++  } finally {
++    await fh.close();
++  }
++  return advanceReceived(prepared.session, bytes.byteLength);
+ }
+ 
+ // 移除会话：中止进行中的 rsync 推送 + 删除临时文件。
+diff --git a/apps/gateway/src/tmux-client/control-mode-capture.ts b/apps/gateway/src/tmux-client/control-mode-capture.ts
+index 3deb09a3..ee16497f 100644
+--- a/apps/gateway/src/tmux-client/control-mode-capture.ts
++++ b/apps/gateway/src/tmux-client/control-mode-capture.ts
+@@ -134,6 +134,9 @@ function parsePaneFrameInfo(block: ControlModeBlock): Omit<AtomicPaneCapture, 't
+   };
+ }
+ 
++export const MAX_PANE_HISTORY_LINES = 4096;
++export const MAX_PANE_HISTORY_CAPTURE_BYTES = 2 * 1024 * 1024;
++
+ export async function capturePaneFrameAtControlBarrier(
+   queue: ControlModeCommandQueue,
+   write: (command: string) => void,
+@@ -143,11 +146,18 @@ export async function capturePaneFrameAtControlBarrier(
+   timeoutMs = 10_000
+ ): Promise<AtomicPaneCapture> {
+   if (!isTmuxPaneId(paneId)) throw new Error(`invalid tmux pane id: ${paneId}`);
+-  const boundedHistoryLines = Math.max(0, Math.min(4096, Math.floor(historyLines)));
+-  const infoPromise = queue.execute(write, `display-message -p -t ${paneId} "#{pane_width}|#{pane_height}|#{alternate_on}|#{cursor_x}|#{cursor_y}|#{history_size}|#{mouse_standard_flag}|#{mouse_button_flag}|#{mouse_all_flag}|#{mouse_sgr_flag}|#{mouse_utf8_flag}"`, {
+-    timeoutMs,
+-    transform: parsePaneFrameInfo,
+-  });
++  const boundedHistoryLines = Math.max(
++    0,
++    Math.min(MAX_PANE_HISTORY_LINES, Math.floor(historyLines))
++  );
++  const infoPromise = queue.execute(
++    write,
++    `display-message -p -t ${paneId} "#{pane_width}|#{pane_height}|#{alternate_on}|#{cursor_x}|#{cursor_y}|#{history_size}|#{mouse_standard_flag}|#{mouse_button_flag}|#{mouse_all_flag}|#{mouse_sgr_flag}|#{mouse_utf8_flag}"`,
++    {
++      timeoutMs,
++      transform: parsePaneFrameInfo,
++    }
++  );
+   const visibleArgs = ['capture-pane', '-p', '-e', '-J', '-N', '-t', paneId];
+   const textPromise = queue.execute(write, visibleArgs.join(' '), {
+     literal: true,
+diff --git a/apps/gateway/src/tmux-client/external-tmux-core.ts b/apps/gateway/src/tmux-client/external-tmux-core.ts
+index a0e78974..c323bc39 100644
+--- a/apps/gateway/src/tmux-client/external-tmux-core.ts
++++ b/apps/gateway/src/tmux-client/external-tmux-core.ts
+@@ -393,7 +393,7 @@ export abstract class ExternalTmuxConnectionCore {
+   }
+ 
+   requestSnapshot(): void {
+-    void this.requestSnapshotInternal().catch((error) => {
++    void this.snapshotRefreshCoordinator.request().catch((error) => {
+       this.handleSnapshotFailure(error);
+     });
+   }
+@@ -672,7 +672,7 @@ export abstract class ExternalTmuxConnectionCore {
+   }
+ 
+   protected async requestSnapshotInternal(): Promise<void> {
+-    return this.snapshotRefreshCoordinator.request();
++    return this.snapshotRefreshCoordinator.requestImmediate();
+   }
+ 
+   protected async performSnapshot(): Promise<void> {
+diff --git a/apps/gateway/src/tmux-client/external/session-commands.test.ts b/apps/gateway/src/tmux-client/external/session-commands.test.ts
+index fc01ab67..7745cae5 100644
+--- a/apps/gateway/src/tmux-client/external/session-commands.test.ts
++++ b/apps/gateway/src/tmux-client/external/session-commands.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, test } from 'bun:test';
+ import type { TmuxWindow } from '@tmex/shared';
+ 
++import { PANE_SCREEN_INFO_FORMAT } from '../capture-history';
+ import type { TmuxConnectionOptions } from '../connection-types';
+ import { ControlModeCommandQueue } from '../control-mode-capture';
+ import { SNAPSHOT_FIELD_SEPARATOR } from '../snapshot-format';
+@@ -361,4 +362,83 @@ describe('SessionCommands', () => {
+       'set-window-option -t @1 window-size latest'
+     );
+   });
++
++  const screenInfoArgv = ['display-message', '-p', '-t', '%1', PANE_SCREEN_INFO_FORMAT];
++
++  test('fetchPaneHistory bounds capture and skips the inactive screen when alt-screen is known', async () => {
++    const captures: Array<{ argv: string[]; maxOutputBytes: number }> = [];
++    const { host, responses } = createHost({
++      runHistoryCapture: async (argv, maxOutputBytes) => {
++        captures.push({ argv, maxOutputBytes });
++        return 'VISIBLE\n';
++      },
++    });
++    responses.set(screenInfoArgv.join(' '), ok('0 8 1 4 0 0 0 0 0\n'));
++
++    const result = await new SessionCommands(host).fetchPaneHistory('%1');
++
++    expect(captures).toHaveLength(1);
++    expect(captures[0]?.argv).toEqual([
++      'capture-pane',
++      '-t',
++      '%1',
++      '-S',
++      '-4096',
++      '-E',
++      '-',
++      '-e',
++      '-J',
++      '-N',
++      '-p',
++    ]);
++    expect(captures[0]?.maxOutputBytes).toBeGreaterThan(64 * 1024);
++    expect(result?.alternateScreen).toBe(false);
++    expect(result?.data.startsWith('VISIBLE')).toBe(true);
++  });
++
++  test('fetchPaneHistory captures both screens only when alt-screen state is unknown, still bounded', async () => {
++    const captures: Array<{ argv: string[]; maxOutputBytes: number }> = [];
++    const { host, responses } = createHost({
++      runHistoryCapture: async (argv, maxOutputBytes) => {
++        captures.push({ argv, maxOutputBytes });
++        return argv.includes('-a') ? 'ALT\n' : 'NORMAL\n';
++      },
++    });
++    responses.set(screenInfoArgv.join(' '), ok('not-a-flag\n'));
++
++    const result = await new SessionCommands(host).fetchPaneHistory('%1');
++
++    expect(captures).toHaveLength(2);
++    expect(captures.map((entry) => entry.argv.includes('-a'))).toEqual([false, true]);
++    expect(captures.every((entry) => entry.argv.includes('-4096'))).toBe(true);
++    expect(captures.every((entry) => entry.maxOutputBytes > 64 * 1024)).toBe(true);
++    expect(result?.data.startsWith('NORMAL')).toBe(true);
++  });
++
++  test('concurrent fetchPaneHistory callers for the same pane share one capture', async () => {
++    let started = 0;
++    let resolveCapture!: (value: string) => void;
++    const gate = new Promise<string>((resolve) => {
++      resolveCapture = resolve;
++    });
++    const { host, responses } = createHost({
++      runHistoryCapture: async () => {
++        started += 1;
++        return gate;
++      },
++    });
++    responses.set(screenInfoArgv.join(' '), ok('0 0 0 24 0 0 0 0 0\n'));
++    const commands = new SessionCommands(host);
++
++    const first = commands.fetchPaneHistory('%1');
++    const second = commands.fetchPaneHistory('%1');
++    await Bun.sleep(0);
++    expect(started).toBe(1);
++
++    resolveCapture('shared\n');
++    const [left, right] = await Promise.all([first, second]);
++    expect(left).toBe(right);
++    expect(left?.data.startsWith('shared')).toBe(true);
++    expect(started).toBe(1);
++  });
+ });
+diff --git a/apps/gateway/src/tmux-client/external/session-commands.ts b/apps/gateway/src/tmux-client/external/session-commands.ts
+index 31968439..879ade4f 100644
+--- a/apps/gateway/src/tmux-client/external/session-commands.ts
++++ b/apps/gateway/src/tmux-client/external/session-commands.ts
+@@ -16,6 +16,8 @@ import type { TmuxConnectionOptions } from '../connection-types';
+ import {
+   type AtomicPaneCapture,
+   type ControlModeCommandQueue,
++  MAX_PANE_HISTORY_CAPTURE_BYTES,
++  MAX_PANE_HISTORY_LINES,
+   capturePaneFrameAtControlBarrier,
+ } from '../control-mode-capture';
+ import { SNAPSHOT_FIELD_SEPARATOR, isTmuxPaneId, isTmuxWindowId } from '../snapshot-format';
+@@ -121,6 +123,10 @@ export function buildResizePaneByIdArgv(
+ 
+ export class SessionCommands {
+   private stackedLayoutTransition: Promise<void> = Promise.resolve();
++  private readonly paneHistoryInflight = new Map<
++    string,
++    Promise<{ data: string; alternateScreen: boolean; modes: number } | null>
++  >();
+ 
+   constructor(private readonly host: SessionCommandHost) {}
+ 
+@@ -331,30 +337,50 @@ export class SessionCommands {
+   async fetchPaneHistory(
+     paneId: string
+   ): Promise<{ data: string; alternateScreen: boolean; modes: number } | null> {
+-    const screenInfo = parsePaneScreenInfo(
+-      (await this.runTmux(['display-message', '-p', '-t', paneId, PANE_SCREEN_INFO_FORMAT], true))
+-        .stdout
+-    );
+-    const normal = (
+-      await this.runTmux(
+-        ['capture-pane', '-t', paneId, '-S', '-', '-E', '-', '-e', '-J', '-N', '-p'],
+-        true,
+-        30_000
+-      )
+-    ).stdout;
+-    const alternate = (
+-      await this.runTmux(
+-        ['capture-pane', '-t', paneId, '-a', '-S', '-', '-E', '-', '-e', '-J', '-N', '-p', '-q'],
+-        true,
+-        30_000
+-      )
++    const existing = this.paneHistoryInflight.get(paneId);
++    if (existing) return existing;
++    const pending = this.fetchPaneHistoryUncached(paneId).finally(() => {
++      if (this.paneHistoryInflight.get(paneId) === pending) {
++        this.paneHistoryInflight.delete(paneId);
++      }
++    });
++    this.paneHistoryInflight.set(paneId, pending);
++    return pending;
++  }
++
++  private async fetchPaneHistoryUncached(
++    paneId: string
++  ): Promise<{ data: string; alternateScreen: boolean; modes: number } | null> {
++    const screenRaw = (
++      await this.runTmux(['display-message', '-p', '-t', paneId, PANE_SCREEN_INFO_FORMAT], true)
+     ).stdout;
++    const screenInfo = parsePaneScreenInfo(screenRaw);
++    const alternateOn = parseAlternateOnFlag(screenRaw);
++
++    const capture = async (alternate: boolean): Promise<string> => {
++      try {
++        return await this.host.runHistoryCapture(
++          buildLegacyHistoryCaptureArgv(paneId, alternate),
++          MAX_PANE_HISTORY_CAPTURE_BYTES
++        );
++      } catch (error) {
++        if (error instanceof TmuxTargetMissingError) return '';
++        throw error;
++      }
++    };
+ 
+-    const history = screenInfo.alternateScreen
+-      ? hasRenderableTerminalContent(normal)
+-        ? normal
+-        : alternate
+-      : normal || alternate;
++    let history: string;
++    if (alternateOn === null) {
++      const normal = await capture(false);
++      const alternate = await capture(true);
++      history = screenInfo.alternateScreen
++        ? hasRenderableTerminalContent(normal)
++          ? normal
++          : alternate
++        : normal || alternate;
++    } else {
++      history = await capture(false);
++    }
+ 
+     if (!history) {
+       return null;
+@@ -739,3 +765,18 @@ export class SessionCommands {
+     ]);
+   }
+ }
++
++function parseAlternateOnFlag(raw: string): boolean | null {
++  const flag = raw.trim().split(/\s+/)[0];
++  if (flag === '1') return true;
++  if (flag === '0') return false;
++  return null;
++}
++
++function buildLegacyHistoryCaptureArgv(paneId: string, alternate: boolean): string[] {
++  const argv = ['capture-pane', '-t', paneId];
++  if (alternate) argv.push('-a');
++  argv.push('-S', `-${MAX_PANE_HISTORY_LINES}`, '-E', '-', '-e', '-J', '-N', '-p');
++  if (alternate) argv.push('-q');
++  return argv;
++}
+diff --git a/apps/gateway/src/tmux-client/local-external-connection.eagain.test.ts b/apps/gateway/src/tmux-client/local-external-connection.eagain.test.ts
+index c95c7587..59ff5563 100644
+--- a/apps/gateway/src/tmux-client/local-external-connection.eagain.test.ts
++++ b/apps/gateway/src/tmux-client/local-external-connection.eagain.test.ts
+@@ -549,7 +549,7 @@ describe('LocalExternalTmuxConnection EAGAIN handling', () => {
+     try {
+       // public requestSnapshot：内部捕获瞬时 spawn 错误，不应抛出/不触发 onError/onClose
+       connection.requestSnapshot();
+-      await Bun.sleep(30);
++      await Bun.sleep(200);
+     } finally {
+       process.off('unhandledRejection', onUnhandled);
+     }
+@@ -610,14 +610,14 @@ describe('LocalExternalTmuxConnection EAGAIN handling', () => {
+     // 1) 触发一次 EAGAIN：不发快照、不 shutdown
+     eagainPhase = true;
+     connection.requestSnapshot();
+-    await Bun.sleep(30);
++    await Bun.sleep(200);
+     expect(snapshots.length).toBe(baseSnapshots);
+     expect(closeCalls).toBe(0);
+ 
+     // 2) 恢复正常：后续快照正常发出，连接健康
+     eagainPhase = false;
+     connection.requestSnapshot();
+-    await Bun.sleep(30);
++    await Bun.sleep(200);
+     expect(snapshots.length).toBeGreaterThan(baseSnapshots);
+ 
+     expect(
+diff --git a/apps/gateway/src/tmux-client/local-external-connection.test.ts b/apps/gateway/src/tmux-client/local-external-connection.test.ts
+index d4f90a33..0f5c863c 100644
+--- a/apps/gateway/src/tmux-client/local-external-connection.test.ts
++++ b/apps/gateway/src/tmux-client/local-external-connection.test.ts
+@@ -7,6 +7,7 @@ import type { TmuxEvent } from './events';
+ import {
+   type ControlClientProcess,
+   LocalExternalTmuxConnection,
++  readTextWithByteLimit,
+   shouldIgnoreReaderAbortError,
+ } from './local-external-connection';
+ import { TmuxTargetMissingError } from './target-missing';
+@@ -207,6 +208,31 @@ beforeAll(() => {
+   runMigrations();
+ });
+ 
++describe('readTextWithByteLimit', () => {
++  test('rejects when stdout exceeds the capture byte cap', async () => {
++    const stream = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new Uint8Array(8).fill(0x61));
++        controller.enqueue(new Uint8Array(8).fill(0x62));
++        controller.close();
++      },
++    });
++    await expect(readTextWithByteLimit(stream, 10)).rejects.toThrow(
++      'tmux history capture exceeded bounded output'
++    );
++  });
++
++  test('returns the decoded text when under the cap', async () => {
++    const stream = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode('ok'));
++        controller.close();
++      },
++    });
++    await expect(readTextWithByteLimit(stream, 16)).resolves.toBe('ok');
++  });
++});
++
+ describe('LocalExternalTmuxConnection', () => {
+   test('shouldIgnoreReaderAbortError matches releaseLock abort noise', () => {
+     expect(
+@@ -902,10 +928,10 @@ describe('LocalExternalTmuxConnection', () => {
+           ) {
+             return ok('1 8 3 40 0 0 0 0 0\n');
+           }
+-          if (command === 'capture-pane -t %1 -S - -E - -e -J -N -p') {
++          if (command === 'capture-pane -t %1 -S -4096 -E - -e -J -N -p') {
+             return ok('VIM SCREEN\n');
+           }
+-          if (command === 'capture-pane -t %1 -a -S - -E - -e -J -N -p -q') {
++          if (command === 'capture-pane -t %1 -a -S -4096 -E - -e -J -N -p -q') {
+             return ok('\n\n\n');
+           }
+           throw new Error(`unexpected command: ${command}`);
+@@ -958,10 +984,10 @@ describe('LocalExternalTmuxConnection', () => {
+           ) {
+             return ok('1 2 1 40 0 1 0 1 0\n');
+           }
+-          if (command === 'capture-pane -t %1 -S - -E - -e -J -N -p') {
++          if (command === 'capture-pane -t %1 -S -4096 -E - -e -J -N -p') {
+             return ok('VISIBLE TUI\n');
+           }
+-          if (command === 'capture-pane -t %1 -a -S - -E - -e -J -N -p -q') {
++          if (command === 'capture-pane -t %1 -a -S -4096 -E - -e -J -N -p -q') {
+             return ok('sh-3.2$ opencode .\n');
+           }
+           throw new Error(`unexpected command: ${command}`);
+@@ -1015,10 +1041,10 @@ describe('LocalExternalTmuxConnection', () => {
+             // 光标在可见区域倒数第 3 行（如 Claude Code 输入行），列 8
+             return ok('0 8 1 4 0 0 0 0 0\n');
+           }
+-          if (command === 'capture-pane -t %1 -S - -E - -e -J -N -p') {
++          if (command === 'capture-pane -t %1 -S -4096 -E - -e -J -N -p') {
+             return ok('sh-3.2$ \n> input   \nstatus bar\n\n');
+           }
+-          if (command === 'capture-pane -t %1 -a -S - -E - -e -J -N -p -q') {
++          if (command === 'capture-pane -t %1 -a -S -4096 -E - -e -J -N -p -q') {
+             return ok('');
+           }
+           throw new Error(`unexpected command: ${command}`);
+@@ -1689,7 +1715,7 @@ describe('LocalExternalTmuxConnection lifecycle events', () => {
+     await connection.connect();
+     invalid = true;
+     connection.requestSnapshot();
+-    await Bun.sleep(80);
++    await Bun.sleep(200);
+ 
+     expect(events).toHaveLength(0);
+     connection.disconnect();
+@@ -1812,9 +1838,9 @@ describe('LocalExternalTmuxConnection lifecycle events', () => {
+     await connection.connect();
+     expect(events).toHaveLength(0);
+ 
+-    connection.requestSnapshot();
+-    connection.requestSnapshot();
+-    connection.requestSnapshot();
++    (connection as any).requestSnapshotInternal();
++    (connection as any).requestSnapshotInternal();
++    (connection as any).requestSnapshotInternal();
+     await Bun.sleep(30);
+ 
+     expect(paneListCalls).toBe(2);
+@@ -1827,7 +1853,7 @@ describe('LocalExternalTmuxConnection lifecycle events', () => {
+     expect(events.map((e) => e.eventType)).toEqual(['tmux_pane_close']);
+ 
+     connection.requestSnapshot();
+-    await Bun.sleep(50);
++    await Bun.sleep(200);
+     expect(events.map((e) => e.eventType)).toEqual(['tmux_pane_close']);
+     connection.disconnect();
+   });
+diff --git a/apps/gateway/src/tmux-client/local-external-connection.ts b/apps/gateway/src/tmux-client/local-external-connection.ts
+index bb397261..60d8a278 100644
+--- a/apps/gateway/src/tmux-client/local-external-connection.ts
++++ b/apps/gateway/src/tmux-client/local-external-connection.ts
+@@ -27,6 +27,7 @@ import {
+ } from './external-tmux-core';
+ import { buildEnsureGhosttyTerminfoScript } from './ghostty-terminfo';
+ import { encodeBytesToHexChunks } from './input-encoder';
++import { TmuxTargetMissingError, isTargetMissingMessage } from './target-missing';
+ import {
+   isControlModeSupported,
+   parseTmuxVersion,
+@@ -46,7 +47,7 @@ interface LocalExternalTmuxConnectionDeps {
+   enableSubscription: boolean;
+   platform: NodeJS.Platform;
+   getDevice: (deviceId: string) => Device | null;
+-  run: (argv: string[]) => Promise<CommandResult>;
++  run: (argv: string[], maxOutputBytes?: number) => Promise<CommandResult>;
+   ensureGhosttyTerminfo: () => Promise<boolean>;
+   parkingCommand: () => string;
+   spawnControlClient: (argv: string[]) => ControlClientProcess;
+@@ -92,7 +93,45 @@ function isTransientSpawnError(error: unknown): boolean {
+   );
+ }
+ 
+-export function defaultRun(argv: string[]): Promise<CommandResult> {
++export async function readTextWithByteLimit(
++  stream: ReadableStream<Uint8Array>,
++  maxOutputBytes?: number
++): Promise<string> {
++  if (maxOutputBytes === undefined) {
++    return new Response(stream).text();
++  }
++  const limit = Math.max(1, Math.floor(maxOutputBytes));
++  const reader = stream.getReader();
++  const chunks: Uint8Array[] = [];
++  let total = 0;
++  try {
++    while (true) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      if (!value?.byteLength) continue;
++      total += value.byteLength;
++      if (total > limit) {
++        throw new Error('tmux history capture exceeded bounded output');
++      }
++      chunks.push(value);
++    }
++  } finally {
++    try {
++      reader.releaseLock();
++    } catch {
++      /* ignore */
++    }
++  }
++  const merged = new Uint8Array(total);
++  let offset = 0;
++  for (const chunk of chunks) {
++    merged.set(chunk, offset);
++    offset += chunk.byteLength;
++  }
++  return new TextDecoder().decode(merged);
++}
++
++export function defaultRun(argv: string[], maxOutputBytes?: number): Promise<CommandResult> {
+   return new Promise((resolve, reject) => {
+     const subprocess = Bun.spawn(argv, {
+       env: buildLocalTmuxEnv(getLocalShellPath()),
+@@ -101,14 +140,21 @@ export function defaultRun(argv: string[]): Promise<CommandResult> {
+     });
+ 
+     Promise.all([
+-      new Response(subprocess.stdout).text(),
++      readTextWithByteLimit(subprocess.stdout, maxOutputBytes),
+       new Response(subprocess.stderr).text(),
+       subprocess.exited,
+     ])
+       .then(([stdout, stderr, exitCode]) => {
+         resolve({ stdout, stderr, exitCode });
+       })
+-      .catch(reject);
++      .catch((error) => {
++        try {
++          subprocess.kill();
++        } catch {
++          /* ignore */
++        }
++        reject(error);
++      });
+   });
+ }
+ 
+@@ -297,11 +343,37 @@ export class LocalExternalTmuxConnection extends ExternalTmuxConnectionCore {
+   }
+ 
+   protected async runHistoryCapture(argv: string[], maxOutputBytes: number): Promise<string> {
+-    const { stdout } = await this.runTmux(argv, 'silent');
+-    if (new TextEncoder().encode(stdout).byteLength > maxOutputBytes) {
++    let result: CommandResult;
++    try {
++      result = await this.deps.run(buildLocalTmuxArgv(argv), maxOutputBytes);
++    } catch (error) {
++      if (
++        error instanceof Error &&
++        error.message === 'tmux history capture exceeded bounded output'
++      ) {
++        throw error;
++      }
++      if (isTransientSpawnError(error)) {
++        result = {
++          exitCode: TMUX_SPAWN_UNAVAILABLE_EXIT,
++          stdout: '',
++          stderr: error instanceof Error ? error.message : String(error),
++        };
++      } else {
++        throw error;
++      }
++    }
++    if (new TextEncoder().encode(result.stdout).byteLength > maxOutputBytes) {
+       throw new Error('tmux history capture exceeded bounded output');
+     }
+-    return stdout;
++    if (result.exitCode === 0) return result.stdout;
++    const message = (
++      result.stderr.trim() ||
++      result.stdout.trim() ||
++      `tmux command failed: ${argv.join(' ')}`
++    ).trim();
++    if (isTargetMissingMessage(message)) throw new TmuxTargetMissingError(message);
++    throw new Error(message);
+   }
+ 
+   protected shouldAbortSnapshot(results: CommandResult[]): boolean {
+diff --git a/apps/gateway/src/tmux-client/pane-retention.test.ts b/apps/gateway/src/tmux-client/pane-retention.test.ts
+index ead1dc47..692884ce 100644
+--- a/apps/gateway/src/tmux-client/pane-retention.test.ts
++++ b/apps/gateway/src/tmux-client/pane-retention.test.ts
+@@ -92,6 +92,32 @@ describe('pane retention', () => {
+     expect(result.replay[0]?.needsScreen).toBe(true);
+   });
+ 
++  test('cold ingest does not copy payload or fan out, while retained panes keep segments', () => {
++    const retention = new PaneRetention({ scheduleTimers: false });
++    retention.reconcilePanes([
++      { paneId: '%1', paneEpoch: EPOCH_A },
++      { paneId: '%2', paneEpoch: EPOCH_B },
++    ]);
++    const received: string[] = [];
++    const lease = retention.attachConsumer({
++      onData: (segment) => received.push(`${segment.paneId}:${decoder.decode(segment.data)}`),
++    });
++    lease.applySubscriptions(1n, [request('%2', EPOCH_B)], []);
++
++    const coldPayload = encoder.encode('discarded');
++    const coldResult = retention.ingest('%1', EPOCH_A, coldPayload);
++    coldPayload.fill(0x23);
++    expect(coldResult).toBeNull();
++    expect(received).toEqual([]);
++    expect(retention.getLatestCursor('%1')?.terminalSeq).toBe(9n);
++
++    const livePayload = encoder.encode('abc');
++    const live = retention.ingest('%2', EPOCH_B, livePayload);
++    livePayload.fill(0);
++    expect(decoder.decode(live?.data ?? new Uint8Array())).toBe('abc');
++    expect(received).toEqual(['%2:abc']);
++  });
++
+   test('keeps exact replay through grace and hot, then evicts it at TTL', () => {
+     let now = 0;
+     const retention = new PaneRetention({
+diff --git a/apps/gateway/src/tmux-client/pane-retention.ts b/apps/gateway/src/tmux-client/pane-retention.ts
+index 28dde57e..0e555269 100644
+--- a/apps/gateway/src/tmux-client/pane-retention.ts
++++ b/apps/gateway/src/tmux-client/pane-retention.ts
+@@ -147,7 +147,7 @@ export class PaneRetention {
+ 
+     const segment = this.replay.append(state, data, now);
+     this.policy.trimPaneReplay(state, now);
+-    this.replay.fanout(state, segment);
++    if (segment) this.replay.fanout(state, segment);
+     this.policy.afterIngest(state, now);
+     return segment;
+   }
+diff --git a/apps/gateway/src/tmux-client/retention/replay-store.ts b/apps/gateway/src/tmux-client/retention/replay-store.ts
+index 1b247aa1..36215a86 100644
+--- a/apps/gateway/src/tmux-client/retention/replay-store.ts
++++ b/apps/gateway/src/tmux-client/retention/replay-store.ts
+@@ -88,21 +88,21 @@ export class PaneReplayStore {
+     }
+   }
+ 
+-  append(state: PaneState, data: Uint8Array, now: number): PaneDataSegment {
+-    const ownedData = copyBytes(data);
++  append(state: PaneState, data: Uint8Array, now: number): PaneDataSegment | null {
+     const seqStart = state.latestSeq;
+-    const seqEnd = seqStart + BigInt(ownedData.byteLength);
++    const seqEnd = seqStart + BigInt(data.byteLength);
+     state.latestSeq = seqEnd;
+ 
+-    const retain = state.mode !== 'cold';
+-    if (retain) {
+-      state.replay.push({ seqStart, seqEnd, data: ownedData, receivedAt: now });
+-      state.replayBytes += ownedData.byteLength;
+-      this.kernel.adjustRetainedBytes(ownedData.byteLength);
+-    } else {
++    if (state.mode === 'cold') {
+       state.dirtyWhileCold = true;
++      return null;
+     }
+ 
++    const ownedData = copyBytes(data);
++    state.replay.push({ seqStart, seqEnd, data: ownedData, receivedAt: now });
++    state.replayBytes += ownedData.byteLength;
++    this.kernel.adjustRetainedBytes(ownedData.byteLength);
++
+     return {
+       paneId: state.paneId,
+       paneEpoch: copyBytes(state.paneEpoch),
+@@ -113,6 +113,7 @@ export class PaneReplayStore {
+   }
+ 
+   fanout(state: PaneState, segment: PaneDataSegment): void {
++    if (this.kernel.consumers.size === 0) return;
+     for (const consumer of this.kernel.consumers.values()) {
+       const request = consumer.active.get(state.paneId) ?? consumer.hot.get(state.paneId);
+       if (!request || !bytesEqual(request.paneEpoch, state.paneEpoch)) continue;
+diff --git a/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.test.ts b/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.test.ts
+index 0604ee98..8ac30311 100644
+--- a/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.test.ts
++++ b/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.test.ts
+@@ -32,14 +32,17 @@ describe('SnapshotRefreshCoordinator', () => {
+     let runs = 0;
+     let active = 0;
+     let maxActive = 0;
+-    const coordinator = new SnapshotRefreshCoordinator(async () => {
+-      const index = runs;
+-      runs += 1;
+-      active += 1;
+-      maxActive = Math.max(maxActive, active);
+-      await gates[index]?.promise;
+-      active -= 1;
+-    });
++    const coordinator = new SnapshotRefreshCoordinator(
++      async () => {
++        const index = runs;
++        runs += 1;
++        active += 1;
++        maxActive = Math.max(maxActive, active);
++        await gates[index]?.promise;
++        active -= 1;
++      },
++      { quietPeriodMs: 0 }
++    );
+ 
+     const first = coordinator.request();
+     const second = coordinator.request();
+@@ -61,15 +64,89 @@ describe('SnapshotRefreshCoordinator', () => {
+ 
+   test('resets after a failed run so a later demand can retry', async () => {
+     let runs = 0;
+-    const coordinator = new SnapshotRefreshCoordinator(async () => {
+-      runs += 1;
+-      if (runs === 1) {
+-        throw new Error('snapshot failed');
+-      }
+-    });
++    const coordinator = new SnapshotRefreshCoordinator(
++      async () => {
++        runs += 1;
++        if (runs === 1) {
++          throw new Error('snapshot failed');
++        }
++      },
++      { quietPeriodMs: 0 }
++    );
+ 
+     await expect(coordinator.request()).rejects.toThrow('snapshot failed');
+     await expect(coordinator.request()).resolves.toBeUndefined();
+     expect(runs).toBe(2);
+   });
++
++  test('quiet period caps structure refreshes under 1s of continuous notifications', async () => {
++    let now = 0;
++    let runs = 0;
++    const waits: Array<{ due: number; resolve: () => void }> = [];
++    const coordinator = new SnapshotRefreshCoordinator(
++      async () => {
++        runs += 1;
++      },
++      {
++        quietPeriodMs: 150,
++        now: () => now,
++        delay: (ms) =>
++          new Promise<void>((resolve) => {
++            waits.push({ due: now + ms, resolve });
++          }),
++      }
++    );
++
++    async function tick(ms: number): Promise<void> {
++      now += ms;
++      const due = waits.filter((item) => item.due <= now);
++      const rest = waits.filter((item) => item.due > now);
++      waits.length = 0;
++      waits.push(...rest);
++      for (const item of due) item.resolve();
++      await Promise.resolve();
++      await Promise.resolve();
++    }
++
++    coordinator.request();
++    await Promise.resolve();
++    await Promise.resolve();
++    expect(runs).toBe(1);
++
++    for (let elapsed = 0; elapsed < 1000; elapsed += 10) {
++      coordinator.request();
++      await tick(10);
++    }
++
++    // 3 commands per refresh（display-message / list-windows / list-panes）
++    expect(runs).toBeLessThanOrEqual(7);
++    expect(runs * 3).toBeLessThanOrEqual(21);
++    expect(runs).toBeGreaterThanOrEqual(6);
++  });
++
++  test('requestImmediate skips the quiet period for user commands', async () => {
++    let now = 0;
++    let runs = 0;
++    let delayed = 0;
++    const coordinator = new SnapshotRefreshCoordinator(
++      async () => {
++        runs += 1;
++      },
++      {
++        quietPeriodMs: 150,
++        now: () => now,
++        delay: (ms) => {
++          delayed += ms;
++          now += ms;
++          return Promise.resolve();
++        },
++      }
++    );
++
++    await coordinator.request();
++    expect(runs).toBe(1);
++    await coordinator.requestImmediate();
++    expect(runs).toBe(2);
++    expect(delayed).toBe(0);
++  });
+ });
+diff --git a/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.ts b/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.ts
+index ae8890f7..7e16103e 100644
+--- a/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.ts
++++ b/apps/gateway/src/tmux-client/snapshot-refresh-coordinator.ts
+@@ -1,24 +1,63 @@
++export const SNAPSHOT_REFRESH_QUIET_PERIOD_MS = 150;
++
+ export class SnapshotRefreshCoordinator {
+   private active: Promise<void> | null = null;
+   private trailingRequested = false;
++  private trailingImmediate = false;
++  private lastRefreshAt: number | null = null;
++  private cancelQuiet: (() => void) | null = null;
++  private readonly quietPeriodMs: number;
++  private readonly now: () => number;
++  private readonly delay: (ms: number) => Promise<void>;
+ 
+-  constructor(private readonly refresh: () => Promise<void>) {}
++  constructor(
++    private readonly refresh: () => Promise<void>,
++    options: {
++      quietPeriodMs?: number;
++      now?: () => number;
++      delay?: (ms: number) => Promise<void>;
++    } = {}
++  ) {
++    this.quietPeriodMs = options.quietPeriodMs ?? SNAPSHOT_REFRESH_QUIET_PERIOD_MS;
++    this.now = options.now ?? Date.now;
++    this.delay = options.delay ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
++  }
+ 
+   request(): Promise<void> {
++    return this.enqueue(false);
++  }
++
++  requestImmediate(): Promise<void> {
++    this.cancelQuiet?.();
++    return this.enqueue(true);
++  }
++
++  private enqueue(immediate: boolean): Promise<void> {
+     if (this.active) {
+       this.trailingRequested = true;
++      if (immediate) this.trailingImmediate = true;
+       return this.active;
+     }
+ 
+     this.trailingRequested = false;
++    this.trailingImmediate = false;
+     const active = Promise.resolve().then(async () => {
+       try {
++        if (!immediate) {
++          await this.waitQuiet();
++        }
+         while (true) {
+           await this.refresh();
++          this.lastRefreshAt = this.now();
+           if (!this.trailingRequested) {
+             break;
+           }
++          const nextImmediate = this.trailingImmediate;
+           this.trailingRequested = false;
++          this.trailingImmediate = false;
++          if (!nextImmediate) {
++            await this.waitQuiet();
++          }
+         }
+       } finally {
+         this.active = null;
+@@ -27,4 +66,25 @@ export class SnapshotRefreshCoordinator {
+     this.active = active;
+     return active;
+   }
++
++  private remainingQuiet(): number {
++    if (this.lastRefreshAt === null || this.quietPeriodMs <= 0) return 0;
++    return Math.max(0, this.quietPeriodMs - (this.now() - this.lastRefreshAt));
++  }
++
++  private waitQuiet(): Promise<void> {
++    const remaining = this.remainingQuiet();
++    if (remaining <= 0) return Promise.resolve();
++    return new Promise((resolve) => {
++      let settled = false;
++      const done = () => {
++        if (settled) return;
++        settled = true;
++        this.cancelQuiet = null;
++        resolve();
++      };
++      this.cancelQuiet = done;
++      void this.delay(remaining).then(done);
++    });
++  }
+ }
+diff --git a/apps/gateway/src/watch/scheduler.test.ts b/apps/gateway/src/watch/scheduler.test.ts
+index caa5cdac..42bc7be8 100644
+--- a/apps/gateway/src/watch/scheduler.test.ts
++++ b/apps/gateway/src/watch/scheduler.test.ts
+@@ -23,13 +23,13 @@ describe('WatchRuleScheduler', () => {
+     };
+ 
+     const first = scheduler.add(
+-      { id: 'r1', deviceId: 'd1', triggerType: 'match', intervalSeconds: 1 },
+-      (id) => ticks.push(id),
++      { id: 'r1', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 1 },
++      (deviceId, paneId) => ticks.push(`${deviceId}:${paneId}`),
+       scheduleInterval
+     );
+     const second = scheduler.add(
+-      { id: 'r1', deviceId: 'd1', triggerType: 'match', intervalSeconds: 1 },
+-      (id) => ticks.push(id),
++      { id: 'r1', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 1 },
++      (deviceId, paneId) => ticks.push(`${deviceId}:${paneId}`),
+       scheduleInterval
+     );
+ 
+@@ -45,7 +45,7 @@ describe('WatchRuleScheduler', () => {
+     const scheduleInterval = () => () => {};
+ 
+     scheduler.add(
+-      { id: 'r1', deviceId: 'd1', triggerType: 'match', intervalSeconds: 30 },
++      { id: 'r1', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 30 },
+       () => {},
+       scheduleInterval
+     );
+@@ -78,4 +78,113 @@ describe('WatchRuleScheduler', () => {
+     });
+     expect(ran).toBe(false);
+   });
++
++  test('同 pane 多规则共用一个 timer，间隔取最小值', () => {
++    const scheduler = new WatchRuleScheduler();
++    const timers: Array<{ ms: number; cleared: boolean; fire: () => void }> = [];
++    const ticks: string[] = [];
++    const scheduleInterval = (fn: () => void, ms: number) => {
++      const entry = { ms, cleared: false, fire: fn };
++      timers.push(entry);
++      return () => {
++        entry.cleared = true;
++      };
++    };
++
++    scheduler.add(
++      { id: 'r1', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 30 },
++      (deviceId, paneId) => ticks.push(`${deviceId}:${paneId}`),
++      scheduleInterval
++    );
++    scheduler.add(
++      { id: 'r2', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 5 },
++      (deviceId, paneId) => ticks.push(`${deviceId}:${paneId}`),
++      scheduleInterval
++    );
++    scheduler.add(
++      { id: 'r3', deviceId: 'd1', paneId: '%2', triggerType: 'match', intervalSeconds: 10 },
++      (deviceId, paneId) => ticks.push(`${deviceId}:${paneId}`),
++      scheduleInterval
++    );
++
++    const live = timers.filter((t) => !t.cleared);
++    expect(live.map((t) => t.ms).sort((a, b) => a - b)).toEqual([5000, 10000]);
++
++    live.find((t) => t.ms === 5000)?.fire();
++    expect(ticks).toEqual(['d1:%1']);
++  });
++
++  test('100 条同 pane 规则只调度 1 个 timer；长 interval 规则跳过中间 tick', () => {
++    const scheduler = new WatchRuleScheduler();
++    const timers: Array<{ ms: number; fire: () => void }> = [];
++    const scheduleInterval = (fn: () => void, ms: number) => {
++      timers.push({ ms, fire: fn });
++      return () => {};
++    };
++
++    for (let i = 0; i < 99; i++) {
++      scheduler.add(
++        {
++          id: `fast-${i}`,
++          deviceId: 'd1',
++          paneId: '%1',
++          triggerType: 'match',
++          intervalSeconds: 5,
++        },
++        () => {},
++        scheduleInterval
++      );
++    }
++    scheduler.add(
++      {
++        id: 'slow',
++        deviceId: 'd1',
++        paneId: '%1',
++        triggerType: 'llm',
++        intervalSeconds: 30,
++      },
++      () => {},
++      scheduleInterval
++    );
++
++    expect(timers).toHaveLength(1);
++    expect(timers[0]?.ms).toBe(5000);
++
++    expect(scheduler.takeDueRuleIds('d1', '%1')).toHaveLength(99);
++    expect(scheduler.takeDueRuleIds('d1', '%1')).toHaveLength(99);
++    expect(scheduler.takeDueRuleIds('d1', '%1')).toHaveLength(99);
++    expect(scheduler.takeDueRuleIds('d1', '%1')).toHaveLength(99);
++    expect(scheduler.takeDueRuleIds('d1', '%1')).toHaveLength(99);
++    const sixth = scheduler.takeDueRuleIds('d1', '%1');
++    expect(sixth).toHaveLength(100);
++    expect(sixth).toContain('slow');
++  });
++
++  test('移除 pane 上最后一条规则才清 timer；更短规则移除后重臂到新的最小间隔', () => {
++    const scheduler = new WatchRuleScheduler();
++    const timers: Array<{ ms: number; cleared: boolean }> = [];
++    const scheduleInterval = (_fn: () => void, ms: number) => {
++      const entry = { ms, cleared: false };
++      timers.push(entry);
++      return () => {
++        entry.cleared = true;
++      };
++    };
++
++    scheduler.add(
++      { id: 'slow', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 30 },
++      () => {},
++      scheduleInterval
++    );
++    scheduler.add(
++      { id: 'fast', deviceId: 'd1', paneId: '%1', triggerType: 'match', intervalSeconds: 5 },
++      () => {},
++      scheduleInterval
++    );
++    scheduler.detach('fast');
++    expect(timers.filter((t) => !t.cleared).map((t) => t.ms)).toEqual([30000]);
++
++    scheduler.detach('slow');
++    expect(timers.filter((t) => !t.cleared)).toHaveLength(0);
++  });
+ });
+diff --git a/apps/gateway/src/watch/scheduler.ts b/apps/gateway/src/watch/scheduler.ts
+index ccb23dc5..3f995a60 100644
+--- a/apps/gateway/src/watch/scheduler.ts
++++ b/apps/gateway/src/watch/scheduler.ts
+@@ -10,15 +10,34 @@ export function effectiveIntervalSeconds(
+   return Math.max(min, rule.intervalSeconds);
+ }
+ 
++function paneKey(deviceId: string, paneId: string): string {
++  return `${deviceId}\0${paneId}`;
++}
++
+ export interface ScheduledRule {
+   ruleId: string;
+   deviceId: string;
++  paneId: string;
++  intervalMs: number;
++  accruedMs: number;
+   clearTimer: (() => void) | null;
+   tickPromise: Promise<void> | null;
+ }
+ 
++interface PaneGroup {
++  deviceId: string;
++  paneId: string;
++  ruleIds: Set<string>;
++  minIntervalMs: number;
++  clearTimer: (() => void) | null;
++  tickPromise: Promise<void> | null;
++  onTick: (deviceId: string, paneId: string) => void;
++  scheduleInterval: (fn: () => void, ms: number) => () => void;
++}
++
+ export class WatchRuleScheduler {
+   private readonly rules = new Map<string, ScheduledRule>();
++  private readonly groups = new Map<string, PaneGroup>();
+ 
+   has(ruleId: string): boolean {
+     return this.rules.has(ruleId);
+@@ -33,8 +52,8 @@ export class WatchRuleScheduler {
+   }
+ 
+   add(
+-    rule: Pick<WatchRuleRecord, 'id' | 'deviceId' | 'triggerType' | 'intervalSeconds'>,
+-    onTick: (ruleId: string) => void,
++    rule: Pick<WatchRuleRecord, 'id' | 'deviceId' | 'paneId' | 'triggerType' | 'intervalSeconds'>,
++    onTick: (deviceId: string, paneId: string) => void,
+     scheduleInterval: (fn: () => void, ms: number) => () => void
+   ): ScheduledRule | null {
+     if (this.rules.has(rule.id)) {
+@@ -43,25 +62,68 @@ export class WatchRuleScheduler {
+     const entry: ScheduledRule = {
+       ruleId: rule.id,
+       deviceId: rule.deviceId,
++      paneId: rule.paneId,
++      intervalMs: effectiveIntervalSeconds(rule) * 1000,
++      accruedMs: 0,
+       clearTimer: null,
+       tickPromise: null,
+     };
+-    entry.clearTimer = scheduleInterval(
+-      () => onTick(rule.id),
+-      effectiveIntervalSeconds(rule) * 1000
+-    );
+     this.rules.set(rule.id, entry);
++    this.attachToGroup(entry, onTick, scheduleInterval);
+     return entry;
+   }
+ 
++  takeDueRuleIds(deviceId: string, paneId: string): string[] {
++    const group = this.groups.get(paneKey(deviceId, paneId));
++    if (!group) {
++      return [];
++    }
++    const due: string[] = [];
++    for (const ruleId of group.ruleIds) {
++      const entry = this.rules.get(ruleId);
++      if (!entry) {
++        continue;
++      }
++      entry.accruedMs += group.minIntervalMs;
++      if (entry.accruedMs >= entry.intervalMs) {
++        entry.accruedMs = 0;
++        due.push(ruleId);
++      }
++    }
++    return due;
++  }
++
+   detach(ruleId: string): ScheduledRule | undefined {
+     const entry = this.rules.get(ruleId);
+     if (!entry) {
+       return undefined;
+     }
+     this.rules.delete(ruleId);
+-    entry.clearTimer?.();
+-    entry.clearTimer = null;
++    const key = paneKey(entry.deviceId, entry.paneId);
++    const group = this.groups.get(key);
++    if (!group) {
++      return entry;
++    }
++    group.ruleIds.delete(ruleId);
++    if (group.ruleIds.size === 0) {
++      group.clearTimer?.();
++      group.clearTimer = null;
++      if (!group.tickPromise) {
++        this.groups.delete(key);
++      }
++      return entry;
++    }
++    let min = Number.POSITIVE_INFINITY;
++    for (const id of group.ruleIds) {
++      const remaining = this.rules.get(id);
++      if (remaining && remaining.intervalMs < min) {
++        min = remaining.intervalMs;
++      }
++    }
++    if (min !== group.minIntervalMs) {
++      group.minIntervalMs = min;
++      this.armGroup(group);
++    }
+     return entry;
+   }
+ 
+@@ -85,9 +147,73 @@ export class WatchRuleScheduler {
+     return promise;
+   }
+ 
++  async runPaneExclusive(deviceId: string, paneId: string, fn: () => Promise<void>): Promise<void> {
++    const group = this.groups.get(paneKey(deviceId, paneId));
++    if (!group || group.tickPromise) {
++      return;
++    }
++    const promise = (async () => {
++      try {
++        await fn();
++      } catch (error) {
++        console.error(`[watch] pane tick failed for ${deviceId} ${paneId}:`, error);
++      }
++    })().finally(() => {
++      if (group.tickPromise === promise) {
++        group.tickPromise = null;
++      }
++      if (group.ruleIds.size === 0) {
++        this.groups.delete(paneKey(deviceId, paneId));
++      }
++    });
++    group.tickPromise = promise;
++    return promise;
++  }
++
+   async waitForTick(entry: ScheduledRule): Promise<void> {
+     if (entry.tickPromise) {
+       await entry.tickPromise.catch(() => undefined);
+     }
++    const group = this.groups.get(paneKey(entry.deviceId, entry.paneId));
++    if (group?.tickPromise) {
++      await group.tickPromise.catch(() => undefined);
++    }
++  }
++
++  private attachToGroup(
++    entry: ScheduledRule,
++    onTick: (deviceId: string, paneId: string) => void,
++    scheduleInterval: (fn: () => void, ms: number) => () => void
++  ): void {
++    const key = paneKey(entry.deviceId, entry.paneId);
++    let group = this.groups.get(key);
++    if (!group) {
++      group = {
++        deviceId: entry.deviceId,
++        paneId: entry.paneId,
++        ruleIds: new Set([entry.ruleId]),
++        minIntervalMs: entry.intervalMs,
++        clearTimer: null,
++        tickPromise: null,
++        onTick,
++        scheduleInterval,
++      };
++      this.groups.set(key, group);
++      this.armGroup(group);
++      return;
++    }
++    group.ruleIds.add(entry.ruleId);
++    if (entry.intervalMs < group.minIntervalMs) {
++      group.minIntervalMs = entry.intervalMs;
++      this.armGroup(group);
++    }
++  }
++
++  private armGroup(group: PaneGroup): void {
++    group.clearTimer?.();
++    group.clearTimer = group.scheduleInterval(
++      () => group.onTick(group.deviceId, group.paneId),
++      group.minIntervalMs
++    );
+   }
+ }
+diff --git a/apps/gateway/src/watch/service.test.ts b/apps/gateway/src/watch/service.test.ts
+index 081e2832..42f6b074 100644
+--- a/apps/gateway/src/watch/service.test.ts
++++ b/apps/gateway/src/watch/service.test.ts
+@@ -15,7 +15,7 @@ import {
+   getWatchRuleById,
+   getWatchRuleState,
+ } from '../db/watch';
+-import { WatchService, type WatchRuntimeLike, effectiveIntervalSeconds } from './service';
++import { type WatchRuntimeLike, WatchService, effectiveIntervalSeconds } from './service';
+ 
+ const TEST_DEVICE_ID = 'watch-service-test-device';
+ 
+@@ -72,7 +72,10 @@ afterAll(() => {
+ 
+ interface Harness {
+   service: WatchService;
+-  notifications: Array<{ eventType: EventType; event: Omit<WebhookEvent, 'eventType' | 'timestamp'> }>;
++  notifications: Array<{
++    eventType: EventType;
++    event: Omit<WebhookEvent, 'eventType' | 'timestamp'>;
++  }>;
+   broadcasts: Array<{ ruleId: string; eventType: number; payload: unknown }>;
+   acquires: string[];
+   releases: string[];
+@@ -83,7 +86,7 @@ interface Harness {
+   setCaptureError: (error: Error | null) => void;
+   setNow: (date: Date) => void;
+   advanceMinutes: (minutes: number) => void;
+-  timers: Array<{ ms: number; cleared: boolean }>;
++  timers: Array<{ ms: number; cleared: boolean; fire: () => void }>;
+ }
+ 
+ function createHarness(options: { llmBaseUrl?: string; errorThreshold?: number } = {}): Harness {
+@@ -138,8 +141,8 @@ function createHarness(options: { llmBaseUrl?: string; errorThreshold?: number }
+       broadcasts.push({ ruleId, eventType, payload });
+     },
+     now: () => now,
+-    scheduleInterval: (_fn, ms) => {
+-      const entry = { ms, cleared: false };
++    scheduleInterval: (fn, ms) => {
++      const entry = { ms, cleared: false, fire: fn };
+       timers.push(entry);
+       return () => {
+         entry.cleared = true;
+@@ -250,6 +253,29 @@ describe('WatchService - 调度与设备连接分组', () => {
+ 
+     await harness.service.stop();
+   });
++
++  test('同 pane 100 条规则每个 polling tick 只 capture 一次', async () => {
++    const harness = createHarness();
++    const rules = Array.from({ length: 100 }, (_, i) =>
++      harness.makeRule({ pattern: `P${i}`, fireMode: 'repeat' })
++    );
++    harness.setScreen('quiet\n');
++    await harness.service.start();
++
++    expect(harness.timers.filter((t) => !t.cleared)).toHaveLength(1);
++    for (const rule of rules) {
++      expect(harness.service.isRuleScheduled(rule.id)).toBe(true);
++    }
++
++    await harness.service.tickPane(TEST_DEVICE_ID, '%1');
++    expect(harness.captureCalls).toEqual(['%1']);
++    expect(rules.every((rule) => harness.service.getSamples(rule.id).length === 1)).toBe(true);
++
++    await harness.service.tickPane(TEST_DEVICE_ID, '%1');
++    expect(harness.captureCalls).toEqual(['%1', '%1']);
++
++    await harness.service.stop();
++  });
+ });
+ 
+ describe('WatchService - match 型触发', () => {
+@@ -407,7 +433,9 @@ describe('WatchService - LLM 介入', () => {
+     await harness.service.tickRule(rule.id);
+     expect(harness.notifications).toHaveLength(1);
+     expect(harness.notifications[0].eventType).toBe('watch_triggered');
+-    const message = String((harness.notifications[0].event.payload as Record<string, unknown>).message);
++    const message = String(
++      (harness.notifications[0].event.payload as Record<string, unknown>).message
++    );
+     expect(message).not.toMatch(UNCONFIRMED_FRAGMENT);
+ 
+     await harness.service.stop();
+@@ -435,7 +463,9 @@ describe('WatchService - LLM 介入', () => {
+     await harness.service.tickRule(rule.id);
+     // fail-open：触发 + 标注未经确认 + 模型不可用告警
+     const triggered = harness.notifications.filter((n) => n.eventType === 'watch_triggered');
+-    const unavailable = harness.notifications.filter((n) => n.eventType === 'watch_model_unavailable');
++    const unavailable = harness.notifications.filter(
++      (n) => n.eventType === 'watch_model_unavailable'
++    );
+     expect(triggered).toHaveLength(1);
+     expect(unavailable).toHaveLength(1);
+     expect(String((triggered[0].event.payload as Record<string, unknown>).message)).toMatch(
+diff --git a/apps/gateway/src/watch/service.ts b/apps/gateway/src/watch/service.ts
+index 456d66de..d5d5bf9b 100644
+--- a/apps/gateway/src/watch/service.ts
++++ b/apps/gateway/src/watch/service.ts
+@@ -15,7 +15,7 @@ import {
+   getWatchRuleById,
+   getWatchRuleState,
+   updateWatchRule,
+-  upsertWatchRuleState,
++  writeWatchRuleState,
+ } from '../db/watch';
+ import { eventNotifier } from '../events';
+ import { resolveLanguageModel } from '../llm/provider-registry';
+@@ -41,10 +41,7 @@ export interface WatchServiceDeps {
+   listEnabledRules: () => WatchRuleRecord[];
+   getRule: (id: string) => WatchRuleRecord | null;
+   getState: (id: string) => WatchRuleStateRecord | null;
+-  upsertState: (
+-    id: string,
+-    updates: Partial<Omit<WatchRuleStateRecord, 'ruleId'>>
+-  ) => WatchRuleStateRecord;
++  upsertState: (id: string, updates: Partial<Omit<WatchRuleStateRecord, 'ruleId'>>) => void;
+   updateRule: (
+     id: string,
+     updates: Partial<Omit<WatchRuleRecord, 'id' | 'createdAt' | 'updatedAt'>>
+@@ -76,7 +73,7 @@ const defaultDeps: WatchServiceDeps = {
+   listEnabledRules: getEnabledWatchRules,
+   getRule: getWatchRuleById,
+   getState: getWatchRuleState,
+-  upsertState: upsertWatchRuleState,
++  upsertState: writeWatchRuleState,
+   updateRule: updateWatchRule,
+   deleteRule: deleteWatchRule,
+   acquireRuntime: (deviceId) => tmuxRuntimeRegistry.acquire(deviceId),
+@@ -172,10 +169,16 @@ export class WatchService {
+     return this.scheduler.runExclusive(ruleId, () => this.runTick(ruleId));
+   }
+ 
++  async tickPane(deviceId: string, paneId: string): Promise<void> {
++    return this.scheduler.runPaneExclusive(deviceId, paneId, () =>
++      this.runPaneTick(deviceId, paneId)
++    );
++  }
++
+   private addRule(rule: WatchRuleRecord): void {
+     const added = this.scheduler.add(
+       rule,
+-      (ruleId) => void this.tickRule(ruleId),
++      (deviceId, paneId) => void this.tickPane(deviceId, paneId),
+       this.deps.scheduleInterval
+     );
+     if (!added) {
+@@ -202,13 +205,19 @@ export class WatchService {
+   }
+ 
+   private async runTick(ruleId: string): Promise<void> {
+-    const rule = this.deps.getRule(ruleId);
+-    if (!rule || !rule.enabled) {
+-      await this.teardownRule(ruleId);
++    const captured = await this.captureForRule(ruleId);
++    if (!captured) {
+       return;
+     }
++    await this.evaluateCaptured(captured.rule, captured.screen, captured.now);
++  }
+ 
+-    const device = this.runtimePool.get(rule.deviceId);
++  private async runPaneTick(deviceId: string, paneId: string): Promise<void> {
++    const dueIds = this.scheduler.takeDueRuleIds(deviceId, paneId);
++    if (dueIds.length === 0) {
++      return;
++    }
++    const device = this.runtimePool.get(deviceId);
+     if (!device) {
+       return;
+     }
+@@ -217,23 +226,82 @@ export class WatchService {
+     let screen: string;
+     try {
+       const runtime = await this.runtimePool.ensureRuntime(device);
+-      screen = await runtime.capturePaneText(rule.paneId);
++      screen = await runtime.capturePaneText(paneId);
+     } catch (error) {
+-      if (!this.scheduler.has(rule.id)) {
+-        return;
++      for (const ruleId of dueIds) {
++        await this.handleCaptureFailure(ruleId, error, now);
+       }
+-      const message = toErrorMessage(error);
+-      if (isTargetMissingMessage(message)) {
+-        await this.handlePaneGone(rule);
+-        return;
++      return;
++    }
++
++    for (const ruleId of dueIds) {
++      if (!this.scheduler.has(ruleId)) {
++        continue;
+       }
+-      await this.recordRuleError(rule, message, now);
++      await this.scheduler.runExclusive(ruleId, async () => {
++        const rule = this.deps.getRule(ruleId);
++        if (!rule || !rule.enabled) {
++          await this.teardownRule(ruleId);
++          return;
++        }
++        await this.evaluateCaptured(rule, screen, now);
++      });
++    }
++  }
++
++  private async captureForRule(
++    ruleId: string
++  ): Promise<{ rule: WatchRuleRecord; screen: string; now: Date } | null> {
++    const rule = this.deps.getRule(ruleId);
++    if (!rule || !rule.enabled) {
++      await this.teardownRule(ruleId);
++      return null;
++    }
++
++    const device = this.runtimePool.get(rule.deviceId);
++    if (!device) {
++      return null;
++    }
++
++    const now = this.deps.now();
++    try {
++      const runtime = await this.runtimePool.ensureRuntime(device);
++      const screen = await runtime.capturePaneText(rule.paneId);
++      if (!this.scheduler.has(rule.id)) {
++        return null;
++      }
++      return { rule, screen, now };
++    } catch (error) {
++      await this.handleCaptureFailure(ruleId, error, now, rule);
++      return null;
++    }
++  }
++
++  private async handleCaptureFailure(
++    ruleId: string,
++    error: unknown,
++    now: Date,
++    knownRule?: WatchRuleRecord
++  ): Promise<void> {
++    if (!this.scheduler.has(ruleId)) {
+       return;
+     }
+-    if (!this.scheduler.has(rule.id)) {
++    const rule = knownRule ?? this.deps.getRule(ruleId);
++    if (!rule) {
+       return;
+     }
++    const message = toErrorMessage(error);
++    if (isTargetMissingMessage(message)) {
++      await this.handlePaneGone(rule);
++      return;
++    }
++    await this.recordRuleError(rule, message, now);
++  }
+ 
++  private async evaluateCaptured(rule: WatchRuleRecord, screen: string, now: Date): Promise<void> {
++    if (!this.scheduler.has(rule.id)) {
++      return;
++    }
+     const state = this.deps.getState(rule.id);
+     if (rule.triggerType === 'llm') {
+       await this.processLlmRule(rule, state, screen, now);

@@ -1,0 +1,1897 @@
+diff --git a/packages/ghostty-terminal/bench/render-bridge.bench.ts b/packages/ghostty-terminal/bench/render-bridge.bench.ts
+index 109c62a3..b394c059 100644
+--- a/packages/ghostty-terminal/bench/render-bridge.bench.ts
++++ b/packages/ghostty-terminal/bench/render-bridge.bench.ts
+@@ -52,6 +52,11 @@ const SCENARIOS: Scenario[] = [
+       write(`${cursorTo(row)}\x1b[K${rowPayload(frame)}`);
+     },
+   },
++  {
++    name: 'clean frames (0/40)',
++    dirtyRows: 0,
++    mutate: () => {},
++  },
+   {
+     name: '20% dirty rows (8/40)',
+     dirtyRows: Math.round(ROWS * 0.2),
+diff --git a/packages/ghostty-terminal/src/canvas-renderer.layers.test.ts b/packages/ghostty-terminal/src/canvas-renderer.layers.test.ts
+index 689ee2c4..76485bac 100644
+--- a/packages/ghostty-terminal/src/canvas-renderer.layers.test.ts
++++ b/packages/ghostty-terminal/src/canvas-renderer.layers.test.ts
+@@ -116,6 +116,7 @@ let previousClearInterval: typeof globalThis.clearInterval;
+ 
+ function setup(): {
+   renderer: CanvasRenderer;
++  mainCanvas: FakeCanvas;
+   selectionCanvas: FakeCanvas;
+   cursorCanvas: FakeCanvas;
+ } {
+@@ -137,7 +138,12 @@ function setup(): {
+   });
+ 
+   // 构造顺序：main / link / selection / cursor
+-  return { renderer, selectionCanvas: created[2], cursorCanvas: created[3] };
++  return {
++    renderer,
++    mainCanvas: created[0],
++    selectionCanvas: created[2],
++    cursorCanvas: created[3],
++  };
+ }
+ 
+ function drain(canvas: FakeCanvas): DrawOp[] {
+@@ -181,6 +187,23 @@ afterEach(() => {
+ });
+ 
+ describe('选区层只在选区状态变化时重画', () => {
++  // 拖拽期间的每帧入口：只重画选区层，主画布与光标层一笔都不动。
++  test('drawSelectionOnly 不碰主画布与光标层，且对同一批矩形去重', () => {
++    const { renderer, mainCanvas, selectionCanvas, cursorCanvas } = setup();
++    renderFrame(renderer, { selectionRects: [{ row: 0, x: 1, width: 2 }] });
++    drain(mainCanvas);
++    drain(selectionCanvas);
++    drain(cursorCanvas);
++
++    renderer.drawSelectionOnly([{ row: 1, x: 0, width: 3 }], 'rgba(9,9,9,0.5)');
++    expect(drain(selectionCanvas).length).toBeGreaterThan(0);
++    expect(drain(mainCanvas)).toEqual([]);
++    expect(drain(cursorCanvas)).toEqual([]);
++
++    renderer.drawSelectionOnly([{ row: 1, x: 0, width: 3 }], 'rgba(9,9,9,0.5)');
++    expect(drain(selectionCanvas)).toEqual([]);
++  });
++
+   test('无选区的连续帧不碰选区层', () => {
+     const { renderer, selectionCanvas } = setup();
+     renderFrame(renderer);
+diff --git a/packages/ghostty-terminal/src/canvas-renderer.ts b/packages/ghostty-terminal/src/canvas-renderer.ts
+index 66b651f1..77ba13f3 100644
+--- a/packages/ghostty-terminal/src/canvas-renderer.ts
++++ b/packages/ghostty-terminal/src/canvas-renderer.ts
+@@ -451,6 +451,11 @@ export class CanvasRenderer {
+     this.linkContext.clearRect(0, 0, this.linkCanvas.width, this.linkCanvas.height);
+   }
+ 
++  // 只重画选区层：拖拽期间的唯一变化就是选区矩形，主画布/光标层一个像素都不用碰。
++  drawSelectionOnly(rects: GhosttySelectionRect[], color: string): void {
++    this.drawSelection(rects, color, false);
++  }
++
+   // 选区层与主画布的按行重绘互不相干：只在选区矩形集、选区色或画布尺寸变化时重画，
+   // 没有选区的常态帧（绝大多数）完全不碰这一层。
+   private drawSelection(rects: GhosttySelectionRect[], color: string, wiped: boolean): void {
+diff --git a/packages/ghostty-terminal/src/render-state.cache.test.ts b/packages/ghostty-terminal/src/render-state.cache.test.ts
+index 342d1cfc..d5e98869 100644
+--- a/packages/ghostty-terminal/src/render-state.cache.test.ts
++++ b/packages/ghostty-terminal/src/render-state.cache.test.ts
+@@ -1,6 +1,6 @@
+ // render-state 的跨帧缓存：调色板按 colors 结构体字节比对失效，行按逐 cell 比对复用。
+-// 内核在当前 ghostty 构建里把每一行恒报为 dirty（见 bench/render-bridge.bench.ts），
+-// 因此「哪些行真的要重画」完全由这里的比对决定，钉住其失效条件。
++// 内核报脏的行才会走逐 cell 比对（短路见 render-state.dirty.test.ts），比对结果决定
++// 「哪些行真的要重画」，这里钉住其失效条件。
+ import { describe, expect, test } from 'bun:test';
+ import { type GhosttyBindings, getGhosttyBindings } from './ghostty-wasm';
+ import {
+diff --git a/packages/ghostty-terminal/src/render-state.dirty.test.ts b/packages/ghostty-terminal/src/render-state.dirty.test.ts
+new file mode 100644
+index 00000000..59ee54e5
+--- /dev/null
++++ b/packages/ghostty-terminal/src/render-state.dirty.test.ts
+@@ -0,0 +1,287 @@
++// 行 dirty 短路：内核报「本行未脏」时 iterateRows 整行沿用上一帧、一个 cell 都不读。
++// dirty 位遵循「消费即清」，读后必须写回 false，正确性完全押在内核的标脏范围上，
++// 因此这里用差分测试钉死：同一批字节喂两台终端，一台跨帧复用、一台每步换新 render state
++// （必然全扫），逐 cell 比对两者产出必须完全一致。
++import { describe, expect, test } from 'bun:test';
++import { type GhosttyBindings, getGhosttyBindings } from './ghostty-wasm';
++import {
++  createRenderState,
++  disposeRenderStateResources,
++  iterateRows,
++  readRenderSnapshotMeta,
++  updateRenderState,
++} from './render-state';
++import type { GhosttyRenderRow, GhosttyTheme } from './types';
++
++const THEME: GhosttyTheme = {
++  background: '#111111',
++  foreground: '#eeeeee',
++  cursor: '#eeeeee',
++  selectionBackground: 'rgba(120,120,120,0.4)',
++  black: '#000000',
++  red: '#cc6666',
++  green: '#b5bd68',
++  yellow: '#f0c674',
++  blue: '#81a2be',
++  magenta: '#b294bb',
++  cyan: '#8abeb7',
++  white: '#c5c8c6',
++  brightBlack: '#666666',
++  brightRed: '#d54e53',
++  brightGreen: '#b9ca4a',
++  brightYellow: '#e7c547',
++  brightBlue: '#7aa6da',
++  brightMagenta: '#c397d8',
++  brightCyan: '#70c0b1',
++  brightWhite: '#eaeaea',
++};
++
++const THEME_LIGHT: GhosttyTheme = { ...THEME, background: '#fafafa', red: '#aa0000' };
++
++const COLS = 24;
++const ROWS = 6;
++
++type Step = { name: string; run: (bindings: GhosttyBindings, terminal: number) => void };
++
++const write =
++  (data: string): Step['run'] =>
++  (bindings, terminal) => {
++    bindings.writeVt(terminal, data);
++  };
++
++// 覆盖「行内容可能变化」的各类来源：写入、擦除、光标移动、内容滚动、视口滚动、
++// resize（含软换行重排）、主题换色、宽字符与组合字符。
++const STEPS: Step[] = [
++  { name: '初始填充', run: write('\x1b[2J\x1b[H') },
++  ...Array.from({ length: 10 }, (_, index) => ({
++    name: `写第 ${index} 行`,
++    run: write(`line-${index} 内容 ${index}\r\n`),
++  })),
++  { name: '无输入的空帧', run: () => {} },
++  { name: '改中间一行', run: write('\x1b[3;1HZZZ') },
++  { name: '光标移到别处', run: write('\x1b[1;1H') },
++  { name: '行内擦除', run: write('\x1b[2;3H\x1b[K') },
++  { name: '带 SGR 写入', run: write('\x1b[4;1H\x1b[1;31mred bold\x1b[0m') },
++  { name: '宽字符与组合字符', run: write('\x1b[5;1H宽字符 é ab') },
++  { name: '内容滚动一行', run: write('\x1b[6;1H\n') },
++  {
++    name: '视口上滚 1 行',
++    run: (bindings, terminal) => bindings.scrollViewportDelta(terminal, -1),
++  },
++  { name: '视口上滚后空帧', run: () => {} },
++  { name: '视口下滚 1 行', run: (bindings, terminal) => bindings.scrollViewportDelta(terminal, 1) },
++  { name: '视口回到顶部', run: (bindings, terminal) => bindings.scrollViewportTop(terminal) },
++  { name: '视口回到底部', run: (bindings, terminal) => bindings.scrollViewportBottom(terminal) },
++  { name: '软换行超长行', run: write(`\x1b[1;1H${'w'.repeat(COLS * 2 + 5)}`) },
++  {
++    name: 'resize 变窄（重排软换行）',
++    run: (bindings, terminal) =>
++      bindings.resizeTerminal(terminal, 16, ROWS, { width: 8, height: 16 }),
++  },
++  { name: 'resize 后空帧', run: () => {} },
++  {
++    name: 'resize 变宽',
++    run: (bindings, terminal) =>
++      bindings.resizeTerminal(terminal, COLS, ROWS, { width: 8, height: 16 }),
++  },
++  {
++    name: '切换主题',
++    run: (bindings, terminal) => bindings.setTerminalTheme(terminal, THEME_LIGHT),
++  },
++  { name: '切主题后空帧', run: () => {} },
++  { name: '清屏', run: write('\x1b[2J\x1b[H') },
++  { name: '备用屏', run: write('\x1b[?1049h\x1b[H alt screen ') },
++  { name: '回主屏', run: write('\x1b[?1049l') },
++];
++
++// 只保留会被 canvas / 选择模型消费的字段：行几何、文本、逐 cell 的形与色。
++function project(rows: GhosttyRenderRow[]): unknown {
++  return rows.map((row) => ({
++    y: row.y,
++    wrap: row.wrap,
++    wrapContinuation: row.wrapContinuation,
++    text: row.text,
++    cells: row.cells.map((cell) => ({
++      x: cell.x,
++      text: cell.text,
++      codepoints: [...cell.codepoints],
++      widthKind: cell.widthKind,
++      hasText: cell.hasText,
++      style: { ...cell.style },
++      fgColor: cell.fgColor ? { ...cell.fgColor } : null,
++      bgColor: cell.bgColor ? { ...cell.bgColor } : null,
++    })),
++  }));
++}
++
++// 只截 bindRenderStateRowCells：它是「本行走了逐 cell 全扫」的唯一入口。
++function countingBindings(bindings: GhosttyBindings): {
++  proxy: GhosttyBindings;
++  scannedRows: () => number;
++} {
++  let scanned = 0;
++  const proxy = new Proxy(bindings, {
++    get(target, prop) {
++      if (prop === 'bindRenderStateRowCells') {
++        return (iterator: number, cells: number) => {
++          scanned += 1;
++          target.bindRenderStateRowCells(iterator, cells);
++        };
++      }
++      const value = Reflect.get(target, prop) as unknown;
++      return typeof value === 'function' ? value.bind(target) : value;
++    },
++  }) as GhosttyBindings;
++
++  return { proxy, scannedRows: () => scanned };
++}
++
++describe('行 dirty 短路', () => {
++  test('跨帧复用与每帧全扫的产出逐 cell 一致', async () => {
++    const bindings = await getGhosttyBindings();
++    const reused = bindings.createTerminal(COLS, ROWS, 200);
++    const fresh = bindings.createTerminal(COLS, ROWS, 200);
++    bindings.setTerminalTheme(reused, THEME);
++    bindings.setTerminalTheme(fresh, THEME);
++    const reusedState = createRenderState(bindings);
++
++    try {
++      for (const step of STEPS) {
++        step.run(bindings, reused);
++        step.run(bindings, fresh);
++
++        updateRenderState(reusedState, reused);
++        const actual = project(Array.from(iterateRows(reusedState)));
++
++        // 全新 render state 没有上一帧可比，必然逐 cell 全扫，作为基准真值。
++        const freshState = createRenderState(bindings);
++        updateRenderState(freshState, fresh);
++        const expected = project(Array.from(iterateRows(freshState)));
++        disposeRenderStateResources(freshState);
++
++        expect({ step: step.name, rows: actual }).toEqual({ step: step.name, rows: expected });
++      }
++    } finally {
++      disposeRenderStateResources(reusedState);
++      bindings.freeTerminal(reused);
++      bindings.freeTerminal(fresh);
++    }
++  });
++
++  test('未脏的行不读任何 cell，被改的行才全扫', async () => {
++    const real = await getGhosttyBindings();
++    const { proxy, scannedRows } = countingBindings(real);
++    const terminal = proxy.createTerminal(COLS, ROWS, 200);
++    const state = createRenderState(proxy);
++
++    const frame = () => {
++      updateRenderState(state, terminal);
++      const rows = Array.from(iterateRows(state));
++      return { rows, meta: readRenderSnapshotMeta(state) };
++    };
++
++    try {
++      proxy.writeVt(terminal, 'alpha\r\nbeta\r\ngamma');
++      const first = frame();
++      // 首帧没有可比基线：每一行都要全扫。
++      expect(scannedRows()).toBe(ROWS);
++      expect(first.meta.dirty).toBe('full');
++
++      const before = scannedRows();
++      const idle = frame();
++      expect(scannedRows()).toBe(before);
++      expect(idle.meta.dirty).toBe('clean');
++      for (let index = 0; index < idle.rows.length; index += 1) {
++        expect(idle.rows[index].cells).toBe(first.rows[index].cells);
++      }
++
++      // 改第 1 行：内核把该行与光标离开的行标脏，只有这些行才重新扫 cell。
++      const beforeWrite = scannedRows();
++      proxy.writeVt(terminal, '\x1b[1;1HZ');
++      const after = frame();
++      const rescanned = scannedRows() - beforeWrite;
++      expect(rescanned).toBeGreaterThan(0);
++      expect(rescanned).toBeLessThan(ROWS);
++      expect(after.meta.dirty).toBe('partial');
++      expect(after.rows[0].dirty).toBeTrue();
++      expect(after.rows[0].text.startsWith('Z')).toBeTrue();
++      expect(after.rows[5].cells).toBe(first.rows[5].cells);
++    } finally {
++      disposeRenderStateResources(state);
++      proxy.freeTerminal(terminal);
++    }
++  });
++
++  test('视口滚动一行后所有行重画且内容正确', async () => {
++    const bindings = await getGhosttyBindings();
++    const terminal = bindings.createTerminal(COLS, 4, 200);
++    const state = createRenderState(bindings);
++
++    const frame = () => {
++      updateRenderState(state, terminal);
++      const rows = Array.from(iterateRows(state));
++      return { rows, meta: readRenderSnapshotMeta(state) };
++    };
++
++    try {
++      for (let index = 0; index < 12; index += 1) {
++        bindings.writeVt(terminal, `line-${index}\r\n`);
++      }
++      frame();
++      expect(frame().meta.dirty).toBe('clean');
++
++      bindings.scrollViewportDelta(terminal, -1);
++      const scrolled = frame();
++      expect(scrolled.meta.dirty).toBe('full');
++      expect(scrolled.rows.every((row) => row.dirty)).toBeTrue();
++      expect(scrolled.rows.map((row) => row.text.trimEnd())).toEqual([
++        'line-8',
++        'line-9',
++        'line-10',
++        'line-11',
++      ]);
++
++      bindings.scrollViewportDelta(terminal, 1);
++      const back = frame();
++      expect(back.rows.map((row) => row.text.trimEnd())).toEqual([
++        'line-9',
++        'line-10',
++        'line-11',
++        '',
++      ]);
++    } finally {
++      disposeRenderStateResources(state);
++      bindings.freeTerminal(terminal);
++    }
++  });
++
++  test('迭代中途中断后丢弃缓存，下一帧全扫重建', async () => {
++    const real = await getGhosttyBindings();
++    const { proxy, scannedRows } = countingBindings(real);
++    const terminal = proxy.createTerminal(COLS, ROWS, 200);
++    const state = createRenderState(proxy);
++
++    try {
++      proxy.writeVt(terminal, 'alpha\r\nbeta');
++      updateRenderState(state, terminal);
++      Array.from(iterateRows(state));
++
++      // 只消费前两行就丢下生成器：这两行的 dirty 位已被消费，缓存必须整体作废。
++      updateRenderState(state, terminal);
++      const partial = iterateRows(state);
++      partial.next();
++      partial.next();
++      partial.return(undefined);
++
++      const before = scannedRows();
++      updateRenderState(state, terminal);
++      const rows = Array.from(iterateRows(state));
++      expect(scannedRows() - before).toBe(ROWS);
++      expect(rows[0].text.startsWith('alpha')).toBeTrue();
++      expect(rows[1].text.startsWith('beta')).toBeTrue();
++    } finally {
++      disposeRenderStateResources(state);
++      proxy.freeTerminal(terminal);
++    }
++  });
++});
+diff --git a/packages/ghostty-terminal/src/render-state.ts b/packages/ghostty-terminal/src/render-state.ts
+index 5c4dda9c..5fe939cf 100644
+--- a/packages/ghostty-terminal/src/render-state.ts
++++ b/packages/ghostty-terminal/src/render-state.ts
+@@ -329,7 +329,9 @@ function readRawCellEnum(
+   return bindings.view().getInt32(scratch.u32, true);
+ }
+ 
+-function readReportedRowDirty(resources: GhosttyRenderStateResources): boolean {
++// 内核的行 dirty 位遵循「消费即清」：读到 true 必须写回 false，否则它一直是 true
++//（旧实现从不回写，于是每行恒报脏，只能靠逐 cell 比对判断变化）。
++function consumeReportedRowDirty(resources: GhosttyRenderStateResources): boolean {
+   const scratch = ensureScratch(resources);
+   const bindings = resources.bindings;
+   assertReadResult(
+@@ -340,7 +342,17 @@ function readReportedRowDirty(resources: GhosttyRenderStateResources): boolean {
+     ),
+     'bool'
+   );
+-  return bindings.view().getUint8(scratch.u8) !== 0;
++  if (bindings.view().getUint8(scratch.u8) === 0) {
++    return false;
++  }
++
++  bindings.view().setUint8(scratch.u8, 0);
++  bindings.setRenderStateRowValue(
++    resources.rowIteratorHandle,
++    GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
++    scratch.u8
++  );
++  return true;
+ }
+ 
+ function readCellColor(
+@@ -763,6 +775,12 @@ function readRow(
+   rowIndex: number,
+   previous: GhosttyRenderRow | null
+ ): GhosttyRenderRow {
++  // dirty 位先读：内核报本行未脏且上一帧可比时整行沿用，一个 cell 都不读。
++  const reportedDirty = consumeReportedRowDirty(resources);
++  if (!reportedDirty && previous) {
++    return previous.dirty ? { ...previous, dirty: false } : previous;
++  }
++
+   const rawRow = readRowRaw(resources);
+   resources.bindings.bindRenderStateRowCells(resources.rowIteratorHandle, resources.rowCellsHandle);
+ 
+@@ -771,9 +789,6 @@ function readRow(
+ 
+   const wrap = readRawRowBool(resources, rawRow, GHOSTTY_ROW_DATA_WRAP);
+   const wrapContinuation = readRawRowBool(resources, rawRow, GHOSTTY_ROW_DATA_WRAP_CONTINUATION);
+-  // WASM 侧的行 dirty 位在当前 ghostty 构建里恒为 true（见 bench 报告），只作为
+-  // 「必须重画」的下限；真正的重画判据是上面的逐 cell 比对。
+-  const reportedDirty = readReportedRowDirty(resources);
+ 
+   const reused = changed
+     ? null
+@@ -885,6 +900,9 @@ export function* iterateRows(
+   );
+ 
+   const rows: GhosttyRenderRow[] = [];
++  // dirty 位在迭代中逐行被消费，生成器一旦被中途丢弃这一帧就不能再当基线：
++  // 先作废缓存，走完整轮才写回。
++  resources.previousRows = null;
+   let rowIndex = 0;
+   while (
+     rowIndex < meta.rows &&
+diff --git a/packages/ghostty-terminal/src/terminal-render-coordinator.ts b/packages/ghostty-terminal/src/terminal-render-coordinator.ts
+index 13fb4b18..792417c8 100644
+--- a/packages/ghostty-terminal/src/terminal-render-coordinator.ts
++++ b/packages/ghostty-terminal/src/terminal-render-coordinator.ts
+@@ -51,6 +51,7 @@ export type RenderCoordinatorHost = {
+   selectionColor(): string;
+   fileLinkContext(): FileLinkContext | null;
+   onSnapshot(snapshot: RenderSnapshot): void;
++  onSelectionText(text: string | null): void;
+ };
+ 
+ // 渲染编排：拉取 WASM 快照 → 维护绝对行号的行模型缓存 → 交给 CanvasRenderer 出帧，
+@@ -68,6 +69,7 @@ export class TerminalRenderCoordinator {
+   private readonly loop = new TerminalRenderLoop(() => {
+     this.renderNow();
+   });
++  private selectionFrame: number | null = null;
+   private linkOverlayDrawnOffset = -1;
+   private viewportOffset = 0;
+   private viewportRows = DEFAULT_ROWS;
+@@ -107,6 +109,28 @@ export class TerminalRenderCoordinator {
+     this.loop.schedule();
+   }
+ 
++  // 选区拖拽专用：本帧只有选区矩形变了，复用上一次全渲染留下的 renderedRows / lineCache
++  // 重画选区层，不碰 WASM，也不重扫任何 cell；每帧最多一次。
++  scheduleSelectionRepaint(): void {
++    if (this.selectionFrame !== null) {
++      return;
++    }
++
++    this.selectionFrame = requestAnimationFrame(() => {
++      this.selectionFrame = null;
++      const renderer = this.renderer;
++      if (!renderer) {
++        return;
++      }
++
++      renderer.drawSelectionOnly(
++        this.host.selectionRects(this.viewportOffset, this.viewportRows),
++        this.host.selectionColor()
++      );
++      this.host.onSelectionText(this.host.selectionText());
++    });
++  }
++
+   // 标记本次渲染必须全画并立即同步执行（不等 rAF）：DOM 重插入或容器尺寸变化后
+   // canvas 位图可能已被清空，但内核未必同步报 dirty='full'（issue #45 bug 3）。
+   forceFullRepaint(): void {
+@@ -116,6 +140,7 @@ export class TerminalRenderCoordinator {
+ 
+   cancelPending(): void {
+     this.loop.cancelPending();
++    this.cancelSelectionRepaint();
+   }
+ 
+   setTheme(theme: GhosttyTheme): void {
+@@ -189,6 +214,9 @@ export class TerminalRenderCoordinator {
+       return;
+     }
+ 
++    // 全渲染本身会重画选区层，排队中的选区帧就是多余的。
++    this.cancelSelectionRepaint();
++
+     // 本帧若被 forceFullRepaint 标记，传给 renderer 让它绕过 dirty='clean' 早退
+     //（issue #45 bug 3）。
+     const forceFull = this.loop.consumeForceFull();
+@@ -239,12 +267,22 @@ export class TerminalRenderCoordinator {
+   }
+ 
+   dispose(): void {
++    this.cancelSelectionRepaint();
+     this.renderer?.dispose();
+     this.renderer = null;
+     this.lineCache.clear();
+     this.renderedRows = [];
+   }
+ 
++  private cancelSelectionRepaint(): void {
++    if (this.selectionFrame === null) {
++      return;
++    }
++
++    cancelAnimationFrame(this.selectionFrame);
++    this.selectionFrame = null;
++  }
++
+   private lineModelFor(row: GhosttyRenderRow): SelectionLineModel {
+     const cached = this.lineModelByCells.get(row.cells);
+     if (cached && cached.wrappedToNext === row.wrap) {
+diff --git a/packages/ghostty-terminal/src/terminal-selection.drag.test.ts b/packages/ghostty-terminal/src/terminal-selection.drag.test.ts
+new file mode 100644
+index 00000000..27deb45a
+--- /dev/null
++++ b/packages/ghostty-terminal/src/terminal-selection.drag.test.ts
+@@ -0,0 +1,191 @@
++// 选区拖拽路径：mousemove 不再同步跑全渲染。同 cell 的移动直接丢弃，跨 cell 的移动
++// 只排一帧「选区层重绘」（复用上一次全渲染留下的行模型，不读 WASM），自动滚动 / 输出 /
++// resize 仍走全渲染。
++import { afterEach, describe, expect, test } from 'bun:test';
++import type { GhosttyBindings } from './ghostty-wasm';
++import type { GhosttyRenderStateResources } from './render-state';
++import type { SelectionLineModel } from './selection-model';
++import { TerminalRenderCoordinator } from './terminal-render-coordinator';
++import { type SelectionHostContext, TerminalSelection } from './terminal-selection';
++import { type FakeDom, installFakeDom } from './test-support/fake-dom';
++import { lineModelFromText } from './test-support/selection-line-model';
++import type { GhosttySelectionRect } from './types';
++
++const CELL_WIDTH = 10;
++const CELL_HEIGHT = 20;
++const BOUNDS = { top: 0, bottom: 200 };
++
++type Calls = { render: number; renderSelection: number; scroll: number[] };
++
++function createContext(overrides: Partial<SelectionHostContext> = {}): {
++  context: SelectionHostContext;
++  calls: Calls;
++} {
++  const calls: Calls = { render: 0, renderSelection: 0, scroll: [] };
++  const context: SelectionHostContext = {
++    getLineModel: (line: number): SelectionLineModel => lineModelFromText(`line-${line} content`),
++    hitTest: (clientX: number, clientY: number) => ({
++      line: Math.floor(clientY / CELL_HEIGHT),
++      col: Math.floor(clientX / CELL_WIDTH),
++    }),
++    getScreenBounds: () => BOUNDS,
++    scrollViewportBy: (delta: number) => {
++      calls.scroll.push(delta);
++    },
++    render: () => {
++      calls.render += 1;
++    },
++    renderSelection: () => {
++      calls.renderSelection += 1;
++    },
++    ...overrides,
++  };
++
++  return { context, calls };
++}
++
++describe('TerminalSelection 拖拽', () => {
++  test('按下走全渲染，跨 cell 拖拽只排选区重绘', () => {
++    const { context, calls } = createContext();
++    const selection = new TerminalSelection(context);
++
++    expect(selection.begin(5, 5, 'character')).toBeTrue();
++    expect(calls).toMatchObject({ render: 1, renderSelection: 0 });
++
++    selection.update(35, 5);
++    selection.update(65, 5);
++    expect(calls).toMatchObject({ render: 1, renderSelection: 2 });
++    expect(selection.getText()).toBe('line-0 ');
++  });
++
++  test('落在同一 cell 的移动完全不重绘', () => {
++    const { context, calls } = createContext();
++    const selection = new TerminalSelection(context);
++
++    selection.begin(5, 5, 'character');
++    selection.update(35, 5);
++    expect(calls.renderSelection).toBe(1);
++
++    // 同一 cell 内的亚像素抖动：一律丢弃。
++    selection.update(36, 6);
++    selection.update(39, 9);
++    expect(calls.renderSelection).toBe(1);
++    expect(calls.render).toBe(1);
++
++    // 但拖拽仍算「动过」，松手时不应被判成原地单击而清空选区。
++    selection.update(45, 5);
++    expect(calls.renderSelection).toBe(2);
++  });
++
++  test('同 cell 抖动仍算「拖拽过」，松手判 keep（行为与旧实现一致）', () => {
++    const { context, calls } = createContext();
++    const selection = new TerminalSelection(context);
++
++    selection.begin(5, 5, 'character');
++    selection.update(6, 6);
++    expect(calls.renderSelection).toBe(0);
++    expect(selection.finishPointerDrag({ button: 0, clientX: 6, clientY: 6 } as MouseEvent)).toBe(
++      'keep'
++    );
++  });
++
++  test('拖出视口的自动滚动仍走全渲染', async () => {
++    const { context, calls } = createContext();
++    const selection = new TerminalSelection(context);
++
++    selection.begin(5, 5, 'character');
++    selection.update(5, 400);
++    const beforeTicks = calls.render;
++
++    await new Promise((resolve) => setTimeout(resolve, 160));
++    selection.endDrag();
++
++    expect(calls.scroll.length).toBeGreaterThan(0);
++    expect(calls.render).toBeGreaterThan(beforeTicks);
++  });
++});
++
++describe('TerminalRenderCoordinator 选区重绘', () => {
++  let dom: FakeDom | null = null;
++
++  afterEach(() => {
++    dom?.restore();
++    dom = null;
++  });
++
++  function setup(): {
++    fakeDom: FakeDom;
++    coordinator: TerminalRenderCoordinator;
++    painted: Array<{ rects: GhosttySelectionRect[]; color: string }>;
++    selectionTexts: Array<string | null>;
++  } {
++    const fakeDom = installFakeDom();
++    dom = fakeDom;
++    const painted: Array<{ rects: GhosttySelectionRect[]; color: string }> = [];
++    const selectionTexts: Array<string | null> = [];
++
++    const coordinator = new TerminalRenderCoordinator(
++      {} as GhosttyBindings,
++      1,
++      {} as GhosttyRenderStateResources,
++      {
++        cellDimensions: () => ({ width: CELL_WIDTH, height: CELL_HEIGHT }),
++        screenBounds: () => ({ left: 0, top: 0 }),
++        viewportCols: () => 80,
++        viewportRows: () => 24,
++        selectionRects: () => [{ row: 0, x: 1, width: 2 }],
++        selectionText: () => 'picked',
++        selectionColor: () => 'rgba(1,2,3,0.4)',
++        fileLinkContext: () => null,
++        onSnapshot: () => {},
++        onSelectionText: (text) => {
++          selectionTexts.push(text);
++        },
++      }
++    );
++
++    coordinator.attach({
++      kind: 'fake',
++      render: () => {},
++      drawSelectionOnly: (rects: GhosttySelectionRect[], color: string) => {
++        painted.push({ rects, color });
++      },
++      drawLinkUnderlines: () => {},
++      clearLinkUnderlines: () => {},
++      dispose: () => {},
++    } as unknown as Parameters<TerminalRenderCoordinator['attach']>[0]);
++
++    return { fakeDom, coordinator, painted, selectionTexts };
++  }
++
++  test('同一帧内的多次请求合并成一次选区层重绘', async () => {
++    const { fakeDom, coordinator, painted, selectionTexts } = setup();
++
++    coordinator.scheduleSelectionRepaint();
++    coordinator.scheduleSelectionRepaint();
++    coordinator.scheduleSelectionRepaint();
++    expect(painted).toEqual([]);
++
++    await fakeDom.flushAnimationFrames();
++
++    expect(painted).toEqual([{ rects: [{ row: 0, x: 1, width: 2 }], color: 'rgba(1,2,3,0.4)' }]);
++    // 选区文本每帧最多算一次（拖拽中不再逐次 mousemove 序列化）。
++    expect(selectionTexts).toEqual(['picked']);
++
++    coordinator.dispose();
++  });
++
++  test('cancelPending / dispose 会取消排队中的选区帧', async () => {
++    const { fakeDom, coordinator, painted } = setup();
++
++    coordinator.scheduleSelectionRepaint();
++    coordinator.cancelPending();
++    await fakeDom.flushAnimationFrames();
++    expect(painted).toEqual([]);
++
++    coordinator.scheduleSelectionRepaint();
++    coordinator.dispose();
++    await fakeDom.flushAnimationFrames();
++    expect(painted).toEqual([]);
++  });
++});
+diff --git a/packages/ghostty-terminal/src/terminal-selection.ts b/packages/ghostty-terminal/src/terminal-selection.ts
+index 4a1addd2..7112a8d1 100644
+--- a/packages/ghostty-terminal/src/terminal-selection.ts
++++ b/packages/ghostty-terminal/src/terminal-selection.ts
+@@ -21,6 +21,7 @@ type PointerDragState = {
+   mode: SelectionMode;
+   lastClientX: number | null;
+   lastClientY: number | null;
++  lastPoint: SelectionPoint | null;
+ };
+ 
+ export type SelectionHostContext = {
+@@ -29,6 +30,7 @@ export type SelectionHostContext = {
+   getScreenBounds(): { top: number; bottom: number } | null;
+   scrollViewportBy(delta: number): void;
+   render(): void;
++  renderSelection(): void;
+ };
+ 
+ // 指针拖拽结束后的处置：ignored=非本次拖拽的事件；clear=原地单击应清空选择；
+@@ -45,6 +47,10 @@ export function selectionModeFromClickDetail(detail: number): SelectionMode {
+   return 'character';
+ }
+ 
++function samePoint(point: SelectionPoint, previous: SelectionPoint | null): boolean {
++  return previous !== null && previous.line === point.line && previous.col === point.col;
++}
++
+ function createPointerDragState(): PointerDragState {
+   return {
+     active: false,
+@@ -52,6 +58,7 @@ function createPointerDragState(): PointerDragState {
+     mode: 'character',
+     lastClientX: null,
+     lastClientY: null,
++    lastPoint: null,
+   };
+ }
+ 
+@@ -116,6 +123,7 @@ export class TerminalSelection {
+       mode,
+       lastClientX: clientX,
+       lastClientY: clientY,
++      lastPoint: point,
+     };
+     this.state = resolvePointerSelection(
+       this.state,
+@@ -140,12 +148,17 @@ export class TerminalSelection {
+     this.drag.lastClientX = clientX;
+     this.drag.lastClientY = clientY;
+ 
+-    if (point) {
+-      this.drag.moved = true;
++    // 落在同一个 cell 的移动不改变选区：直接跳过，避免每个 mousemove 都触发重绘。
++    if (point && !samePoint(point, this.drag.lastPoint)) {
++      this.drag.lastPoint = point;
+       this.state = updateSelectionFocus(this.state, point, (line) =>
+         this.context.getLineModel(line)
+       );
+-      this.context.render();
++      // 拖拽期间只有选区矩形在变：走 rAF 合并的选区层重绘，不跑全渲染。
++      this.context.renderSelection();
++    }
++    if (point) {
++      this.drag.moved = true;
+     }
+ 
+     this.updateAutoScroll();
+@@ -250,6 +263,7 @@ export class TerminalSelection {
+     }
+ 
+     this.state = updateSelectionFocus(this.state, point, (line) => this.context.getLineModel(line));
++    this.drag.lastPoint = point;
+     this.drag.moved = true;
+     this.context.render();
+   }
+diff --git a/packages/ghostty-terminal/src/terminal.canvas.test.ts b/packages/ghostty-terminal/src/terminal.canvas.test.ts
+index 173473f3..bfc30f3e 100644
+--- a/packages/ghostty-terminal/src/terminal.canvas.test.ts
++++ b/packages/ghostty-terminal/src/terminal.canvas.test.ts
+@@ -2238,6 +2238,42 @@ describe('GhosttyTerminalController clipboard and selection API', () => {
+     disposable.dispose();
+   });
+ 
++  // 拖拽热路径：每个 mousemove 曾同步跑一遍完整渲染（重扫全部行 / 重算选区文本）。
++  // 现在只排一帧选区层重绘，全渲染仍由输出、自动滚动、松手等真正的内容变化驱动。
++  test('拖拽中的移动只排选区帧，输出与松手仍走全渲染', async () => {
++    dom = installCanvasDom();
++    const bindings = createFakeBindings();
++    // readScrollbar 每次全渲染恰好调用一次，用作全渲染计数器。
++    let fullRenders = 0;
++    const readScrollbar = bindings.readScrollbar;
++    bindings.readScrollbar = (...args: any[]) => {
++      fullRenders += 1;
++      return readScrollbar(...args);
++    };
++    const { terminal } = await setupTerminal(bindings);
++    await dom.flushAnimationFrames();
++
++    expect(terminal.startTouchSelection(4, 4, 'character')).toBeTrue();
++    const afterBegin = fullRenders;
++
++    terminal.updateTouchSelection(40, 4);
++    terminal.updateTouchSelection(80, 4);
++    terminal.updateTouchSelection(81, 4);
++    expect(fullRenders).toBe(afterBegin);
++    expect(dom.pendingAnimationFrames()).toBe(1);
++
++    await dom.flushAnimationFrames();
++    expect(fullRenders).toBe(afterBegin);
++    expect((globalThis as any).__tmexE2eTerminalSelectionText ?? null).not.toBeNull();
++
++    // 拖拽期间到达的输出必须照常全渲染。
++    terminal.write('output during drag');
++    await dom.flushAnimationFrames();
++    expect(fullRenders).toBeGreaterThan(afterBegin);
++
++    terminal.endTouchSelection();
++  });
++
+   // 分屏回归：同一页挂多个控制器时，__tmexE2eTerminalSelectionText 是唯一的全局探针，
+   // 每个控制器每帧都会写它。空闲 pane 的任意一帧曾把有选区 pane 的探针抹成 null，而渲染
+   // 循环按需调度、本 pane 空闲后不会再写回来，探针就永久停在 null
+diff --git a/packages/ghostty-terminal/src/terminal.ts b/packages/ghostty-terminal/src/terminal.ts
+index 6c84c49d..a66aa3ee 100644
+--- a/packages/ghostty-terminal/src/terminal.ts
++++ b/packages/ghostty-terminal/src/terminal.ts
+@@ -153,6 +153,7 @@ export class GhosttyTerminalController implements CompatibleTerminalLike {
+         selectionColor: () => this.options.theme.selectionBackground,
+         fileLinkContext: () => this.fileLinkContext,
+         onSnapshot: (snapshot) => this.applyRenderSnapshot(snapshot),
++        onSelectionText: (text) => this.updateSelectionTextProbe(text),
+       }
+     );
+     this.selection = new TerminalSelection({
+@@ -165,6 +166,9 @@ export class GhosttyTerminalController implements CompatibleTerminalLike {
+       render: () => {
+         this.renderCoordinator.renderNow();
+       },
++      renderSelection: () => {
++        this.renderCoordinator.scheduleSelectionRepaint();
++      },
+     });
+   }
+ 
+diff --git a/packages/shared/src/ws-borsh/codec-view.test.ts b/packages/shared/src/ws-borsh/codec-view.test.ts
+new file mode 100644
+index 00000000..eb68d4b6
+--- /dev/null
++++ b/packages/shared/src/ws-borsh/codec-view.test.ts
+@@ -0,0 +1,103 @@
++import { describe, expect, it } from 'bun:test';
++import {
++  decodeEnvelope,
++  decodeEnvelopeView,
++  decodePayload,
++  decodeTermOutputView,
++  encodeEnvelope,
++  encodePayload,
++} from './codec';
++import { WsBorshError } from './errors';
++import { TermOutputSchema } from './schema';
++
++function termOutputPayload(data: Uint8Array, deviceId = 'dev-1', paneId = '%1'): Uint8Array {
++  return encodePayload(TermOutputSchema, { deviceId, paneId, encoding: 0, data });
++}
++
++function frameOf(data: Uint8Array): Uint8Array {
++  return encodeEnvelope(0x0401, termOutputPayload(data), 7);
++}
++
++describe('decodeEnvelopeView', () => {
++  it('与 decodeEnvelope 结果一致，且 payload 借用原始缓冲', () => {
++    const frame = frameOf(new Uint8Array([1, 2, 3, 4]));
++    const view = decodeEnvelopeView(frame);
++    expect(view).toEqual(decodeEnvelope(frame));
++    expect(view.payload.buffer).toBe(frame.buffer);
++    expect(decodeEnvelope(frame).payload.buffer).not.toBe(frame.buffer);
++  });
++
++  it('尾部多余字节与 decodeEnvelope 一样被忽略', () => {
++    const frame = frameOf(new Uint8Array([9]));
++    const padded = new Uint8Array(frame.length + 5);
++    padded.set(frame);
++    padded.fill(0xab, frame.length);
++    expect(decodeEnvelopeView(padded)).toEqual(decodeEnvelope(padded));
++  });
++
++  it('过短帧 / 错误 magic / 头部截断 / payload 截断都抛 WsBorshError', () => {
++    const frame = frameOf(new Uint8Array([1, 2, 3, 4]));
++    for (const bad of [
++      new Uint8Array([1, 2, 3]),
++      new Uint8Array(16),
++      frame.subarray(0, 14),
++      frame.subarray(0, frame.length - 1),
++    ]) {
++      expect(() => decodeEnvelopeView(bad)).toThrow(WsBorshError);
++      expect(() => decodeEnvelope(bad)).toThrow(WsBorshError);
++    }
++  });
++
++  it('超大 payload 长度前缀被拒绝', () => {
++    const frame = frameOf(new Uint8Array([1, 2, 3, 4]));
++    new DataView(frame.buffer, frame.byteOffset).setUint32(12, 0xffffffff, true);
++    expect(() => decodeEnvelopeView(frame)).toThrow(WsBorshError);
++    expect(() => decodeEnvelope(frame)).toThrow(WsBorshError);
++  });
++});
++
++describe('decodeTermOutputView', () => {
++  it('与 decodePayload 结果一致，且 data 借用原始缓冲', () => {
++    const data = new Uint8Array([10, 20, 30, 40, 50]);
++    const payload = termOutputPayload(data, '设备-1', '%42');
++    const view = decodeTermOutputView(payload);
++    expect(view).toEqual(decodePayload(TermOutputSchema, payload));
++    expect(view.data.buffer).toBe(payload.buffer);
++    expect(decodePayload(TermOutputSchema, payload).data.buffer).not.toBe(payload.buffer);
++  });
++
++  it('空 data 与尾部多余字节的行为与 decodePayload 一致', () => {
++    const payload = termOutputPayload(new Uint8Array());
++    expect(decodeTermOutputView(payload)).toEqual(decodePayload(TermOutputSchema, payload));
++
++    const padded = new Uint8Array(payload.length + 3);
++    padded.set(payload);
++    padded.fill(0x7f, payload.length);
++    expect(decodeTermOutputView(padded)).toEqual(decodePayload(TermOutputSchema, padded));
++  });
++
++  it('截断的 payload 抛 WsBorshError（与 decodePayload 同类错误）', () => {
++    const payload = termOutputPayload(new Uint8Array([1, 2, 3, 4]));
++    for (const cut of [2, 6, payload.length - 5, payload.length - 1]) {
++      const truncated = payload.subarray(0, cut);
++      expect(() => decodeTermOutputView(truncated)).toThrow(WsBorshError);
++      expect(() => decodePayload(TermOutputSchema, truncated)).toThrow(WsBorshError);
++    }
++  });
++
++  it('超大 data 长度前缀被拒绝', () => {
++    const payload = termOutputPayload(new Uint8Array([1, 2, 3, 4]));
++    const dataLengthOffset = payload.length - 4 - 4;
++    new DataView(payload.buffer, payload.byteOffset).setUint32(dataLengthOffset, 0xffffffff, true);
++    expect(() => decodeTermOutputView(payload)).toThrow(WsBorshError);
++    expect(() => decodePayload(TermOutputSchema, payload)).toThrow(WsBorshError);
++  });
++
++  it('整帧端到端零拷贝：data 视图指回 WebSocket 帧缓冲', () => {
++    const data = new Uint8Array(64).fill(0x41);
++    const frame = frameOf(data);
++    const view = decodeTermOutputView(decodeEnvelopeView(frame).payload);
++    expect(view.data.buffer).toBe(frame.buffer);
++    expect(view.data).toEqual(data);
++  });
++});
+diff --git a/packages/shared/src/ws-borsh/codec.ts b/packages/shared/src/ws-borsh/codec.ts
+index 6ae9bd35..73104030 100644
+--- a/packages/shared/src/ws-borsh/codec.ts
++++ b/packages/shared/src/ws-borsh/codec.ts
+@@ -4,7 +4,7 @@
+ import type { Schema } from '@zorsh/zorsh';
+ import type { b } from '@zorsh/zorsh';
+ import { ERROR_INVALID_FRAME, ERROR_PAYLOAD_DECODE_FAILED, WsBorshError } from './errors';
+-import { ChunkSchema, EnvelopeSchema } from './schema';
++import { ChunkSchema, EnvelopeSchema, type TermOutputSchema } from './schema';
+ 
+ // ========== 常量 ==========
+ 
+@@ -79,6 +79,70 @@ export function decodeEnvelope(data: Uint8Array): Envelope {
+   }
+ }
+ 
++// 零拷贝解码：bytes 字段返回入参缓冲的 subarray 视图，只用于 TERM_OUTPUT 这类每帧可达 MiB 级的
++// 热路径（通用 schema 解码器逐字节 copy 一遍）。调用方不得改写返回的视图，也不得跨帧长期持有。
++
++const ENVELOPE_HEADER_BYTES = 16; // magic(2) + version(2) + kind(2) + flags(2) + seq(4) + payloadLen(4)
++const utf8Decoder = new TextDecoder();
++
++export function decodeEnvelopeView(data: Uint8Array): Envelope {
++  if (data.length < 12) {
++    throw new WsBorshError(ERROR_INVALID_FRAME, false, 'Envelope too small');
++  }
++  if (data[0] !== MAGIC[0] || data[1] !== MAGIC[1]) {
++    throw new WsBorshError(ERROR_INVALID_FRAME, false, 'Invalid magic bytes');
++  }
++  if (data.length < ENVELOPE_HEADER_BYTES) {
++    throw new WsBorshError(ERROR_INVALID_FRAME, false, 'Envelope header truncated');
++  }
++  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
++  const payloadLength = view.getUint32(12, true);
++  if (payloadLength > data.length - ENVELOPE_HEADER_BYTES) {
++    throw new WsBorshError(ERROR_INVALID_FRAME, false, 'Envelope payload truncated');
++  }
++  return {
++    magic: data.subarray(0, 2),
++    version: view.getUint16(2, true),
++    kind: view.getUint16(4, true),
++    flags: view.getUint16(6, true),
++    seq: view.getUint32(8, true),
++    payload: data.subarray(ENVELOPE_HEADER_BYTES, ENVELOPE_HEADER_BYTES + payloadLength),
++  };
++}
++
++export type TermOutputView = b.infer<typeof TermOutputSchema>;
++
++export function decodeTermOutputView(payload: Uint8Array): TermOutputView {
++  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
++  let offset = 0;
++  const takeLength = (): number => {
++    if (offset + 4 > payload.length) {
++      throw new WsBorshError(ERROR_PAYLOAD_DECODE_FAILED, false, 'TERM_OUTPUT payload truncated');
++    }
++    const length = view.getUint32(offset, true);
++    offset += 4;
++    if (length > payload.length - offset) {
++      throw new WsBorshError(ERROR_PAYLOAD_DECODE_FAILED, false, 'TERM_OUTPUT payload truncated');
++    }
++    return length;
++  };
++  const takeString = (): string => {
++    const length = takeLength();
++    const text = utf8Decoder.decode(payload.subarray(offset, offset + length));
++    offset += length;
++    return text;
++  };
++  const deviceId = takeString();
++  const paneId = takeString();
++  const encoding = payload[offset];
++  if (encoding === undefined) {
++    throw new WsBorshError(ERROR_PAYLOAD_DECODE_FAILED, false, 'TERM_OUTPUT payload truncated');
++  }
++  offset += 1;
++  const dataLength = takeLength();
++  return { deviceId, paneId, encoding, data: payload.subarray(offset, offset + dataLength) };
++}
++
+ export function decodePayload<T>(schema: Schema<T>, data: Uint8Array): T {
+   try {
+     return schema.deserialize(data);
+diff --git a/packages/shared/src/ws-borsh/index.ts b/packages/shared/src/ws-borsh/index.ts
+index b019a363..04a46ffe 100644
+--- a/packages/shared/src/ws-borsh/index.ts
++++ b/packages/shared/src/ws-borsh/index.ts
+@@ -245,6 +245,9 @@ export {
+   encodeEnvelope,
+   encodePayload,
+   decodeEnvelope,
++  decodeEnvelopeView,
++  type TermOutputView,
++  decodeTermOutputView,
+   decodePayload,
+   decodeEnvelopeAndPayload,
+   type ChunkData,
+diff --git a/packages/terminal-ui/bench/history-paging.bench.ts b/packages/terminal-ui/bench/history-paging.bench.ts
+index 4f9356ed..418f43d2 100644
+--- a/packages/terminal-ui/bench/history-paging.bench.ts
++++ b/packages/terminal-ui/bench/history-paging.bench.ts
+@@ -1,4 +1,5 @@
+ import type { GatewayPaneHistoryPage, GatewayPaneScreenSnapshot } from '@tmex/ws-client';
++import { HeadlessTerminal } from 'ghostty-terminal/headless';
+ import {
+   normalizeHistoryForTerminal,
+   normalizeLiveOutputForTerminal,
+@@ -139,3 +140,42 @@ console.log(`history paging: ${PAGE_COUNT} pages x ${PAGE_BYTES / 1024} KiB, ${C
+ run('warmup', writeBatched);
+ run('warmup', writeLegacy);
+ report([run('legacy (per-page)', writeLegacy), run('batched (current)', writeBatched)]);
++
++// 真实 ghostty parser 下的分页重排：TerminalSurface 现在把成串到达的页攒到一个
++// 显示帧窗口再重建一次，这里对比逐页重建与整批一次重建的解析耗时。
++// RIS：HeadlessTerminal 没有 reset()，用整机复位序列等价替代 writeCanonicalSnapshot 的 reset
++const RIS = '\x1bc';
++const REPLAY_PAGES = 22;
++const REPLAY_PAGE_BYTES = 126 * 1024;
++
++function makeReplayPage(index: number): GatewayPaneHistoryPage {
++  const line = `${String(index).padStart(4, '0')} ${'x'.repeat(COLS - 5)}\n`;
++  const body = line.repeat(Math.ceil(REPLAY_PAGE_BYTES / line.length));
++  const lineEnd = (REPLAY_PAGES - index) * ROWS;
++  return { ...makePage(index), lineStart: lineEnd - ROWS, lineEnd, data: encoder.encode(body) };
++}
++
++async function replay(
++  label: string,
++  pages: readonly GatewayPaneHistoryPage[],
++  perPage: boolean
++): Promise<void> {
++  const terminal = await HeadlessTerminal.create({ cols: COLS, rows: ROWS, scrollback: 10_000 });
++  const accumulated: GatewayPaneHistoryPage[] = [];
++  const started = performance.now();
++  for (const page of pages) {
++    accumulated.unshift(page);
++    if (!perPage && page !== pages[pages.length - 1]) continue;
++    terminal.write(RIS);
++    terminal.write(buildCanonicalSnapshotPayload(snapshot, accumulated));
++  }
++  const elapsedMs = performance.now() - started;
++  terminal.free();
++  console.log(`${label.padEnd(30)} ${elapsedMs.toFixed(1).padStart(8)} ms`);
++}
++
++const replayPages = Array.from({ length: REPLAY_PAGES }, (_, index) => makeReplayPage(index));
++console.log(`\nghostty replay: ${REPLAY_PAGES} pages x ${REPLAY_PAGE_BYTES / 1024} KiB`);
++await replay('warmup', replayPages, false);
++await replay('per-page rebuild', replayPages, true);
++await replay('batched rebuild', replayPages, false);
+diff --git a/packages/terminal-ui/bench/normalization.bench.ts b/packages/terminal-ui/bench/normalization.bench.ts
+new file mode 100644
+index 00000000..161d40ed
+--- /dev/null
++++ b/packages/terminal-ui/bench/normalization.bench.ts
+@@ -0,0 +1,87 @@
++// live 输出补 CR 的两种实现：旧版先数一遍 CR、再分配、再抄一遍（两趟 + 每块一次分配），
++// 现实现单趟写进常驻暂存区，无裸 LF 时零拷贝原样返回。
++// 运行：bun packages/terminal-ui/bench/normalization.bench.ts
++import { normalizeLiveOutputForTerminal } from '../src/components/normalization';
++
++const TOTAL_BYTES = 10 * 1024 * 1024;
++const CHUNKS = 320;
++const CHUNK_BYTES = TOTAL_BYTES / CHUNKS;
++const WARMUP_ROUNDS = 3;
++const MEASURED_ROUNDS = 10;
++
++function makeChunk(pattern: string): Uint8Array {
++  const unit = new TextEncoder().encode(pattern);
++  const chunk = new Uint8Array(CHUNK_BYTES);
++  for (let index = 0; index < chunk.length; index += 1)
++    chunk[index] = unit[index % unit.length] ?? 0;
++  return chunk;
++}
++
++function legacyNormalize(
++  data: Uint8Array,
++  previousEndedWithCR: boolean
++): { normalized: Uint8Array; endedWithCR: boolean } {
++  let prevWasCR = previousEndedWithCR;
++  let extraCRCount = 0;
++  for (const byte of data) {
++    if (byte === 0x0a && !prevWasCR) extraCRCount += 1;
++    prevWasCR = byte === 0x0d;
++  }
++  const endedWithCR = prevWasCR;
++  if (extraCRCount === 0) return { normalized: data, endedWithCR };
++
++  const normalized = new Uint8Array(data.length + extraCRCount);
++  let writeIndex = 0;
++  prevWasCR = previousEndedWithCR;
++  for (const byte of data) {
++    if (byte === 0x0a && !prevWasCR) {
++      normalized[writeIndex] = 0x0d;
++      writeIndex += 1;
++    }
++    normalized[writeIndex] = byte;
++    writeIndex += 1;
++    prevWasCR = byte === 0x0d;
++  }
++  return { normalized, endedWithCR };
++}
++
++type Normalize = typeof normalizeLiveOutputForTerminal;
++
++function measure(label: string, chunk: Uint8Array, normalize: Normalize): void {
++  const run = (): number => {
++    let endedWithCR = false;
++    let bytes = 0;
++    for (let index = 0; index < CHUNKS; index += 1) {
++      const result = normalize(chunk, endedWithCR);
++      endedWithCR = result.endedWithCR;
++      bytes += result.normalized.byteLength;
++    }
++    return bytes;
++  };
++
++  for (let round = 0; round < WARMUP_ROUNDS; round += 1) run();
++  const samples: number[] = [];
++  let bytes = 0;
++  for (let round = 0; round < MEASURED_ROUNDS; round += 1) {
++    const started = performance.now();
++    bytes = run();
++    samples.push(performance.now() - started);
++  }
++  samples.sort((left, right) => left - right);
++  const median = samples[Math.floor(samples.length / 2)] ?? 0;
++  console.log(
++    `${label.padEnd(30)} median ${median.toFixed(1).padStart(7)} ms  out=${(bytes / (1024 * 1024)).toFixed(1)} MiB`
++  );
++}
++
++console.log(
++  `normalization: ${TOTAL_BYTES / (1024 * 1024)} MiB in ${CHUNKS} x ${CHUNK_BYTES / 1024} KiB chunks`
++);
++for (const [name, pattern] of [
++  ['bare LF (y\\n)', 'y\n'],
++  ['already CRLF', 'y\r\n'],
++] as const) {
++  const chunk = makeChunk(pattern);
++  measure(`${name} legacy`, chunk, legacyNormalize);
++  measure(`${name} current`, chunk, normalizeLiveOutputForTerminal);
++}
+diff --git a/packages/terminal-ui/src/components/TerminalSurface.test.ts b/packages/terminal-ui/src/components/TerminalSurface.test.ts
+index 3fbb5a3c..24be15ec 100644
+--- a/packages/terminal-ui/src/components/TerminalSurface.test.ts
++++ b/packages/terminal-ui/src/components/TerminalSurface.test.ts
+@@ -68,6 +68,9 @@ interface Harness {
+   recoveries: GatewayRebaseReason[];
+   applied: Array<GatewayPaneScreenSnapshot | null>;
+   stream(): string;
++  // history 批处理窗口由测试显式驱动
++  runScheduled(): void;
++  scheduledCount(): number;
+ }
+ 
+ async function createHarness(options?: {
+@@ -77,6 +80,7 @@ async function createHarness(options?: {
+   const target = createTarget();
+   const recoveries: GatewayRebaseReason[] = [];
+   const applied: Array<GatewayPaneScreenSnapshot | null> = [];
++  let pending: Array<() => void> = [];
+   const surface = new TerminalSurface<RecordingTarget>({
+     createTarget: async () => target,
+     writeSnapshot: writeCanonicalSnapshot,
+@@ -88,10 +92,23 @@ async function createHarness(options?: {
+     onSnapshotApplied: (_target, snapshot) => {
+       applied.push(snapshot);
+     },
++    scheduleHistoryFlush: (flush) => pending.push(flush),
+     ...options,
+   });
+   await surface.initialize();
+-  return { surface, target, recoveries, applied, stream: () => target.writes.join('') };
++  return {
++    surface,
++    target,
++    recoveries,
++    applied,
++    stream: () => target.writes.join(''),
++    runScheduled: () => {
++      const callbacks = pending;
++      pending = [];
++      for (const callback of callbacks) callback();
++    },
++    scheduledCount: () => pending.length,
++  };
+ }
+ 
+ function cursorOf(beforeLine: number): GatewayHistoryCursor {
+@@ -161,42 +178,68 @@ describe('TerminalSurface history paging', () => {
+ 
+     harness.target.writes.length = 0;
+     expect(harness.surface.applyHistoryPage(PAGE_NEWEST)).toBe(true);
++    harness.runScheduled();
+     expect(harness.stream()).toBe(`${PREFIX}l5\r\nl6\r\ncurrent\r\n`);
+     expect(harness.surface.getNextHistoryCursor()).toEqual(cursorOf(4));
+ 
+     harness.target.writes.length = 0;
+     expect(harness.surface.applyHistoryPage(PAGE_MIDDLE)).toBe(true);
++    harness.runScheduled();
+     expect(harness.stream()).toBe(`${PREFIX}l3\r\nl4\r\nl5\r\nl6\r\ncurrent\r\n`);
+ 
+     harness.target.writes.length = 0;
++    // 末页（nextCursor 为空）不等窗口，直接落地
+     expect(harness.surface.applyHistoryPage(PAGE_OLDEST)).toBe(true);
+     expect(harness.stream()).toBe(`${PREFIX}l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\ncurrent\r\n`);
+     expect(harness.surface.getNextHistoryCursor()).toBeNull();
+   });
+ 
+-  test('每页到达都重建一次终端：reset / resize / repaint 各一次，CR 状态复位', async () => {
++  test('一个窗口内到达的多页只重建一次终端：reset / resize / repaint 各一次，CR 状态复位', async () => {
+     const harness = await createHarness();
+     harness.surface.replace(snapshotOf(SNAPSHOT_BODY, cursorOf(6)));
+     harness.target.liveOutputEndedWithCR = true;
+ 
+     harness.surface.applyHistoryPage(PAGE_NEWEST);
+     harness.surface.applyHistoryPage(PAGE_MIDDLE);
++    expect(harness.scheduledCount()).toBe(1);
++    harness.runScheduled();
+ 
+-    expect(harness.target.resets).toBe(3);
+-    expect(harness.target.repaints).toBe(3);
+-    expect(harness.target.sizes).toHaveLength(3);
++    expect(harness.target.resets).toBe(2);
++    expect(harness.target.repaints).toBe(2);
++    expect(harness.target.sizes).toHaveLength(2);
+     expect(harness.target.liveOutputEndedWithCR).toBe(false);
+-    expect(harness.applied).toHaveLength(4);
++    expect(harness.applied).toHaveLength(3);
++  });
++
++  test('22 页成串到达只触发一次重建', async () => {
++    const pageCount = 22;
++    const harness = await createHarness({ maxHistoryPages: pageCount });
++    harness.surface.replace(snapshotOf(SNAPSHOT_BODY, cursorOf(pageCount)));
++    harness.target.resets = 0;
++
++    // 末页 lineStart 为 0（nextCursor 为空）会立即落地，这里只喂到倒数第二页
++    for (let index = pageCount; index > 1; index -= 1) {
++      expect(harness.surface.applyHistoryPage(pageOf(index - 1, index, `l${index}\n`))).toBe(true);
++    }
++    expect(harness.target.resets).toBe(0);
++
++    harness.runScheduled();
++    expect(harness.target.resets).toBe(1);
++    expect(harness.surface.getDiagnosticState().historyPages).toBe(pageCount - 1);
+   });
+ 
+-  test('history 落地后 live 输出继续追加在快照正文之后', async () => {
++  test('live 输出到达时先落地攒着的 history，再追加字节', async () => {
+     const harness = await createHarness();
+     harness.surface.replace(snapshotOf(SNAPSHOT_BODY, cursorOf(6)));
+     harness.surface.applyHistoryPage(PAGE_NEWEST);
+ 
+     harness.target.writes.length = 0;
+     harness.surface.write({ deviceId: 'device-1', paneId: '%1', data: encoder.encode('next\n') });
+-    expect(harness.stream()).toBe('next\r\n');
++    expect(harness.stream()).toBe(`${PREFIX}l5\r\nl6\r\ncurrent\r\nnext\r\n`);
++
++    // 窗口到点时不再重建一次，live 字节不会被清掉
++    harness.runScheduled();
++    expect(harness.stream()).toBe(`${PREFIX}l5\r\nl6\r\ncurrent\r\nnext\r\n`);
+   });
+ 
+   test('alternate-screen 模式位与快照尺寸在每次重建时保持一致', async () => {
+@@ -204,6 +247,7 @@ describe('TerminalSurface history paging', () => {
+     const snapshot = snapshotOf(SNAPSHOT_BODY, cursorOf(6));
+     harness.surface.replace({ ...snapshot, cols: 100, rows: 30 });
+     harness.surface.applyHistoryPage(PAGE_NEWEST);
++    harness.runScheduled();
+ 
+     expect(harness.target.sizes).toEqual([
+       { cols: 100, rows: 30 },
+@@ -260,6 +304,8 @@ describe('TerminalSurface history paging', () => {
+ 
+     harness.target.writes.length = 0;
+     harness.surface.replace(snapshotOf(SNAPSHOT_BODY, cursorOf(6)));
++    // 攒着的页随快照一起作废，窗口到点不再重建
++    harness.runScheduled();
+     expect(harness.stream()).toBe(`${PREFIX}current\r\n`);
+     expect(harness.surface.getDiagnosticState().historyPages).toBe(0);
+     expect(harness.surface.getDiagnosticState().historyBytes).toBe(0);
+diff --git a/packages/terminal-ui/src/components/TerminalSurface.ts b/packages/terminal-ui/src/components/TerminalSurface.ts
+index 3422de0d..21138163 100644
+--- a/packages/terminal-ui/src/components/TerminalSurface.ts
++++ b/packages/terminal-ui/src/components/TerminalSurface.ts
+@@ -19,6 +19,9 @@ type HistoryPageRejection = Extract<HistoryPageValidation, { ok: false }>;
+ // 分页上限 = ceil(10000 / 512)（gateway 单页最多 MAX_CAPTURE_LINES = 512 行）再留两页余量。
+ const MAX_SURFACE_HISTORY_BYTES = 10_000 * 200;
+ const MAX_SURFACE_HISTORY_PAGES = 22;
++// 每页到达都整屏重排一次的话，一次滚到底的代价是 O(页数²)；成串到达的页（sink 挂载
++// 时的回放、快链路上的连续分页）攒一个显示帧再重排，末页与 live 字节到达时立即落地。
++const HISTORY_BATCH_MS = 16;
+ 
+ export interface TerminalSurfaceTarget {
+   dispose(): void;
+@@ -51,6 +54,7 @@ export interface TerminalSurfaceOptions<Target extends TerminalSurfaceTarget> {
+   onSnapshotApplied?(target: Target, snapshot: GatewayPaneScreenSnapshot | null): void;
+   maxHistoryBytes?: number;
+   maxHistoryPages?: number;
++  scheduleHistoryFlush?(flush: () => void): void;
+ }
+ 
+ function copyHistoryCursor(cursor: GatewayHistoryCursor | null): GatewayHistoryCursor | null {
+@@ -113,6 +117,8 @@ export class TerminalSurface<Target extends TerminalSurfaceTarget> {
+   private historyPages: GatewayPaneHistoryPage[] = [];
+   private historyBytes = 0;
+   private nextHistoryCursor: GatewayHistoryCursor | null = null;
++  private historyFlushPending = false;
++  private historyFlushScheduled = false;
+   private recoveryRequested = false;
+   private recoveryReason: GatewayRebaseReason | null = null;
+   private disposed = false;
+@@ -168,6 +174,8 @@ export class TerminalSurface<Target extends TerminalSurfaceTarget> {
+ 
+   write(frame: GatewayTerminalData): void {
+     if (this.disposed || !this.target) return;
++    // 攒着的 history 重排会 reset 终端，live 字节必须写在重排之后
++    this.flushHistory();
+     this.options.writeLive(this.target, frame.data);
+   }
+ 
+@@ -178,6 +186,7 @@ export class TerminalSurface<Target extends TerminalSurfaceTarget> {
+     this.historyPages = [];
+     this.historyBytes = 0;
+     this.nextHistoryCursor = copyHistoryCursor(owned.historyCursor);
++    this.historyFlushPending = false;
+     this.recoveryRequested = false;
+     this.recoveryReason = null;
+     this.options.writeSnapshot(this.target, owned, []);
+@@ -204,6 +213,7 @@ export class TerminalSurface<Target extends TerminalSurfaceTarget> {
+   dispose(): void {
+     if (this.disposed) return;
+     this.disposed = true;
++    this.historyFlushPending = false;
+     this.target?.dispose();
+     this.target = null;
+     this.latestSnapshot = null;
+@@ -231,16 +241,44 @@ export class TerminalSurface<Target extends TerminalSurfaceTarget> {
+       return;
+     }
+     this.nextHistoryCursor = null;
++    // 预算耗尽，不会再有页进来：把攒着的页立刻落地
++    this.flushHistory();
+   }
+ 
+   private commitHistoryPage(page: GatewayPaneHistoryPage): void {
+-    const target = this.target;
+-    const snapshot = this.latestSnapshot;
+-    if (!target || !snapshot) return;
++    if (!this.target || !this.latestSnapshot) return;
+     const owned = copyHistoryPage(page);
+     insertHistoryPage(this.historyPages, owned);
+     this.historyBytes += owned.data.byteLength;
+     this.nextHistoryCursor = copyHistoryCursor(owned.nextCursor);
++    this.historyFlushPending = true;
++    // 末页之后不会再有页到达，等窗口只是白白多等一帧
++    if (!this.nextHistoryCursor) {
++      this.flushHistory();
++      return;
++    }
++    if (this.historyFlushScheduled) return;
++    this.historyFlushScheduled = true;
++    this.scheduleHistoryFlush(() => {
++      this.historyFlushScheduled = false;
++      this.flushHistory();
++    });
++  }
++
++  private scheduleHistoryFlush(flush: () => void): void {
++    if (this.options.scheduleHistoryFlush) {
++      this.options.scheduleHistoryFlush(flush);
++      return;
++    }
++    setTimeout(flush, HISTORY_BATCH_MS);
++  }
++
++  private flushHistory(): void {
++    if (!this.historyFlushPending) return;
++    this.historyFlushPending = false;
++    const target = this.target;
++    const snapshot = this.latestSnapshot;
++    if (!target || !snapshot) return;
+     this.options.writeSnapshot(target, snapshot, this.historyPages);
+     this.options.onSnapshotApplied?.(target, snapshot);
+   }
+diff --git a/packages/terminal-ui/src/components/normalization.test.ts b/packages/terminal-ui/src/components/normalization.test.ts
+index f8a19f2f..bb579a64 100644
+--- a/packages/terminal-ui/src/components/normalization.test.ts
++++ b/packages/terminal-ui/src/components/normalization.test.ts
+@@ -5,6 +5,54 @@ function decode(bytes: Uint8Array): string {
+   return new TextDecoder().decode(bytes);
+ }
+ 
++// 改动前的两趟实现，作为逐字节等价的参照物
++function referenceNormalize(
++  data: Uint8Array,
++  previousEndedWithCR: boolean
++): { normalized: Uint8Array; endedWithCR: boolean } {
++  let prevWasCR = previousEndedWithCR;
++  let extraCRCount = 0;
++  for (const byte of data) {
++    if (byte === 0x0a && !prevWasCR) extraCRCount += 1;
++    prevWasCR = byte === 0x0d;
++  }
++  const endedWithCR = prevWasCR;
++  if (extraCRCount === 0) return { normalized: data, endedWithCR };
++
++  const normalized = new Uint8Array(data.length + extraCRCount);
++  let writeIndex = 0;
++  prevWasCR = previousEndedWithCR;
++  for (const byte of data) {
++    if (byte === 0x0a && !prevWasCR) {
++      normalized[writeIndex] = 0x0d;
++      writeIndex += 1;
++    }
++    normalized[writeIndex] = byte;
++    writeIndex += 1;
++    prevWasCR = byte === 0x0d;
++  }
++  return { normalized, endedWithCR };
++}
++
++const ALPHABET = [0x0a, 0x0d, 0x41, 0x42, 0x1b, 0x00];
++
++function randomBytes(random: () => number, length: number): Uint8Array {
++  const bytes = new Uint8Array(length);
++  for (let index = 0; index < length; index += 1) {
++    bytes[index] = ALPHABET[Math.floor(random() * ALPHABET.length)] ?? 0x41;
++  }
++  return bytes;
++}
++
++// 线性同余：固定种子，失败可复现
++function seededRandom(seed: number): () => number {
++  let state = seed >>> 0;
++  return () => {
++    state = (state * 1664525 + 1013904223) >>> 0;
++    return state / 0x1_0000_0000;
++  };
++}
++
+ describe('normalizeHistoryForTerminal', () => {
+   test('keeps intermediate line breaks but should not advance past the last visible row', () => {
+     expect(normalizeHistoryForTerminal('row-1\nrow-2\n')).toBe('row-1\r\nrow-2');
+@@ -26,4 +74,44 @@ describe('normalizeLiveOutputForTerminal', () => {
+     expect(decode(first.normalized)).toBe('a\r');
+     expect(decode(second.normalized)).toBe('\nb');
+   });
++
++  test('无裸 LF 时原样返回入参，不复制', () => {
++    const data = new TextEncoder().encode('a\r\nb');
++    expect(normalizeLiveOutputForTerminal(data, false).normalized).toBe(data);
++  });
++
++  test('空块沿用上一块的 CR 状态', () => {
++    expect(normalizeLiveOutputForTerminal(new Uint8Array(0), true).endedWithCR).toBe(true);
++    expect(normalizeLiveOutputForTerminal(new Uint8Array(0), false).endedWithCR).toBe(false);
++  });
++
++  test('1000 组随机分块与两趟参照实现逐字节一致', () => {
++    const random = seededRandom(0x5eed);
++    for (let round = 0; round < 1000; round += 1) {
++      const chunks = Array.from({ length: 1 + Math.floor(random() * 5) }, () =>
++        randomBytes(random, Math.floor(random() * 24))
++      );
++      let expectedCR = false;
++      let actualCR = false;
++      for (const chunk of chunks) {
++        const expected = referenceNormalize(chunk, expectedCR);
++        // 暂存区在下一次调用时被覆盖，先复制再比对
++        const actual = normalizeLiveOutputForTerminal(chunk, actualCR);
++        const actualBytes = actual.normalized.slice();
++        expectedCR = expected.endedWithCR;
++        actualCR = actual.endedWithCR;
++        expect(actualCR).toBe(expectedCR);
++        expect(actualBytes).toEqual(expected.normalized.slice());
++      }
++    }
++  });
++
++  test('超过暂存区上限的大块走独立分配且结果正确', () => {
++    const data = new Uint8Array(300 * 1024).fill(0x0a);
++    const result = normalizeLiveOutputForTerminal(data, false);
++    expect(result.normalized.byteLength).toBe(data.length * 2);
++    expect(result.normalized[0]).toBe(0x0d);
++    expect(result.normalized[1]).toBe(0x0a);
++    expect(result.endedWithCR).toBe(false);
++  });
+ });
+diff --git a/packages/terminal-ui/src/components/normalization.ts b/packages/terminal-ui/src/components/normalization.ts
+index faa34104..13fda40b 100644
+--- a/packages/terminal-ui/src/components/normalization.ts
++++ b/packages/terminal-ui/src/components/normalization.ts
+@@ -11,30 +11,46 @@ export function wrapAlternateScreenHistory(data: string): string {
+   return ALT_SCREEN_HISTORY_PREAMBLE + normalizeHistoryForTerminal(data);
+ }
+ 
+-export function normalizeLiveOutputForTerminal(
+-  data: Uint8Array,
+-  previousEndedWithCR: boolean
+-): { normalized: Uint8Array; endedWithCR: boolean } {
+-  let prevWasCR = previousEndedWithCR;
+-  let extraCRCount = 0;
++// 补 CR 的常驻暂存区：live 输出每帧都要走一遍，逐帧新建缓冲会把 GC 压力堆到渲染线程上。
++// 超过上限的一次性大载荷（history 重排的快照正文可达 MB 级）单独分配，避免把常驻缓冲永久撑大。
++const NORMALIZE_SCRATCH_MAX_BYTES = 256 * 1024;
++let normalizeScratch = new Uint8Array(0);
+ 
+-  for (const byte of data) {
+-    if (byte === 0x0a && !prevWasCR) {
+-      extraCRCount += 1;
+-    }
+-    prevWasCR = byte === 0x0d;
+-  }
++function normalizeScratchOf(bytes: number): Uint8Array {
++  if (bytes > NORMALIZE_SCRATCH_MAX_BYTES) return new Uint8Array(bytes);
++  if (normalizeScratch.length < bytes) normalizeScratch = new Uint8Array(bytes);
++  return normalizeScratch;
++}
+ 
+-  const endedWithCR = prevWasCR;
+-  if (extraCRCount === 0) {
+-    return { normalized: data, endedWithCR };
++function indexOfBareLF(data: Uint8Array, previousEndedWithCR: boolean): number {
++  let prevWasCR = previousEndedWithCR;
++  for (let index = 0; index < data.length; index += 1) {
++    const byte = data[index];
++    if (byte === 0x0a && !prevWasCR) return index;
++    prevWasCR = byte === 0x0d;
+   }
++  return -1;
++}
+ 
+-  const normalized = new Uint8Array(data.length + extraCRCount);
+-  let writeIndex = 0;
+-  prevWasCR = previousEndedWithCR;
++/**
++ * 裸 LF 补齐 CR。整块无裸 LF 时原样返回，否则只从第一个裸 LF 起改写。
++ * 返回的缓冲可能是复用的暂存区视图，只在下一次调用前有效——调用方必须同步消费。
++ */
++export function normalizeLiveOutputForTerminal(
++  data: Uint8Array,
++  previousEndedWithCR: boolean
++): { normalized: Uint8Array; endedWithCR: boolean } {
++  const endedWithCR = data.length === 0 ? previousEndedWithCR : data[data.length - 1] === 0x0d;
++  const start = indexOfBareLF(data, previousEndedWithCR);
++  if (start < 0) return { normalized: data, endedWithCR };
+ 
+-  for (const byte of data) {
++  const normalized = normalizeScratchOf(data.length + (data.length - start));
++  normalized.set(data.subarray(0, start));
++  let writeIndex = start;
++  // start 处必然是裸 LF，其前一个字节按定义不是 CR
++  let prevWasCR = false;
++  for (let index = start; index < data.length; index += 1) {
++    const byte = data[index];
+     if (byte === 0x0a && !prevWasCR) {
+       normalized[writeIndex] = 0x0d;
+       writeIndex += 1;
+@@ -44,5 +60,5 @@ export function normalizeLiveOutputForTerminal(
+     prevWasCR = byte === 0x0d;
+   }
+ 
+-  return { normalized, endedWithCR };
++  return { normalized: normalized.subarray(0, writeIndex), endedWithCR };
+ }
+diff --git a/packages/ws-client/src/connection.test.ts b/packages/ws-client/src/connection.test.ts
+index d5cf5475..919bf37b 100644
+--- a/packages/ws-client/src/connection.test.ts
++++ b/packages/ws-client/src/connection.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, test } from 'bun:test';
+ import { BorshWebSocketClient, defaultWsUrl } from './client';
+ import { createGatewayConnection } from './connection';
++import { DEFAULT_PANE_OUTPUT_FLUSH_MS } from './pane-output-coalescer';
+ import type { PaneSink } from './pane-sink-registry';
+ import { createSharedGatewayTransport } from './transport';
+ 
+@@ -14,6 +15,9 @@ function collectingSink(outputs: Uint8Array[]): PaneSink {
+   };
+ }
+ 
++const flushOutputs = () =>
++  new Promise((resolve) => setTimeout(resolve, DEFAULT_PANE_OUTPUT_FLUSH_MS * 4));
++
+ describe('createGatewayConnection', () => {
+   test('每个连接持有独立的 pane-sink 注册表', async () => {
+     const a = createGatewayConnection({ wsUrl: 'ws://a.example/ws' });
+@@ -23,12 +27,12 @@ describe('createGatewayConnection', () => {
+     a.paneSinks.registerPaneSink('dev', 'pane', collectingSink(receivedA));
+ 
+     b.paneSinks.dispatchPaneOutput('dev', 'pane', new Uint8Array([1]));
+-    // 输出在微任务边界合并下发
+-    await Promise.resolve();
++    // 输出在合并窗口到点后下发
++    await flushOutputs();
+     expect(receivedA.length).toBe(0);
+ 
+     a.paneSinks.dispatchPaneOutput('dev', 'pane', new Uint8Array([2]));
+-    await Promise.resolve();
++    await flushOutputs();
+     expect(receivedA.length).toBe(1);
+ 
+     a.dispose();
+diff --git a/packages/ws-client/src/pane-output-coalescer.test.ts b/packages/ws-client/src/pane-output-coalescer.test.ts
+index 7a85e41f..b049ce48 100644
+--- a/packages/ws-client/src/pane-output-coalescer.test.ts
++++ b/packages/ws-client/src/pane-output-coalescer.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, test } from 'bun:test';
+-import { PaneOutputCoalescer } from './pane-output-coalescer';
++import { DEFAULT_PANE_OUTPUT_FLUSH_MS, PaneOutputCoalescer } from './pane-output-coalescer';
+ import type { GatewayTerminalData } from './transport';
+ 
+ const encode = (text: string) => new TextEncoder().encode(text);
+@@ -132,3 +132,50 @@ describe('PaneOutputCoalescer', () => {
+     expect(harness.texts()).toEqual(['kept']);
+   });
+ });
++
++describe('PaneOutputCoalescer 默认有界调度', () => {
++  function createDefaultHarness() {
++    const emitted: GatewayTerminalData[] = [];
++    return {
++      coalescer: new PaneOutputCoalescer((_key, merged) => emitted.push(merged)),
++      texts: () => emitted.map((entry) => decode(entry.data)),
++    };
++  }
++
++  const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
++
++  test('同一宏任务内的连续帧合并为一次下发', async () => {
++    const harness = createDefaultHarness();
++
++    harness.coalescer.push('dev:%1', frame('%1', 'a'));
++    harness.coalescer.push('dev:%1', frame('%1', 'b'));
++    await Promise.resolve();
++    expect(harness.texts()).toEqual([]);
++
++    await tick(DEFAULT_PANE_OUTPUT_FLUSH_MS * 4);
++    expect(harness.texts()).toEqual(['ab']);
++  });
++
++  test('窗口内跨宏任务到达的帧同样合并', async () => {
++    const harness = createDefaultHarness();
++
++    harness.coalescer.push('dev:%1', frame('%1', 'a'));
++    await tick(0);
++    harness.coalescer.push('dev:%1', frame('%1', 'b'));
++    expect(harness.texts()).toEqual([]);
++
++    await tick(DEFAULT_PANE_OUTPUT_FLUSH_MS * 4);
++    expect(harness.texts()).toEqual(['ab']);
++  });
++
++  test('控制事件的 flush 立即下发，窗口到点不再补发空帧', async () => {
++    const harness = createDefaultHarness();
++
++    harness.coalescer.push('dev:%1', frame('%1', 'a'));
++    harness.coalescer.flush('dev:%1');
++    expect(harness.texts()).toEqual(['a']);
++
++    await tick(DEFAULT_PANE_OUTPUT_FLUSH_MS * 4);
++    expect(harness.texts()).toEqual(['a']);
++  });
++});
+diff --git a/packages/ws-client/src/pane-output-coalescer.ts b/packages/ws-client/src/pane-output-coalescer.ts
+index d6839215..cc68748c 100644
+--- a/packages/ws-client/src/pane-output-coalescer.ts
++++ b/packages/ws-client/src/pane-output-coalescer.ts
+@@ -1,14 +1,16 @@
+ // per-pane 输出合并：高频小帧逐帧下发时，每帧都要在 WASM 里搬一次缓冲、查一次 alt-screen、
+-// 排一次渲染，成本按帧数线性增长。这里把同一个 pane 在同一宏任务内的连续输出攒成一帧，
+-// 在微任务边界（不是定时器，避免交互延迟回退）或攒够 flushBytes 时一次性下发。
++// 排一次渲染，成本按帧数线性增长。每条 WebSocket 消息是独立宏任务，微任务边界只能合并
++// 同一条消息里的连续帧，因此这里用有界窗口：攒够 flushBytes 立即下发，否则最多等
++// DEFAULT_PANE_OUTPUT_FLUSH_MS 毫秒（不用 rAF：一帧 16.7ms 的回显延迟比这更差）。
+ //
+ // 顺序保证：同一 pane 的字节严格按到达顺序拼接；任何会改变画面基线的事件
+ //（reset / history / snapshot / rebase / sink 换绑与注销）都要先 flush 再执行。
+-// 帧字节按引用暂存不复制：flush 必定发生在同一宏任务内（微任务边界或攒够阈值），
+-// 解码缓冲在此期间不会被复用。
++// 帧字节按引用暂存不复制：每帧的字节来自各自的解码结果，没有跨帧复用的缓冲。
+ import type { GatewayTerminalData } from './transport';
+ 
+ export const DEFAULT_PANE_OUTPUT_FLUSH_BYTES = 32 * 1024;
++// 攒不满阈值时的最大附加延迟
++export const DEFAULT_PANE_OUTPUT_FLUSH_MS = 4;
+ 
+ export type PaneOutputScheduler = (flush: () => void) => void;
+ 
+@@ -68,7 +70,8 @@ export class PaneOutputCoalescer {
+     options: PaneOutputCoalescerOptions = {}
+   ) {
+     this.flushBytes = options.flushBytes ?? DEFAULT_PANE_OUTPUT_FLUSH_BYTES;
+-    this.schedule = options.schedule ?? ((flush) => queueMicrotask(flush));
++    this.schedule =
++      options.schedule ?? ((flush) => void setTimeout(flush, DEFAULT_PANE_OUTPUT_FLUSH_MS));
+   }
+ 
+   push(key: string, frame: GatewayTerminalData): void {
+diff --git a/packages/ws-client/src/pane-sink-registry.test.ts b/packages/ws-client/src/pane-sink-registry.test.ts
+index 44ab6378..cb6d99f4 100644
+--- a/packages/ws-client/src/pane-sink-registry.test.ts
++++ b/packages/ws-client/src/pane-sink-registry.test.ts
+@@ -1,4 +1,5 @@
+ import { afterEach, describe, expect, test } from 'bun:test';
++import { DEFAULT_PANE_OUTPUT_FLUSH_MS } from './pane-output-coalescer';
+ import {
+   type PaneResetOrigin,
+   type PaneSink,
+@@ -49,7 +50,9 @@ function createFrameRecordingSink() {
+ 
+ const encode = (text: string) => new TextEncoder().encode(text);
+ // 输出合并在微任务边界落地：让出一次微任务队列即可看到 flush 结果
+-const flushOutputs = () => Promise.resolve();
++// 默认合并窗口是定时器（见 pane-output-coalescer），微任务边界不再触发下发
++const flushOutputs = () =>
++  new Promise((resolve) => setTimeout(resolve, DEFAULT_PANE_OUTPUT_FLUSH_MS * 4));
+ 
+ afterEach(() => {
+   resetPaneSinkRegistryForTest();
+diff --git a/packages/ws-client/src/protocol-dispatcher.test.ts b/packages/ws-client/src/protocol-dispatcher.test.ts
+index 3032df23..1fe0cd3e 100644
+--- a/packages/ws-client/src/protocol-dispatcher.test.ts
++++ b/packages/ws-client/src/protocol-dispatcher.test.ts
+@@ -106,4 +106,19 @@ describe('ProtocolDispatcher', () => {
+     }
+     expect(rec.messages).toEqual([]);
+   });
++
++  test('业务帧 payload 借用原始帧缓冲（零拷贝）', () => {
++    const rec = createRecorder();
++    const buffer = frame(wsBorsh.encodeEnvelope(wsBorsh.KIND_TERM_OUTPUT, new Uint8Array(64), 5));
++    rec.dispatcher.handleFrame(buffer);
++    expect(rec.messages[0]?.payload.buffer).toBe(buffer);
++  });
++
++  test('payload 长度前缀越界的帧被丢弃', () => {
++    const rec = createRecorder();
++    const bytes = wsBorsh.encodeEnvelope(wsBorsh.KIND_TERM_OUTPUT, new Uint8Array([1, 2]), 6);
++    new DataView(bytes.buffer, bytes.byteOffset).setUint32(12, 0xffffffff, true);
++    rec.dispatcher.handleFrame(frame(bytes));
++    expect(rec.messages).toEqual([]);
++  });
+ });
+diff --git a/packages/ws-client/src/protocol-dispatcher.ts b/packages/ws-client/src/protocol-dispatcher.ts
+index 970abcc5..3013db2b 100644
+--- a/packages/ws-client/src/protocol-dispatcher.ts
++++ b/packages/ws-client/src/protocol-dispatcher.ts
+@@ -48,7 +48,8 @@ export class ProtocolDispatcher {
+     }
+ 
+     try {
+-      const envelope = wsBorsh.decodeEnvelope(buffer);
++      // 视图解码：payload 直接借用帧缓冲，TERM_OUTPUT 的 MiB 级字节不再逐帧 copy 两遍
++      const envelope = wsBorsh.decodeEnvelopeView(buffer);
+ 
+       if (envelope.kind === wsBorsh.KIND_CHUNK) {
+         this.handleChunk(envelope.payload);
+diff --git a/packages/ws-client/src/transport-message-decoder.test.ts b/packages/ws-client/src/transport-message-decoder.test.ts
+index 0ef3eeea..0e256bb9 100644
+--- a/packages/ws-client/src/transport-message-decoder.test.ts
++++ b/packages/ws-client/src/transport-message-decoder.test.ts
+@@ -242,4 +242,20 @@ describe('decodeGatewayTransportMessage', () => {
+     expect(handled).toBe(true);
+     expect(events).toEqual([{ type: 'rebase-required', reason: 'resource_exhausted' }]);
+   });
++  test('terminal-data 的 data 是 payload 视图，截断/越界 payload 抛错', () => {
++    const payload = wsBorsh.encodePayload(wsBorsh.schema.TermOutputSchema, {
++      deviceId: 'dev-1',
++      paneId: '%1',
++      encoding: 0,
++      data: new Uint8Array(32).fill(7),
++    });
++    const { events } = collect(wsBorsh.KIND_TERM_OUTPUT, payload);
++    const frame = (events[0] as Extract<GatewayTransportEvent, { type: 'terminal-data' }>).frame;
++    expect(frame.data.buffer).toBe(payload.buffer);
++
++    expect(() => collect(wsBorsh.KIND_TERM_OUTPUT, payload.subarray(0, 10))).toThrow();
++    const oversize = new Uint8Array(payload);
++    new DataView(oversize.buffer).setUint32(oversize.length - 36, 0xffffffff, true);
++    expect(() => collect(wsBorsh.KIND_TERM_OUTPUT, oversize)).toThrow();
++  });
+ });
+diff --git a/packages/ws-client/src/transport-message-decoder.ts b/packages/ws-client/src/transport-message-decoder.ts
+index 6b54809e..ac750635 100644
+--- a/packages/ws-client/src/transport-message-decoder.ts
++++ b/packages/ws-client/src/transport-message-decoder.ts
+@@ -124,7 +124,7 @@ const MESSAGE_DECODERS = new Map<number, MessageDecoder>([
+   [
+     wsBorsh.KIND_TERM_OUTPUT,
+     (payload, emit) => {
+-      const decoded = wsBorsh.decodePayload(wsBorsh.schema.TermOutputSchema, payload);
++      const decoded = wsBorsh.decodeTermOutputView(payload);
+       emit({
+         type: 'terminal-data',
+         frame: { deviceId: decoded.deviceId, paneId: decoded.paneId, data: decoded.data },

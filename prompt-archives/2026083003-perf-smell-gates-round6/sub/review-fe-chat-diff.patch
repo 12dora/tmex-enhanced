@@ -1,0 +1,2440 @@
+diff --git a/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx b/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx
+index 5a0a6ed1..0fecb60d 100644
+--- a/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx
++++ b/apps/fe/src/components/page-layouts/components/agent-session-dialogs.tsx
+@@ -16,7 +16,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '
+ import { Input } from '@tmex/ui/input';
+ import { X } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+-import { useSidebarAgentSessions } from './use-sidebar-agent-sessions';
++import { useSidebarAgentDialogs } from './use-sidebar-agent-sessions';
+ 
+ export function AgentSessionDialogs() {
+   const { t } = useTranslation();
+@@ -29,7 +29,7 @@ export function AgentSessionDialogs() {
+     sessionDeleteCandidate,
+     closeDeleteDialog,
+     confirmDeleteSession,
+-  } = useSidebarAgentSessions();
++  } = useSidebarAgentDialogs();
+ 
+   return (
+     <>
+diff --git a/apps/fe/src/components/page-layouts/components/agent-session-row.tsx b/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
+index 45515fd6..84037497 100644
+--- a/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
++++ b/apps/fe/src/components/page-layouts/components/agent-session-row.tsx
+@@ -13,8 +13,9 @@ import {
+ } from '@tmex/ui/dropdown-menu';
+ import { useSidebar } from '@tmex/ui/sidebar';
+ import { Bot, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
++import { memo } from 'react';
+ import { useTranslation } from 'react-i18next';
+-import { useSidebarAgentSessions } from './use-sidebar-agent-sessions';
++import { useSidebarAgentCommands } from './use-sidebar-agent-sessions';
+ 
+ export function StatusDot({ status }: { status: AgentSessionDto['status'] }) {
+   return (
+@@ -42,7 +43,7 @@ function SessionActionsMenu({
+ }) {
+   const { t } = useTranslation();
+   const { isMobile } = useSidebar();
+-  const { requestRenameSession, requestDeleteSession } = useSidebarAgentSessions();
++  const { requestRenameSession, requestDeleteSession } = useSidebarAgentCommands();
+   const enlarged = enlargeOnTouch && isMobile;
+   return (
+     <DropdownMenu>
+@@ -99,7 +100,7 @@ function SessionActionsMenu({
+   );
+ }
+ 
+-export function PaneSessionRow({
++export const PaneSessionRow = memo(function PaneSessionRow({
+   session,
+   isActive,
+   paused = false,
+@@ -139,9 +140,9 @@ export function PaneSessionRow({
+       </div>
+     </div>
+   );
+-}
++});
+ 
+-export function OrphanSessionRow({
++export const OrphanSessionRow = memo(function OrphanSessionRow({
+   session,
+   isActive,
+   paused = false,
+@@ -193,4 +194,4 @@ export function OrphanSessionRow({
+       </div>
+     </div>
+   );
+-}
++});
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx b/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+index 8b50724a..cea6c8bf 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-agent-sessions.tsx
+@@ -15,21 +15,26 @@ import { useTranslation } from 'react-i18next';
+ import { AgentSessionDialogs } from './agent-session-dialogs';
+ import { OrphanSessionRow, PaneSessionRow } from './agent-session-row';
+ import {
+-  SidebarAgentSessionsContext,
++  SidebarAgentCommandsContext,
++  SidebarAgentDialogsContext,
+   collectKnownPaneIds,
+   isSessionAttached,
+   isSessionPaused,
+-  paneKey,
+-  useSidebarAgentSessions,
++  useActiveSessionId,
++  useNodeSessions,
++  useSessionsForPane,
++  useSidebarAgentCommands,
+   useSidebarAgentSessionsController,
+ } from './use-sidebar-agent-sessions';
+ 
+ export function SidebarAgentSessionsProvider({ children }: { children: ReactNode }) {
+-  const value = useSidebarAgentSessionsController();
++  const { commands, dialogs } = useSidebarAgentSessionsController();
+   return (
+-    <SidebarAgentSessionsContext.Provider value={value}>
+-      {children}
+-    </SidebarAgentSessionsContext.Provider>
++    <SidebarAgentCommandsContext.Provider value={commands}>
++      <SidebarAgentDialogsContext.Provider value={dialogs}>
++        {children}
++      </SidebarAgentDialogsContext.Provider>
++    </SidebarAgentCommandsContext.Provider>
+   );
+ }
+ 
+@@ -85,12 +90,13 @@ function AgentPaneSessions({
+   deviceId: string;
+   paneId: string;
+ }) {
+-  const { sessionsByPane, activeSessionId, nodeOffline } = useSidebarAgentSessions();
++  const { nodeOffline } = useSidebarAgentCommands();
+   const handleSelectSession = useSelectSession(nav);
+-  const sessions = sessionsByPane.get(paneKey(deviceId, paneId));
++  const sessions = useSessionsForPane(deviceId, paneId);
++  const activeSessionId = useActiveSessionId();
+   return (
+     <div className="mt-1 space-y-0.5 [@media(any-pointer:coarse)]:space-y-1">
+-      {sessions?.map((session) => (
++      {sessions.map((session) => (
+         <PaneSessionRow
+           key={session.id}
+           session={session}
+@@ -114,7 +120,9 @@ function AgentOrphanSessions({
+ }) {
+   const { t } = useTranslation();
+   const [open, setOpen] = useState(false);
+-  const { orderedSessions, activeSessionId, nodeOffline } = useSidebarAgentSessions();
++  const { nodeOffline } = useSidebarAgentCommands();
++  const orderedSessions = useNodeSessions();
++  const activeSessionId = useActiveSessionId();
+   const handleSelectSession = useSelectSession(nav);
+   const snapshots = useTmuxStore((state) => state.snapshots);
+ 
+diff --git a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
+index 8a8d1499..f471a330 100644
+--- a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
++++ b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.test.ts
+@@ -1,14 +1,15 @@
+ import { describe, expect, test } from 'bun:test';
+ import type { AgentSessionDto, StateSnapshotPayload, TmuxPane, TmuxWindow } from '@tmex/shared';
+ import { isSessionOnNode } from '@tmex/stores';
++import { shallow } from 'zustand/vanilla/shallow';
++import { OrphanSessionRow, PaneSessionRow } from './agent-session-row';
+ import {
+   collectKnownPaneIds,
+   compareSessions,
+-  groupSessionsByPane,
+   isSessionAttached,
+   isSessionPaused,
+   orderSessions,
+-  paneKey,
++  sessionsForPane,
+ } from './use-sidebar-agent-sessions';
+ 
+ function session(partial: Partial<AgentSessionDto> & { id: string }): AgentSessionDto {
+@@ -35,6 +36,8 @@ function session(partial: Partial<AgentSessionDto> & { id: string }): AgentSessi
+   };
+ }
+ 
++const NODE_A = 'a'.repeat(32);
++
+ function toRecord(list: AgentSessionDto[]): Record<string, AgentSessionDto> {
+   return Object.fromEntries(list.map((item) => [item.id, item]));
+ }
+@@ -117,30 +120,63 @@ describe('orderSessions', () => {
+   });
+ });
+ 
+-describe('groupSessionsByPane', () => {
+-  test('groups by device+pane preserving input order', () => {
+-    const first = session({ id: 'a', deviceId: 'd1', paneId: '%1' });
+-    const second = session({ id: 'b', deviceId: 'd1', paneId: '%1' });
+-    const other = session({ id: 'c', deviceId: 'd2', paneId: '%1' });
+-    const grouped = groupSessionsByPane([first, second, other]);
+-    expect(grouped.get(paneKey('d1', '%1'))?.map((item) => item.id)).toEqual(['a', 'b']);
+-    expect(grouped.get(paneKey('d2', '%1'))?.map((item) => item.id)).toEqual(['c']);
++describe('sessionsForPane', () => {
++  const order = ['a', 'b', 'c'];
++
++  test('只取本 node 挂在该 pane 上的会话，顺序跟随 sessionOrder', () => {
++    const sessions = toRecord([
++      session({ id: 'a', deviceId: 'd1', paneId: '%1' }),
++      session({ id: 'b', deviceId: 'd1', paneId: '%1' }),
++      session({ id: 'c', deviceId: 'd2', paneId: '%1' }),
++    ]);
++    expect(sessionsForPane(sessions, ['b', 'a'], null, 'd1', '%1').map((s) => s.id)).toEqual([
++      'b',
++      'a',
++    ]);
++    expect(sessionsForPane(sessions, order, NODE_A, 'd1', '%1')).toEqual([]);
+   });
+ 
+-  test('does not collide when ids concatenate ambiguously', () => {
+-    const left = session({ id: 'a', deviceId: 'd', paneId: '1%1' });
+-    const right = session({ id: 'b', deviceId: 'd1', paneId: '%1' });
+-    const grouped = groupSessionsByPane([left, right]);
+-    expect(grouped.size).toBe(2);
++  test('device/pane 分开比较，拼接歧义不会串台', () => {
++    const sessions = toRecord([
++      session({ id: 'a', deviceId: 'd', paneId: '1%1' }),
++      session({ id: 'b', deviceId: 'd1', paneId: '%1' }),
++    ]);
++    expect(sessionsForPane(sessions, order, null, 'd1', '%1').map((s) => s.id)).toEqual(['b']);
++    expect(sessionsForPane(sessions, order, null, 'd', '1%1').map((s) => s.id)).toEqual(['a']);
+   });
+ 
+-  test('drops sessions without device or pane', () => {
+-    const grouped = groupSessionsByPane([
+-      session({ id: 'a' }),
+-      session({ id: 'b', deviceId: 'd1' }),
+-      session({ id: 'c', paneId: '%1' }),
++  test('未绑定 device/pane 的会话不入列', () => {
++    const sessions = toRecord([session({ id: 'a' }), session({ id: 'b', deviceId: 'd1' })]);
++    expect(sessionsForPane(sessions, order, null, 'd1', '%1')).toEqual([]);
++  });
++
++  // 性能契约：某个会话更新后，未受影响的 pane 必须逐项同引用（useShallow 据此保住数组引用，
++  // 该 pane 分支整支不重渲染），受影响 pane 内没变的行也保持同引用（React.memo 据此跳过）。
++  test('无关会话更新后，其它 pane 的列表逐项同引用', () => {
++    const before = toRecord([
++      session({ id: 'a', deviceId: 'd1', paneId: '%1' }),
++      session({ id: 'b', deviceId: 'd1', paneId: '%1' }),
++      session({ id: 'c', deviceId: 'd2', paneId: '%2' }),
+     ]);
+-    expect(grouped.size).toBe(0);
++    const after = { ...before, a: { ...before.a, title: 'renamed' } };
++
++    const otherBefore = sessionsForPane(before, order, null, 'd2', '%2');
++    const otherAfter = sessionsForPane(after, order, null, 'd2', '%2');
++    expect(shallow(otherBefore, otherAfter)).toBe(true);
++
++    const paneBefore = sessionsForPane(before, order, null, 'd1', '%1');
++    const paneAfter = sessionsForPane(after, order, null, 'd1', '%1');
++    expect(shallow(paneBefore, paneAfter)).toBe(false);
++    expect(paneAfter[0]).not.toBe(paneBefore[0]);
++    expect(paneAfter[1]).toBe(paneBefore[1]);
++  });
++});
++
++describe('会话行组件', () => {
++  test('两种会话行都是 React.memo 组件（props 不变即跳过重渲染）', () => {
++    for (const row of [PaneSessionRow, OrphanSessionRow]) {
++      expect((row as unknown as { $$typeof: symbol }).$$typeof).toBe(Symbol.for('react.memo'));
++    }
+   });
+ });
+ 
+@@ -203,8 +239,6 @@ describe('isSessionAttached', () => {
+   });
+ });
+ 
+-const NODE_A = 'a'.repeat(32);
+-
+ describe('per-node session filtering', () => {
+   const local = session({ id: 'local', deviceId: 'd1', paneId: '%1' });
+   const remote = session({ id: 'remote', nodeId: NODE_A, deviceId: 'd1', paneId: '%1' });
+@@ -216,10 +250,9 @@ describe('per-node session filtering', () => {
+   });
+ 
+   test('grouping by pane stays per node, so identical device:pane keys do not collide', () => {
+-    const selfGroups = groupSessionsByPane(all.filter((item) => isSessionOnNode(item, null)));
+-    const remoteGroups = groupSessionsByPane(all.filter((item) => isSessionOnNode(item, NODE_A)));
+-    expect(selfGroups.get(paneKey('d1', '%1'))).toEqual([local]);
+-    expect(remoteGroups.get(paneKey('d1', '%1'))).toEqual([remote]);
++    const sessions = toRecord(all);
++    expect(sessionsForPane(sessions, ['local', 'remote'], null, 'd1', '%1')).toEqual([local]);
++    expect(sessionsForPane(sessions, ['local', 'remote'], NODE_A, 'd1', '%1')).toEqual([remote]);
+   });
+ });
+ 
+diff --git a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
+index 08bd1455..52ca8880 100644
+--- a/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
++++ b/apps/fe/src/components/page-layouts/components/use-sidebar-agent-sessions.ts
+@@ -10,13 +10,16 @@ import {
+   normalizeAgentNodeId,
+ } from '@tmex/stores';
+ import { useRuntime } from '@tmex/stores/react';
+-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+-
+-const PANE_KEY_SEPARATOR = '\u0000';
+-
+-export function paneKey(deviceId: string, paneId: string): string {
+-  return `${deviceId}${PANE_KEY_SEPARATOR}${paneId}`;
+-}
++import {
++  type Context,
++  createContext,
++  useCallback,
++  useContext,
++  useEffect,
++  useMemo,
++  useState,
++} from 'react';
++import { useShallow } from 'zustand/react/shallow';
+ 
+ /** updatedAt 倒序；同一时间戳按 id 升序兜底，保证比较函数反对称与排序稳定 */
+ export function compareSessions(a: AgentSessionDto, b: AgentSessionDto): number {
+@@ -49,23 +52,63 @@ export function orderSessions(
+   return ordered;
+ }
+ 
+-export function groupSessionsByPane(
+-  ordered: readonly AgentSessionDto[]
++const PANE_KEY_SEPARATOR = '\u0000';
++const NO_SESSIONS: AgentSessionDto[] = [];
++
++function paneKey(deviceId: string, paneId: string): string {
++  return `${deviceId}${PANE_KEY_SEPARATOR}${paneId}`;
++}
++
++/**
++ * 一份 sessions + sessionOrder 下按 pane 的分组，按 node 各缓存一份：
++ * 每个 pane 的选择器都要这份结果，重算一次就够，之后各自 O(1) 取自己那格。
++ */
++const paneGroupCache = new WeakMap<
++  object,
++  Map<string, { order: readonly string[]; grouped: Map<string, AgentSessionDto[]> }>
++>();
++
++function groupSessionsByPane(
++  sessions: Record<string, AgentSessionDto | undefined>,
++  sessionOrder: readonly string[],
++  nodeId: string | null
+ ): Map<string, AgentSessionDto[]> {
++  let byNode = paneGroupCache.get(sessions);
++  if (!byNode) {
++    byNode = new Map();
++    paneGroupCache.set(sessions, byNode);
++  }
++  const cacheKey = nodeId ?? '';
++  const cached = byNode.get(cacheKey);
++  if (cached && cached.order === sessionOrder) return cached.grouped;
++
+   const grouped = new Map<string, AgentSessionDto[]>();
+-  for (const session of ordered) {
++  for (const session of orderSessions(sessions, sessionOrder)) {
+     if (!session.deviceId || !session.paneId) continue;
++    if (!isSessionOnNode(session, nodeId)) continue;
+     const key = paneKey(session.deviceId, session.paneId);
+     const list = grouped.get(key);
+-    if (list) {
+-      list.push(session);
+-    } else {
+-      grouped.set(key, [session]);
+-    }
++    if (list) list.push(session);
++    else grouped.set(key, [session]);
+   }
++  byNode.set(cacheKey, { order: sessionOrder, grouped });
+   return grouped;
+ }
+ 
++/** 本 node 上挂在该 pane 的会话，顺序与整表一致 */
++export function sessionsForPane(
++  sessions: Record<string, AgentSessionDto | undefined>,
++  sessionOrder: readonly string[],
++  nodeId: string | null,
++  deviceId: string,
++  paneId: string
++): AgentSessionDto[] {
++  return (
++    groupSessionsByPane(sessions, sessionOrder, nodeId).get(paneKey(deviceId, paneId)) ??
++    NO_SESSIONS
++  );
++}
++
+ export function collectKnownPaneIds(
+   snapshots: Record<string, StateSnapshotPayload | undefined>
+ ): Map<string, Set<string>> {
+@@ -116,14 +159,16 @@ export function isSessionPaused(
+   return isNodePaused(nodeOffline, session.lastError);
+ }
+ 
+-export interface SidebarAgentSessionsContextValue {
+-  orderedSessions: AgentSessionDto[];
+-  sessionsByPane: ReadonlyMap<string, AgentSessionDto[]>;
+-  activeSessionId: string | null;
+-  /** 本分节所属 node（null 即 entry 自身）；新建会话与过滤都用它 */
+-  nodeId: string | null;
++/** 分节级的稳定值：会话变动不改它的引用，行菜单据此免于跟着列表重渲染 */
++export interface SidebarAgentCommands {
+   /** 本分节所属 node 是否离线（`undefined` 即 mesh 状态未知）：行灰显且不可点入 */
+   nodeOffline: boolean | undefined;
++  requestRenameSession: (session: AgentSessionDto) => void;
++  requestDeleteSession: (session: AgentSessionDto) => void;
++}
++
++/** 对话框状态只有 AgentSessionDialogs 消费，单独成 context，开关对话框不惊动会话行 */
++export interface SidebarAgentDialogsState {
+   sessionRenameCandidate: AgentSessionDto | null;
+   sessionRenameValue: string;
+   setSessionRenameValue: (value: string) => void;
+@@ -132,27 +177,65 @@ export interface SidebarAgentSessionsContextValue {
+   sessionDeleteCandidate: AgentSessionDto | null;
+   closeDeleteDialog: () => void;
+   confirmDeleteSession: () => void;
+-  requestRenameSession: (session: AgentSessionDto) => void;
+-  requestDeleteSession: (session: AgentSessionDto) => void;
+ }
+ 
+-export const SidebarAgentSessionsContext = createContext<SidebarAgentSessionsContextValue | null>(
+-  null
+-);
++export const SidebarAgentCommandsContext = createContext<SidebarAgentCommands | null>(null);
++export const SidebarAgentDialogsContext = createContext<SidebarAgentDialogsState | null>(null);
+ 
+-export function useSidebarAgentSessions(): SidebarAgentSessionsContextValue {
+-  const ctx = useContext(SidebarAgentSessionsContext);
+-  if (!ctx) {
++function useProvided<T>(context: Context<T | null>): T {
++  const value = useContext(context);
++  if (!value) {
+     throw new Error('sidebarAgentAdapter must be used within SidebarAgentSessionsProvider');
+   }
+-  return ctx;
++  return value;
++}
++
++export function useSidebarAgentCommands(): SidebarAgentCommands {
++  return useProvided(SidebarAgentCommandsContext);
++}
++
++export function useSidebarAgentDialogs(): SidebarAgentDialogsState {
++  return useProvided(SidebarAgentDialogsContext);
++}
++
++// 会话状态一律来自 entry（self）网关，与本分节挂的是哪个 node 的运行时无关
++function useSessionNodeId(): string | null {
++  return normalizeAgentNodeId(useRuntime().nodeId);
++}
++
++/** 单个 pane 的会话列表：内容不变就保持数组引用，本 pane 之外的更新不会重渲染这一支 */
++export function useSessionsForPane(deviceId: string, paneId: string): AgentSessionDto[] {
++  const nodeId = useSessionNodeId();
++  return selfAgentStore()(
++    useShallow((state) =>
++      sessionsForPane(state.sessions, state.sessionOrder, nodeId, deviceId, paneId)
++    )
++  );
++}
++
++/** 本 node 上的全部会话（孤立会话区用；只有那一个组件订阅整表） */
++export function useNodeSessions(): AgentSessionDto[] {
++  const nodeId = useSessionNodeId();
++  return selfAgentStore()(
++    useShallow((state) =>
++      orderSessions(state.sessions, state.sessionOrder).filter((session) =>
++        isSessionOnNode(session, nodeId)
++      )
++    )
++  );
++}
++
++export function useActiveSessionId(): string | null {
++  const nodeId = useSessionNodeId();
++  return selfAgentStore()((state) => activeSessionIdOnNode(state, nodeId));
+ }
+ 
+-export function useSidebarAgentSessionsController(): SidebarAgentSessionsContextValue {
++export function useSidebarAgentSessionsController(): {
++  commands: SidebarAgentCommands;
++  dialogs: SidebarAgentDialogsState;
++} {
+   const runtime = useRuntime();
+-  // 会话状态一律来自 entry（self）网关，与本分节挂的是哪个 node 的运行时无关
+   const agentStore = selfAgentStore();
+-  const nodeId = normalizeAgentNodeId(runtime.nodeId);
+   const nodeOffline = useNodeOffline(runtime.nodeId);
+ 
+   // AgentTab 挂载时也会拉列表，这里只在列表尚未加载过时兜底，避免切换侧边栏 tab 反复全量拉取
+@@ -162,19 +245,6 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+     if (!store.sessionsLoaded) void store.loadSessions();
+   }, [agentStore]);
+ 
+-  const sessions = agentStore((state) => state.sessions);
+-  const sessionOrder = agentStore((state) => state.sessionOrder);
+-  const activeSessionId = agentStore((state) => activeSessionIdOnNode(state, nodeId));
+-
+-  // 单一列表按 node 过滤：本分节只展示绑在自己这个 node 上的会话，
+-  // 于是 isSessionAttached 比对的快照也一定是该会话所在 node 的快照。
+-  const orderedSessions = useMemo(
+-    () =>
+-      orderSessions(sessions, sessionOrder).filter((session) => isSessionOnNode(session, nodeId)),
+-    [sessions, sessionOrder, nodeId]
+-  );
+-  const sessionsByPane = useMemo(() => groupSessionsByPane(orderedSessions), [orderedSessions]);
+-
+   const [sessionRenameCandidate, setSessionRenameCandidate] = useState<AgentSessionDto | null>(
+     null
+   );
+@@ -209,13 +279,13 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+   const closeRenameDialog = useCallback(() => setSessionRenameCandidate(null), []);
+   const closeDeleteDialog = useCallback(() => setSessionDeleteCandidate(null), []);
+ 
+-  return useMemo(
++  const commands = useMemo(
++    () => ({ nodeOffline, requestRenameSession, requestDeleteSession }),
++    [nodeOffline, requestRenameSession, requestDeleteSession]
++  );
++
++  const dialogs = useMemo(
+     () => ({
+-      orderedSessions,
+-      sessionsByPane,
+-      activeSessionId,
+-      nodeId,
+-      nodeOffline,
+       sessionRenameCandidate,
+       sessionRenameValue,
+       setSessionRenameValue,
+@@ -224,15 +294,8 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+       sessionDeleteCandidate,
+       closeDeleteDialog,
+       confirmDeleteSession,
+-      requestRenameSession,
+-      requestDeleteSession,
+     }),
+     [
+-      orderedSessions,
+-      sessionsByPane,
+-      activeSessionId,
+-      nodeId,
+-      nodeOffline,
+       sessionRenameCandidate,
+       sessionRenameValue,
+       closeRenameDialog,
+@@ -240,8 +303,8 @@ export function useSidebarAgentSessionsController(): SidebarAgentSessionsContext
+       sessionDeleteCandidate,
+       closeDeleteDialog,
+       confirmDeleteSession,
+-      requestRenameSession,
+-      requestDeleteSession,
+     ]
+   );
++
++  return { commands, dialogs };
+ }
+diff --git a/packages/panels/src/agent/agent-composer.tsx b/packages/panels/src/agent/agent-composer.tsx
+index e978b318..2e17e56f 100644
+--- a/packages/panels/src/agent/agent-composer.tsx
++++ b/packages/panels/src/agent/agent-composer.tsx
+@@ -1,4 +1,4 @@
+-import { type ReactNode, useEffect, useRef, useState } from 'react';
++import { memo, useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+ import type { AgentWriteMode } from '@tmex/shared';
+@@ -9,27 +9,77 @@ import { SendIcon, SparklesIcon, SquareIcon, ZapIcon } from 'lucide-react';
+ 
+ import { ModelPicker } from './model-picker';
+ 
+-function ChatInput({
++interface ComposerControls {
++  writeMode: AgentWriteMode;
++  allowControlChars: boolean;
++  modelProviderId: string | null;
++  modelId: string | null;
++  hasActiveSession: boolean;
++  isOrphan: boolean;
++  onModelChange: (providerId: string | null, modelId: string) => void;
++  onWriteModeChange: (writeMode: AgentWriteMode) => void;
++  onAllowControlCharsChange: (allow: boolean) => void;
++}
++
++/** 写入模式与控制字符开关：全是原始值 props，流式刷新不会让它失效 */
++const WriteModeControls = memo(function WriteModeControls({
++  writeMode,
++  allowControlChars,
++  hasActiveSession,
++  isOrphan,
++  onWriteModeChange,
++  onAllowControlCharsChange,
++}: Omit<ComposerControls, 'modelProviderId' | 'modelId' | 'onModelChange'>) {
++  const { t } = useTranslation();
++  return (
++    <div className="flex shrink-0 items-center gap-3">
++      <div className="flex items-center gap-1.5">
++        <span className="text-muted-foreground text-xs">
++          {writeMode === 'auto' ? t('agent.writeMode.auto') : t('agent.writeMode.confirm')}
++        </span>
++        <Switch
++          data-testid="agent-write-mode-switch"
++          checked={writeMode === 'auto'}
++          disabled={hasActiveSession && isOrphan}
++          onCheckedChange={(checked) => {
++            onWriteModeChange(checked ? 'auto' : 'confirm');
++          }}
++        />
++      </div>
++      {hasActiveSession && (
++        <div className="flex items-center gap-1.5">
++          <span className="text-muted-foreground text-xs" title={t('agent.controlChars.hint')}>
++            {t('agent.controlChars.label')}
++          </span>
++          <Switch
++            data-testid="agent-control-chars-switch"
++            checked={allowControlChars}
++            disabled={isOrphan}
++            title={t('agent.controlChars.hint')}
++            onCheckedChange={onAllowControlCharsChange}
++          />
++        </div>
++      )}
++    </div>
++  );
++});
++
++const ChatInput = memo(function ChatInput({
+   onSend,
+   onSteer,
+   onStop,
+   running,
+-  steerable,
+   disabled,
+   draftPrompt,
+-  modelPicker,
+-  writeModeControl,
+-}: {
+-  onSend?: (text: string) => void;
+-  onSteer?: (text: string) => void;
+-  onStop?: () => void;
+-  running?: boolean;
+-  steerable?: boolean;
+-  disabled?: boolean;
++  ...controls
++}: ComposerControls & {
++  onSend: (text: string) => void;
++  onSteer: (text: string) => void;
++  onStop: () => void;
++  running: boolean;
++  disabled: boolean;
+   /** 本 node 草稿上的预填 prompt（rsync 自动安装流程） */
+-  draftPrompt?: string | null;
+-  modelPicker?: ReactNode;
+-  writeModeControl?: ReactNode;
++  draftPrompt: string | null;
+ }) {
+   const { t } = useTranslation();
+   const [text, setText] = useState('');
+@@ -46,14 +96,14 @@ function ChatInput({
+   const submit = (): void => {
+     const trimmed = text.trim();
+     if (!trimmed || disabled) return;
+-    onSend?.(trimmed);
++    onSend(trimmed);
+     setText('');
+   };
+ 
+   const steer = (): void => {
+     const trimmed = text.trim();
+     if (!trimmed || disabled) return;
+-    onSteer?.(trimmed);
++    onSteer(trimmed);
+     setText('');
+   };
+ 
+@@ -79,12 +129,19 @@ function ChatInput({
+       />
+       <div className="flex min-w-0 flex-wrap items-center gap-2 px-2.5 pb-2.5">
+         <div className="flex min-w-0 flex-1 items-center gap-2">
+-          {writeModeControl}
+-          {modelPicker && <div className="min-w-0 flex-1">{modelPicker}</div>}
++          <WriteModeControls {...controls} />
++          <div className="min-w-0 flex-1">
++            <ModelPicker
++              providerId={controls.modelProviderId}
++              modelId={controls.modelId}
++              onChange={controls.onModelChange}
++              disabled={running}
++            />
++          </div>
+         </div>
+         {running ? (
+           <div className="ml-auto flex shrink-0 items-center gap-1.5">
+-            {steerable && (
++            {controls.hasActiveSession && (
+               <Button
+                 data-testid="agent-chat-steer"
+                 size="icon"
+@@ -111,7 +168,7 @@ function ChatInput({
+               data-testid="agent-chat-stop"
+               size="icon"
+               variant="destructive"
+-              onClick={() => onStop?.()}
++              onClick={onStop}
+               aria-label={t('agent.panel.stop')}
+             >
+               <SquareIcon />
+@@ -132,44 +189,20 @@ function ChatInput({
+       </div>
+     </div>
+   );
+-}
++});
+ 
+ /** 输入区：空草稿态的欢迎块 + 输入框及其模型 / 写入模式控件 */
+-export function AgentComposer({
++export const AgentComposer = memo(function AgentComposer({
+   draftEmpty,
+-  draftPrompt,
+-  disabled,
+-  running,
+-  hasActiveSession,
+-  isOrphan,
+-  writeMode,
+-  allowControlChars,
+-  modelProviderId,
+-  modelId,
+-  onSend,
+-  onSteer,
+-  onStop,
+-  onModelChange,
+-  onWriteModeChange,
+-  onAllowControlCharsChange,
+-}: {
++  ...input
++}: ComposerControls & {
+   draftEmpty: boolean;
+-  /** 本 node 草稿上的预填 prompt */
+   draftPrompt: string | null;
+   disabled: boolean;
+   running: boolean;
+-  hasActiveSession: boolean;
+-  isOrphan: boolean;
+-  writeMode: AgentWriteMode;
+-  allowControlChars: boolean;
+-  modelProviderId: string | null;
+-  modelId: string | null;
+   onSend: (text: string) => void;
+   onSteer: (text: string) => void;
+   onStop: () => void;
+-  onModelChange: (providerId: string | null, modelId: string) => void;
+-  onWriteModeChange: (writeMode: AgentWriteMode) => void;
+-  onAllowControlCharsChange: (allow: boolean) => void;
+ }) {
+   const { t } = useTranslation();
+ 
+@@ -182,57 +215,7 @@ export function AgentComposer({
+           <p className="text-muted-foreground text-xs">{t('agent.welcome.subtitle')}</p>
+         </div>
+       )}
+-      <ChatInput
+-        disabled={disabled}
+-        draftPrompt={draftPrompt}
+-        running={running}
+-        steerable={hasActiveSession}
+-        onSend={onSend}
+-        onSteer={onSteer}
+-        onStop={onStop}
+-        modelPicker={
+-          <ModelPicker
+-            providerId={modelProviderId}
+-            modelId={modelId}
+-            onChange={onModelChange}
+-            disabled={running}
+-          />
+-        }
+-        writeModeControl={
+-          <div className="flex shrink-0 items-center gap-3">
+-            <div className="flex items-center gap-1.5">
+-              <span className="text-muted-foreground text-xs">
+-                {writeMode === 'auto' ? t('agent.writeMode.auto') : t('agent.writeMode.confirm')}
+-              </span>
+-              <Switch
+-                data-testid="agent-write-mode-switch"
+-                checked={writeMode === 'auto'}
+-                disabled={hasActiveSession && isOrphan}
+-                onCheckedChange={(checked) => {
+-                  onWriteModeChange(checked ? 'auto' : 'confirm');
+-                }}
+-              />
+-            </div>
+-            {hasActiveSession && (
+-              <div className="flex items-center gap-1.5">
+-                <span
+-                  className="text-muted-foreground text-xs"
+-                  title={t('agent.controlChars.hint')}
+-                >
+-                  {t('agent.controlChars.label')}
+-                </span>
+-                <Switch
+-                  data-testid="agent-control-chars-switch"
+-                  checked={allowControlChars}
+-                  disabled={isOrphan}
+-                  title={t('agent.controlChars.hint')}
+-                  onCheckedChange={onAllowControlCharsChange}
+-                />
+-              </div>
+-            )}
+-          </div>
+-        }
+-      />
++      <ChatInput {...input} />
+     </div>
+   );
+-}
++});
+diff --git a/packages/panels/src/agent/agent-thread-blocks.ts b/packages/panels/src/agent/agent-thread-blocks.ts
+index 31dbed3e..cd97e8a1 100644
+--- a/packages/panels/src/agent/agent-thread-blocks.ts
++++ b/packages/panels/src/agent/agent-thread-blocks.ts
+@@ -35,6 +35,7 @@ export function buildBlocksWithConfirmations(
+   confirmations: Confirmations
+ ): UiThreadBlock[] {
+   const merged = buildThreadBlocks(messages, inProgress);
++  if (!confirmations || confirmations.length === 0) return merged;
+   const knownToolCallIds = new Set<string>();
+   for (const block of merged) {
+     if (block.kind === 'tool-call') {
+diff --git a/packages/panels/src/agent/chat-thread.test.tsx b/packages/panels/src/agent/chat-thread.test.tsx
+new file mode 100644
+index 00000000..346a7eff
+--- /dev/null
++++ b/packages/panels/src/agent/chat-thread.test.tsx
+@@ -0,0 +1,145 @@
++// bun test 无 DOM，行重渲染数按 React.memo 的默认浅比较语义推算（type 相同 + props 浅相等即跳过）。
++
++import { describe, expect, test } from 'bun:test';
++import type { AgentMessageDto } from '@tmex/shared';
++import { I18N_RESOURCES } from '@tmex/shared';
++import type { SessionInProgress } from '@tmex/stores';
++import i18next from 'i18next';
++import type { ReactElement } from 'react';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { I18nextProvider } from 'react-i18next';
++import { buildBlocksWithConfirmations } from './agent-thread-blocks';
++import { ChatThread, isPinnedToBottom, threadRows } from './chat-thread';
++
++const i18n = i18next.createInstance();
++await i18n.init({
++  lng: 'zh_CN',
++  fallbackLng: 'zh_CN',
++  resources: I18N_RESOURCES,
++  interpolation: { escapeValue: false },
++  react: { useSuspense: false },
++});
++
++const NO_CONFIRMATIONS = new Map<string, string>();
++const onDecide = (): void => undefined;
++
++function history(count: number): AgentMessageDto[] {
++  return Array.from({ length: count }, (_, i) => ({
++    id: `m${i}`,
++    sessionId: 's1',
++    seq: i,
++    role: 'user',
++    content: { role: 'user', content: `question ${i}` },
++    createdAt: '2026-01-01T00:00:00.000Z',
++  })) as AgentMessageDto[];
++}
++
++function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
++  const keys = Object.keys(a);
++  if (keys.length !== Object.keys(b).length) return false;
++  return keys.every((key) => Object.is(a[key], b[key]));
++}
++
++/** React.memo 语义下会真正重渲染的行数：新增的行，或 type/props 变了的行 */
++function rerenderCount(prev: ReactElement[], next: ReactElement[]): number {
++  const before = new Map(prev.map((row) => [row.key, row]));
++  let count = 0;
++  for (const row of next) {
++    const old = before.get(row.key);
++    if (
++      !old ||
++      old.type !== row.type ||
++      !shallowEqual(old.props as Record<string, unknown>, row.props as Record<string, unknown>)
++    ) {
++      count++;
++    }
++  }
++  return count;
++}
++
++describe('threadRows', () => {
++  test('rows are memo components keyed by block id', () => {
++    const rows = threadRows(
++      buildBlocksWithConfirmations(history(3), undefined, undefined),
++      NO_CONFIRMATIONS,
++      onDecide
++    );
++    expect(rows).toHaveLength(3);
++    expect(rows.map((row) => row.key)).toEqual(['m0', 'm1', 'm2']);
++    for (const row of rows) {
++      expect((row.type as { $$typeof?: symbol }).$$typeof).toBe(Symbol.for('react.memo'));
++    }
++  });
++
++  test('streaming 50 deltas re-renders only the tail row', () => {
++    const messages = history(2000);
++    let text = '';
++    const flush = (): ReactElement[] => {
++      text += 'token ';
++      const inProgress: SessionInProgress = {
++        texts: [{ messageId: 'live', text, stale: false }],
++        reasonings: [],
++        toolCalls: [],
++        staleBarrier: false,
++      };
++      return threadRows(
++        buildBlocksWithConfirmations(messages, inProgress, undefined),
++        NO_CONFIRMATIONS,
++        onDecide
++      );
++    };
++
++    let prev = flush();
++    let total = 0;
++    for (let i = 0; i < 50; i++) {
++      const next = flush();
++      total += rerenderCount(prev, next);
++      prev = next;
++    }
++    expect(prev).toHaveLength(2001);
++    expect(total).toBe(50);
++  });
++});
++
++describe('ChatThread', () => {
++  function render(blocks: number): string {
++    return renderToStaticMarkup(
++      <I18nextProvider i18n={i18n}>
++        <ChatThread
++          blocks={buildBlocksWithConfirmations(history(blocks), undefined, undefined)}
++          running={false}
++          emptyText="empty"
++          confirmationByToolCallId={NO_CONFIRMATIONS}
++          onDecide={onDecide}
++        />
++      </I18nextProvider>
++    );
++  }
++
++  function count(html: string, testid: string): number {
++    return html.split(`data-testid="${testid}"`).length - 1;
++  }
++
++  test('renders the whole thread when it fits in the window', () => {
++    const html = render(10);
++    expect(count(html, 'agent-user-message')).toBe(10);
++    expect(count(html, 'agent-show-earlier')).toBe(0);
++  });
++
++  test('renders only the last 200 blocks and offers to show earlier ones', () => {
++    const html = render(500);
++    expect(count(html, 'agent-user-message')).toBe(200);
++    expect(count(html, 'agent-show-earlier')).toBe(1);
++    expect(html).toContain('显示更早的 300 条消息');
++    expect(html).toContain('question 300');
++    expect(html).not.toContain('question 299');
++  });
++});
++
++describe('isPinnedToBottom', () => {
++  test('stays pinned within the threshold and unpins once scrolled up', () => {
++    expect(isPinnedToBottom({ scrollHeight: 1000, scrollTop: 953, clientHeight: 0 })).toBe(true);
++    expect(isPinnedToBottom({ scrollHeight: 1000, scrollTop: 900, clientHeight: 53 })).toBe(true);
++    expect(isPinnedToBottom({ scrollHeight: 1000, scrollTop: 800, clientHeight: 100 })).toBe(false);
++  });
++});
+diff --git a/packages/panels/src/agent/chat-thread.tsx b/packages/panels/src/agent/chat-thread.tsx
+index 695fd8b5..a5621658 100644
+--- a/packages/panels/src/agent/chat-thread.tsx
++++ b/packages/panels/src/agent/chat-thread.tsx
+@@ -2,7 +2,14 @@ import type { UiThreadBlock } from '@tmex/stores';
+ import { cn } from '@tmex/ui';
+ import { Button } from '@tmex/ui/button';
+ import { ArrowDownIcon } from 'lucide-react';
+-import { useEffect, useRef, useState } from 'react';
++import {
++  type ReactElement,
++  useCallback,
++  useEffect,
++  useLayoutEffect,
++  useRef,
++  useState,
++} from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+ import { AssistantMessage } from './messages/assistant-message';
+@@ -11,16 +18,68 @@ import { ToolCallCard } from './messages/tool-call-card';
+ import { UserMessage } from './messages/user-message';
+ 
+ const PIN_THRESHOLD_PX = 48;
++/** 默认只渲染最近这么多块，点「显示更早」再按此步长展开 */
++const WINDOW_STEP = 200;
++
++type Decide = (confirmationId: string, approved: boolean) => void;
+ 
+ export interface ChatThreadProps {
+   blocks: UiThreadBlock[];
+   running: boolean;
+   emptyText: string;
+   confirmationByToolCallId: Map<string, string>;
+-  onDecide: (confirmationId: string, approved: boolean) => void;
++  onDecide: Decide;
+   className?: string;
+ }
+ 
++export function isPinnedToBottom(el: {
++  scrollHeight: number;
++  scrollTop: number;
++  clientHeight: number;
++}): boolean {
++  return el.scrollHeight - el.scrollTop - el.clientHeight < PIN_THRESHOLD_PX;
++}
++
++/**
++ * 每个块渲染成一个 React.memo 行：key 取块 id，props 全是稳定引用或原始值，
++ * 于是流式期间只有尾部的块换了对象、只有尾行重渲染。
++ */
++export function threadRows(
++  blocks: UiThreadBlock[],
++  confirmationByToolCallId: Map<string, string>,
++  onDecide: Decide
++): ReactElement[] {
++  const rows: ReactElement[] = [];
++  for (const block of blocks) {
++    switch (block.kind) {
++      case 'user':
++        rows.push(<UserMessage key={block.key} text={block.text} />);
++        break;
++      case 'assistant-text':
++        rows.push(
++          <AssistantMessage key={block.key} text={block.text} streaming={block.streaming} />
++        );
++        break;
++      case 'reasoning':
++        rows.push(<ReasoningBlock key={block.key} text={block.text} streaming={block.streaming} />);
++        break;
++      case 'tool-call':
++        rows.push(
++          <ToolCallCard
++            key={block.key}
++            call={block.call}
++            confirmationId={confirmationByToolCallId.get(block.call.toolCallId)}
++            onDecide={onDecide}
++          />
++        );
++        break;
++      default:
++        break;
++    }
++  }
++  return rows;
++}
++
+ function RunningIndicator() {
+   return (
+     <div data-testid="agent-running-indicator" className="flex items-center gap-1 self-start px-1">
+@@ -42,7 +101,16 @@ export function ChatThread({
+   const { t } = useTranslation();
+   const containerRef = useRef<HTMLDivElement | null>(null);
+   const pinnedRef = useRef(true);
++  const frameRef = useRef<number | null>(null);
++  const anchorRef = useRef<number | null>(null);
++  const decideRef = useRef(onDecide);
++  decideRef.current = onDecide;
++  const decide = useCallback<Decide>(
++    (confirmationId, approved) => decideRef.current(confirmationId, approved),
++    []
++  );
+   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
++  const [windowSize, setWindowSize] = useState(WINDOW_STEP);
+ 
+   const scrollToBottom = (): void => {
+     const el = containerRef.current;
+@@ -52,28 +120,51 @@ export function ChatThread({
+     setShowJumpToBottom(false);
+   };
+ 
+-  // 吸底：用户未上滚时新内容自动滚到底
++  // 吸底：用户未上滚时新内容自动滚到底，多次 flush 合并成一帧一次读写，避免每次提交都强制布局
+   // biome-ignore lint/correctness/useExhaustiveDependencies: blocks/running 变化即触发吸底
+   useEffect(() => {
+-    if (pinnedRef.current) {
+-      const el = containerRef.current;
+-      if (el) {
+-        el.scrollTop = el.scrollHeight;
+-      }
+-    } else {
++    if (!pinnedRef.current) {
+       setShowJumpToBottom(true);
++      return;
+     }
++    if (frameRef.current !== null) return;
++    frameRef.current = requestAnimationFrame(() => {
++      frameRef.current = null;
++      const el = containerRef.current;
++      if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
++    });
+   }, [blocks, running]);
+ 
++  useEffect(
++    () => () => {
++      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
++    },
++    []
++  );
++
++  // 展开更早的消息后按「距底距离」锚点回写 scrollTop，视口内容不跳
++  // biome-ignore lint/correctness/useExhaustiveDependencies: windowSize 变化即是回写时机
++  useLayoutEffect(() => {
++    const el = containerRef.current;
++    const anchor = anchorRef.current;
++    anchorRef.current = null;
++    if (el && anchor !== null) el.scrollTop = el.scrollHeight - anchor;
++  }, [windowSize]);
++
+   const handleScroll = (): void => {
+     const el = containerRef.current;
+     if (!el) return;
+-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+-    const pinned = distance < PIN_THRESHOLD_PX;
++    const pinned = isPinnedToBottom(el);
+     pinnedRef.current = pinned;
+     setShowJumpToBottom(!pinned);
+   };
+ 
++  const showEarlier = (): void => {
++    const el = containerRef.current;
++    anchorRef.current = el ? el.scrollHeight - el.scrollTop : null;
++    setWindowSize((size) => size + WINDOW_STEP);
++  };
++
+   if (blocks.length === 0 && !running) {
+     return (
+       <div
+@@ -85,6 +176,8 @@ export function ChatThread({
+     );
+   }
+ 
++  const hidden = Math.max(0, blocks.length - windowSize);
++
+   return (
+     <div className={cn('relative min-h-0 flex-1', className)}>
+       <div
+@@ -94,31 +187,18 @@ export function ChatThread({
+         onScroll={handleScroll}
+       >
+         <div className="flex flex-col gap-3">
+-          {blocks.map((block) => {
+-            switch (block.kind) {
+-              case 'user':
+-                return <UserMessage key={block.key} text={block.text} />;
+-              case 'assistant-text':
+-                return (
+-                  <AssistantMessage key={block.key} text={block.text} streaming={block.streaming} />
+-                );
+-              case 'reasoning':
+-                return (
+-                  <ReasoningBlock key={block.key} text={block.text} streaming={block.streaming} />
+-                );
+-              case 'tool-call':
+-                return (
+-                  <ToolCallCard
+-                    key={block.key}
+-                    call={block.call}
+-                    confirmationId={confirmationByToolCallId.get(block.call.toolCallId)}
+-                    onDecide={onDecide}
+-                  />
+-                );
+-              default:
+-                return null;
+-            }
+-          })}
++          {hidden > 0 && (
++            <Button
++              data-testid="agent-show-earlier"
++              size="sm"
++              variant="ghost"
++              className="text-muted-foreground self-center text-xs"
++              onClick={showEarlier}
++            >
++              {t('agent.panel.showEarlier', { count: hidden })}
++            </Button>
++          )}
++          {threadRows(hidden > 0 ? blocks.slice(hidden) : blocks, confirmationByToolCallId, decide)}
+           {running && <RunningIndicator />}
+         </div>
+       </div>
+diff --git a/packages/panels/src/agent/composer-isolation.test.ts b/packages/panels/src/agent/composer-isolation.test.ts
+new file mode 100644
+index 00000000..d19c8e6f
+--- /dev/null
++++ b/packages/panels/src/agent/composer-isolation.test.ts
+@@ -0,0 +1,169 @@
++// 流式 delta flush 期间输入区不应重渲染：动作引用恒定 + 传给 AgentComposer 的 props 全是原始值，
++// memo 的浅比较因此始终命中。bun test 无 DOM，这里用 React.memo 的浅比较语义直接判定。
++
++import { describe, expect, test } from 'bun:test';
++
++import type { AgentSessionDto } from '@tmex/shared';
++import type { SessionInProgress } from '@tmex/stores';
++
++import { AgentComposer } from './agent-composer';
++import { deriveAgentTabView } from './agent-tab-view';
++import {
++  type AgentTabActionDeps,
++  type AgentTabActions,
++  createAgentTabActions,
++} from './use-agent-tab-actions';
++import type { AgentStoreHandle, AgentTabState } from './use-agent-tab-state';
++
++const FLUSHES = 50;
++
++function session(overrides: Partial<AgentSessionDto> = {}): AgentSessionDto {
++  return {
++    id: 's1',
++    deviceId: 'd1',
++    paneId: '%1',
++    providerId: null,
++    modelId: 'm1',
++    writeMode: 'confirm',
++    allowControlChars: false,
++    status: 'running',
++    lastError: null,
++    ...overrides,
++  } as AgentSessionDto;
++}
++
++function makeState(
++  stopped: string[],
++  activeSession: AgentSessionDto,
++  inProgress: SessionInProgress | undefined
++): AgentTabState {
++  const agentStore = {
++    getState: () => ({
++      stopSession: (id: string) => {
++        stopped.push(id);
++      },
++    }),
++  } as unknown as AgentStoreHandle;
++  return {
++    agentStore,
++    snapshots: {},
++    nodeId: null,
++    nodeOffline: undefined,
++    devices: [{ id: 'd1', name: 'laptop' }],
++    devicesLoading: false,
++    devicesError: false,
++    routeDeviceId: 'd1',
++    routePaneId: '%1',
++    routePaneTitle: 'vim',
++    activeSessionId: activeSession.id,
++    activeSession,
++    draft: null,
++    messages: [],
++    inProgress,
++    pendingConfirmations: undefined,
++    sending: false,
++    materializingDraft: false,
++    queued: undefined,
++    defaultWriteMode: 'confirm',
++  } as unknown as AgentTabState;
++}
++
++function progress(chars: number): SessionInProgress {
++  return {
++    texts: [{ messageId: 'm', text: 'x'.repeat(chars), stale: false }],
++    reasonings: [],
++    toolCalls: [],
++    staleBarrier: false,
++  };
++}
++
++/** AgentTab 传给 AgentComposer 的 props（与 agent-tab.tsx 一致） */
++function composerProps(state: AgentTabState, actions: AgentTabActions): Record<string, unknown> {
++  const view = deriveAgentTabView(state);
++  return {
++    draftEmpty: view.draftEmpty,
++    draftPrompt: view.draft?.prompt ?? null,
++    disabled: view.inputDisabled,
++    running: view.running,
++    hasActiveSession: Boolean(view.activeSession),
++    isOrphan: view.isOrphan,
++    writeMode: view.writeMode,
++    allowControlChars: view.allowControlChars,
++    modelProviderId: view.modelProviderId,
++    modelId: view.modelId,
++    onSend: actions.onSend,
++    onSteer: actions.onSteer,
++    onStop: actions.onStop,
++    onModelChange: actions.onModelChange,
++    onWriteModeChange: actions.onWriteModeChange,
++    onAllowControlCharsChange: actions.onAllowControlCharsChange,
++  };
++}
++
++/** React.memo 默认比较：键集合相同且每个键 Object.is 相等 */
++function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
++  const keys = Object.keys(a);
++  if (keys.length !== Object.keys(b).length) return false;
++  return keys.every((key) => Object.is(a[key], b[key]));
++}
++
++describe('composer 与流式刷新的隔离', () => {
++  test('AgentComposer 是 memo 组件', () => {
++    expect((AgentComposer as unknown as { $$typeof: symbol }).$$typeof).toBe(
++      Symbol.for('react.memo')
++    );
++  });
++
++  test('50 次 delta flush 后 composer props 一次都没变（即不重渲染）', () => {
++    const stopped: string[] = [];
++    const active = session();
++    const deps = { current: {} as AgentTabActionDeps };
++    const setState = (state: AgentTabState): void => {
++      deps.current = {
++        state,
++        view: deriveAgentTabView(state),
++        navigate: (() => {}) as unknown as AgentTabActionDeps['navigate'],
++        host: {} as AgentTabActionDeps['host'],
++        setSidebarTab: () => {},
++      };
++    };
++
++    setState(makeState(stopped, active, undefined));
++    const actions = createAgentTabActions(deps);
++    const first = composerProps(deps.current.state, actions);
++
++    let changed = 0;
++    for (let i = 1; i <= FLUSHES; i += 1) {
++      setState(makeState(stopped, active, progress(i * 40)));
++      if (!shallowEqual(first, composerProps(deps.current.state, actions))) changed += 1;
++    }
++
++    expect(changed).toBe(0);
++  });
++
++  test('动作引用恒定但始终作用于最新的 state', () => {
++    const stopped: string[] = [];
++    const deps = { current: {} as AgentTabActionDeps };
++    const first = session({ id: 's1' });
++    const setState = (state: AgentTabState): void => {
++      deps.current = {
++        state,
++        view: deriveAgentTabView(state),
++        navigate: (() => {}) as unknown as AgentTabActionDeps['navigate'],
++        host: {} as AgentTabActionDeps['host'],
++        setSidebarTab: () => {},
++      };
++    };
++
++    setState(makeState(stopped, first, undefined));
++    const actions = createAgentTabActions(deps);
++    const onStop = actions.onStop;
++
++    actions.onStop();
++    setState(makeState(stopped, session({ id: 's2' }), progress(10)));
++    actions.onStop();
++
++    expect(actions.onStop).toBe(onStop);
++    expect(stopped).toEqual(['s1', 's2']);
++  });
++});
+diff --git a/packages/panels/src/agent/messages/assistant-message.tsx b/packages/panels/src/agent/messages/assistant-message.tsx
+index 6fa30cd4..e910c851 100644
+--- a/packages/panels/src/agent/messages/assistant-message.tsx
++++ b/packages/panels/src/agent/messages/assistant-message.tsx
+@@ -1,7 +1,8 @@
+ import { cn } from '@tmex/ui';
++import { memo } from 'react';
+ import { StreamingMarkdown } from '../../markdown/streaming-markdown';
+ 
+-export function AssistantMessage({
++export const AssistantMessage = memo(function AssistantMessage({
+   text,
+   streaming = false,
+   className,
+@@ -18,4 +19,4 @@ export function AssistantMessage({
+       <StreamingMarkdown text={text} streaming={streaming} />
+     </div>
+   );
+-}
++});
+diff --git a/packages/panels/src/agent/messages/reasoning-block.tsx b/packages/panels/src/agent/messages/reasoning-block.tsx
+index 371e4f41..a0294c7c 100644
+--- a/packages/panels/src/agent/messages/reasoning-block.tsx
++++ b/packages/panels/src/agent/messages/reasoning-block.tsx
+@@ -1,9 +1,10 @@
+ import { cn } from '@tmex/ui';
+ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@tmex/ui/collapsible';
+ import { BrainIcon, ChevronRightIcon, Loader2Icon } from 'lucide-react';
++import { memo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+-export function ReasoningBlock({
++export const ReasoningBlock = memo(function ReasoningBlock({
+   text,
+   streaming = false,
+   className,
+@@ -32,4 +33,4 @@ export function ReasoningBlock({
+       </CollapsibleContent>
+     </Collapsible>
+   );
+-}
++});
+diff --git a/packages/panels/src/agent/messages/tool-call-card.tsx b/packages/panels/src/agent/messages/tool-call-card.tsx
+index 6b1b53a5..ddcea27a 100644
+--- a/packages/panels/src/agent/messages/tool-call-card.tsx
++++ b/packages/panels/src/agent/messages/tool-call-card.tsx
+@@ -16,7 +16,7 @@ import {
+   WrenchIcon,
+   XIcon,
+ } from 'lucide-react';
+-import { createContext, useContext, useState } from 'react';
++import { createContext, memo, useContext, useState } from 'react';
+ import type { ReactNode } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
+@@ -429,7 +429,12 @@ function ToolDetailsDialog({
+   );
+ }
+ 
+-export function ToolCallCard({ call, confirmationId, onDecide, className }: ToolCallCardProps) {
++export const ToolCallCard = memo(function ToolCallCard({
++  call,
++  confirmationId,
++  onDecide,
++  className,
++}: ToolCallCardProps) {
+   const { t } = useTranslation();
+   const [dialogOpen, setDialogOpen] = useState(false);
+   const status = toolCallStatus(call, confirmationId);
+@@ -486,4 +491,4 @@ export function ToolCallCard({ call, confirmationId, onDecide, className }: Tool
+       />
+     </div>
+   );
+-}
++});
+diff --git a/packages/panels/src/agent/messages/user-message.tsx b/packages/panels/src/agent/messages/user-message.tsx
+index 3098faf1..54879c4a 100644
+--- a/packages/panels/src/agent/messages/user-message.tsx
++++ b/packages/panels/src/agent/messages/user-message.tsx
+@@ -1,6 +1,10 @@
+ import { cn } from '@tmex/ui';
++import { memo } from 'react';
+ 
+-export function UserMessage({ text, className }: { text: string; className?: string }) {
++export const UserMessage = memo(function UserMessage({
++  text,
++  className,
++}: { text: string; className?: string }) {
+   return (
+     <div
+       data-testid="agent-user-message"
+@@ -12,4 +16,4 @@ export function UserMessage({ text, className }: { text: string; className?: str
+       {text}
+     </div>
+   );
+-}
++});
+diff --git a/packages/panels/src/agent/use-agent-tab-actions.ts b/packages/panels/src/agent/use-agent-tab-actions.ts
+index b15a2fec..3ebd03d5 100644
+--- a/packages/panels/src/agent/use-agent-tab-actions.ts
++++ b/packages/panels/src/agent/use-agent-tab-actions.ts
+@@ -1,10 +1,13 @@
+ // AgentTab 的动作层：把视图事件翻译成 agent store 调用与路由跳转。
++// 动作对象整个 tab 生命周期内保持同一引用（依赖走 ref 快照），
++// 这样流式 delta flush 不会让 memo 化的输入区失效。
+ 
++import { useRef } from 'react';
+ import type { NavigateFunction } from 'react-router';
+ import { useNavigate } from 'react-router';
+ 
+ import type { AgentSessionDto, AgentWriteMode } from '@tmex/shared';
+-import type { HostServices } from '@tmex/stores';
++import type { HostServices, SidebarTab } from '@tmex/stores';
+ import { encodePaneIdForUrl, hostAppPath } from '@tmex/stores';
+ import { useRuntime, useUIStore } from '@tmex/stores/react';
+ 
+@@ -31,6 +34,19 @@ export interface AgentTabActions {
+   onAllowControlCharsChange: (allow: boolean) => void;
+ }
+ 
++export interface AgentTabActionDeps {
++  state: AgentTabState;
++  view: AgentTabView;
++  navigate: NavigateFunction;
++  host: HostServices;
++  setSidebarTab: (tab: SidebarTab) => void;
++}
++
++/** 每次渲染刷新的依赖快照容器：动作只在调用时读它，自身引用恒定 */
++export interface AgentTabActionDepsRef {
++  current: AgentTabActionDeps;
++}
++
+ // 会话绑定的 pane 属于本 tab 所在的 node，跳转必须带上该 node 的路由前缀
+ function navigateToBinding(
+   navigate: NavigateFunction,
+@@ -53,15 +69,15 @@ function navigateToBinding(
+   }
+ }
+ 
+-function createSessionActions(state: AgentTabState, view: AgentTabView) {
+-  const { agentStore, activeSession, activeSessionId, draft, nodeId } = state;
+-  const { routeDeviceId, routePaneId, routePaneTitle } = state;
++function createSessionActions(ref: AgentTabActionDepsRef) {
+   return {
+     onDecide: (confirmationId: string, approved: boolean) => {
++      const { agentStore, activeSessionId } = ref.current.state;
+       if (!activeSessionId) return;
+       void agentStore.getState().decideConfirmation(activeSessionId, confirmationId, approved);
+     },
+     onNewSession: () => {
++      const { agentStore, nodeId, routeDeviceId, routePaneId, routePaneTitle } = ref.current.state;
+       if (!routeDeviceId || !routePaneId) return;
+       agentStore.getState().startDraft({
+         nodeId,
+@@ -71,21 +87,25 @@ function createSessionActions(state: AgentTabState, view: AgentTabView) {
+       });
+     },
+     onStop: () => {
++      const { agentStore, activeSession } = ref.current.state;
+       if (!activeSession) return;
+       void agentStore.getState().stopSession(activeSession.id);
+     },
+     onRetry: () => {
+-      if (!activeSession || !view.retryText) return;
+-      void agentStore.getState().sendMessage(activeSession.id, view.retryText);
++      const { state, view } = ref.current;
++      if (!state.activeSession || !view.retryText) return;
++      void state.agentStore.getState().sendMessage(state.activeSession.id, view.retryText);
+     },
+     onRebind: () => {
+       // 后端只接受 paneId：跨设备的路由 pane 不能改绑，否则会把别的设备的 pane id 写进本会话
++      const { agentStore, activeSession, routeDeviceId, routePaneId } = ref.current.state;
+       if (!activeSession || !routePaneId) return;
+       if (!canRebindToRoute(activeSession, { deviceId: routeDeviceId, paneId: routePaneId }))
+         return;
+       void agentStore.getState().rebindPane(activeSession.id, routePaneId);
+     },
+     onModelChange: (providerId: string | null, modelId: string) => {
++      const { agentStore, activeSession, draft, nodeId } = ref.current.state;
+       if (activeSession) {
+         void agentStore.getState().setSessionModel(activeSession.id, providerId, modelId);
+       } else if (draft) {
+@@ -105,10 +125,10 @@ function sendToDraft(store: AgentStoreState, nodeId: string | null, text: string
+   })();
+ }
+ 
+-function createMessageActions(state: AgentTabState) {
+-  const { agentStore, activeSession, draft, nodeId } = state;
++function createMessageActions(ref: AgentTabActionDepsRef) {
+   return {
+     onSend: (text: string) => {
++      const { agentStore, activeSession, draft, nodeId } = ref.current.state;
+       const store = agentStore.getState();
+       if (activeSession) {
+         if (activeSession.status === 'running') {
+@@ -123,66 +143,80 @@ function createMessageActions(state: AgentTabState) {
+       }
+     },
+     onSteer: (text: string) => {
++      const { agentStore, activeSession } = ref.current.state;
+       if (!activeSession) return;
+       void agentStore.getState().enqueueMessage(activeSession.id, text, true);
+     },
+   };
+ }
+ 
+-function createQueueActions(state: AgentTabState, view: AgentTabView) {
+-  const { agentStore, activeSession } = state;
++function createQueueActions(ref: AgentTabActionDepsRef) {
+   return {
+     onQueueEdit: (itemId: string, text: string) => {
++      const { agentStore, activeSession } = ref.current.state;
+       if (!activeSession) return;
+       void agentStore.getState().editQueuedMessage(activeSession.id, itemId, text);
+     },
+     onQueueWithdraw: (itemId: string) => {
++      const { agentStore, activeSession } = ref.current.state;
+       if (!activeSession) return;
+       void agentStore.getState().withdrawQueuedMessage(activeSession.id, itemId);
+     },
+     onQueueSteer: () => {
++      const { state, view } = ref.current;
+       const first = view.queuedItems[0];
+-      if (!activeSession || !first) return;
+-      const store = agentStore.getState();
++      if (!state.activeSession || !first) return;
++      const sessionId = state.activeSession.id;
++      const store = state.agentStore.getState();
+       void (async () => {
+-        await store.withdrawQueuedMessage(activeSession.id, first.id);
+-        await store.enqueueMessage(activeSession.id, first.text, true);
++        await store.withdrawQueuedMessage(sessionId, first.id);
++        await store.enqueueMessage(sessionId, first.text, true);
+       })();
+     },
+   };
+ }
+ 
+-function createSettingActions(state: AgentTabState) {
+-  const { agentStore, activeSession } = state;
++function createSettingActions(ref: AgentTabActionDepsRef) {
+   return {
+     onWriteModeChange: (next: AgentWriteMode) => {
+       // 记忆为默认值（影响后续新 session）；有活动 session 时同时改该 session
++      const { agentStore, activeSession } = ref.current.state;
+       agentStore.getState().setDefaultWriteMode(next);
+       if (activeSession) {
+         void agentStore.getState().setWriteMode(activeSession.id, next);
+       }
+     },
+     onAllowControlCharsChange: (allow: boolean) => {
++      const { agentStore, activeSession } = ref.current.state;
+       if (!activeSession) return;
+       void agentStore.getState().setAllowControlChars(activeSession.id, allow);
+     },
+   };
+ }
+ 
+-export function useAgentTabActions(state: AgentTabState, view: AgentTabView): AgentTabActions {
+-  const navigate = useNavigate();
+-  const { host } = useRuntime();
+-  const setSidebarTab = useUIStore((uiState) => uiState.setSidebarTab);
++export function createAgentTabActions(ref: AgentTabActionDepsRef): AgentTabActions {
+   return {
+-    ...createSessionActions(state, view),
+-    ...createMessageActions(state),
+-    ...createQueueActions(state, view),
+-    ...createSettingActions(state),
++    ...createSessionActions(ref),
++    ...createMessageActions(ref),
++    ...createQueueActions(ref),
++    ...createSettingActions(ref),
+     onBindingClick: () => {
++      const { state, view, navigate, host } = ref.current;
+       navigateToBinding(navigate, host, state.activeSession, view.binding);
+     },
+     onSwitchSession: () => {
+-      setSidebarTab('panes');
++      ref.current.setSidebarTab('panes');
+     },
+   };
+ }
++
++export function useAgentTabActions(state: AgentTabState, view: AgentTabView): AgentTabActions {
++  const navigate = useNavigate();
++  const { host } = useRuntime();
++  const setSidebarTab = useUIStore((uiState) => uiState.setSidebarTab);
++  const deps = useRef<AgentTabActionDeps>({ state, view, navigate, host, setSidebarTab });
++  deps.current = { state, view, navigate, host, setSidebarTab };
++  const actions = useRef<AgentTabActions | null>(null);
++  actions.current ??= createAgentTabActions(deps);
++  return actions.current;
++}
+diff --git a/packages/panels/src/files/file-node-actions.tsx b/packages/panels/src/files/file-node-actions.tsx
+index bb4dd1df..2d919756 100644
+--- a/packages/panels/src/files/file-node-actions.tsx
++++ b/packages/panels/src/files/file-node-actions.tsx
+@@ -6,7 +6,7 @@ import { useRuntime } from '@tmex/stores/react';
+ import { ContextMenuContent, ContextMenuItem, ContextMenuSeparator } from '@tmex/ui/context-menu';
+ import { Download, FolderOpen } from 'lucide-react';
+ import type { DragEvent } from 'react';
+-import { useCallback } from 'react';
++import { useCallback, useMemo } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
+ import { downloadFileWithTransport } from './bulk-transfer';
+@@ -48,21 +48,24 @@ export function useFileNodeActions(rootId: string, entry: FileEntryDto): FileNod
+     }
+   }, [entry.name, entry.path, rootId, runtime, t]);
+ 
+-  const dragHandlers: FileNodeDragHandlers = {
+-    onDragStart: (e) => {
+-      // 拖到系统下载（仅 Chromium 生效，URL 必须绝对；其它浏览器静默无效，菜单「下载」兜底）
+-      const absUrl = window.location.origin + fileDownloadUrl(runtime.nodeId, rootId, entry.path);
+-      e.dataTransfer.setData('DownloadURL', `application/octet-stream:${entry.name}:${absUrl}`);
+-      e.dataTransfer.effectAllowed = 'copy';
+-    },
+-    onDragEnd: (e) => {
+-      // 拖到 OS 成功放下时（dropEffect=copy）由浏览器接管下载，JS 无进度可显示，
+-      // 仅给一个轻提示让用户知道下载已开始（去浏览器下载区查看进度）
+-      if (e.dataTransfer.dropEffect === 'copy') {
+-        toast(t('files.transfer.dragDownloadStarted', { name: entry.name }));
+-      }
+-    },
+-  };
++  const dragHandlers = useMemo<FileNodeDragHandlers>(
++    () => ({
++      onDragStart: (e) => {
++        // 拖到系统下载（仅 Chromium 生效，URL 必须绝对；其它浏览器静默无效，菜单「下载」兜底）
++        const absUrl = window.location.origin + fileDownloadUrl(runtime.nodeId, rootId, entry.path);
++        e.dataTransfer.setData('DownloadURL', `application/octet-stream:${entry.name}:${absUrl}`);
++        e.dataTransfer.effectAllowed = 'copy';
++      },
++      onDragEnd: (e) => {
++        // 拖到 OS 成功放下时（dropEffect=copy）由浏览器接管下载，JS 无进度可显示，
++        // 仅给一个轻提示让用户知道下载已开始（去浏览器下载区查看进度）
++        if (e.dataTransfer.dropEffect === 'copy') {
++          toast(t('files.transfer.dragDownloadStarted', { name: entry.name }));
++        }
++      },
++    }),
++    [entry.name, entry.path, rootId, runtime.nodeId, t]
++  );
+ 
+   return { download, dragHandlers };
+ }
+diff --git a/packages/panels/src/files/files-tab.test.tsx b/packages/panels/src/files/files-tab.test.tsx
+index 35a052bb..d874b7a9 100644
+--- a/packages/panels/src/files/files-tab.test.tsx
++++ b/packages/panels/src/files/files-tab.test.tsx
+@@ -4,7 +4,7 @@
+ // 「关掉开关就消失」由 root-visibility 的单测覆盖。
+ 
+ import { describe, expect, test } from 'bun:test';
+-import type { FileRootDto } from '@tmex/shared';
++import type { FileEntryDto, FileRootDto } from '@tmex/shared';
+ import { installWindowStorage } from '@tmex/stores/test-utils';
+ 
+ installWindowStorage();
+@@ -118,3 +118,82 @@ describe('FilesTab 在 node 离线时', () => {
+     );
+   });
+ });
++
++function fileEntry(index: number): FileEntryDto {
++  return {
++    name: `f${index}.txt`,
++    path: `${LOCAL_ROOT.path}/f${index}.txt`,
++    type: 'file',
++    category: 'text',
++    size: 1,
++    modifiedAt: null,
++    isSymlink: false,
++  };
++}
++
++/**
++ * 静态渲染下 zustand 读的是**建店时**的 state（persist 的 hydrate 之后才落到 getState），
++ * 展开态无法经 localStorage 预置，于是把 fileTree 面换成一个已展开的桩；
++ * 目录列表直接喂进 query 缓存，这样能在无 DOM 环境里数出真正挂载了多少行。
++ */
++function renderExpandedRoot(entries: FileEntryDto[]): string {
++  const runtime = createAppRuntime({ storagePrefix: `files-tab-test-${storageSeq++}:` });
++  const fileTreeState = {
++    expanded: { [`${LOCAL_ROOT.id}\n${LOCAL_ROOT.path}`]: true },
++    toggle: () => undefined,
++    expand: () => undefined,
++    collapse: () => undefined,
++    pruneRoot: () => undefined,
++    pruneStaleRoots: () => undefined,
++  };
++  const fileTree = Object.assign(
++    <T,>(selector: (state: typeof fileTreeState) => T): T => selector(fileTreeState),
++    { getState: () => fileTreeState }
++  );
++  const expandedRuntime = {
++    ...runtime,
++    stores: { ...runtime.stores, fileTree },
++  } as unknown as typeof runtime;
++
++  const queryClient = new QueryClient();
++  queryClient.setQueryData(['files', 'roots'], { roots: [LOCAL_ROOT] });
++  queryClient.setQueryData(['files', 'list', LOCAL_ROOT.id, LOCAL_ROOT.path], {
++    path: LOCAL_ROOT.path,
++    entries,
++    truncated: false,
++  });
++  const html = renderToStaticMarkup(
++    <MemoryRouter>
++      <I18nextProvider i18n={i18n}>
++        <QueryClientProvider client={queryClient}>
++          <RuntimeProvider runtime={expandedRuntime}>
++            <SidebarProvider>
++              <FilesTab />
++            </SidebarProvider>
++          </RuntimeProvider>
++        </QueryClientProvider>
++      </I18nextProvider>
++    </MemoryRouter>
++  );
++  runtime.dispose();
++  return html;
++}
++
++function countRows(html: string): number {
++  return html.match(/data-testid="file-item-/g)?.length ?? 0;
++}
++
++describe('FilesTab 的单目录行数上限', () => {
++  test('2000 条只挂 500 行，其余收在「显示其余」按钮后', () => {
++    const html = renderExpandedRoot(Array.from({ length: 2000 }, (_, i) => fileEntry(i)));
++    expect(countRows(html)).toBe(500);
++    expect(html).toContain(`data-testid="file-show-more-${LOCAL_ROOT.id}-${LOCAL_ROOT.path}"`);
++    expect(html).toContain('显示其余 1500 项');
++  });
++
++  test('未超过上限时全量渲染，不出现「显示其余」', () => {
++    const html = renderExpandedRoot(Array.from({ length: 12 }, (_, i) => fileEntry(i)));
++    expect(countRows(html)).toBe(12);
++    expect(html).not.toContain('data-testid="file-show-more-');
++  });
++});
+diff --git a/packages/panels/src/files/files-tab.tsx b/packages/panels/src/files/files-tab.tsx
+index 20d871f7..c5af5214 100644
+--- a/packages/panels/src/files/files-tab.tsx
++++ b/packages/panels/src/files/files-tab.tsx
+@@ -1,7 +1,7 @@
+ import { useIsFetching, useQuery, useQueryClient } from '@tanstack/react-query';
+ import type { FileEntryDto, FileRootDto, SystemInfo } from '@tmex/shared';
+ import { Loader2, RotateCw, TriangleAlert } from 'lucide-react';
+-import { useEffect, useMemo } from 'react';
++import { memo, useEffect, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { matchPath, useLocation, useNavigate } from 'react-router';
+ 
+@@ -26,6 +26,9 @@ const DEFAULT_TRANSFER_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+ 
+ const INDENT_STEP = 12;
+ 
++// 单个目录一次最多渲染多少行：后端每目录上限 2000，全量挂载会造出上千个带右键菜单的组件
++const DISPLAY_CAP = 500;
++
+ function useSelectedFilePath(): { rootId: string; path: string } | null {
+   const location = useLocation();
+   const { host } = useRuntime();
+@@ -119,11 +122,15 @@ function FilesTabInner({ hideHeader }: FilesTabProps) {
+     if (rootsQuery.data) pruneStaleRoots(rootsQuery.data.roots.map((r) => r.id));
+   }, [rootsQuery.data, pruneStaleRoots]);
+ 
+-  const ctx: TreeContext = {
+-    llmConfigured: (providersQuery.data?.providers ?? []).length > 0,
+-    localDeviceId: devicesQuery.data?.devices.find((d) => d.type === 'local')?.id ?? null,
+-    transferMaxBytes: systemInfoQuery.data?.transferMaxBytes ?? DEFAULT_TRANSFER_MAX_BYTES,
+-  };
++  // 每次渲染都新建 ctx 会让整棵树的 memo 失效
++  const ctx = useMemo<TreeContext>(
++    () => ({
++      llmConfigured: (providersQuery.data?.providers ?? []).length > 0,
++      localDeviceId: devicesQuery.data?.devices.find((d) => d.type === 'local')?.id ?? null,
++      transferMaxBytes: systemInfoQuery.data?.transferMaxBytes ?? DEFAULT_TRANSFER_MAX_BYTES,
++    }),
++    [providersQuery.data, devicesQuery.data, systemInfoQuery.data]
++  );
+ 
+   const refresh = () => void queryClient.invalidateQueries({ queryKey: ['files'] });
+ 
+@@ -205,7 +212,7 @@ function FilesTabInner({ hideHeader }: FilesTabProps) {
+ 
+ // 递归的目录节点：把数据（列表 + 轮询）、上传、rsync 提示三块副作用交给对应 hooks，
+ // 自身只负责组合与递归渲染子节点。
+-function DirNode({
++const DirNode = memo(function DirNode({
+   root,
+   rootId,
+   path,
+@@ -232,8 +239,13 @@ function DirNode({
+     localDeviceId: ctx.localDeviceId,
+   });
+ 
++  const [showAll, setShowAll] = useState(false);
++
+   const indent = depth * INDENT_STEP + 4;
+   const childIndent = indent + 18;
++  const entries = query.data?.entries;
++  const hidden = !showAll && entries ? Math.max(entries.length - DISPLAY_CAP, 0) : 0;
++  const visible = hidden > 0 && entries ? entries.slice(0, DISPLAY_CAP) : entries;
+ 
+   return (
+     <DirectoryNodeView
+@@ -262,7 +274,7 @@ function DirNode({
+       {query.isError && (
+         <NodeError code={errCode} indent={childIndent} onRetry={() => void query.refetch()} />
+       )}
+-      {query.data?.entries.map((entry) =>
++      {visible?.map((entry) =>
+         entry.type === 'dir' ? (
+           <DirNode
+             key={entry.path}
+@@ -277,6 +289,17 @@ function DirNode({
+           <FileLeaf key={entry.path} entry={entry} root={root} depth={depth + 1} />
+         )
+       )}
++      {hidden > 0 && (
++        <button
++          type="button"
++          data-testid={`file-show-more-${rootId}-${path}`}
++          onClick={() => setShowAll(true)}
++          style={{ paddingLeft: childIndent }}
++          className="flex w-full min-w-0 items-center rounded-md py-1 pr-2 text-left text-[11px] text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
++        >
++          {t('files.showMore', { count: hidden })}
++        </button>
++      )}
+       {query.data && query.data.entries.length === 0 && (
+         <div
+           style={{ paddingLeft: childIndent }}
+@@ -295,9 +318,9 @@ function DirNode({
+       )}
+     </DirectoryNodeView>
+   );
+-}
++});
+ 
+-function FileLeaf({
++const FileLeaf = memo(function FileLeaf({
+   entry,
+   root,
+   depth,
+@@ -363,4 +386,4 @@ function FileLeaf({
+       />
+     </ContextMenu>
+   );
+-}
++});
+diff --git a/packages/panels/src/files/use-directory-upload.ts b/packages/panels/src/files/use-directory-upload.ts
+index f1854e97..027e91d8 100644
+--- a/packages/panels/src/files/use-directory-upload.ts
++++ b/packages/panels/src/files/use-directory-upload.ts
+@@ -3,7 +3,7 @@
+ import { useQueryClient } from '@tanstack/react-query';
+ import { formatBytes } from '@tmex/api-client';
+ import { useFileTreeStore, useRuntime } from '@tmex/stores/react';
+-import { type ChangeEvent, type DragEvent, useCallback, useRef, useState } from 'react';
++import { type ChangeEvent, type DragEvent, useCallback, useMemo, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
+ import { uploadFileWithTransport } from './bulk-transfer';
+@@ -82,30 +82,34 @@ export function useDirectoryUpload(
+     [expand, path, queryClient, rootId, runtime.apiClient, runtime.nodeId, t, transferMaxBytes]
+   );
+ 
+-  const dropZoneProps: DropZoneProps = {
+-    onDragEnter: (e) => {
+-      if (!hasExternalFiles(e)) return;
+-      e.preventDefault();
+-      dragDepth.current += 1;
+-      setDragActive(true);
+-    },
+-    onDragOver: (e) => {
+-      if (!hasExternalFiles(e)) return;
+-      e.preventDefault();
+-      e.dataTransfer.dropEffect = 'copy';
+-    },
+-    onDragLeave: (e) => {
+-      if (!hasExternalFiles(e)) return;
+-      dragDepth.current -= 1;
+-      if (dragDepth.current <= 0) resetDrag();
+-    },
+-    onDrop: (e) => {
+-      if (!hasExternalFiles(e)) return;
+-      e.preventDefault();
+-      resetDrag();
+-      void upload(Array.from(e.dataTransfer.files));
+-    },
+-  };
++  // 稳定引用：目录节点每次重渲染都新建这组 handler 会连带刷新拖放区的 props
++  const dropZoneProps = useMemo<DropZoneProps>(
++    () => ({
++      onDragEnter: (e) => {
++        if (!hasExternalFiles(e)) return;
++        e.preventDefault();
++        dragDepth.current += 1;
++        setDragActive(true);
++      },
++      onDragOver: (e) => {
++        if (!hasExternalFiles(e)) return;
++        e.preventDefault();
++        e.dataTransfer.dropEffect = 'copy';
++      },
++      onDragLeave: (e) => {
++        if (!hasExternalFiles(e)) return;
++        dragDepth.current -= 1;
++        if (dragDepth.current <= 0) resetDrag();
++      },
++      onDrop: (e) => {
++        if (!hasExternalFiles(e)) return;
++        e.preventDefault();
++        resetDrag();
++        void upload(Array.from(e.dataTransfer.files));
++      },
++    }),
++    [resetDrag, upload]
++  );
+ 
+   return {
+     dragActive,
+diff --git a/packages/panels/src/markdown/streaming-markdown.test.ts b/packages/panels/src/markdown/streaming-markdown.test.ts
+new file mode 100644
+index 00000000..d61916f3
+--- /dev/null
++++ b/packages/panels/src/markdown/streaming-markdown.test.ts
+@@ -0,0 +1,115 @@
++import { describe, expect, test } from 'bun:test';
++
++import {
++  EMPTY_MARKDOWN_SPLIT,
++  advanceMarkdownSplit,
++  splitMarkdownBlocks,
++} from './streaming-markdown';
++
++/** 参考实现：一次性逐行扫描，作为增量分块的对照 */
++function referenceSplit(text: string): string[] {
++  const blocks: string[] = [];
++  let current: string[] = [];
++  let inFence = false;
++  const push = (): void => {
++    const block = current.join('\n');
++    if (block.trim()) blocks.push(block);
++    current = [];
++  };
++  for (const line of text.split('\n')) {
++    if (/^\s*(```|~~~)/.test(line)) {
++      inFence = !inFence;
++      current.push(line);
++      continue;
++    }
++    if (!inFence && line.trim() === '') {
++      push();
++      continue;
++    }
++    current.push(line);
++  }
++  push();
++  return blocks;
++}
++
++const LINES = [
++  'hello world',
++  '',
++  '  ',
++  '```',
++  '```ts',
++  '~~~',
++  'const a = 1;',
++  '- item',
++  '',
++  '# title',
++  '| a | b |',
++  'tail',
++];
++
++function mulberry32(seed: number): () => number {
++  let a = seed >>> 0;
++  return () => {
++    a = (a + 0x6d2b79f5) >>> 0;
++    let t = Math.imul(a ^ (a >>> 15), 1 | a);
++    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++  };
++}
++
++describe('splitMarkdownBlocks', () => {
++  test('围栏外空行分块，围栏内空行不分块', () => {
++    expect(splitMarkdownBlocks('a\n\nb')).toEqual(['a', 'b']);
++    expect(splitMarkdownBlocks('```\na\n\nb\n```')).toEqual(['```\na\n\nb\n```']);
++    expect(splitMarkdownBlocks('')).toEqual([]);
++    expect(splitMarkdownBlocks('a\n\n\n  \nb\n')).toEqual(['a', 'b']);
++  });
++
++  test('与参考实现一致', () => {
++    for (const text of ['a\n\nb', '```\n\n```', '  \n\na', 'a\n  ', '~~~\ncode\n~~~\n\nx']) {
++      expect(splitMarkdownBlocks(text)).toEqual(referenceSplit(text));
++    }
++  });
++});
++
++describe('advanceMarkdownSplit', () => {
++  test('随机追加的增量结果等于全量分块', () => {
++    const rand = mulberry32(20260831);
++    for (let doc = 0; doc < 60; doc += 1) {
++      const lines: string[] = [];
++      for (let i = 0; i < 40; i += 1) {
++        lines.push(LINES[Math.floor(rand() * LINES.length)] as string);
++      }
++      const full = lines.join('\n');
++
++      let split = EMPTY_MARKDOWN_SPLIT;
++      let cursor = 0;
++      while (cursor < full.length) {
++        cursor = Math.min(full.length, cursor + 1 + Math.floor(rand() * 7));
++        const prefix = full.slice(0, cursor);
++        split = advanceMarkdownSplit(split, prefix);
++        expect(split.blocks).toEqual(referenceSplit(prefix));
++      }
++    }
++  });
++
++  test('非前缀输入退回全量扫描', () => {
++    const first = advanceMarkdownSplit(EMPTY_MARKDOWN_SPLIT, 'a\n\nb\n\nc');
++    expect(first.blocks).toEqual(['a', 'b', 'c']);
++    const reset = advanceMarkdownSplit(first, 'x\n\ny');
++    expect(reset.blocks).toEqual(['x', 'y']);
++  });
++
++  test('重复传入同一文本结果不变（幂等）', () => {
++    const once = advanceMarkdownSplit(EMPTY_MARKDOWN_SPLIT, 'a\n\nb\n');
++    const twice = advanceMarkdownSplit(once, 'a\n\nb\n');
++    expect(twice.blocks).toEqual(once.blocks);
++  });
++
++  test('已封口块保持同一字符串值，供块级 memo 命中', () => {
++    const a = advanceMarkdownSplit(EMPTY_MARKDOWN_SPLIT, 'first\n\nsec');
++    const b = advanceMarkdownSplit(a, 'first\n\nsecond');
++    expect(b.blocks[0]).toBe(a.blocks[0] as string);
++    expect(b.sealed).toBe(a.sealed);
++  });
++});
+diff --git a/packages/panels/src/markdown/streaming-markdown.tsx b/packages/panels/src/markdown/streaming-markdown.tsx
+index 38642d35..9a96183e 100644
+--- a/packages/panels/src/markdown/streaming-markdown.tsx
++++ b/packages/panels/src/markdown/streaming-markdown.tsx
+@@ -1,14 +1,31 @@
+-// 流式 markdown 渲染：按 fence 感知的双换行分块，块级 memo，
+-// 流式追加时只有最后一块重新 parse，避免长文本整体重渲染。
++// 流式 markdown 渲染：按 fence 感知的空行分块，块级 memo，
++// 流式追加时只重扫最后一个未封口块并只 parse 它，前面的块直接命中 memo。
+ 
+ import { cn } from '@tmex/ui';
+-import { memo, useMemo } from 'react';
++import { memo, useMemo, useRef } from 'react';
+ import ReactMarkdown, { type Components } from 'react-markdown';
+ import remarkGfm from 'remark-gfm';
+ 
++const FENCE = /^\s*(```|~~~)/;
++
++/** 增量分块的续扫点：sealed 是已被空行封口、不会再被追加改变的块 */
++export interface MarkdownSplit {
++  text: string;
++  sealed: string[];
++  /** 未封口块在 text 中的起点（该位置必不在围栏内） */
++  openStart: number;
++  blocks: string[];
++}
++
++export const EMPTY_MARKDOWN_SPLIT: MarkdownSplit = {
++  text: '',
++  sealed: [],
++  openStart: 0,
++  blocks: [],
++};
++
+ /** 在代码块围栏外的空行处分块（围栏内的双换行不是块边界） */
+-export function splitMarkdownBlocks(text: string): string[] {
+-  const lines = text.split('\n');
++function splitTail(text: string): string[] {
+   const blocks: string[] = [];
+   let current: string[] = [];
+   let inFence = false;
+@@ -21,8 +38,8 @@ export function splitMarkdownBlocks(text: string): string[] {
+     current = [];
+   };
+ 
+-  for (const line of lines) {
+-    if (/^\s*(```|~~~)/.test(line)) {
++  for (const line of text.split('\n')) {
++    if (FENCE.test(line)) {
+       inFence = !inFence;
+       current.push(line);
+       continue;
+@@ -38,6 +55,41 @@ export function splitMarkdownBlocks(text: string): string[] {
+   return blocks;
+ }
+ 
++/**
++ * 从上次结果续扫：只有「以换行结尾的围栏外空行」才是终局边界，其前的块不会再变；
++ * 尾部未封口区每次重扫（末行是否为空行还可能被下一段 delta 改写）。
++ * text 不以上次文本为前缀时退回全量扫描。
++ */
++export function advanceMarkdownSplit(prev: MarkdownSplit, text: string): MarkdownSplit {
++  const base = text.startsWith(prev.text) ? prev : EMPTY_MARKDOWN_SPLIT;
++  const appended: string[] = [];
++  let openStart = base.openStart;
++  let inFence = false;
++  let lineStart = openStart;
++  let nl = text.indexOf('\n', lineStart);
++
++  while (nl !== -1) {
++    const line = text.slice(lineStart, nl);
++    if (FENCE.test(line)) {
++      inFence = !inFence;
++    } else if (!inFence && line.trim() === '') {
++      const block = lineStart > openStart ? text.slice(openStart, lineStart - 1) : '';
++      if (block.trim()) appended.push(block);
++      openStart = nl + 1;
++    }
++    lineStart = nl + 1;
++    nl = text.indexOf('\n', lineStart);
++  }
++
++  const sealed = appended.length ? [...base.sealed, ...appended] : base.sealed;
++  const tail = splitTail(text.slice(openStart));
++  return { text, sealed, openStart, blocks: tail.length ? [...sealed, ...tail] : sealed };
++}
++
++export function splitMarkdownBlocks(text: string): string[] {
++  return advanceMarkdownSplit(EMPTY_MARKDOWN_SPLIT, text).blocks;
++}
++
+ const markdownComponents: Components = {
+   a: ({ node: _node, ...props }) => (
+     <a
+@@ -92,7 +144,11 @@ export function StreamingMarkdown({
+   streaming?: boolean;
+   className?: string;
+ }) {
+-  const blocks = useMemo(() => splitMarkdownBlocks(text), [text]);
++  const splitRef = useRef(EMPTY_MARKDOWN_SPLIT);
++  const blocks = useMemo(() => {
++    splitRef.current = advanceMarkdownSplit(splitRef.current, text);
++    return splitRef.current.blocks;
++  }, [text]);
+ 
+   return (
+     <div className={cn('flex min-w-0 flex-col gap-2 text-sm leading-relaxed', className)}>
+diff --git a/packages/stores/src/agent-thread.ts b/packages/stores/src/agent-thread.ts
+index 6620bee8..27da7516 100644
+--- a/packages/stores/src/agent-thread.ts
++++ b/packages/stores/src/agent-thread.ts
+@@ -42,60 +42,117 @@ export function emptyInProgress(): SessionInProgress {
+   return { texts: [], reasonings: [], toolCalls: [], staleBarrier: false };
+ }
+ 
+-/**
+- * 合并持久化消息与流式中状态：
+- * - 历史中未配对的 tool-call 用 inProgress 里同 toolCallId 的即时结果补全；
+- * - inProgress 独有的 toolCalls / 文本段追加在末尾（流式显示）。
+- */
+-export function buildThreadBlocks(
+-  messages: AgentMessageDto[] | undefined,
+-  inProgress: SessionInProgress | undefined
+-): UiThreadBlock[] {
+-  const { blocks, toolBlocksById } = parsePersistedMessages(messages ?? []);
++const EMPTY_MESSAGES: AgentMessageDto[] = [];
+ 
+-  if (!inProgress) {
+-    return blocks;
++interface HistoryCache {
++  /** 纯历史解析结果，标识稳定 */
++  base: UiThreadBlock[];
++  /** base 叠加流式 tool-result 后的版本（copy-on-write），无补丁时即 base */
++  patched: UiThreadBlock[];
++  /** toolCallId -> 在数组中的下标 */
++  toolIndex: Map<string, number>;
++}
++
++// 按 messages 数组引用缓存历史解析：每次 delta flush 只重建流式尾部，不再全量重解析。
++const historyCache = new WeakMap<AgentMessageDto[], HistoryCache>();
++// 流式块按 inProgress 段/调用对象引用缓存，未变化的段保持块标识稳定（供 React.memo 命中）。
++const liveBlockCache = new WeakMap<object, UiThreadBlock>();
++
++function historyOf(messages: AgentMessageDto[]): HistoryCache {
++  const cached = historyCache.get(messages);
++  if (cached) return cached;
++  const { blocks } = parsePersistedMessages(messages);
++  const toolIndex = new Map<string, number>();
++  blocks.forEach((block, index) => {
++    if (block.kind === 'tool-call') toolIndex.set(block.call.toolCallId, index);
++  });
++  const entry: HistoryCache = { base: blocks, patched: blocks, toolIndex };
++  historyCache.set(messages, entry);
++  return entry;
++}
++
++/** 把流式里已出结果的 tool-call 补进历史块：只替换受影响的那一个块，其余保持原对象。 */
++function patchResolved(entry: HistoryCache, calls: InProgressToolCall[]): void {
++  let next: UiThreadBlock[] | null = null;
++  for (const call of calls) {
++    if (!call.resolved) continue;
++    const index = entry.toolIndex.get(call.toolCallId);
++    if (index === undefined) continue;
++    const block = (next ?? entry.patched)[index];
++    if (block.kind !== 'tool-call' || block.call.resolved) continue;
++    next ??= [...entry.patched];
++    next[index] = {
++      ...block,
++      call: {
++        ...block.call,
++        output: call.output,
++        isError: call.isError,
++        denied: call.denied,
++        resolved: true,
++      },
++    };
+   }
++  if (next) entry.patched = next;
++}
+ 
++function cachedBlock(source: object, create: () => UiThreadBlock): UiThreadBlock {
++  const cached = liveBlockCache.get(source);
++  if (cached) return cached;
++  const block = create();
++  liveBlockCache.set(source, block);
++  return block;
++}
++
++function liveTail(entry: HistoryCache, inProgress: SessionInProgress): UiThreadBlock[] {
++  const tail: UiThreadBlock[] = [];
+   for (const call of inProgress.toolCalls) {
+-    const existing = toolBlocksById.get(call.toolCallId);
+-    if (existing) {
+-      if (!existing.resolved && call.resolved) {
+-        existing.output = call.output;
+-        existing.isError = call.isError;
+-        existing.denied = call.denied;
+-        existing.resolved = true;
+-      }
+-      continue;
+-    }
+-    blocks.push({
+-      kind: 'tool-call',
+-      key: `live-tool-${call.toolCallId}`,
+-      call,
+-    });
++    if (entry.toolIndex.has(call.toolCallId)) continue;
++    tail.push(
++      cachedBlock(call, () => ({ kind: 'tool-call', key: `live-tool-${call.toolCallId}`, call }))
++    );
+   }
+-
+   for (const segment of inProgress.reasonings) {
+     if (!segment.text) continue;
+-    blocks.push({
+-      kind: 'reasoning',
+-      key: `live-reasoning-${segment.messageId}`,
+-      text: segment.text,
+-      streaming: true,
+-    });
++    tail.push(
++      cachedBlock(segment, () => ({
++        kind: 'reasoning',
++        key: `live-reasoning-${segment.messageId}`,
++        text: segment.text,
++        streaming: true,
++      }))
++    );
+   }
+-
+   for (const segment of inProgress.texts) {
+     if (!segment.text) continue;
+-    blocks.push({
+-      kind: 'assistant-text',
+-      key: `live-text-${segment.messageId}`,
+-      text: segment.text,
+-      streaming: true,
+-    });
++    tail.push(
++      cachedBlock(segment, () => ({
++        kind: 'assistant-text',
++        key: `live-text-${segment.messageId}`,
++        text: segment.text,
++        streaming: true,
++      }))
++    );
+   }
++  return tail;
++}
+ 
+-  return blocks;
++/**
++ * 合并持久化消息与流式中状态：
++ * - 历史中未配对的 tool-call 用 inProgress 里同 toolCallId 的即时结果补全；
++ * - inProgress 独有的 toolCalls / 文本段追加在末尾（流式显示）。
++ * 历史部分按 messages 引用缓存，跨 flush 保持块对象标识不变。
++ */
++export function buildThreadBlocks(
++  messages: AgentMessageDto[] | undefined,
++  inProgress: SessionInProgress | undefined
++): UiThreadBlock[] {
++  const entry = historyOf(messages ?? EMPTY_MESSAGES);
++  if (!inProgress) {
++    return entry.base;
++  }
++  patchResolved(entry, inProgress.toolCalls);
++  const tail = liveTail(entry, inProgress);
++  return tail.length === 0 ? entry.patched : [...entry.patched, ...tail];
+ }
+ 
+ export function maxMessageSeq(messages: AgentMessageDto[] | undefined): number {
+diff --git a/packages/stores/src/agent.ts b/packages/stores/src/agent.ts
+index cbf3cca1..7e2aec44 100644
+--- a/packages/stores/src/agent.ts
++++ b/packages/stores/src/agent.ts
+@@ -4,7 +4,7 @@
+ import type { AgentSessionDto, AgentSessionStatus } from '@tmex/shared';
+ import { buildAgentSubscribe, buildAgentUnsubscribe } from '@tmex/ws-client';
+ import { create } from 'zustand';
+-import { persist } from 'zustand/middleware';
++import { type PersistStorage, createJSONStorage, persist } from 'zustand/middleware';
+ import { createAgentDeltaBuffer } from './agent-delta-buffer';
+ import { type AgentEventContext, handleAgentEventMessage } from './agent-event-router';
+ import { createAgentHistorySync } from './agent-history-sync';
+@@ -24,6 +24,34 @@ export type {
+   StartDraftInput,
+ } from './agent-state';
+ 
++type AgentPersisted = Pick<AgentState, 'activeSessionIdByNode' | 'defaultWriteMode'>;
++
++/**
++ * persist 在每次 set（含流式 delta flush）后都会写盘，而持久化的只有两个偏好字段：
++ * 序列化结果与已落盘的一致就跳过同步的 localStorage 写。
++ */
++function dedupedStorage(): PersistStorage<AgentPersisted> | undefined {
++  let written: string | null = null;
++  return createJSONStorage<AgentPersisted>(() => {
++    const base = window.localStorage;
++    return {
++      getItem: (name) => {
++        written = base.getItem(name);
++        return written;
++      },
++      setItem: (name, value) => {
++        if (value === written) return;
++        written = value;
++        base.setItem(name, value);
++      },
++      removeItem: (name) => {
++        written = null;
++        base.removeItem(name);
++      },
++    };
++  });
++}
++
+ export function createAgentStore(core: RuntimeCore, disposers: Array<() => void> = []) {
+   let initialized = false;
+ 
+@@ -125,7 +153,8 @@ export function createAgentStore(core: RuntimeCore, disposers: Array<() => void>
+         name: `${core.storagePrefix}tmex-agent`,
+         version: AGENT_PERSIST_VERSION,
+         migrate: migrateAgentPersistedState,
+-        partialize: (state) => ({
++        storage: dedupedStorage(),
++        partialize: (state): AgentPersisted => ({
+           activeSessionIdByNode: state.activeSessionIdByNode,
+           defaultWriteMode: state.defaultWriteMode,
+         }),
