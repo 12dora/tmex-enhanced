@@ -1,0 +1,11 @@
+apps/gateway tests:  2969 pass  0 fail  tsc_errors: 21
+apps/fe tests:  1070 pass  0 fail  tsc_errors: 0
+packages/panels tests:  650 pass  0 fail  tsc_errors: 0
+packages/stores tests:  368 pass  0 fail  tsc_errors: 1
+packages/shared tests:  392 pass  0 fail  tsc_errors: 0
+packages/ws-client tests:  283 pass  0 fail  tsc_errors: 0
+packages/terminal-ui tests:  325 pass  0 fail  tsc_errors: 0
+packages/ghostty-terminal tests:  216 pass  0 fail  tsc_errors: 0
+packages/api-client tests:  132 pass  0 fail  tsc_errors: 5
+packages/app tests:  475 pass  1 fail  tsc_errors: 1
+DONE
