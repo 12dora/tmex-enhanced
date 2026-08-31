@@ -67,3 +67,11 @@
    - 登录：cloudflared 写默认路径 cert 被接受并拷入管理目录（修复"授权成功仍报进程失败"）
    - Access：新增 external.externalAccess 三态；真机实测 cert 令牌权限不足时 CF apps 接口静默返回空（organizations 同凭证 403），故 cert 来源空列表降级 checked:false（不可证伪），仅用户令牌的空列表可信
    - 文案：settings.remoteAccess 三语专业化重写（新增 14 key 零改名，错误文案均含可执行下一步）
+
+## 附 4：远程访问二期 + 设置加载 + 节点取消（同日第三批）
+
+- **设置 tab 加载慢**（BO）：双段串行 RTT（chunk 下载→挂载→数据请求）→ 空闲逐个预热七个 tab chunk + 悬停预热与 ai/terminal 数据预取，入口 +0.19kB gzip。
+- **节点待确认取消按钮**（指挥官）：pending 行右侧新增取消，删本地记录、join 串即消，hub 侧按 10 分钟窗口自然过期。
+- **standalone 本机登录**（BM→BP→BQ 三段安全链）：local_auth 单例表 + /api/auth/mode 加性 localAuth 四元组；bootstrap/toggle 仅本机可调、零凭证不可生效；整站门（UI/REST/WS/healthz 降级）接 live effective；生产 standalone 经 authSurfaceOnly 装配缝挂 auth 面（inert peers/streams，不建 mesh 网络栈），local-routes 统一交 authenticate；装配 E2E：bootstrap→enable→login→关门→disable 恢复。已知边界：反代把 requestIP 全写成 127.0.0.1 时 loopback 判定失真；生效后无 cookie 关闭需先登录。
+- **向导「直接连接」路径**（BN）：纯前端 WizardMode='direct'（服务端枚举不动），mode→direct 两步；4 档访问保护（节点登录保护/本机登录已启用/无保护+启用流程+硬确认/unknown 不误报）；凭证已保存常驻块改一次性 toast；Access 步骤标题去 Cloudflare 前缀、『无需公网 IP 或端口映射』。
+- 门禁：auth-routes 入册 fileLines（三段合入越 900，拆分只搬行）；--tighten 全量校准 118→116 条。
