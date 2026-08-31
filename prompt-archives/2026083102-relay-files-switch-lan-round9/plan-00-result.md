@@ -54,7 +54,16 @@
 ## 提交
 `4ee1152c` files 多节点 → `06f0a6b2` 徽标/详情 → `de145abf` 切换性能 → `310af64f` 保活收口 → `96ba9a92` mesh 直连 → `0a711e45` e2e spec →（G5b 后）升级安全 + 文档/档案/版本。
 
+## 发布与上线（2026-09-01 凌晨）
+- GitHub Release `v1.1.4`（tarball + SHA256SUMS）；main ff 至 `fb85a06e`（含档案），分支 `feat/round9-relay-files-perf`、`feat/crash-safe-upgrade` 已 push。
+- 本机生产：tarball `upgrade --apply-current-package` 上线 1.1.4（healthz ok、launchd 正常、迁移 32、uplink online）。
+- 远端（全部经 `sub/hub-ops/hub-ops.ts`，无 ssh）：jiefa-dns-1 直接 `tmex upgrade` 成功；jiefa-app 的 api.github.com 403，改为 files API 上传 tarball + `bun package/bin/tmex.js upgrade --apply-current-package` 成功（该机无 node）；Hub `tmex`（github.com 不通）同法上传 + 在其本机 pane 里 apply，1.0.2 → 1.1.4。docker-node 仍 1.0.2（容器需重建镜像，未处理）。
+- **升级 Hub 后本机 key-log 立即补齐 seq 5/6，`peer_cache` 刷新（list_version 7）**——任务 4 的根因（旧 Hub 不广播新 node.list）确认修复；在办公网内可望 ws-secure 直连，家中仍走中转。
+- 清理：三台机器的 `/tmp/tmex-ops` 与临时文件根均已删除。
+
 ## 遗留 / 需用户决定
-- 升级远端 Hub 到 1.1.4（否则本机永远学不到新节点，直连无从谈起）。
+- 本机生产 `~/Library/Application Support/tmex/staging/`（约 58MB，误触事故遗留）可手动 `rm -rf` 清理（本会话不动生产目录）。
+- docker-node 仍 1.0.2（需重建镜像）。
+- 新升级器在 `feat/crash-safe-upgrade` 分支，review J 的 7 个 blocker 修完并双模式演练后再随后续版本发布。
 - `SelectionToolbar` 覆盖终端顶部居中区域吞点击（O3 发现的既有 UX 问题）。
 - `node-login-<id>` testid 在设备页与侧栏 Files 分节重复（V1 O5），mesh e2e helper 需按容器收窄。

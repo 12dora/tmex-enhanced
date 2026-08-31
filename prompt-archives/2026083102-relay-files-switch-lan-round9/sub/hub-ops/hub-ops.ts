@@ -639,6 +639,14 @@ async function cmdRootAdd(session: Session, args: Args): Promise<void> {
   console.log(`created root ${data.root.id}  path=${data.root.path}  device=${data.root.deviceId}`);
 }
 
+async function cmdRootDel(session: Session, args: Args): Promise<void> {
+  const node = str(args, 'node') ?? 'self';
+  await ensureNode(session, node);
+  const rootId = required(args, 'root');
+  await apiJson(session, node, `/api/files/roots/${rootId}`, { method: 'DELETE' });
+  console.log(`deleted root ${rootId}`);
+}
+
 async function cmdUpload(session: Session, args: Args): Promise<void> {
   const node = str(args, 'node') ?? 'self';
   await ensureNode(session, node);
@@ -756,6 +764,9 @@ switch (args.cmd) {
     break;
   case 'root-add':
     await cmdRootAdd(session, args);
+    break;
+  case 'root-del':
+    await cmdRootDel(session, args);
     break;
   case 'upload':
     await cmdUpload(session, args);
