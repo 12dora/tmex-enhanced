@@ -50,3 +50,9 @@
 ## 附：全仓 lint 清零（用户追加指令）
 
 `bun run lint`（biome check . + 复杂度门禁）在 main 上即有 259 个预存错误（第六轮归档脚本 + 测试文件格式漂移），本轮清零：prompt-archives 加入 biome ignore（归档不格式化）；测试/spec 文件 overrides 豁免 noNonNullAssertion/noDelete（测试惯用法，process.env 用 delete 是正确写法）；全仓 `biome check --write` 统一格式（180+ 文件）；手工修复：theme spec 的 `[^]*`→`[\s\S]*`、spike-assert while 赋值表达式、main.tsx 有意依赖加注释豁免、index.css @import 位置（Vite 构建期解析，源顺序承载主题覆盖语义）文件级豁免、build-i18n node: 协议、重连指示器 div→button（键盘可达）、清理失效 biome-ignore。gate.ts 的 --tighten 改动同步修 noDelete；ghostty-wasm allowlist 1620→1624（格式化撑行）。
+
+## 附 2：遗留项处置（用户指令：1 修复 / 2 评估 / 3 修复）
+
+1. **link-detector lookbehind**：`FILE_PATH_PATTERN` 构造包进 `buildFilePathPattern()` try/catch，不支持 lookbehind 的引擎（iOS Safari <16.4）返回 null，文件路径检测优雅降级、URL 检测不受影响，模块不再求值即抛。
+2. **encodeMouseEvent 模式查询实测**（Bun + 真实 wasm，M 系列桌面）：`isTerminalModeEnabled` 34.8 ns/次、完整 `encodeMouseEvent`（motion+SGR+1003）218 ns/次；120Hz 持续鼠标移动 = 0.026 ms/s，240Hz = 0.052 ms/s。按低端移动设备 50× 放大也仅 ~1.3 ms/s（单核 0.13%）。**结论：非热点，不修**，wasm bindings 签名保持不动；此项从待办中移除。
+3. **ws-client 溢出 toast**：`pending-overflow` 事件接 `notifications.error`，新增 i18n key `websocket.inputDropped`（zh：「连接中断，刚才的输入未能发送。连接恢复后请重新输入或粘贴。」，en/ja 同义），测试断言 toast 触发。
