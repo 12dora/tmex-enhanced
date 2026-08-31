@@ -54,3 +54,10 @@ fe 995 / panels 650 / gateway 2965 / app 475+1 既有 fail（build-runtime 需�
 - 加入已有中继第 4 步就地生成加入码（F5）：`use-create-enrollment.ts` 从节点管理页抽出共用；面板四态；第 5 步真实 `joinCommand` 联动，未生成前用真实函数 + 占位哨兵生成预览。第 6 步确认加入未搬入（需要 `useEnrollmentWatch`/`useAdmitAction` 编排，双 admit 引擎有 seq_gap 风险）。
 - 整包测试下其他用例桩污染共享查询键，地址推导加形状守卫。
 - v1.1.2 Release（tag `aa7c9da3`），本机已升级。
+
+## 1.1.3（第三批反馈）
+
+- 加入码标签「加入码（有效期 N 分钟）」按 TTL 推导，去独立提示行；第 3 步中英文案压到一行。
+- enrollment 引擎单例化（F6）→ R4 安全审查 9 条（F7）→ R5 复审 5 FIXED/4 PARTIAL + 1 新 BLOCKER（F9）：全局 key-log 写互斥（含吊销）、签前重校验、已签记录先入未确认存储、事务表 + busyIds + 取消延后、操作上下文快照与代际、签名者租约仅覆盖记录构建、面板会话绑定与回收、复合 reset。引擎第三轮后按价值判定收束。
+- 「本机作为中继」第 3–5 步按隧道状态与 auth mode 推导（F8，`host-status.ts`）。
+- v1.1.3 Release（tag `e1de4588`），本机已升级。远端应用服务器 10.110.88.3 安装待用户确认登录凭据与加入码。

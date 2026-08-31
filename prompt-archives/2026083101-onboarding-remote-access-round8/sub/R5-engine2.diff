@@ -1,0 +1,1718 @@
+diff --git a/apps/fe/src/auth/credential-prompt.test.tsx b/apps/fe/src/auth/credential-prompt.test.tsx
+index e9e9796b..37415c78 100644
+--- a/apps/fe/src/auth/credential-prompt.test.tsx
++++ b/apps/fe/src/auth/credential-prompt.test.tsx
+@@ -11,9 +11,13 @@ import {
+   WrongPasswordError,
+   credentialErrorText,
+   decodeRootPublicKey,
++  forgetSigner,
+   isRetryableCredentialError,
++  leaseSigner,
++  rememberSigner,
+   runWithChoice,
+   signerFromChoice,
++  takeRememberedSigner,
+   usablePasskeys,
+ } from './credential-prompt';
+ 
+@@ -223,3 +227,49 @@ describe('错误分类与根公钥解码', () => {
+     expect(decodeRootPublicKey('@@@')).toBeNull();
+   });
+ });
++
++describe('复用窗口的归属与租约', () => {
++  const NOW = 1_700_000_000_000;
++
++  test('只有存进去的那个实例能清掉它：别的对话框卸载不影响', () => {
++    const mine = Symbol('mine');
++    const other = Symbol('other');
++    const rootKey = rootKeyFromSeed(new Uint8Array(32).fill(0x31));
++    rememberSigner({ kind: 'root', rootKey }, NOW, mine);
++
++    // 另一个对话框实例卸载：不是它存的，一个字节都不许动。
++    forgetSigner(other);
++    expect(takeRememberedSigner(NOW)).not.toBeNull();
++    expect(rootKey.seed.every((byte) => byte === 0)).toBe(false);
++
++    forgetSigner(mine);
++    expect(takeRememberedSigner(NOW)).toBeNull();
++    expect(rootKey.seed.every((byte) => byte === 0)).toBe(true);
++  });
++
++  test('不带归属的清理照旧无条件生效（页面级重置 / 测试）', () => {
++    const rootKey = rootKeyFromSeed(new Uint8Array(32).fill(0x32));
++    rememberSigner({ kind: 'root', rootKey }, NOW, Symbol('owner'));
++    forgetSigner();
++    expect(takeRememberedSigner(NOW)).toBeNull();
++    expect(rootKey.seed.every((byte) => byte === 0)).toBe(true);
++  });
++
++  test('租约期内不清零：签名做完释放租约才抹掉', () => {
++    const owner = Symbol('owner');
++    const rootKey = rootKeyFromSeed(new Uint8Array(32).fill(0x33));
++    const signer = { kind: 'root', rootKey } as const;
++    rememberSigner(signer, NOW, owner);
++
++    const release = leaseSigner(signer);
++    forgetSigner(owner);
++    // 复用窗口已经交出去了，但正在签的这份根钥还不能动。
++    expect(takeRememberedSigner(NOW)).toBeNull();
++    expect(rootKey.seed.every((byte) => byte === 0)).toBe(false);
++
++    release();
++    expect(rootKey.seed.every((byte) => byte === 0)).toBe(true);
++    // 重复释放不该再动别的东西。
++    release();
++  });
++});
+diff --git a/apps/fe/src/auth/credential-prompt.tsx b/apps/fe/src/auth/credential-prompt.tsx
+index cd40565d..b239810b 100644
+--- a/apps/fe/src/auth/credential-prompt.tsx
++++ b/apps/fe/src/auth/credential-prompt.tsx
+@@ -14,7 +14,7 @@ import { bytesEqual, decodeBase64url } from '@tmex/shared/auth';
+ import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+ import { Fingerprint, KeyRound, Loader2 } from 'lucide-react';
+-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import {
+   passkeysForOrigin,
+@@ -30,8 +30,16 @@ export const SIGNER_REUSE_WINDOW_MS = 5 * 60 * 1000;
+ // 5 分钟凭据复用（仅内存）
+ // ---------------------------------------------------------------------------
+ 
+-let rememberedSigner: { signer: RecordSigner; until: number } | null = null;
++/** 复用窗口的归属令牌：谁存的谁才能清（多个对话框实例同时挂着时的唯一判据）。 */
++export type SignerOwner = symbol;
++
++let rememberedSigner: { signer: RecordSigner; until: number; owner: SignerOwner | null } | null =
++  null;
+ let rememberedTimer: ReturnType<typeof setTimeout> | null = null;
++/** 正在被使用（签一条记录）的签名者：租约期内不清零，`leases` 记引用计数。 */
++const leases = new Map<RecordSigner, number>();
++/** 租约期内被要求清零的签名者：等租约还清再动手。 */
++const deferredWipes = new Set<RecordSigner>();
+ 
+ /** 根钥签名者的 seed 是根私钥：丢引用不够，必须显式清零。 */
+ export function wipeSigner(signer: RecordSigner | null | undefined): void {
+@@ -45,16 +53,41 @@ function dropRemembered(): void {
+   }
+   const previous = rememberedSigner;
+   rememberedSigner = null;
+-  wipeSigner(previous?.signer);
++  if (!previous) return;
++  // 有人正拿它签记录：现在清零会让签名用到半截的根钥，推迟到租约释放。
++  if (leases.has(previous.signer)) deferredWipes.add(previous.signer);
++  else wipeSigner(previous.signer);
++}
++
++/**
++ * 占住一个签名者，直到记录构造完成。
++ *
++ * 复用窗口是模块级的，任何一个对话框实例卸载都会调 `forgetSigner()`；没有租约时，
++ * 那次清零会把引擎正在用的根钥 seed 抹成 0，签出来的记录直接作废（见 R4 #5）。
++ */
++export function leaseSigner(signer: RecordSigner): () => void {
++  leases.set(signer, (leases.get(signer) ?? 0) + 1);
++  let released = false;
++  return () => {
++    if (released) return;
++    released = true;
++    const rest = (leases.get(signer) ?? 1) - 1;
++    if (rest > 0) {
++      leases.set(signer, rest);
++      return;
++    }
++    leases.delete(signer);
++    if (deferredWipes.delete(signer)) wipeSigner(signer);
++  };
+ }
+ 
+ /**
+  * 记住刚做完的密码 / passkey 交互，5 分钟内自动复用。
+  * 到期由定时器主动清零，而不是等下一次 `takeRememberedSigner()`——否则根私钥副本会一直留在堆里。
+  */
+-export function rememberSigner(signer: RecordSigner, now: number): void {
++export function rememberSigner(signer: RecordSigner, now: number, owner?: SignerOwner): void {
+   dropRemembered();
+-  rememberedSigner = { signer, until: now + SIGNER_REUSE_WINDOW_MS };
++  rememberedSigner = { signer, until: now + SIGNER_REUSE_WINDOW_MS, owner: owner ?? null };
+   rememberedTimer = setTimeout(() => {
+     rememberedTimer = null;
+     dropRemembered();
+@@ -72,8 +105,14 @@ export function takeRememberedSigner(now: number): RecordSigner | null {
+   return rememberedSigner.signer;
+ }
+ 
+-/** 复用窗口结束（用完 / 页面卸载 / 换用户）：立刻清零。 */
+-export function forgetSigner(): void {
++/**
++ * 复用窗口结束（用完 / 页面卸载 / 换用户）：立刻清零。
++ *
++ * 带 `owner` 时**只清自己存进去的那个**：设置页与侧滑面板各挂一个对话框实例，
++ * 任一实例卸载都不该抹掉另一实例刚做完的认证（见 R4 #5）。
++ */
++export function forgetSigner(owner?: SignerOwner): void {
++  if (owner && rememberedSigner?.owner !== owner) return;
+   dropRemembered();
+ }
+ 
+@@ -373,11 +412,32 @@ interface PendingPrompt {
+   reject: (error: unknown) => void;
+ }
+ 
++/** 本实例的归属令牌：只清自己存进复用窗口的那个签名者。 */
++function usePromptOwner(): SignerOwner {
++  const ref = useRef<SignerOwner | null>(null);
++  if (ref.current === null) ref.current = Symbol('credential-prompt');
++  return ref.current;
++}
++
++/** 卸载：挂着的请求当取消处理，**本实例存的**根钥立刻清零（别人存的不碰）。 */
++function usePromptTeardown(pendingRef: RefObject<PendingPrompt | null>, owner: SignerOwner): void {
++  useEffect(
++    () => () => {
++      pendingRef.current?.resolve(null);
++      pendingRef.current = null;
++      forgetSigner(owner);
++    },
++    [pendingRef, owner]
++  );
++}
++
+ export function useCredentialPrompt(config: CredentialPromptConfig): CredentialPromptHandle {
+   const [open, setOpen] = useState<CredentialPurpose | null>(null);
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const pendingRef = useRef<PendingPrompt | null>(null);
++  const owner = usePromptOwner();
++  usePromptTeardown(pendingRef, owner);
+ 
+   const { kdfParams, rootPublicKey, passkeys, passkeyAvailable, origin } = config;
+   const usable = useMemo(
+@@ -445,11 +505,11 @@ export function useCredentialPrompt(config: CredentialPromptConfig): CredentialP
+       return ask(options.purpose ?? 'admit', async (choice) => {
+         const signer = await signerFromChoice(choice, kdfParams, rootPublicKey);
+         // 交给复用窗口托管：它负责到期 / 显式清零，调用方不必再管根钥 seed。
+-        rememberSigner(signer, Date.now());
++        rememberSigner(signer, Date.now(), owner);
+         return signer;
+       });
+     },
+-    [ask, kdfParams, rootPublicKey]
++    [ask, kdfParams, rootPublicKey, owner]
+   );
+ 
+   const withSigner = useCallback(
+@@ -463,20 +523,12 @@ export function useCredentialPrompt(config: CredentialPromptConfig): CredentialP
+     [ask, kdfParams, rootPublicKey]
+   );
+ 
+-  useEffect(
+-    () => () => {
+-      // 组件卸载：挂着的请求当取消处理，复用窗口里的根钥立刻清零。
+-      pendingRef.current?.resolve(null);
+-      pendingRef.current = null;
+-      forgetSigner();
+-    },
+-    []
+-  );
++  const forget = useCallback(() => forgetSigner(owner), [owner]);
+ 
+   return {
+     request: request as CredentialPromptHandle['request'],
+     withSigner: withSigner as CredentialPromptHandle['withSigner'],
+-    forget: forgetSigner,
++    forget,
+     passkeys: usable,
+     dialog: open ? (
+       <CredentialPromptDialog
+diff --git a/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx b/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx
+index ee528f15..47e214ef 100644
+--- a/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx
++++ b/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx
+@@ -240,13 +240,17 @@ describe('JoinSteps 步骤 6「确认加入」', () => {
+     createdAt: 1_700_000_000_000,
+   };
+ 
+-  function confirmStatus(patch: Parameters<typeof setEnrollmentEngineStateForTest>[0]): string {
++  function confirmStatus(
++    patch: Parameters<typeof setEnrollmentEngineStateForTest>[0],
++    session: { id: string; admitted: boolean } = { id: 'e-1', admitted: false }
++  ): string {
+     setEnrollmentEngineStateForTest(patch);
+     const enrollment = {
+       meshEnabled: true,
+       hubOnline: true,
+-      pending: PENDING,
++      session,
+       engine: getEnrollmentEngineState(),
++      confirmManually: () => undefined,
+     } as unknown as Parameters<typeof JoinConfirmStatus>[0]['enrollment'];
+     return render(<JoinConfirmStatus enrollment={enrollment} />);
+   }
+@@ -283,10 +287,17 @@ describe('JoinSteps 步骤 6「确认加入」', () => {
+     expect(html).toContain('nodes.enrollment.badCertSig');
+   });
+ 
+-  test('本次会话还没有 pending 时什么都不渲染', () => {
++  test('刷新后引擎投影没了，会话里的「已加入」标记仍然显示', () => {
++    const html = confirmStatus({}, { id: 'e-1', admitted: true });
++    expect(html).toContain('data-testid="connect-join-admitted"');
++    expect(html).not.toContain('data-testid="connect-join-confirm"');
++  });
++
++  test('本次会话还没有 enrollment 时什么都不渲染', () => {
+     const enrollment = {
+-      pending: null,
++      session: null,
+       engine: getEnrollmentEngineState(),
++      confirmManually: () => undefined,
+     } as unknown as Parameters<typeof JoinConfirmStatus>[0]['enrollment'];
+     const html = render(<JoinConfirmStatus enrollment={enrollment} />);
+     expect(html).not.toContain('data-testid="connect-join-pending"');
+diff --git a/apps/fe/src/components/side-panels/connect-devices/join-token.tsx b/apps/fe/src/components/side-panels/connect-devices/join-token.tsx
+index f0fde5d8..e166c2ec 100644
+--- a/apps/fe/src/components/side-panels/connect-devices/join-token.tsx
++++ b/apps/fe/src/components/side-panels/connect-devices/join-token.tsx
+@@ -5,10 +5,13 @@
+ // 这里只负责把 mesh 模式、hub 通道与凭据对话框接上，并渲染本次会话那条 pending 的状态。
+ 
+ import { decodeRootPublicKey, useCredentialPrompt, usePasskeys } from '@/auth/credential-prompt';
+-import type { PendingEnrollment } from '@/node/enrollment';
++import {
++  type PendingEnrollment,
++  listPendingEnrollments,
++  subscribePendingEnrollments,
++} from '@/node/enrollment';
+ import {
+   type EnrollmentEngineState,
+-  confirmManually,
+   useEnrollmentEngine,
+   useEnrollmentEngineState,
+ } from '@/node/enrollment-engine';
+@@ -23,7 +26,7 @@ import { defaultAuthApi } from '@tmex/api-client/auth/index';
+ import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+ import { Check, Loader2, ShieldCheck } from 'lucide-react';
+-import { type ReactElement, useEffect, useState } from 'react';
++import { type ReactElement, useEffect, useState, useSyncExternalStore } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { CommandBlock } from './command-block';
+ import { GuideLink } from './guide-step';
+@@ -34,6 +37,49 @@ const NO_MESH_NODES: MeshNode[] = [];
+ /** admit 成功后拉一次成员集：面板自己没有列表，但侧栏与设备页共用这份 store。 */
+ const refreshAfterAdmit = () => void refreshMeshNodes();
+ 
++/**
++ * 本次面板会话跟踪的那条 enrollment（**只有 id 与是否已加入，绝不含加入码或私钥**）。
++ *
++ * 落 sessionStorage：面板关掉再开、或整页刷新后，步骤 6 仍要停在正确的状态——
++ * pending 本身活在 `enrollment.ts` 的 store 里，丢的只是「哪条是本次会话建的」这层关联，
++ * 而「已加入」在 pending 被删之后只剩这个标记能证明（见 R4 #8）。
++ */
++export interface JoinSession {
++  id: string;
++  admitted: boolean;
++}
++
++const SESSION_STORAGE_KEY = 'tmex.connectDevices.joinSession';
++
++function sessionStore(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null {
++  return (globalThis as { sessionStorage?: Storage }).sessionStorage ?? null;
++}
++
++function readJoinSession(): JoinSession | null {
++  try {
++    const raw = sessionStore()?.getItem(SESSION_STORAGE_KEY);
++    const parsed: unknown = raw ? JSON.parse(raw) : null;
++    if (!parsed || typeof parsed !== 'object') return null;
++    const row = parsed as Record<string, unknown>;
++    if (typeof row.id !== 'string' || !row.id) return null;
++    return { id: row.id, admitted: row.admitted === true };
++  } catch {
++    return null;
++  }
++}
++
++function writeJoinSession(session: JoinSession | null): JoinSession | null {
++  try {
++    const store = sessionStore();
++    if (!store) return session;
++    if (session) store.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
++    else store.removeItem(SESSION_STORAGE_KEY);
++  } catch {
++    // 隐私模式下 sessionStorage 会抛；内存态仍然有效，刷新后丢失即可。
++  }
++  return session;
++}
++
+ /** 加入码有效期（分钟）：由 pending 自身的 `createdAt → exp` 反推，不写死。 */
+ export function joinTokenTtlMinutes(pending: PendingEnrollment): number {
+   return Math.max(1, Math.round((pending.exp - pending.createdAt) / 60_000));
+@@ -45,13 +91,54 @@ export interface JoinEnrollment {
+   /** hub 管理面是否可用（探测成功）。 */
+   hubOnline: boolean;
+   create: CreateEnrollmentState;
+-  /** 本次面板会话创建的那条 pending；只跟踪它，不展示全局待确认列表。 */
+-  pending: PendingEnrollment | null;
++  /** 本次面板会话创建的那条 enrollment；只跟踪它，不展示全局待确认列表。 */
++  session: JoinSession | null;
+   engine: EnrollmentEngineState;
++  /** 步骤 6 的「确认加入」：绑定本面板这个引擎槽位。 */
++  confirmManually: (enrollmentId: string) => void;
+   /** 凭据对话框，必须由调用方挂进 DOM。 */
+   dialog: ReactElement | null;
+ }
+ 
++/** 本次会话那条 enrollment 是否已经走完：过期、取消，或刷新回来时它早已不在 pending store 里。 */
++function isSessionGone(
++  id: string,
++  engine: EnrollmentEngineState,
++  pendings: PendingEnrollment[]
++): boolean {
++  if (engine.expiredIds.includes(id) || engine.cancelledIds.includes(id)) return true;
++  return !pendings.some((row) => row.hubEnrollmentId === id);
++}
++
++/**
++ * 跟踪本次面板会话那条 enrollment：创建时记下、admit 后打上标记、终态时清掉，
++ * 整个过程同步落 sessionStorage，刷新 / 重开面板后步骤 6 仍停在正确的状态。
++ */
++function useJoinSession(createdId: string | null, engine: EnrollmentEngineState) {
++  const pendings = useSyncExternalStore(
++    subscribePendingEnrollments,
++    listPendingEnrollments,
++    listPendingEnrollments
++  );
++  const [session, setSession] = useState<JoinSession | null>(readJoinSession);
++  useEffect(() => {
++    if (createdId) setSession(writeJoinSession({ id: createdId, admitted: false }));
++  }, [createdId]);
++
++  const id = session?.id ?? null;
++  const admitted = id !== null && (session?.admitted === true || engine.admittedIds.includes(id));
++  const gone = id !== null && !admitted && isSessionGone(id, engine, pendings);
++  useEffect(() => {
++    if (id === null) return;
++    if (gone) setSession(writeJoinSession(null));
++    else if (admitted) {
++      setSession((row) => (row?.admitted ? row : writeJoinSession({ id, admitted: true })));
++    }
++  }, [id, gone, admitted]);
++
++  return gone ? null : session;
++}
++
+ export function useJoinEnrollment(): JoinEnrollment {
+   const api = defaultAuthApi;
+   const { mode: rawMode, meshEnabled } = useSharedAuthMode(api);
+@@ -81,7 +168,7 @@ export function useJoinEnrollment(): JoinEnrollment {
+   });
+ 
+   const { t } = useTranslation();
+-  useEnrollmentEngine({
++  const { confirmManually } = useEnrollmentEngine({
+     api,
+     mode,
+     hubApi: hub.hubApi,
+@@ -98,26 +185,15 @@ export function useJoinEnrollment(): JoinEnrollment {
+     clearedIds: engine.clearedIds,
+   });
+ 
+-  // join 串会被 `clearedIds` 清掉，但步骤 6 还要接着显示「已加入」，因此单独记住这条 pending。
+-  const [pending, setPending] = useState<PendingEnrollment | null>(null);
+-  const created = create.created;
+-  useEffect(() => {
+-    if (created) setPending(created.pending);
+-  }, [created]);
+-  const dropped =
+-    pending !== null &&
+-    (engine.expiredIds.includes(pending.hubEnrollmentId) ||
+-      engine.cancelledIds.includes(pending.hubEnrollmentId));
+-  useEffect(() => {
+-    if (dropped) setPending(null);
+-  }, [dropped]);
++  const session = useJoinSession(create.created?.pending.hubEnrollmentId ?? null, engine);
+ 
+   return {
+     meshEnabled,
+     hubOnline: hub.online,
+     create,
+-    pending: dropped ? null : pending,
++    session,
+     engine,
++    confirmManually: (enrollmentId: string) => void confirmManually(enrollmentId),
+     dialog: prompt.dialog,
+   };
+ }
+@@ -204,11 +280,12 @@ export function JoinTokenFields({ enrollment }: { enrollment: JoinEnrollment })
+  */
+ export function JoinConfirmStatus({ enrollment }: { enrollment: JoinEnrollment }) {
+   const { t } = useTranslation();
+-  const { pending, engine } = enrollment;
+-  if (!pending) return null;
+-  const id = pending.hubEnrollmentId;
++  const { session, engine } = enrollment;
++  if (!session) return null;
++  const id = session.id;
+ 
+-  if (engine.admittedIds.includes(id)) {
++  // 刷新后引擎的终态投影没了，靠会话里的标记继续显示「已加入」。
++  if (session.admitted || engine.admittedIds.includes(id)) {
+     return (
+       <p className="text-xs text-muted-foreground" data-testid="connect-join-admitted">
+         {t('connectDevices.computer.join.confirm.done')}
+@@ -240,7 +317,7 @@ export function JoinConfirmStatus({ enrollment }: { enrollment: JoinEnrollment }
+             type="button"
+             size="sm"
+             disabled={busy}
+-            onClick={() => void confirmManually(pending)}
++            onClick={() => enrollment.confirmManually(id)}
+             data-testid="connect-join-confirm"
+           >
+             {busy ? <Loader2 className="animate-spin" /> : <Check />}
+diff --git a/apps/fe/src/node/enrollment-engine.test.ts b/apps/fe/src/node/enrollment-engine.test.ts
+index 63b37e8f..660de483 100644
+--- a/apps/fe/src/node/enrollment-engine.test.ts
++++ b/apps/fe/src/node/enrollment-engine.test.ts
+@@ -1,7 +1,8 @@
+ // 宿主级 enrollment 引擎：一条监听回路 + 一条 admit 流水线。
+ //
+ // 核心不变量：无论挂了几个消费方（设置页 + 侧滑面板），同一张证书都只能签出**一条**
+-// `admit-node`。两条就是同一个 head 上的两个 seq，hub 只收得下一条，另一条永久 `seq_gap`。
++// `admit-node`；且任意两条 admit 的 `keyLogHead → 签名 → append` 之间不许交叠——
++// 交叠就是同一个 head 上的两个 seq，hub 只收得下一条，另一条永久 `seq_gap`。
+ 
+ import { beforeEach, describe, expect, test } from 'bun:test';
+ import type { AuthApi } from '@tmex/api-client/auth/index';
+@@ -12,6 +13,8 @@ installWindowStorage();
+ const {
+   createEnrollment,
+   createNodeCertificate,
++  decodeBase64url,
++  decodeKeyLogRecord,
+   encodeBase64url,
+   generateEd25519KeyPair,
+   rootKeyFromSeed,
+@@ -22,13 +25,14 @@ const {
+   clearPendingEnrollments,
+   clearUnconfirmedRecords,
+   listPendingEnrollments,
++  listUnconfirmedRecordIds,
+   setPendingStorage,
+   submitAdmitRecord,
++  unconfirmedRecord,
+ } = await import('./enrollment');
+ const {
+   cancelPending,
+   configureEnrollmentEngineForTest,
+-  confirmManually,
+   enrollmentEngineDebugForTest,
+   getEnrollmentEngineState,
+   registerAdmitContext,
+@@ -101,13 +105,13 @@ interface PromptSpy {
+   requests: number;
+ }
+ 
+-function promptSpy(): PromptSpy {
++function promptSpy(signer: unknown = null): PromptSpy {
+   const spy: PromptSpy = {
+     requests: 0,
+     prompt: {
+       request: () => {
+         spy.requests += 1;
+-        return Promise.resolve(null);
++        return Promise.resolve(signer);
+       },
+       withSigner: () => Promise.resolve(null),
+       forget: () => undefined,
+@@ -129,6 +133,10 @@ function context(api: AuthApi, prompt = promptSpy().prompt): AdmitContext {
+   };
+ }
+ 
++function recordSeq(record: { bytes: string }): bigint {
++  return decodeKeyLogRecord(decodeBase64url(record.bytes)).seq;
++}
++
+ // 推送源桩：`push()` 直接喂给引擎注册的监听器。
+ const pushHandlers = new Set<(event: { certificate: string; certSig: string }) => void>();
+ let starts = 0;
+@@ -150,8 +158,15 @@ function flush(): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, 0));
+ }
+ 
++/** 多轮宏任务：一条 admit 里串着取 head、签名、append 好几段异步。 */
++async function settle(rounds = 6): Promise<void> {
++  for (let i = 0; i < rounds; i += 1) await flush();
++}
++
+ let collectCalls = 0;
+ let collectResult: CertificateCandidate[] = [];
++/** 轮询请求的往返延迟（宏任务轮数）：用来制造「结果回来时局面已经变了」的时序。 */
++let collectDelay = 0;
+ 
+ beforeEach(() => {
+   resetEnrollmentEngineForTest();
+@@ -159,6 +174,7 @@ beforeEach(() => {
+   starts = 0;
+   collectCalls = 0;
+   collectResult = [];
++  collectDelay = 0;
+   forgetSigner();
+   setPendingStorage({
+     getItem: () => null,
+@@ -171,9 +187,10 @@ beforeEach(() => {
+     events,
+     now: () => NOW,
+     intervalMs: 3_600_000,
+-    collect: () => {
++    collect: async () => {
+       collectCalls += 1;
+-      return Promise.resolve(collectResult);
++      for (let i = 0; i < collectDelay; i += 1) await flush();
++      return collectResult;
+     },
+   });
+ });
+@@ -187,12 +204,12 @@ describe('单例回路', () => {
+     const second = apiSpy({ ok: true, hubAck: true });
+ 
+     addPendingEnrollment(pending);
+-    const offFirst = registerAdmitContext(context(first.api));
+-    const offSecond = registerAdmitContext(context(second.api));
++    const one = registerAdmitContext(context(first.api));
++    const two = registerAdmitContext(context(second.api));
+     // 推送订阅与轮询各一份：第二个消费方没有再开一条。
+     expect(starts).toBe(1);
+     expect(pushHandlers.size).toBe(1);
+-    await flush();
++    await settle();
+     expect(collectCalls).toBe(1);
+     // 证书只被签了一次，且交给最后注册的上下文。
+     expect(first.appended).toHaveLength(0);
+@@ -200,8 +217,8 @@ describe('单例回路', () => {
+     expect(getEnrollmentEngineState().admittedIds).toEqual(['e-1']);
+     expect(listPendingEnrollments()).toHaveLength(0);
+ 
+-    offSecond();
+-    offFirst();
++    two.release();
++    one.release();
+   });
+ 
+   test('同一张证书连续到达两次也只签一次（模块级 in-flight 锁）', async () => {
+@@ -210,13 +227,13 @@ describe('单例回路', () => {
+     const spy = apiSpy({ ok: true, hubAck: true });
+ 
+     addPendingEnrollment(pending);
+-    const off = registerAdmitContext(context(spy.api));
++    const ctx = registerAdmitContext(context(spy.api));
+     push(candidate);
+     push(candidate);
+-    await flush();
++    await settle();
+ 
+     expect(spy.appended).toHaveLength(1);
+-    off();
++    ctx.release();
+   });
+ 
+   test('注销后回落到上一个上下文，全部注销则停掉回路', async () => {
+@@ -227,24 +244,24 @@ describe('单例回路', () => {
+     const second = apiSpy({ ok: true, hubAck: true });
+ 
+     addPendingEnrollment(one.pending);
+-    const offFirst = registerAdmitContext(context(first.api));
+-    const offSecond = registerAdmitContext(context(second.api));
++    const page = registerAdmitContext(context(first.api));
++    const panel = registerAdmitContext(context(second.api));
+     push(one.candidate);
+-    await flush();
++    await settle();
+     expect(second.appended).toHaveLength(1);
+ 
+     // 后注册的走了：回落到第一个上下文，回路继续跑。
+-    offSecond();
++    panel.release();
+     expect(enrollmentEngineDebugForTest().contexts).toBe(1);
+     addPendingEnrollment(two.pending);
+     rememberSigner({ kind: 'root', rootKey }, NOW);
+     push(two.candidate);
+-    await flush();
++    await settle();
+     expect(first.appended).toHaveLength(1);
+     expect(second.appended).toHaveLength(1);
+ 
+     // 没有消费方了：推送订阅与轮询都撤掉。
+-    offFirst();
++    page.release();
+     expect(enrollmentEngineDebugForTest()).toMatchObject({ contexts: 0, watching: false });
+     expect(pushHandlers.size).toBe(0);
+   });
+@@ -267,13 +284,13 @@ describe('单例回路', () => {
+ 
+     addPendingEnrollment(pending);
+     // 先注册带 hub 通道的设置页，再注册还没定位到 hub 的面板。
+-    const offPage = registerAdmitContext({ ...context(spy.api), hubApi });
+-    const offPanel = registerAdmitContext(context(spy.api));
+-    await flush();
++    const page = registerAdmitContext({ ...context(spy.api), hubApi });
++    const panel = registerAdmitContext(context(spy.api));
++    await settle();
+ 
+     expect(spy.appended).toHaveLength(1);
+-    offPanel();
+-    offPage();
++    panel.release();
++    page.release();
+   });
+ 
+   test('passkey 用户不自动签，只把 pending 标成「证书已到」等手动确认', async () => {
+@@ -282,27 +299,168 @@ describe('单例回路', () => {
+     const spy = apiSpy({ ok: true, hubAck: true });
+ 
+     addPendingEnrollment(pending);
+-    const off = registerAdmitContext(context(spy.api));
++    const ctx = registerAdmitContext(context(spy.api));
+     push(candidate);
+-    await flush();
++    await settle();
+ 
+     expect(spy.appended).toHaveLength(0);
+     expect(getEnrollmentEngineState().certificateReadyIds).toEqual(['e-5']);
+     expect(listPendingEnrollments()).toHaveLength(1);
+-    off();
++    ctx.release();
+   });
+ 
+   test('证书对不上 pending 时按 id 记下提示 key', async () => {
+     const { pending, candidate } = await fixture('e-6');
+     const spy = apiSpy({ ok: true, hubAck: true });
+     addPendingEnrollment(pending);
+-    const off = registerAdmitContext(context(spy.api));
++    const ctx = registerAdmitContext(context(spy.api));
+     // 换一份坏签名：`bad_cert_sig`
+     push({ certificate: candidate.certificate, certSig: encodeBase64url(new Uint8Array(64)) });
+-    await flush();
++    await settle();
+ 
+     expect(getEnrollmentEngineState().invalidById['e-6']).toBe('nodes.enrollment.badCertSig');
+-    off();
++    ctx.release();
++  });
++
++  test('admit 成功后每个活着的消费方都会被刷新，而不只是签名的那个', async () => {
++    const { pending, candidate } = await fixture('e-13');
++    rememberSigner({ kind: 'root', rootKey }, NOW);
++    const spy = apiSpy({ ok: true, hubAck: true });
++    const done: string[] = [];
++
++    addPendingEnrollment(pending);
++    const page = registerAdmitContext({
++      ...context(spy.api),
++      onDone: () => done.push('page'),
++    });
++    const panel = registerAdmitContext({
++      ...context(spy.api),
++      onDone: () => done.push('panel'),
++    });
++    push(candidate);
++    await settle();
++
++    expect(done.sort()).toEqual(['page', 'panel']);
++    panel.release();
++    page.release();
++  });
++
++  test('槽位 mode 还是 null 的消费方不会挡住可签名的那个', async () => {
++    const { pending, candidate } = await fixture('e-14');
++    rememberSigner({ kind: 'root', rootKey }, NOW);
++    const spy = apiSpy({ ok: true, hubAck: true });
++
++    addPendingEnrollment(pending);
++    const page = registerAdmitContext(context(spy.api));
++    // 面板先于 `/api/auth/mode` 返回就注册进来：它签不了，但不该让整条流水线停摆。
++    const panel = registerAdmitContext({ ...context(spy.api), mode: null });
++    push(candidate);
++    await settle();
++
++    expect(spy.appended).toHaveLength(1);
++    panel.release();
++    page.release();
++  });
++});
++
++describe('全局 key log 写锁', () => {
++  test('两条不同 pending 的 admit 串行：第二条签在第一条 append 之后的头上', async () => {
++    const one = await fixture('e-lock-1');
++    const two = await fixture('e-lock-2');
++    rememberSigner({ kind: 'root', rootKey }, NOW);
++
++    const order: string[] = [];
++    const appended: { bytes: string; sig: string }[] = [];
++    const api = {
++      // head 随已 append 的条数推进；取 head 本身是异步的（真实实现要过网络）。
++      keyLogHead: async () => {
++        order.push('head');
++        await flush();
++        return {
++          seq: 5 + appended.length,
++          hash: encodeBase64url(new Uint8Array(32).fill(7)),
++        };
++      },
++      appendKeyLog: (body: { bytes: string; sig: string }) => {
++        order.push('append');
++        appended.push(body);
++        return Promise.resolve({ ok: true as const, hubAck: true });
++      },
++    } as unknown as AuthApi;
++
++    addPendingEnrollment(one.pending);
++    addPendingEnrollment(two.pending);
++    const ctx = registerAdmitContext(context(api));
++    // 两张证书几乎同时到达：取 head 的 promise 必然交叠。
++    push(one.candidate);
++    push(two.candidate);
++    await settle(12);
++
++    expect(order).toEqual(['head', 'append', 'head', 'append']);
++    expect(appended).toHaveLength(2);
++    expect(recordSeq(appended[0])).toBe(6n);
++    // 第二条看到的是第一条 append 之后的头，而不是同一个。
++    expect(recordSeq(appended[1])).toBe(7n);
++    expect(getEnrollmentEngineState().admittedIds.sort()).toEqual(['e-lock-1', 'e-lock-2']);
++    ctx.release();
++  });
++});
++
++describe('陈旧结果复核', () => {
++  test('推送已 admit 之后，轮询带回的同一张证书被静默丢弃', async () => {
++    const { pending, candidate } = await fixture('e-stale');
++    collectResult = [candidate];
++    // 轮询在推送 admit 全部走完之后才回来：它手里那份 pending 快照已经作废。
++    collectDelay = 8;
++    rememberSigner({ kind: 'root', rootKey }, NOW);
++    const spy = apiSpy({ ok: true, hubAck: true });
++
++    addPendingEnrollment(pending);
++    const ctx = registerAdmitContext(context(spy.api));
++    // 注册即发起一次轮询；推送紧随其后，两条路径的结果都指向同一条 pending。
++    push(candidate);
++    await settle(12);
++
++    expect(spy.appended).toHaveLength(1);
++    expect(getEnrollmentEngineState().admittedIds).toEqual(['e-stale']);
++    ctx.release();
++  });
++
++  test('自动 admit 之后再点「确认加入」什么都不做，也不要凭据', async () => {
++    const { pending, candidate } = await fixture('e-late');
++    rememberSigner({ kind: 'root', rootKey }, NOW);
++    const spy = apiSpy({ ok: true, hubAck: true });
++    const prompt = promptSpy();
++
++    addPendingEnrollment(pending);
++    const ctx = registerAdmitContext(context(spy.api, prompt.prompt));
++    push(candidate);
++    await settle();
++    expect(spy.appended).toHaveLength(1);
++
++    await ctx.confirmManually('e-late');
++    expect(prompt.requests).toBe(0);
++    expect(spy.appended).toHaveLength(1);
++    ctx.release();
++  });
++
++  test('坏证书之后来了有效证书：判定失败的提示被清掉，按钮重新出现', async () => {
++    const { pending, candidate } = await fixture('e-recover');
++    // passkey 用户：证书到了也不自动签，正好停在「待确认」那一格。
++    rememberSigner({ kind: 'passkey', credentialId: 'cred-1' }, NOW);
++    const spy = apiSpy({ ok: true, hubAck: true });
++
++    addPendingEnrollment(pending);
++    const ctx = registerAdmitContext(context(spy.api));
++    push({ certificate: candidate.certificate, certSig: encodeBase64url(new Uint8Array(64)) });
++    await settle();
++    expect(getEnrollmentEngineState().invalidById['e-recover']).toBe('nodes.enrollment.badCertSig');
++
++    push(candidate);
++    await settle();
++    expect(getEnrollmentEngineState().invalidById['e-recover']).toBeUndefined();
++    expect(getEnrollmentEngineState().certificateReadyIds).toEqual(['e-recover']);
++    ctx.release();
+   });
+ });
+ 
+@@ -317,13 +475,13 @@ describe('手动确认', () => {
+ 
+     const prompt = promptSpy();
+     const spy = apiSpy({ ok: true, hubAck: true });
+-    const off = registerAdmitContext(context(spy.api, prompt.prompt));
+-    await confirmManually(pending);
++    const ctx = registerAdmitContext(context(spy.api, prompt.prompt));
++    await ctx.confirmManually('e-7');
+ 
+     expect(prompt.requests).toBe(0);
+     expect(spy.appended).toEqual([record]);
+     expect(getEnrollmentEngineState().admittedIds).toEqual(['e-7']);
+-    off();
++    ctx.release();
+   });
+ 
+   test('没有暂存记录时向用户要凭据；用户取消则什么都不做', async () => {
+@@ -331,25 +489,100 @@ describe('手动确认', () => {
+     addPendingEnrollment(pending);
+     const prompt = promptSpy();
+     const spy = apiSpy({ ok: true, hubAck: true });
+-    const off = registerAdmitContext(context(spy.api, prompt.prompt));
+-    await confirmManually(pending);
++    const ctx = registerAdmitContext(context(spy.api, prompt.prompt));
++    await ctx.confirmManually('e-8');
+ 
+     expect(prompt.requests).toBe(1);
+     expect(spy.appended).toHaveLength(0);
+     expect(listPendingEnrollments()).toHaveLength(1);
+-    off();
++    ctx.release();
+   });
+ 
+-  test('取消只删本地 pending 并把 id 记入 clearedIds', async () => {
++  test('用的是发起按钮那个消费方的凭据对话框，而不是最后注册的那个', async () => {
++    const { pending } = await fixture('e-bind');
++    addPendingEnrollment(pending);
++    const page = promptSpy();
++    const panel = promptSpy();
++    const spy = apiSpy({ ok: true, hubAck: true });
++    const pageCtx = registerAdmitContext(context(spy.api, page.prompt));
++    const panelCtx = registerAdmitContext(context(spy.api, panel.prompt));
++
++    await pageCtx.confirmManually('e-bind');
++    expect(page.requests).toBe(1);
++    expect(panel.requests).toBe(0);
++
++    panelCtx.release();
++    pageCtx.release();
++  });
++
++  test('已经注销的消费方按钮不再生效', async () => {
++    const { pending } = await fixture('e-dead');
++    addPendingEnrollment(pending);
++    const prompt = promptSpy();
++    const spy = apiSpy({ ok: true, hubAck: true });
++    const ctx = registerAdmitContext(context(spy.api, prompt.prompt));
++    ctx.release();
++
++    await ctx.confirmManually('e-dead');
++    expect(prompt.requests).toBe(0);
++  });
++
++  test('取消清掉本地 pending、可重发记录与该 id 的全部投影', async () => {
+     const { pending } = await fixture('e-9');
+     addPendingEnrollment(pending);
+-    const off = registerAdmitContext(context(apiSpy({ ok: true, hubAck: true }).api));
++    const ctx = registerAdmitContext(context(apiSpy({ ok: true, hubAck: true }).api));
++    await submitAdmitRecord(apiSpy({ ok: false, code: 'HUB_TIMEOUT' }).api, 'e-9', {
++      bytes: 'YWJj',
++      sig: 'ZGVm',
++    });
++    expect(listUnconfirmedRecordIds()).toEqual(['e-9']);
++
+     cancelPending(pending);
+ 
+     expect(listPendingEnrollments()).toHaveLength(0);
++    expect(listUnconfirmedRecordIds()).toEqual([]);
++    expect(getEnrollmentEngineState().hubUnconfirmedIds).toEqual([]);
+     expect(getEnrollmentEngineState().cancelledIds).toEqual(['e-9']);
+     expect(getEnrollmentEngineState().clearedIds).toContain('e-9');
+-    off();
++    ctx.release();
++  });
++});
++
++describe('append 结果未知', () => {
++  test('请求抛异常时留住已签字节，下一次只重发它，绝不按新 head 重签', async () => {
++    const { pending, candidate } = await fixture('e-throw');
++    rememberSigner({ kind: 'root', rootKey }, NOW);
++    let calls = 0;
++    const appended: { bytes: string; sig: string }[] = [];
++    const api = {
++      keyLogHead: () =>
++        Promise.resolve({ seq: 5, hash: encodeBase64url(new Uint8Array(32).fill(7)) }),
++      appendKeyLog: (body: { bytes: string; sig: string }) => {
++        calls += 1;
++        appended.push(body);
++        // 第一次连接断在半路：服务端到底落没落库无从判断。
++        if (calls === 1) return Promise.reject(new Error('network down'));
++        return Promise.resolve({ ok: true as const, hubAck: true });
++      },
++    } as unknown as AuthApi;
++
++    addPendingEnrollment(pending);
++    const ctx = registerAdmitContext(context(api));
++    push(candidate);
++    await settle();
++
++    const stored = unconfirmedRecord('e-throw');
++    expect(stored).not.toBeNull();
++    expect(stored).toEqual(appended[0]);
++    expect(listPendingEnrollments()).toHaveLength(1);
++
++    // 轮询再看到同一张证书：重发的必须是同一份字节。
++    push(candidate);
++    await settle();
++    expect(appended).toHaveLength(2);
++    expect(appended[1]).toEqual(appended[0]);
++    expect(getEnrollmentEngineState().admittedIds).toEqual(['e-throw']);
++    ctx.release();
+   });
+ });
+ 
+@@ -357,22 +590,33 @@ describe('过期清理', () => {
+   test('引擎自己扫过期 pending，join 串随 clearedIds 一起消失', async () => {
+     const { pending } = await fixture('e-10');
+     addPendingEnrollment(pending);
++    await submitAdmitRecord(apiSpy({ ok: false, code: 'HUB_TIMEOUT' }).api, 'e-10', {
++      bytes: 'YWJj',
++      sig: 'ZGVm',
++    });
+     configureEnrollmentEngineForTest({ now: () => pending.exp + 1 });
+-    const off = registerAdmitContext(context(apiSpy({ ok: true, hubAck: true }).api));
++    const ctx = registerAdmitContext(context(apiSpy({ ok: true, hubAck: true }).api));
+ 
+     expect(listPendingEnrollments()).toHaveLength(0);
+     expect(getEnrollmentEngineState().expiredIds).toEqual(['e-10']);
+     expect(getEnrollmentEngineState().clearedIds).toContain('e-10');
++    // 过期同样要丢掉可重发记录，否则它会一直挂在「hub 未确认」上。
++    expect(listUnconfirmedRecordIds()).toEqual([]);
+     // pending 没了，回路不该开着。
+     expect(enrollmentEngineDebugForTest().watching).toBe(false);
+-    off();
++    ctx.release();
+   });
+ });
+ 
+ describe('resetEnrollmentEngineForTest', () => {
+-  test('撤掉回路与上下文并清空状态', async () => {
++  test('撤掉回路与上下文，并把协作 store 一起归零', async () => {
+     const { pending } = await fixture('e-11');
+     addPendingEnrollment(pending);
++    await submitAdmitRecord(apiSpy({ ok: false, code: 'HUB_TIMEOUT' }).api, 'e-11', {
++      bytes: 'YWJj',
++      sig: 'ZGVm',
++    });
++    rememberSigner({ kind: 'root', rootKey: rootKeyFromSeed(new Uint8Array(32).fill(9)) }, NOW);
+     registerAdmitContext(context(apiSpy({ ok: true, hubAck: true }).api));
+     expect(enrollmentEngineDebugForTest()).toMatchObject({ contexts: 1, watching: true });
+ 
+@@ -393,5 +637,7 @@ describe('resetEnrollmentEngineForTest', () => {
+       invalidById: {},
+     });
+     expect(pushHandlers.size).toBe(0);
++    expect(listPendingEnrollments()).toHaveLength(0);
++    expect(listUnconfirmedRecordIds()).toEqual([]);
+   });
+ });
+diff --git a/apps/fe/src/node/enrollment-engine.ts b/apps/fe/src/node/enrollment-engine.ts
+index 3f4a996e..4bb7ddce 100644
+--- a/apps/fe/src/node/enrollment-engine.ts
++++ b/apps/fe/src/node/enrollment-engine.ts
+@@ -7,16 +7,18 @@
+ //
+ // 因此：
+ //   - 监听回路（`/mesh/ws` 推送 + 5s 轮询）按注册数引用计数，只跑一份；
+-//   - admit 按 `hubEnrollmentId` 上模块级互斥锁，一个 outcome 最多签一次；
+-//   - 同一时刻只有**一个**生效上下文（最后注册的那个），注销后回落到上一个。
++//   - `keyLogHead → 构造签名 → append` 整段走**引擎级**的一条 FIFO 写锁（key log 的头是全局的，
++//     按 enrollment 上锁挡不住两条不同 enrollment 并行读到同一个头）；
++//   - 每次 await 之后都按权威 pending store 复核，陈旧结果一律静默丢弃；
++//   - 手动确认绑定发起它的那个消费方槽位，后台自动签则挑一个凭据齐备的槽位。
+ 
+-import { takeRememberedSigner } from '@/auth/credential-prompt';
++import { forgetSigner, leaseSigner, takeRememberedSigner } from '@/auth/credential-prompt';
+ import type { CredentialPromptHandle } from '@/auth/credential-prompt';
+ import { type RecordSigner, headFromResponse } from '@/auth/key-log-actions';
+ import type { AuthApi, AuthModeResponse } from '@tmex/api-client/auth/index';
+ import { requireRootEpoch } from '@tmex/api-client/auth/index';
+ import { encodeBase64url } from '@tmex/shared/auth';
+-import { useEffect, useRef, useSyncExternalStore } from 'react';
++import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
+ import { toast } from 'sonner';
+ import {
+   type CertificateCandidate,
+@@ -24,6 +26,8 @@ import {
+   type SignedRecord,
+   admitPlan,
+   buildAdmitNodeRecord,
++  clearPendingEnrollments,
++  clearUnconfirmedRecords,
+   forgetUnconfirmedRecord,
+   isPendingExpired,
+   listPendingEnrollments,
+@@ -69,7 +73,7 @@ export interface AdmitMode extends Pick<AuthModeResponse, 'rootEpoch'> {
+ 
+ export interface AdmitContext {
+   api: AuthApi;
+-  /** 缺 uid / kdf 参数（还没有主用户）时为 `null`：引擎不签任何东西。 */
++  /** 缺 uid / kdf 参数（还没有主用户）时为 `null`：这个消费方不参与签名。 */
+   mode: AdmitMode | null;
+   hubApi: HubApi | null;
+   prompt: CredentialPromptHandle;
+@@ -79,6 +83,12 @@ export interface AdmitContext {
+   t: (key: string, options?: Record<string, unknown>) => string;
+ }
+ 
++/** 绑定到某个消费方槽位的动作。 */
++export interface EnrollmentEngineHandle {
++  /** 「待确认 / 重试」按钮：只认 enrollment id，pending 一律从权威 store 现取。 */
++  confirmManually(enrollmentId: string): Promise<void>;
++}
++
+ export interface EnrollmentEngineState {
+   /** 正在跑 admit 的 pending id。 */
+   busyPendingId: string | null;
+@@ -112,8 +122,15 @@ const EMPTY_STATE: EnrollmentEngineState = {
+ let state: EnrollmentEngineState = EMPTY_STATE;
+ const listeners = new Set<() => void>();
+ 
++/** 一个订阅者抛异常不能把后面的订阅者和调用方一起带走（调用方常在 `finally` 之前）。 */
+ function notify(): void {
+-  for (const listener of listeners) listener();
++  for (const listener of [...listeners]) {
++    try {
++      listener();
++    } catch {
++      // 订阅者自己的渲染错误由 React 的错误边界处理，引擎只保证状态一致。
++    }
++  }
+ }
+ 
+ function commit(patch: Partial<EnrollmentEngineState>): void {
+@@ -153,7 +170,7 @@ interface ContextSlot {
+ 
+ const slots: ContextSlot[] = [];
+ 
+-/** 最后注册且仍有值的上下文；注销后自然回落到上一个。 */
++/** 最后注册且仍有值的上下文；只用来出提示文案。 */
+ function activeContext(): AdmitContext | null {
+   for (let i = slots.length - 1; i >= 0; i -= 1) {
+     if (slots[i].value) return slots[i].value;
+@@ -161,6 +178,19 @@ function activeContext(): AdmitContext | null {
+   return null;
+ }
+ 
++/**
++ * 后台自动签用的上下文：最近一个**凭据齐备**（`mode` 非空）的槽位。
++ *
++ * 侧滑面板可能先于 `/api/auth/mode` 返回就注册进来，此时它的 `mode` 还是 `null`；
++ * 跟着「最后注册的槽位」走会让设置页那个可用上下文被一个空壳挡住（见 R4 #4）。
++ */
++function signingContext(): AdmitContext | null {
++  for (let i = slots.length - 1; i >= 0; i -= 1) {
++    if (slots[i].value?.mode) return slots[i].value;
++  }
++  return null;
++}
++
+ /**
+  * 轮询用的 hub 通道单独取最近一个**非空**的：生效上下文可能还没定位到 hub
+  * （侧滑面板只认 `/api/auth/mode` 的 `hubNodeId`，设置页还会认 mesh 列表的 `isHub`），
+@@ -174,6 +204,17 @@ function activeHubApi(): HubApi | null {
+   return null;
+ }
+ 
++/** admit 成功后，**每个**还活着的消费方都要刷新自己的列表，而不只是签名的那个。 */
++function fanOutDone(): void {
++  for (const slot of [...slots]) {
++    try {
++      slot.value?.onDone();
++    } catch {
++      // 一个消费方的刷新失败不该拖住其它消费方。
++    }
++  }
++}
++
+ function attachSlot(slot: ContextSlot): () => void {
+   slots.push(slot);
+   if (slots.length === 1 && !unsubscribePendings) {
+@@ -191,9 +232,16 @@ function attachSlot(slot: ContextSlot): () => void {
+   };
+ }
+ 
+-/** 注册一个 admit 上下文，返回注销函数。React 之外（测试）也能用。 */
+-export function registerAdmitContext(context: AdmitContext): () => void {
+-  return attachSlot({ value: context });
++/** 注册一个 admit 上下文；`release()` 注销。React 之外（测试）也能用。 */
++export function registerAdmitContext(
++  context: AdmitContext
++): EnrollmentEngineHandle & { release: () => void } {
++  const slot: ContextSlot = { value: context };
++  const detach = attachSlot(slot);
++  return {
++    confirmManually: (enrollmentId: string) => confirmFromSlot(slot, enrollmentId),
++    release: detach,
++  };
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -224,6 +272,13 @@ function onPendingsChanged(): void {
+   syncWatch();
+ }
+ 
++/** 权威 pending：id 与 `enrollPk` 都对得上才算同一条（id 复用也骗不过去）。 */
++function livePending(id: string, enrollPk?: string): PendingEnrollment | null {
++  const row = listPendingEnrollments().find((item) => item.hubEnrollmentId === id);
++  if (!row) return null;
++  return enrollPk === undefined || row.enrollPk === enrollPk ? row : null;
++}
++
+ /**
+  * 过期清理必须是**定时**的：面板一直开着时，十分钟前建的 pending 不能继续留在内存与
+  * sessionStorage 里，对应的 join 串也不能继续留在 DOM（见 F4-3 评审 Major）。
+@@ -238,11 +293,8 @@ function scheduleSweep(): void {
+       sweepTimer = null;
+     }
+     if (slots.length === 0) return;
+-    const removed = prunePendingEnrollments(nowMs());
+-    if (removed.length > 0) {
+-      let expired = state.expiredIds;
+-      for (const row of removed) expired = appendId(expired, row.hubEnrollmentId) ?? expired;
+-      if (expired !== state.expiredIds) commit({ expiredIds: expired });
++    for (const row of prunePendingEnrollments(nowMs())) {
++      finishPending(row.hubEnrollmentId, 'expired');
+     }
+     const next = nextPendingExpiry(listPendingEnrollments());
+     if (next === null) return;
+@@ -292,6 +344,9 @@ function stopWatch(): void {
+ /**
+  * 轮询兜底：逐条 pending 查 `GET /n/<hub>/api/hub/enrollments/:id`。
+  * 查的是本次 enrollment 的 id，因此 `unknown` 是真正的异常信号，照常上报。
++ *
++ * 结果按**拉取时**的 pending 快照判定（这样才知道证书属于谁），随后由 `handleOutcome`
++ * 对权威 store 复核：期间已被推送 admit / 被取消的那条，静默丢弃（见 R4 #2）。
+  */
+ async function tick(): Promise<void> {
+   if (ticking) return;
+@@ -314,18 +369,81 @@ async function tick(): Promise<void> {
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// 终态清理
++// ---------------------------------------------------------------------------
++
++/**
++ * admit / 过期 / 取消走**同一条**收尾：丢掉可重发记录、删本地 pending、清掉这条 id 的
++ * 所有投影（证书已到 / 判定失败）。少清一样，下一条同 id 的记录就会带着上一轮的残留状态。
++ */
++function finishPending(id: string, outcome: 'admitted' | 'expired' | 'cancelled'): void {
++  forgetUnconfirmedRecord(id);
++  if (livePending(id)) removePendingEnrollment(id);
++  commit({ ...clearProjections(id), ...terminalIds(id, outcome) });
++}
++
++function clearProjections(id: string): Partial<EnrollmentEngineState> {
++  const patch: Partial<EnrollmentEngineState> = {};
++  if (state.certificateReadyIds.includes(id)) {
++    patch.certificateReadyIds = state.certificateReadyIds.filter((row) => row !== id);
++  }
++  if (state.invalidById[id]) {
++    const next = { ...state.invalidById };
++    delete next[id];
++    patch.invalidById = next;
++  }
++  return patch;
++}
++
++function terminalIds(
++  id: string,
++  outcome: 'admitted' | 'expired' | 'cancelled'
++): Partial<EnrollmentEngineState> {
++  if (outcome === 'admitted') {
++    const next = appendId(state.admittedIds, id);
++    return next ? { admittedIds: next } : {};
++  }
++  if (outcome === 'expired') {
++    const next = appendId(state.expiredIds, id);
++    return next ? { expiredIds: next } : {};
++  }
++  const next = appendId(state.cancelledIds, id);
++  return next ? { cancelledIds: next } : {};
++}
++
+ // ---------------------------------------------------------------------------
+ // admit 流水线
+ // ---------------------------------------------------------------------------
+ 
+-/** 模块级互斥：同一条 pending 同时只允许一次 admit 在飞。 */
++/** 同一条 pending 同时只允许一次 admit 在飞；只用于去重与 `busyPendingId`。 */
+ const inFlight = new Set<string>();
+ 
+-async function withBusy(id: string, run: () => Promise<void>): Promise<void> {
++/**
++ * key log 写锁：**引擎级**一条 FIFO 链。
++ *
++ * head 是全局的，`keyLogHead → 构造签名 → append` 必须整段串行：两条不同 enrollment 的 admit
++ * 若并行读到同一个 head，就会造出两条同 seq 的记录，hub 只收得下一条，另一条永久 `seq_gap`
++ * （见 R4 #1）。按 enrollment 上锁挡不住这种情况。
++ */
++let keyLogQueue: Promise<unknown> = Promise.resolve();
++
++function withKeyLogLock<T>(run: () => Promise<T>): Promise<T> {
++  const result = keyLogQueue.then(run, run);
++  keyLogQueue = result.then(
++    () => undefined,
++    () => undefined
++  );
++  return result;
++}
++
++/** 锁 → 置忙 → 跑 → 无论如何解锁。锁拿到之后的每一句都在 `try` 里，异常不会把锁焊死。 */
++async function runAdmit(id: string, run: () => Promise<void>): Promise<void> {
++  if (inFlight.has(id)) return;
+   inFlight.add(id);
+-  commit({ busyPendingId: id });
+   try {
+-    await run();
++    commit({ busyPendingId: id });
++    await withKeyLogLock(run);
+   } catch (err) {
+     toast.error(err instanceof Error ? err.message : String(err));
+   } finally {
+@@ -335,12 +453,7 @@ async function withBusy(id: string, run: () => Promise<void>): Promise<void> {
+ }
+ 
+ /** 把一条**已签好**的 admit 记录送出去，并按 B2-6 的码处理结果。 */
+-async function submitAdmit(
+-  context: AdmitContext,
+-  pending: PendingEnrollment,
+-  record: SignedRecord
+-): Promise<void> {
+-  const id = pending.hubEnrollmentId;
++async function submitAdmit(context: AdmitContext, id: string, record: SignedRecord): Promise<void> {
+   // hub=sync：entry 先把记录送 hub 并等 ack，确认之前本地什么都不写。
+   const disposition = await submitAdmitRecord(context.api, id, record);
+   if (disposition.kind === 'unconfirmed') {
+@@ -357,10 +470,9 @@ async function submitAdmit(
+     toast.error(context.t(`auth.errors.${disposition.code}`, { defaultValue: disposition.code }));
+     return;
+   }
+-  removePendingEnrollment(id);
+-  commit({ admittedIds: appendId(state.admittedIds, id) ?? state.admittedIds });
++  finishPending(id, 'admitted');
+   toast.success(context.t('nodes.enrollment.admitted'));
+-  context.onDone();
++  fanOutDone();
+ }
+ 
+ async function signAdmit(
+@@ -372,83 +484,118 @@ async function signAdmit(
+ ): Promise<void> {
+   const { mode } = context;
+   if (!mode) return;
++  const id = pending.hubEnrollmentId;
+   const head = headFromResponse(await context.api.keyLogHead());
+-  // 取 head 是异步的：这中间 pending 可能已经过期，过期后签出来的 admit 也不该被接受。
+-  if (isPendingExpired(pending, nowMs())) {
++  // 取 head 是异步的：这中间 pending 可能已被 admit / 取消，也可能已经过期。
++  const live = livePending(id, pending.enrollPk);
++  if (!live) return;
++  if (isPendingExpired(live, nowMs())) {
+     toast.error(context.t('nodes.enrollment.expired'));
+-    forgetUnconfirmedRecord(pending.hubEnrollmentId);
+-    removePendingEnrollment(pending.hubEnrollmentId);
+-    commit({
+-      expiredIds: appendId(state.expiredIds, pending.hubEnrollmentId) ?? state.expiredIds,
+-    });
++    finishPending(id, 'expired');
+     return;
+   }
+   const record = await buildAdmitNodeRecord({
+     head,
+     rootEpoch: requireRootEpoch(mode),
+     uid: mode.uid,
+-    pending,
++    pending: live,
+     certificateBytes,
+     certSig,
+     signer,
+   });
+-  await submitAdmit(context, pending, {
++  // 签名过程本身可能很久（passkey 仪式）：送出前再复核一次。
++  if (!livePending(id, pending.enrollPk)) return;
++  await submitAdmit(context, id, {
+     bytes: encodeBase64url(record.bytes),
+     sig: encodeBase64url(record.sig),
+   });
+ }
+ 
++/** 收到一张**有效**证书：记下「证书已到」，同时抹掉这条 id 之前的判定失败提示。 */
++function markCertificateReady(id: string): void {
++  const patch: Partial<EnrollmentEngineState> = {};
++  const ready = appendId(state.certificateReadyIds, id);
++  if (ready) patch.certificateReadyIds = ready;
++  if (state.invalidById[id]) {
++    const next = { ...state.invalidById };
++    delete next[id];
++    patch.invalidById = next;
++  }
++  if (ready || patch.invalidById) commit(patch);
++}
++
++function markInvalid(context: AdmitContext | null, id: string, reason: string): void {
++  const key = invalidCertificateKey(reason);
++  if (state.invalidById[id] === key) return;
++  commit({ invalidById: { ...state.invalidById, [id]: key } });
++  if (context) toast.error(context.t(key));
++}
++
+ /** 轮询 / 推送检测出的结果。已过期或签名坏的直接告警；能自动签就自动签。 */
+ async function handleOutcome(outcome: CertificateOutcome): Promise<void> {
+-  const context = activeContext();
+-  if (!context) return;
+   if (outcome.kind === 'unknown') {
+-    toast.error(context.t('nodes.enrollment.unknownCertificate'));
++    const context = activeContext();
++    if (context) toast.error(context.t('nodes.enrollment.unknownCertificate'));
+     return;
+   }
++  const id = outcome.pending.hubEnrollmentId;
++  // 结果可能来自一次陈旧的轮询：pending 已被推送 admit / 被取消时静默丢弃，不再告警。
++  const pending = livePending(id, outcome.pending.enrollPk);
++  if (!pending) return;
+   if (outcome.kind === 'invalid') {
+-    const key = invalidCertificateKey(outcome.reason);
+-    const id = outcome.pending.hubEnrollmentId;
+-    if (state.invalidById[id] !== key) {
+-      commit({ invalidById: { ...state.invalidById, [id]: key } });
+-      toast.error(context.t(key));
+-    }
++    markInvalid(activeContext(), id, outcome.reason);
+     return;
+   }
+-  const id = outcome.pending.hubEnrollmentId;
+-  // 锁在取签名者之前：重复的 outcome 不该白白消耗复用窗口里的凭证。
++  markCertificateReady(id);
++  // 去重在取签名者之前：重复的 outcome 不该白白消耗复用窗口里的凭证。
+   if (inFlight.has(id)) return;
+-  commit({
+-    certificateReadyIds: appendId(state.certificateReadyIds, id) ?? state.certificateReadyIds,
+-  });
++  const context = signingContext();
++  if (!context) return;
+   const signer = takeRememberedSigner(nowMs());
+   // 复用窗口已过、或窗口里是 passkey：都留在「待确认」，等用户点按钮。
+-  const plan = admitPlan(id, canAutoSignAdmit(signer));
+-  if (plan === 'wait') return;
+-  await withBusy(id, async () => {
+-    const stored = unconfirmedRecord(id);
+-    if (plan === 'resend' && stored) await submitAdmit(context, outcome.pending, stored);
+-    else if (signer) {
+-      await signAdmit(context, outcome.pending, outcome.certificateBytes, outcome.certSig, signer);
+-    }
+-  });
++  if (admitPlan(id, canAutoSignAdmit(signer)) === 'wait') return;
++  // 租约保证签名期间没有别的对话框实例把这把根钥清零。
++  const release = signer ? leaseSigner(signer) : null;
++  try {
++    await runAdmit(id, () => admitInLock(context, id, outcome, signer));
++  } finally {
++    release?.();
++  }
++}
++
++/** 临界区里的实际动作：先复核，再决定重发还是现签。 */
++async function admitInLock(
++  context: AdmitContext,
++  id: string,
++  outcome: Extract<CertificateOutcome, { kind: 'admit' }>,
++  signer: RecordSigner | null
++): Promise<void> {
++  const live = livePending(id, outcome.pending.enrollPk);
++  if (!live) return;
++  const stored = unconfirmedRecord(id);
++  // 手上还有未确认记录就只重发它：重签会按（可能已推进的）head 产生新 seq。
++  if (stored) await submitAdmit(context, id, stored);
++  else if (signer) {
++    await signAdmit(context, live, outcome.certificateBytes, outcome.certSig, signer);
++  }
+ }
+ 
+ /**
+- * 「待确认 / 重试」按钮。
++ * 「待确认 / 重试」按钮。**绑定发起它的那个槽位**：设置页点的按钮必须用设置页的凭据对话框、
++ * hub 通道与翻译，不能撞上侧滑面板的（见 R4 #4）。
+  *
+  * 该 pending 手上还留着一条 hub 未确认的记录时，**只重发这份字节**：不要凭据、不取新 head、
+  * 不重新签名。B2-6 保证未确认时服务端没落库，本地 head 没动，原记录仍然接得上；
+  * 而重签会按（可能已推进的）本地 head 产生新 seq，一旦 hub 缺中间那条就永久拒绝。
+  */
+-export async function confirmManually(pending: PendingEnrollment): Promise<void> {
+-  const context = activeContext();
+-  if (!context?.mode) return;
+-  const id = pending.hubEnrollmentId;
+-  if (inFlight.has(id)) return;
+-  const stored = unconfirmedRecord(id);
+-  if (stored) {
+-    await withBusy(id, () => submitAdmit(context, pending, stored));
++async function confirmFromSlot(slot: ContextSlot, id: string): Promise<void> {
++  const context = slot.value;
++  if (!context?.mode || !slots.includes(slot)) return;
++  // 权威 pending 由 id 现取：调用方手里的那份可能已经是上一轮的残影。
++  const pending = livePending(id);
++  if (!pending) return;
++  if (unconfirmedRecord(id)) {
++    await runAdmit(id, () => resendInLock(slot, id, pending.enrollPk));
+     return;
+   }
+   let signer: RecordSigner | null;
+@@ -460,30 +607,56 @@ export async function confirmManually(pending: PendingEnrollment): Promise<void>
+     return;
+   }
+   if (!signer) return;
+-  await withBusy(id, async () => {
+-    const hubApi = activeHubApi();
+-    const candidates = hubApi ? await collectRedeemedCertificates(hubApi, [pending]) : [];
+-    for (const candidate of candidates) {
+-      const outcome = offerCertificate([pending], candidate, nowMs());
+-      if (outcome.kind === 'admit') {
+-        await signAdmit(context, pending, outcome.certificateBytes, outcome.certSig, signer);
+-        return;
+-      }
+-      if (outcome.kind === 'invalid') {
+-        toast.error(context.t(invalidCertificateKey(outcome.reason)));
+-        return;
+-      }
++  // 凭据交互期间可能已被后台自动 admit / 被取消：复核之后才进临界区。
++  if (!slots.includes(slot) || !livePending(id, pending.enrollPk)) return;
++  const release = leaseSigner(signer);
++  try {
++    await runAdmit(id, () => confirmInLock(slot, id, pending.enrollPk, signer));
++  } finally {
++    release();
++  }
++}
++
++async function resendInLock(slot: ContextSlot, id: string, enrollPk: string): Promise<void> {
++  const context = slot.value;
++  if (!context || !slots.includes(slot)) return;
++  if (!livePending(id, enrollPk)) return;
++  const stored = unconfirmedRecord(id);
++  if (stored) await submitAdmit(context, id, stored);
++}
++
++async function confirmInLock(
++  slot: ContextSlot,
++  id: string,
++  enrollPk: string,
++  signer: RecordSigner
++): Promise<void> {
++  const context = slot.value;
++  if (!context || !slots.includes(slot) || !livePending(id, enrollPk)) return;
++  const hubApi = activeHubApi();
++  const pending = livePending(id, enrollPk);
++  if (!pending) return;
++  const candidates = hubApi ? await collectRedeemedCertificates(hubApi, [pending]) : [];
++  const fresh = livePending(id, enrollPk);
++  if (!fresh || !slots.includes(slot)) return;
++  for (const candidate of candidates) {
++    const outcome = offerCertificate([fresh], candidate, nowMs());
++    if (outcome.kind === 'admit') {
++      markCertificateReady(id);
++      await signAdmit(context, fresh, outcome.certificateBytes, outcome.certSig, signer);
++      return;
+     }
+-    toast.error(context.t('nodes.enrollment.noCertificateYet'));
+-  });
++    if (outcome.kind === 'invalid') {
++      markInvalid(context, id, outcome.reason);
++      return;
++    }
++  }
++  toast.error(context.t('nodes.enrollment.noCertificateYet'));
+ }
+ 
+ /** 取消只删本地 pending（hub 侧记录会自然过期），同时让对应的 join 串立刻消失。 */
+ export function cancelPending(pending: { hubEnrollmentId: string }): void {
+-  removePendingEnrollment(pending.hubEnrollmentId);
+-  commit({
+-    cancelledIds: appendId(state.cancelledIds, pending.hubEnrollmentId) ?? state.cancelledIds,
+-  });
++  finishPending(pending.hubEnrollmentId, 'cancelled');
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -491,18 +664,23 @@ export function cancelPending(pending: { hubEnrollmentId: string }): void {
+ // ---------------------------------------------------------------------------
+ 
+ /**
+- * 注册一个 admit 上下文并在挂载期间维持监听回路。
++ * 注册一个 admit 上下文并在挂载期间维持监听回路，返回**绑定到本槽位**的动作。
+  *
+- * 每次渲染都把最新的 `hubApi` / `prompt` / `t` 写进同一个槽位，回路因此总用最新依赖，
+- * 而槽位身份不变——注销时准确回落到上一个消费方。
++ * 槽位值只在提交阶段写：渲染期写会让被 React 丢弃的那次渲染污染引擎依赖。
++ * 槽位身份在整个挂载期不变——注销时准确回落到上一个消费方。
+  */
+-export function useEnrollmentEngine(context: AdmitContext): void {
++export function useEnrollmentEngine(context: AdmitContext): EnrollmentEngineHandle {
+   const slot = useRef<ContextSlot>({ value: null });
+-  slot.current.value = context;
+   useEffect(() => {
+-    const current = slot.current;
+-    return attachSlot(current);
+-  }, []);
++    slot.current.value = context;
++  });
++  // 只在挂载 / 卸载时接线；槽位值由上面那个提交阶段 effect 负责（它先于本 effect 跑）。
++  useEffect(() => attachSlot(slot.current), []);
++  const confirmManually = useCallback(
++    (enrollmentId: string) => confirmFromSlot(slot.current, enrollmentId),
++    []
++  );
++  return { confirmManually };
+ }
+ 
+ export function useEnrollmentEngineState(): EnrollmentEngineState {
+@@ -533,6 +711,7 @@ export function enrollmentEngineDebugForTest(): {
+   return { contexts: slots.length, watching: pollTimer !== null, sweeping: sweepTimer !== null };
+ }
+ 
++/** 复合重置：引擎投影 + 协作 store（pending 存储、未确认记录、凭据复用窗口）一并归零。 */
+ export function resetEnrollmentEngineForTest(): void {
+   stopWatch();
+   if (sweepTimer) clearTimeout(sweepTimer);
+@@ -541,8 +720,12 @@ export function resetEnrollmentEngineForTest(): void {
+   unsubscribePendings = null;
+   slots.length = 0;
+   inFlight.clear();
++  keyLogQueue = Promise.resolve();
+   ticking = false;
+   overrides = {};
++  clearUnconfirmedRecords();
++  clearPendingEnrollments();
++  forgetSigner();
+   state = EMPTY_STATE;
+   notify();
+ }
+diff --git a/apps/fe/src/node/enrollment.test.ts b/apps/fe/src/node/enrollment.test.ts
+index 8c926f9b..bb4e30ca 100644
+--- a/apps/fe/src/node/enrollment.test.ts
++++ b/apps/fe/src/node/enrollment.test.ts
+@@ -1034,6 +1034,28 @@ describe('submitAdmitRecord', () => {
+     expect(unconfirmedRecord('e-4')).toBeNull();
+   });
+ 
++  test('请求抛异常（结果未知）：已签字节必须留住，重试只能重发它', async () => {
++    const api = {
++      appendKeyLog(_body: { bytes: string; sig: string }, opts?: { hubSync?: boolean }) {
++        expect(opts?.hubSync).toBe(true);
++        return Promise.reject(new Error('connection reset'));
++      },
++    };
++    await expect(submitAdmitRecord(api, 'e-throw', RECORD)).rejects.toThrow('connection reset');
++    // 服务端到底落没落库无从判断：唯一安全的重试就是原样重发这份字节。
++    expect(unconfirmedRecord('e-throw')).toEqual(RECORD);
++    expect(admitPlan('e-throw', true)).toBe('resend');
++  });
++
++  test('终态拒绝（签名坏等）不留记录：重发重签都没用', async () => {
++    const api = fakeApi([{ ok: false, code: 'BAD_SIGNATURE' }]);
++    expect(await submitAdmitRecord(api, 'e-6', RECORD)).toEqual({
++      kind: 'error',
++      code: 'BAD_SIGNATURE',
++    });
++    expect(unconfirmedRecord('e-6')).toBeNull();
++  });
++
+   test('订阅者能看到未确认集合的变化（页面据此显示「重试」）', async () => {
+     let ticks = 0;
+     const stop = subscribeUnconfirmedRecords(() => {
+diff --git a/apps/fe/src/node/enrollment.ts b/apps/fe/src/node/enrollment.ts
+index d4e96572..3766d2b9 100644
+--- a/apps/fe/src/node/enrollment.ts
++++ b/apps/fe/src/node/enrollment.ts
+@@ -331,6 +331,14 @@ export function unconfirmedRecord(pendingId: string): SignedRecord | null {
+   return unconfirmedRecords.get(pendingId) ?? null;
+ }
+ 
++/** 暂存一条已签好的记录，等待明确的处置结果。同一份字节重复暂存不再通知订阅者。 */
++function rememberUnconfirmedRecord(pendingId: string, record: SignedRecord): void {
++  const previous = unconfirmedRecords.get(pendingId);
++  if (previous && previous.bytes === record.bytes && previous.sig === record.sig) return;
++  unconfirmedRecords.set(pendingId, record);
++  notifyUnconfirmed();
++}
++
+ export function forgetUnconfirmedRecord(pendingId: string): void {
+   if (unconfirmedRecords.delete(pendingId)) notifyUnconfirmed();
+ }
+@@ -358,6 +366,11 @@ export function admitPlan(pendingId: string, canSign: boolean): 'resend' | 'sign
+  *
+  * 重试路径拿的就是这里存下的对象（`unconfirmedRecord()`），字节完全相同——重试**绝不**重新
+  * 取 head、重新签名。
++ *
++ * **先暂存再发送**：请求抛异常（连接断开、超时、响应畸形）时，服务端到底落没落库是未知的，
++ * 只有原样重发这份字节才安全；若等响应回来才暂存，异常路径下记录就丢了，下一次推送 / 轮询
++ * 会按新 head 再签一条，hub 缺了中间那条便永久 `seq_gap`（见 R4 #3）。
++ * 因此只有拿到**明确**的处置（已确认 / 作废 / 终态拒绝）才丢弃暂存。
+  */
+ export async function submitAdmitRecord(
+   api: {
+@@ -369,14 +382,10 @@ export async function submitAdmitRecord(
+   pendingId: string,
+   record: SignedRecord
+ ): Promise<AdmitDisposition> {
++  rememberUnconfirmedRecord(pendingId, record);
+   const disposition = admitDisposition(await api.appendKeyLog(record, { hubSync: true }));
+-  if (disposition.kind === 'unconfirmed') {
+-    unconfirmedRecords.set(pendingId, record);
+-    notifyUnconfirmed();
+-  } else {
+-    // 确认成功、或这条字节已经作废：都不该再留着让用户重发。
+-    forgetUnconfirmedRecord(pendingId);
+-  }
++  // 确认成功、或这条字节已经作废：都不该再留着让用户重发。
++  if (disposition.kind !== 'unconfirmed') forgetUnconfirmedRecord(pendingId);
+   return disposition;
+ }
+ 
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
+index 3f47921f..dfeeff5a 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
+@@ -10,7 +10,6 @@ import { decodeRootPublicKey, useCredentialPrompt, usePasskeys } from '@/auth/cr
+ import { listPendingEnrollments, subscribePendingEnrollments } from '@/node/enrollment';
+ import {
+   cancelPending,
+-  confirmManually,
+   useEnrollmentEngine,
+   useEnrollmentEngineState,
+ } from '@/node/enrollment-engine';
+@@ -74,7 +73,14 @@ export function NodesManagement({ mode: rawMode, api = defaultAuthApi }: NodesMa
+   const [enrollOpen, setEnrollOpen] = useState(false);
+   // 监听回路、admit 流水线与过期清理都在宿主级单例引擎里：侧滑面板同时开着时也只有一份，
+   // 同一张证书绝不会被签成两条 `admit-node`（见 `enrollment-engine.ts` 顶部）。
+-  useEnrollmentEngine({ api, mode, hubApi: hub.hubApi, prompt, onDone: refreshAll, t });
++  const { confirmManually } = useEnrollmentEngine({
++    api,
++    mode,
++    hubApi: hub.hubApi,
++    prompt,
++    onDone: refreshAll,
++    t,
++  });
+   const engine = useEnrollmentEngineState();
+ 
+   if (!mode) {
+@@ -143,7 +149,7 @@ export function NodesManagement({ mode: rawMode, api = defaultAuthApi }: NodesMa
+           open={enrollOpen}
+           prompt={prompt}
+           pendings={pendings}
+-          onConfirm={(pending) => void confirmManually(pending)}
++          onConfirm={(pending) => void confirmManually(pending.hubEnrollmentId)}
+           onCancel={cancelPending}
+           busyPendingId={engine.busyPendingId}
+           hubUnconfirmedIds={engine.hubUnconfirmedIds}
