@@ -49,3 +49,5 @@
 > 服务器或电脑-本机作为中继时, 第3,4步应当能够自动侦测本机已有配置, 而不是固定文案
 
 > 技术后顺便在应用服务器 10.110.88.3（ubuntu 用户，口令见对话，不入档）这台机器上安装tmex,并加入hub
+
+> tmex hub join 'https://ai.jiefakj.com:18443' --token <redacted> --name jiefa-app

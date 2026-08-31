@@ -61,3 +61,9 @@ fe 995 / panels 650 / gateway 2965 / app 475+1 既有 fail（build-runtime 需�
 - enrollment 引擎单例化（F6）→ R4 安全审查 9 条（F7）→ R5 复审 5 FIXED/4 PARTIAL + 1 新 BLOCKER（F9）：全局 key-log 写互斥（含吊销）、签前重校验、已签记录先入未确认存储、事务表 + busyIds + 取消延后、操作上下文快照与代际、签名者租约仅覆盖记录构建、面板会话绑定与回收、复合 reset。引擎第三轮后按价值判定收束。
 - 「本机作为中继」第 3–5 步按隧道状态与 auth mode 推导（F8，`host-status.ts`）。
 - v1.1.3 Release（tag `e1de4588`），本机已升级。远端应用服务器 10.110.88.3 安装待用户确认登录凭据与加入码。
+
+## 远端应用服务器接入（10.110.88.3，jiefa-app）
+
+- Ubuntu 26.04 / tmux 3.6 / 无 node、bun；`loginctl enable-linger ubuntu`；`apt install unzip`（bun 安装器依赖）；`curl -fsSL …/install.sh | bash -s -- --no-interactive --install-dir ~/.local/share/tmex --host 127.0.0.1 --port 9883 --db-path … --autostart true --lang zh-CN` 一次成功（Bun 1.4.0、tmex 1.1.3、systemd user 服务 active、`~/.local/bin/tmex`）。
+- 用户在本机面板生成加入码（Hub `https://ai.jiefakj.com:18443`），远端 `tmex hub join … --name jiefa-app` → `TMEX_ROLES=node`，首连 `auth_rejected`（待准入），约 50s 后 Hub 侧 admit 落 key-log（seq 5），`[uplink] online`。
+- install.sh 发现并修复：无 TTY 时 `exec 3</dev/tty` 的 bash 报错未被抑制（`788065dc`）。
