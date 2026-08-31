@@ -47,3 +47,10 @@ fe 995 / panels 650 / gateway 2965 / app 475+1 既有 fail（build-runtime 需�
 - 面板错乱根因：`@tmex/ui` Tabs 根的 `data-horizontal:flex-col` 在 Tailwind v4 里匹配布尔属性 `[data-horizontal]`，Base UI 输出的是 `data-orientation="horizontal"`，根一直是 flex-row；此前所有 Tabs 只放标签列表，接入面板首次把内容放进根才暴露。改为 `data-[orientation=horizontal]:flex-col`（`12f88189` 前一提交）。开发实例截图未复现是因为截图早于 F2 的 Tabs/TabsContent 跟进——教训：agent 跟进改动后必须重新截图。
 - 底部两入口 `justify-center`。
 - v1.1.1 Release（tag 首次误建在旧 main 上，删除重建到 `12f88189`），本机已升级到 1.1.1。
+
+## 1.1.2（上线后第二批反馈）
+
+- 移动设备第 1 步地址：新增 `GET /api/system/addresses`（监听地址 + 非回环 IPv4，私网段优先），前端按「公网（命名/临时隧道、Hub 公开地址）→ 局域网 → 非回环当前地址」拼候选（`access-addresses.ts` 纯函数 + `use-access-addresses.ts`），只剩回环时提示监听限制。
+- 加入已有中继第 4 步就地生成加入码（F5）：`use-create-enrollment.ts` 从节点管理页抽出共用；面板四态；第 5 步真实 `joinCommand` 联动，未生成前用真实函数 + 占位哨兵生成预览。第 6 步确认加入未搬入（需要 `useEnrollmentWatch`/`useAdmitAction` 编排，双 admit 引擎有 seq_gap 风险）。
+- 整包测试下其他用例桩污染共享查询键，地址推导加形状守卫。
+- v1.1.2 Release（tag `aa7c9da3`），本机已升级。
