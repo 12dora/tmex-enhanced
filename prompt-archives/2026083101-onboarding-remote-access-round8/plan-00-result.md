@@ -41,3 +41,9 @@ fe 995 / panels 650 / gateway 2965 / app 475+1 既有 fail（build-runtime 需�
 - Actions release workflow 首跑结果见 `sub/`（若失败需修 workflow 后重跑 `workflow_dispatch`）。
 - hub 元数据变更未接 auth-mode 缓存失效（5s TTL 兜底）；前端未消费 `external.probing`。
 - 用户 zh_CN 润色里两处笔误（`temx`、「删除后恢复」）已改为 `tmex`、「删除后无法恢复」；「仅使」改「仅保证」。
+
+## 上线后修复（1.1.1）
+
+- 面板错乱根因：`@tmex/ui` Tabs 根的 `data-horizontal:flex-col` 在 Tailwind v4 里匹配布尔属性 `[data-horizontal]`，Base UI 输出的是 `data-orientation="horizontal"`，根一直是 flex-row；此前所有 Tabs 只放标签列表，接入面板首次把内容放进根才暴露。改为 `data-[orientation=horizontal]:flex-col`（`12f88189` 前一提交）。开发实例截图未复现是因为截图早于 F2 的 Tabs/TabsContent 跟进——教训：agent 跟进改动后必须重新截图。
+- 底部两入口 `justify-center`。
+- v1.1.1 Release（tag 首次误建在旧 main 上，删除重建到 `12f88189`），本机已升级到 1.1.1。
