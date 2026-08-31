@@ -1,0 +1,2031 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+new file mode 100644
+index 00000000..6bdf86f0
+--- /dev/null
++++ b/.github/workflows/release.yml
+@@ -0,0 +1,85 @@
++name: Release
++
++on:
++  push:
++    tags:
++      - 'v*'
++  workflow_dispatch:
++    inputs:
++      tag:
++        description: 'Release tag (e.g. v1.1.0)'
++        required: true
++        type: string
++
++permissions:
++  contents: write
++
++jobs:
++  release:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Resolve tag
++        id: tag
++        run: |
++          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
++            TAG="${{ inputs.tag }}"
++          else
++            TAG="${GITHUB_REF_NAME}"
++          fi
++          TAG="${TAG#refs/tags/}"
++          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
++          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
++
++      - name: Checkout
++        uses: actions/checkout@v4
++        with:
++          ref: ${{ steps.tag.outputs.tag }}
++
++      - name: Setup Bun
++        uses: oven-sh/setup-bun@v2
++
++      - name: Setup Node
++        uses: actions/setup-node@v4
++        with:
++          node-version: '20'
++
++      - name: Install
++        run: bun install --frozen-lockfile
++
++      - name: Build
++        run: bun run build
++
++      - name: Check package version matches tag
++        run: |
++          VERSION="${{ steps.tag.outputs.version }}"
++          PKG_VERSION="$(node -p "require('./packages/app/package.json').version")"
++          if [ "$PKG_VERSION" != "$VERSION" ]; then
++            echo "packages/app version $PKG_VERSION does not match tag version $VERSION"
++            exit 1
++          fi
++
++      - name: Pack CLI
++        working-directory: packages/app
++        run: |
++          npm pack
++          VERSION="${{ steps.tag.outputs.version }}"
++          shasum -a 256 "tmex-cli-${VERSION}.tgz" > SHA256SUMS
++          cat SHA256SUMS
++
++      - name: Publish GitHub Release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          TAG="${{ steps.tag.outputs.tag }}"
++          VERSION="${{ steps.tag.outputs.version }}"
++          TGZ="packages/app/tmex-cli-${VERSION}.tgz"
++          SUMS="packages/app/SHA256SUMS"
++          NOTES_ARGS=(--generate-notes)
++          if [ -f packages/app/CHANGELOG.md ]; then
++            NOTES_ARGS=(--notes-file packages/app/CHANGELOG.md)
++          fi
++          if gh release view "$TAG" >/dev/null 2>&1; then
++            gh release upload "$TAG" "$TGZ" "$SUMS" --clobber
++          else
++            gh release create "$TAG" "$TGZ" "$SUMS" --title "tmex-cli ${VERSION}" "${NOTES_ARGS[@]}"
++          fi
+diff --git a/apps/fe/src/node/enrollment.test.ts b/apps/fe/src/node/enrollment.test.ts
+index 40e2920e..8c926f9b 100644
+--- a/apps/fe/src/node/enrollment.test.ts
++++ b/apps/fe/src/node/enrollment.test.ts
+@@ -858,11 +858,11 @@ describe('凭据复用窗口', () => {
+ describe('joinCommand', () => {
+   test('带名称时加 --name，特殊字符加引号', () => {
+     expect(joinCommand('https://hub.example', 'TOKEN', 'studio')).toBe(
+-      "npx tmex-cli hub join 'https://hub.example' --token TOKEN --name studio"
++      "tmex hub join 'https://hub.example' --token TOKEN --name studio"
+     );
+     expect(joinCommand('https://hub.example', 'TOKEN', 'my node')).toContain("--name 'my node'");
+     expect(joinCommand('https://hub.example', 'TOKEN', null)).toBe(
+-      "npx tmex-cli hub join 'https://hub.example' --token TOKEN"
++      "tmex hub join 'https://hub.example' --token TOKEN"
+     );
+   });
+ 
+@@ -871,7 +871,7 @@ describe('joinCommand', () => {
+     expect(command).toContain("'https://hub.example/x?a=1&b=2'");
+     expect(command).not.toContain('& b');
+     // 引号之外不应再出现裸的 shell 元字符
+-    expect(command.split("'")[0]).toBe('npx tmex-cli hub join ');
++    expect(command.split("'")[0]).toBe('tmex hub join ');
+   });
+ 
+   test('注入型 URL 直接拒绝，不是「引起来就算了」', () => {
+diff --git a/apps/fe/src/node/enrollment.ts b/apps/fe/src/node/enrollment.ts
+index 38ff7b1e..d4e96572 100644
+--- a/apps/fe/src/node/enrollment.ts
++++ b/apps/fe/src/node/enrollment.ts
+@@ -702,7 +702,7 @@ export function joinCommand(hubPublicUrl: string, token: string, name?: string |
+     throw new Error('hub public url must be an https url');
+   }
+   const suffix = name?.trim() ? ` --name ${shellQuote(name.trim())}` : '';
+-  return `npx tmex-cli hub join ${shellQuote(hubPublicUrl)} --token ${shellQuote(token)}${suffix}`;
++  return `tmex hub join ${shellQuote(hubPublicUrl)} --token ${shellQuote(token)}${suffix}`;
+ }
+ 
+ function shellQuote(value: string): string {
+diff --git a/apps/gateway/src/system/update-check.test.ts b/apps/gateway/src/system/update-check.test.ts
+new file mode 100644
+index 00000000..20544b81
+--- /dev/null
++++ b/apps/gateway/src/system/update-check.test.ts
+@@ -0,0 +1,142 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { RELEASE_API_LATEST_URL, releaseTarballName } from '@tmex/shared';
++import { checkForUpdate } from './update-check';
++import { getBaseVersion } from './version';
++
++const originalFetch = globalThis.fetch;
++
++afterEach(() => {
++  globalThis.fetch = originalFetch;
++});
++
++interface GithubReleaseFixture {
++  tag_name?: string;
++  published_at?: string | null;
++  body?: string | null;
++  assets?: Array<{ name: string }>;
++}
++
++interface CapturedFetch {
++  url: string;
++  accept: string | null;
++  apiVersion: string | null;
++  cache: RequestCache | undefined;
++}
++
++const captures: CapturedFetch[] = [];
++
++function headerOf(headers: HeadersInit | undefined, name: string): string | null {
++  if (!headers) return null;
++  if (headers instanceof Headers) return headers.get(name);
++  if (Array.isArray(headers)) {
++    const found = headers.find(([key]) => key.toLowerCase() === name.toLowerCase());
++    return found?.[1] ?? null;
++  }
++  const rec = headers as Record<string, string>;
++  const key = Object.keys(rec).find((k) => k.toLowerCase() === name.toLowerCase());
++  return key ? rec[key] : null;
++}
++
++function mockGithub(status: number, body: GithubReleaseFixture | string): void {
++  captures.length = 0;
++  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
++    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++    captures.push({
++      url,
++      accept: headerOf(init?.headers, 'accept'),
++      apiVersion: headerOf(init?.headers, 'X-GitHub-Api-Version'),
++      cache: init?.cache,
++    });
++    const payload = typeof body === 'string' ? body : JSON.stringify(body);
++    return new Response(payload, {
++      status,
++      headers: { 'content-type': 'application/json' },
++    });
++  }) as typeof fetch;
++}
++
++describe('checkForUpdate', () => {
++  test('newer GitHub release with tarball asset → hasUpdate true and changelog', async () => {
++    const current = getBaseVersion();
++    expect(current).not.toBe('unknown');
++
++    const latest = '99.0.0';
++    const publishedAt = '2026-08-01T12:00:00Z';
++    const changelog = '## 99.0.0\n\n- GitHub release notes';
++    mockGithub(200, {
++      tag_name: `v${latest}`,
++      published_at: publishedAt,
++      body: changelog,
++      assets: [{ name: releaseTarballName(latest) }],
++    });
++
++    const result = await checkForUpdate();
++
++    expect(result.currentVersion).toBe(current);
++    expect(result.latestVersion).toBe(latest);
++    expect(result.hasUpdate).toBe(true);
++    expect(result.changelog).toBe(changelog);
++    expect(result.publishedAt).toBe(publishedAt);
++    expect(captures).toHaveLength(1);
++    expect(captures[0]?.url).toBe(RELEASE_API_LATEST_URL);
++    expect(captures[0]?.accept).toBe('application/vnd.github+json');
++    expect(captures[0]?.apiVersion).toBe('2022-11-28');
++    expect(captures[0]?.cache).toBe('no-store');
++  });
++
++  test('same version → hasUpdate false', async () => {
++    const current = getBaseVersion();
++    mockGithub(200, {
++      tag_name: `v${current}`,
++      published_at: '2026-01-01T00:00:00Z',
++      body: 'same',
++      assets: [{ name: releaseTarballName(current) }],
++    });
++
++    const result = await checkForUpdate();
++    expect(result.latestVersion).toBe(current);
++    expect(result.hasUpdate).toBe(false);
++    expect(result.changelog).toBe('same');
++  });
++
++  test('newer tag without matching tarball asset → hasUpdate false, latestVersion still reported', async () => {
++    mockGithub(200, {
++      tag_name: 'v99.0.0',
++      published_at: '2026-08-01T00:00:00Z',
++      body: 'notes',
++      assets: [{ name: 'source.tar.gz' }],
++    });
++
++    const result = await checkForUpdate();
++    expect(result.latestVersion).toBe('99.0.0');
++    expect(result.hasUpdate).toBe(false);
++    expect(result.changelog).toBe('notes');
++  });
++
++  test('HTTP 403 throws a GitHub Releases error and never falls back to npm', async () => {
++    mockGithub(403, '{"message":"API rate limit exceeded"}');
++
++    await expect(checkForUpdate()).rejects.toThrow(/GitHub Releases API HTTP 403/i);
++    expect(captures.every((c) => !c.url.includes('registry.npmjs.org'))).toBe(true);
++    expect(captures.every((c) => !c.url.includes('jsdelivr'))).toBe(true);
++  });
++
++  test('empty release body → changelog null', async () => {
++    mockGithub(200, {
++      tag_name: 'v99.0.0',
++      published_at: '2026-08-01T00:00:00Z',
++      body: '   ',
++      assets: [{ name: releaseTarballName('99.0.0') }],
++    });
++
++    const result = await checkForUpdate();
++    expect(result.latestVersion).toBe('99.0.0');
++    expect(result.hasUpdate).toBe(true);
++    expect(result.changelog).toBeNull();
++  });
++
++  test('HTTP 404 throws a clear GitHub Releases error', async () => {
++    mockGithub(404, '{"message":"Not Found"}');
++    await expect(checkForUpdate()).rejects.toThrow(/GitHub Releases API HTTP 404/i);
++  });
++});
+diff --git a/apps/gateway/src/system/update-check.ts b/apps/gateway/src/system/update-check.ts
+index 0c385f8c..8dc98868 100644
+--- a/apps/gateway/src/system/update-check.ts
++++ b/apps/gateway/src/system/update-check.ts
+@@ -1,41 +1,51 @@
+ import type { UpdateCheckResult } from '@tmex/shared';
++import { RELEASE_API_LATEST_URL, releaseTarballName } from '@tmex/shared';
+ import { compareVersions } from './semver';
+ import { getBaseVersion } from './version';
+ 
+-const REGISTRY_URL = 'https://registry.npmjs.org/tmex-cli';
+-const changelogCdnUrl = (version: string) =>
+-  `https://cdn.jsdelivr.net/npm/tmex-cli@${version}/CHANGELOG.md`;
+-
+ const FETCH_TIMEOUT_MS = 10_000;
+ 
+-interface Packument {
+-  'dist-tags'?: { latest?: string };
+-  time?: Record<string, string>;
++interface GithubReleaseAsset {
++  name?: string;
++}
++
++interface GithubRelease {
++  tag_name?: string;
++  published_at?: string | null;
++  body?: string | null;
++  assets?: GithubReleaseAsset[];
+ }
+ 
+ /**
+- * 直接查询 npm registry 取 tmex-cli 最新版本，并尽力从 CDN 拉取目标版本的 CHANGELOG.md。
+- * registry 与 CDN 均 no-store 强制取新。changelog 拉取失败返回 null（前端回退版本+日期）。
++ * 查询本仓库 GitHub Releases 最新版（不再走 npm registry）。
++ * changelog 取 release body（markdown）；空则 null。缺少对应 tarball 资产时
++ * 仍回报 latestVersion，但 hasUpdate=false，避免前端提供无法完成的升级。
+  */
+ export async function checkForUpdate(): Promise<UpdateCheckResult> {
+   const current = getBaseVersion();
+ 
+-  const res = await fetch(REGISTRY_URL, {
++  const res = await fetch(RELEASE_API_LATEST_URL, {
+     cache: 'no-store',
+-    headers: { accept: 'application/json', 'cache-control': 'no-cache' },
++    headers: {
++      accept: 'application/vnd.github+json',
++      'X-GitHub-Api-Version': '2022-11-28',
++    },
+     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+   });
+   if (!res.ok) {
+-    throw new Error(`npm registry HTTP ${res.status}`);
++    throw githubReleasesHttpError(res.status);
+   }
+ 
+-  const packument = (await res.json()) as Packument;
+-  const latest = packument['dist-tags']?.latest ?? null;
+-  const publishedAt = latest ? (packument.time?.[latest] ?? null) : null;
++  const release = (await res.json()) as GithubRelease;
++  const latest = stripLeadingV(release.tag_name);
++  const publishedAt = latest ? (release.published_at ?? null) : null;
++  const changelog = releaseChangelog(release.body);
++  const hasTarball =
++    latest !== null &&
++    Array.isArray(release.assets) &&
++    release.assets.some((asset) => asset.name === releaseTarballName(latest));
+   const hasUpdate =
+-    latest !== null && current !== 'unknown' && compareVersions(latest, current) > 0;
+-
+-  const changelog = latest ? await fetchChangelog(latest) : null;
++    latest !== null && hasTarball && current !== 'unknown' && compareVersions(latest, current) > 0;
+ 
+   return {
+     currentVersion: current,
+@@ -46,16 +56,22 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
+   };
+ }
+ 
+-async function fetchChangelog(version: string): Promise<string | null> {
+-  try {
+-    const res = await fetch(changelogCdnUrl(version), {
+-      cache: 'no-store',
+-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+-    });
+-    if (!res.ok) return null;
+-    const text = await res.text();
+-    return text.trim() ? text : null;
+-  } catch {
+-    return null;
++function stripLeadingV(tag: string | undefined): string | null {
++  if (typeof tag !== 'string' || tag.length === 0) return null;
++  return tag.replace(/^v/, '') || null;
++}
++
++function releaseChangelog(body: string | null | undefined): string | null {
++  if (typeof body !== 'string') return null;
++  return body.trim() ? body : null;
++}
++
++function githubReleasesHttpError(status: number): Error {
++  if (status === 403 || status === 429) {
++    return new Error(`GitHub Releases API HTTP ${status}: rate-limited or forbidden`);
++  }
++  if (status === 404) {
++    return new Error('GitHub Releases API HTTP 404: release not found');
+   }
++  return new Error(`GitHub Releases API HTTP ${status}`);
+ }
+diff --git a/apps/gateway/src/system/upgrade.test.ts b/apps/gateway/src/system/upgrade.test.ts
+new file mode 100644
+index 00000000..e2b9ba38
+--- /dev/null
++++ b/apps/gateway/src/system/upgrade.test.ts
+@@ -0,0 +1,96 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { spawnSync } from 'node:child_process';
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { releaseTarballName, releaseTarballUrl } from '@tmex/shared';
++import { stageGithubRelease } from './upgrade';
++
++const originalFetch = globalThis.fetch;
++const tempDirs: string[] = [];
++
++afterEach(() => {
++  globalThis.fetch = originalFetch;
++  for (const dir of tempDirs.splice(0)) {
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++function tempDir(prefix: string): string {
++  const dir = mkdtempSync(join(tmpdir(), prefix));
++  tempDirs.push(dir);
++  return dir;
++}
++
++function toResponseBody(bytes: Buffer): ArrayBuffer {
++  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
++}
++
++function packFakeCliTarball(version: string): Buffer {
++  const dir = tempDir('tmex-pack-src-');
++  const binDir = join(dir, 'package', 'bin');
++  mkdirSync(binDir, { recursive: true });
++  writeFileSync(join(binDir, 'tmex.js'), '#!/usr/bin/env node\nconsole.log("ok");\n');
++  const tgz = join(dir, releaseTarballName(version));
++  const packed = spawnSync('tar', ['-czf', tgz, '-C', dir, 'package'], { encoding: 'utf8' });
++  if (packed.status !== 0) {
++    throw new Error(`tar pack failed: ${packed.stderr}`);
++  }
++  return readFileSync(tgz);
++}
++
++describe('stageGithubRelease', () => {
++  test('downloads GitHub tarball, extracts npm-pack layout, returns package/bin/tmex.js', async () => {
++    const version = '9.9.9';
++    const bytes = packFakeCliTarball(version);
++    const requested: string[] = [];
++
++    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      requested.push(url);
++      expect(init?.redirect === undefined || init.redirect === 'follow').toBe(true);
++      return new Response(toResponseBody(bytes), { status: 200 });
++    }) as typeof fetch;
++
++    const stageDir = tempDir('tmex-upg-stage-');
++    const binPath = await stageGithubRelease(stageDir, version);
++
++    expect(requested).toEqual([releaseTarballUrl(version)]);
++    expect(binPath).toBe(join(stageDir, 'package', 'bin', 'tmex.js'));
++    expect(existsSync(binPath)).toBe(true);
++    expect(readFileSync(binPath, 'utf8')).toContain('console.log("ok")');
++  });
++
++  test('HTTP error while downloading tarball throws and never uses npm', async () => {
++    const requested: string[] = [];
++    globalThis.fetch = (async (input: RequestInfo | URL) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      requested.push(url);
++      return new Response('nope', { status: 403 });
++    }) as typeof fetch;
++
++    await expect(stageGithubRelease(tempDir('tmex-upg-stage-'), '9.9.9')).rejects.toThrow(
++      /GitHub release tarball HTTP 403/i
++    );
++    expect(requested).toEqual([releaseTarballUrl('9.9.9')]);
++    expect(requested.every((url) => !url.includes('registry.npmjs.org'))).toBe(true);
++  });
++
++  test('extract without package/bin/tmex.js throws', async () => {
++    const dir = tempDir('tmex-pack-empty-');
++    writeFileSync(join(dir, 'readme.txt'), 'no cli\n');
++    const tgz = join(dir, 'empty.tgz');
++    const packed = spawnSync('tar', ['-czf', tgz, '-C', dir, 'readme.txt'], { encoding: 'utf8' });
++    if (packed.status !== 0) {
++      throw new Error(`tar pack failed: ${packed.stderr}`);
++    }
++    const bytes = readFileSync(tgz);
++
++    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
++      new Response(toResponseBody(bytes), { status: 200 })) as typeof fetch;
++
++    await expect(stageGithubRelease(tempDir('tmex-upg-stage-'), '1.2.3')).rejects.toThrow(
++      /downloaded tmex-cli binary not found/
++    );
++  });
++});
+diff --git a/apps/gateway/src/system/upgrade.ts b/apps/gateway/src/system/upgrade.ts
+index 992bb397..8a2b95e4 100644
+--- a/apps/gateway/src/system/upgrade.ts
++++ b/apps/gateway/src/system/upgrade.ts
+@@ -4,15 +4,20 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import type { UpgradeState, UpgradeStatus } from '@tmex/shared';
++import { releaseTarballName, releaseTarballUrl } from '@tmex/shared';
+ import { getInstallInfo } from './install-info';
+ 
++const TARBALL_FETCH_TIMEOUT_MS = 120_000;
++
+ /**
+  * 全局唯一升级状态机：idle / downloading / executing。
+  *
+  * 触发流程（仅 canSelfUpdate 由 API 层校验）：
+- *  1. downloading：在临时目录 + 全新 cache 目录中 `bun add tmex-cli@<version>`（无视缓存）。
+- *     此阶段失败时 gateway 仍存活，可经 status() 上报 error 并回到 idle。
+- *  2. executing：detached 拉起下载包的 `bin/tmex.js upgrade --apply-current-package`，
++ *  1. downloading：从本仓库 GitHub Releases 下载 `tmex-cli-<version>.tgz`
++ *     到临时目录（fetch 跟随 GitHub 资产 302），再 `tar -xzf` 解出 npm pack
++ *     布局（`package/`）。CLI 为 bun bundle，无需 npm install。此阶段失败时
++ *     gateway 仍存活，可经 status() 上报 error 并回到 idle。
++ *  2. executing：detached 拉起解压包的 `package/bin/tmex.js upgrade --apply-current-package`，
+  *     子进程停服务（杀掉本 gateway）→ 部署 → 重启。服务重启后新 gateway 启动即 idle。
+  *
+  * 依赖服务 unit 的 KillMode=process / AbandonProcessGroup=true，使 detached 子进程
+@@ -52,7 +57,6 @@ class UpgradeController {
+     const install = getInstallInfo();
+     const installDir = install.installDir;
+     let stageDir: string | null = null;
+-    let cacheDir: string | null = null;
+ 
+     try {
+       if (!installDir) {
+@@ -60,20 +64,9 @@ class UpgradeController {
+       }
+ 
+       stageDir = await mkdtemp(join(tmpdir(), 'tmex-upg-'));
+-      cacheDir = await mkdtemp(join(tmpdir(), 'tmex-upg-cache-'));
+-      await writeFile(
+-        join(stageDir, 'package.json'),
+-        `${JSON.stringify({ name: 'tmex-upgrade-stage', private: true })}\n`
+-      );
+-
+-      // 阶段 1：下载（无视缓存：指向全新的 BUN_INSTALL_CACHE_DIR）
+-      await this.runBunAdd(stageDir, cacheDir, version);
+ 
+       // 校验下载产物：detached 子进程无法回报错误，缺二进制时趁本进程仍存活报错回 idle。
+-      const binPath = join(stageDir, 'node_modules', 'tmex-cli', 'bin', 'tmex.js');
+-      if (!existsSync(binPath)) {
+-        throw new Error(`downloaded tmex-cli binary not found at ${binPath}`);
+-      }
++      const binPath = await stageGithubRelease(stageDir, version);
+ 
+       // 阶段 2：执行（detached，脱离服务进程组）。此后服务会被重启，本进程随之退出，
+       // 临时目录交由系统 tmp 回收，不在此清理（清理会与子进程读包竞争）。
+@@ -84,26 +77,9 @@ class UpgradeController {
+       this.state = 'idle';
+       this.targetVersion = null;
+       if (stageDir) await rm(stageDir, { recursive: true, force: true }).catch(() => {});
+-      if (cacheDir) await rm(cacheDir, { recursive: true, force: true }).catch(() => {});
+     }
+   }
+ 
+-  private runBunAdd(stageDir: string, cacheDir: string, version: string): Promise<void> {
+-    return new Promise<void>((resolve, reject) => {
+-      // gateway 运行于 bun，process.execPath 即 bun，无需 PATH 查找。
+-      const child = spawn(process.execPath, ['add', `tmex-cli@${version}`], {
+-        cwd: stageDir,
+-        env: { ...process.env, BUN_INSTALL_CACHE_DIR: cacheDir },
+-        stdio: 'ignore',
+-      });
+-      child.on('error', reject);
+-      child.on('close', (code) => {
+-        if (code === 0) resolve();
+-        else reject(new Error(`bun add tmex-cli@${version} exited with code ${code ?? 'null'}`));
+-      });
+-    });
+-  }
+-
+   private spawnUpgrade(binPath: string, installDir: string, version: string): void {
+     // 升级日志单独落盘，便于回滚等失败场景排查（detached 子进程的输出不会进服务日志）。
+     let logFd: number | null = null;
+@@ -139,4 +115,45 @@ class UpgradeController {
+   }
+ }
+ 
++/**
++ * 下载 GitHub Release tarball 并解压到 stageDir（npm pack 布局：package/）。
++ * 返回 CLI 入口路径 `<stageDir>/package/bin/tmex.js`。
++ */
++export async function stageGithubRelease(stageDir: string, version: string): Promise<string> {
++  const tarballPath = join(stageDir, releaseTarballName(version));
++  await downloadReleaseTarball(releaseTarballUrl(version), tarballPath);
++  await extractTarball(tarballPath, stageDir);
++
++  const binPath = join(stageDir, 'package', 'bin', 'tmex.js');
++  if (!existsSync(binPath)) {
++    throw new Error(`downloaded tmex-cli binary not found at ${binPath}`);
++  }
++  return binPath;
++}
++
++async function downloadReleaseTarball(url: string, destPath: string): Promise<void> {
++  const res = await fetch(url, {
++    cache: 'no-store',
++    redirect: 'follow',
++    signal: AbortSignal.timeout(TARBALL_FETCH_TIMEOUT_MS),
++  });
++  if (!res.ok) {
++    throw new Error(`GitHub release tarball HTTP ${res.status}`);
++  }
++  await writeFile(destPath, new Uint8Array(await res.arrayBuffer()));
++}
++
++function extractTarball(tarballPath: string, stageDir: string): Promise<void> {
++  return new Promise<void>((resolve, reject) => {
++    const child = spawn('tar', ['-xzf', tarballPath, '-C', stageDir], {
++      stdio: 'ignore',
++    });
++    child.on('error', reject);
++    child.on('close', (code) => {
++      if (code === 0) resolve();
++      else reject(new Error(`tar extract exited with code ${code ?? 'null'}`));
++    });
++  });
++}
++
+ export const upgradeController = new UpgradeController();
+diff --git a/install.sh b/install.sh
+new file mode 100755
+index 00000000..33d850ba
+--- /dev/null
++++ b/install.sh
+@@ -0,0 +1,203 @@
++#!/usr/bin/env bash
++# tmex installer: download the CLI tarball from GitHub Releases and run `init`.
++# Usage:
++#   curl -fsSL https://raw.githubusercontent.com/12dora/tmex-enhanced/main/install.sh | bash
++#   bash install.sh [init flags...]
++# Env:
++#   TMEX_VERSION  pin a release (with or without leading v)
++
++TMEX_RELEASE_REPO='12dora/tmex-enhanced'
++TMEX_MIN_BUN_VERSION='1.3.0'
++
++tmex_parse_tag_name() {
++  printf '%s' "$1" | tr -d '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
++}
++
++tmex_version_from_tag() {
++  local tag="$1"
++  tag="${tag#v}"
++  tag="${tag#V}"
++  printf '%s' "$tag"
++}
++
++# Compare dotted versions. Returns 0 if $1 >= $2.
++tmex_version_ge() {
++  local IFS=.
++  # shellcheck disable=SC2206
++  local a=($1) b=($2)
++  local i x y
++  for i in 0 1 2; do
++    x="${a[$i]:-0}"
++    y="${b[$i]:-0}"
++    x="${x%%[^0-9]*}"
++    y="${y%%[^0-9]*}"
++    x="${x:-0}"
++    y="${y:-0}"
++    if [ "$x" -gt "$y" ]; then
++      return 0
++    fi
++    if [ "$x" -lt "$y" ]; then
++      return 1
++    fi
++  done
++  return 0
++}
++
++tmex_need_cmd() {
++  local name="$1"
++  if ! command -v "$name" >/dev/null 2>&1; then
++    echo "tmex install: missing required command: $name" >&2
++    exit 1
++  fi
++}
++
++tmex_detect_os() {
++  local os
++  os="$(uname -s 2>/dev/null || true)"
++  case "$os" in
++    Darwin | Linux) ;;
++    *)
++      echo "tmex install: unsupported OS: ${os:-unknown} (need macOS or Linux)" >&2
++      exit 1
++      ;;
++  esac
++}
++
++tmex_ensure_bun() {
++  export PATH="${HOME}/.bun/bin:${PATH:-}"
++  if command -v bun >/dev/null 2>&1; then
++    local ver
++    ver="$(bun --version 2>/dev/null || true)"
++    if [ -n "$ver" ] && tmex_version_ge "$ver" "$TMEX_MIN_BUN_VERSION"; then
++      return 0
++    fi
++    echo "tmex install: Bun ${ver:-unknown} is older than ${TMEX_MIN_BUN_VERSION}; installing a newer Bun"
++  else
++    echo "tmex install: Bun not found; installing via bun.sh"
++  fi
++  curl -fsSL https://bun.sh/install | bash
++  export PATH="${HOME}/.bun/bin:${PATH:-}"
++  if ! command -v bun >/dev/null 2>&1; then
++    echo "tmex install: Bun install failed" >&2
++    exit 1
++  fi
++  local ver
++  ver="$(bun --version 2>/dev/null || true)"
++  if [ -z "$ver" ] || ! tmex_version_ge "$ver" "$TMEX_MIN_BUN_VERSION"; then
++    echo "tmex install: Bun ${ver:-unknown} is still older than ${TMEX_MIN_BUN_VERSION}" >&2
++    exit 1
++  fi
++}
++
++tmex_github_json() {
++  local url="$1"
++  curl -fsSL \
++    -H 'Accept: application/vnd.github+json' \
++    -H 'User-Agent: tmex-install' \
++    "$url"
++}
++
++tmex_resolve_version() {
++  if [ -n "${TMEX_VERSION:-}" ]; then
++    tmex_version_from_tag "$TMEX_VERSION"
++    return 0
++  fi
++  local json tag version
++  json="$(tmex_github_json "https://api.github.com/repos/${TMEX_RELEASE_REPO}/releases/latest")" || {
++    echo "tmex install: failed to query GitHub Releases" >&2
++    exit 1
++  }
++  tag="$(tmex_parse_tag_name "$json")"
++  version="$(tmex_version_from_tag "$tag")"
++  if [ -z "$version" ]; then
++    echo "tmex install: latest release JSON is missing tag_name" >&2
++    exit 1
++  fi
++  printf '%s' "$version"
++}
++
++tmex_print_latest() {
++  local json tag
++  json="$(tmex_github_json "https://api.github.com/repos/${TMEX_RELEASE_REPO}/releases/latest")"
++  tag="$(tmex_parse_tag_name "$json")"
++  tmex_version_from_tag "$tag"
++  printf '\n'
++}
++
++tmex_run_init() {
++  local pkg_dir="$1"
++  shift
++  local cli_js="${pkg_dir}/bin/tmex.js"
++  if command -v node >/dev/null 2>&1; then
++    node "$cli_js" init "$@"
++  else
++    bun "$cli_js" init "$@"
++  fi
++}
++
++TMEX_INSTALL_TMP=
++
++tmex_cleanup_tmp() {
++  if [ -n "${TMEX_INSTALL_TMP:-}" ] && [ -d "$TMEX_INSTALL_TMP" ]; then
++    rm -rf "$TMEX_INSTALL_TMP"
++    TMEX_INSTALL_TMP=
++  fi
++}
++
++tmex_install() {
++  set -euo pipefail
++
++  tmex_need_cmd curl
++  tmex_need_cmd tar
++  tmex_detect_os
++  tmex_ensure_bun
++
++  local version tarball_url tgz
++  version="$(tmex_resolve_version)"
++  tarball_url="https://github.com/${TMEX_RELEASE_REPO}/releases/download/v${version}/tmex-cli-${version}.tgz"
++  echo "tmex install: downloading ${tarball_url}"
++
++  TMEX_INSTALL_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tmex-install.XXXXXX")"
++  trap tmex_cleanup_tmp EXIT
++  tgz="${TMEX_INSTALL_TMP}/tmex-cli-${version}.tgz"
++
++  if ! curl -fsSL -o "$tgz" -H 'User-Agent: tmex-install' "$tarball_url"; then
++    echo "tmex install: failed to download ${tarball_url} (version not found or network error)" >&2
++    exit 1
++  fi
++
++  tar -xzf "$tgz" -C "$TMEX_INSTALL_TMP"
++  local pkg_dir="${TMEX_INSTALL_TMP}/package"
++  if [ ! -f "${pkg_dir}/bin/tmex.js" ]; then
++    echo "tmex install: tarball is missing package/bin/tmex.js" >&2
++    exit 1
++  fi
++
++  local -a init_args
++  init_args=("$@")
++  if [ ! -t 0 ]; then
++    if [ -r /dev/tty ]; then
++      echo "tmex install: stdin is not a TTY; attaching /dev/tty for prompts"
++      tmex_run_init "$pkg_dir" "${init_args[@]+"${init_args[@]}"}" </dev/tty
++    else
++      echo "tmex install: no TTY; passing --no-interactive"
++      tmex_run_init "$pkg_dir" "${init_args[@]+"${init_args[@]}"}" --no-interactive
++    fi
++  else
++    tmex_run_init "$pkg_dir" "${init_args[@]+"${init_args[@]}"}"
++  fi
++
++  echo
++  echo "tmex install: done. The tmex command is installed to ~/.local/bin/tmex"
++  echo "If 'tmex' is not found, add ~/.local/bin to PATH:"
++  echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
++}
++
++# When sourced (unit tests), functions stay defined and main does not run.
++if [[ "${1:-}" == "--print-latest" ]]; then
++  set -euo pipefail
++  tmex_print_latest
++  exit 0
++fi
++
++return 0 2>/dev/null || tmex_install "$@"
+diff --git a/packages/app/CHANGELOG.md b/packages/app/CHANGELOG.md
+index 3b2315b5..cec973cd 100644
+--- a/packages/app/CHANGELOG.md
++++ b/packages/app/CHANGELOG.md
+@@ -1,65 +1,31 @@
+-# 1.0.2
++# 1.1.0
+ 
+-_2026-07-27_
++_2026-08-31_
+ 
+ ## English
+ 
+ ### Highlights
+ 
+-- tmex is now ready for its first stable 1.0 release, with a more reliable terminal experience across desktop and mobile.
+-- Terminal output, screen recovery, resizing, mouse reporting, split panes, and input handling now remain consistent during reconnects and heavy activity.
+-- The managed gateway is ready for standalone use, with improved health monitoring, bounded recovery work, dynamic endpoints, and support for Windows psmux runtimes.
++- Distribution moved from the upstream npm package to GitHub Releases of [12dora/tmex-enhanced](https://github.com/12dora/tmex-enhanced). Install with `install.sh`; upgrade and uninstall with the `tmex` command.
++- `init` and `upgrade` install a `tmex` shim into `~/.local/bin` (and `~/.bun/bin` when present) so later commands no longer go through `npx tmex-cli`.
++- Remote-access onboarding is restructured around a dedicated wizard, with a “Connect more devices” guide. The header mesh icon is removed.
+ 
+ ### Features
+ 
+-- Added real-time updates for devices, sessions, windows, and panes.
+-- Added a default local device on fresh installations and clearer device naming based on the host name.
+-- Added configurable terminal file links, host-controlled page titles, injectable host services, and reusable device, console, and management panels.
+-- Added capability negotiation and pluggable WebSocket transports for embedded hosts.
+-- Improved the Files and Settings experience with grouped device sources, file-root update notifications, optional headers, and runtime feature flags for Files and Watch.
+-- Added mobile-friendly navigation and interactions for terminal, settings, device, agent, file, and watch panels.
+-- Added support for disabling selected notification channels and for host-managed notifications.
+-
+-### Reliability and fixes
+-
+-- Fixed the Settings file-roots page crash caused by sharing incompatible cached data with the sidebar.
+-- Improved terminal recovery across alternate screens, blank lines, reconnects, chunked history, remote resizing, pane moves, and stale selections.
+-- Improved mouse and touch behavior, including modifier-key handling, coordinate mapping, dragging, wheel input, and mobile gestures.
+-- Improved theme behavior, including CJK font fallbacks and preset overrides.
+-- Improved connection lifecycle handling, session health, device ordering, and clean shutdown behavior.
+-
+-### Performance
+-
+-- Reduced terminal latency by prioritizing the tmux control channel for input.
+-- Reduced rendering and network overhead with bounded history recovery, output batching, metadata coalescing, and protection for slow clients.
++- Added `install.sh` for one-line install from GitHub Releases (`curl … | bash`, or `bash install.sh` with init flags). Pin a version with `TMEX_VERSION`.
++- `tmex upgrade` downloads `tmex-cli-<version>.tgz` from this repo’s GitHub Releases and re-runs the extracted CLI with `--apply-current-package`.
++- CLI files are copied into `<installDir>/cli/` and exposed as the `tmex` command. `tmex uninstall` removes the shim(s).
+ 
+ ## 中文
+ 
+ ### 版本亮点
+ 
+-- tmex 首次进入稳定版 1.0，桌面端和移动端的终端使用体验更加可靠。
+-- 终端输出、屏幕恢复、尺寸同步、鼠标操作、分屏和输入处理在重连及高负载场景下更加稳定。
+-- 托管网关已经支持独立运行，并增强了健康检查、故障恢复、动态端点和 Windows psmux 运行时支持。
++- 发行渠道从上游 npm 包改为 [12dora/tmex-enhanced](https://github.com/12dora/tmex-enhanced) 的 GitHub Releases。用 `install.sh` 安装，用 `tmex` 命令升级与卸载。
++- `init` 与 `upgrade` 会把 `tmex` 命令安装到 `~/.local/bin`（若存在 `~/.bun/bin` 则同时放一份链接），后续不再经过 `npx tmex-cli`。
++- 远程访问引导改为独立向导，并提供「连接更多设备」说明；顶栏 mesh 图标已去掉。
+ 
+ ### 新功能
+ 
+-- 新增设备、会话、窗口和面板的实时状态更新。
+-- 全新安装时自动创建本地设备，并根据主机名提供更清晰的默认设备名称。
+-- 支持配置终端文件链接、由宿主控制页面标题、注入宿主服务，以及复用设备、控制台和设备管理面板。
+-- 支持能力协商和可插拔 WebSocket 传输，便于集成到宿主应用。
+-- 文件和设置页面支持按设备分组、文件根目录变更通知、可选页面头部，以及 Files 和 Watch 功能开关。
+-- 优化移动端导航，并完善终端、设置、设备、Agent、文件和 Watch 面板的触控操作。
+-- 支持关闭指定通知渠道，并支持由宿主应用统一管理通知。
+-
+-### 稳定性与修复
+-
+-- 修复设置页文件根目录与侧边栏复用不同缓存数据导致的页面崩溃。
+-- 改善备用屏幕、空行、重连、分段历史、远程调整尺寸、面板移动和过期选择状态下的终端恢复。
+-- 改善鼠标和触控操作，包括修饰键、坐标映射、拖拽、滚轮和移动端手势。
+-- 修复主题相关问题，补充中文字体回退并确保预设样式正确生效。
+-- 改善连接生命周期、会话健康状态、设备顺序和退出清理。
+-
+-### 性能
+-
+-- 输入优先通过 tmux 控制通道发送，降低终端输入延迟。
+-- 通过限制历史恢复规模、合并输出、合并状态更新和隔离慢客户端，降低渲染与网络开销。
++- 新增 `install.sh`：从 GitHub Releases 一行安装（`curl … | bash`，或 `bash install.sh` 后接 init 参数）。可用 `TMEX_VERSION` 固定版本。
++- `tmex upgrade` 从本仓库 GitHub Releases 下载 `tmex-cli-<version>.tgz`，解压后以 `--apply-current-package` 执行。
++- CLI 文件部署到 `<installDir>/cli/`，通过 `tmex` 命令调用。`tmex uninstall` 会删除对应 shim。
+diff --git a/packages/app/README.md b/packages/app/README.md
+index 620cd0b4..30ac8f33 100644
+--- a/packages/app/README.md
++++ b/packages/app/README.md
+@@ -1,12 +1,12 @@
+ # tmex-cli
+ 
+-Node.js-compatible CLI for initializing, diagnosing, upgrading, and uninstalling tmex deployment.
++Node.js-compatible CLI for initializing, diagnosing, upgrading, and uninstalling tmex.
+ 
+-Use from npm:
+-- `npx tmex-cli init`
+-- `npx tmex-cli doctor`
+-- `npx tmex-cli upgrade`
+-- `npx tmex-cli uninstall`
++Install from GitHub Releases:
++
++```bash
++curl -fsSL https://raw.githubusercontent.com/12dora/tmex-enhanced/main/install.sh | bash
++```
+ 
+ Commands:
+ - `tmex init`
+diff --git a/packages/app/package.json b/packages/app/package.json
+index b7362230..7fe72b0d 100644
+--- a/packages/app/package.json
++++ b/packages/app/package.json
+@@ -1,11 +1,15 @@
+ {
+   "name": "tmex-cli",
+-  "version": "1.0.2",
++  "version": "1.1.0",
+   "type": "module",
+   "bin": {
+     "tmex": "./bin/tmex.js",
+     "tmex-cli": "./bin/tmex.js"
+   },
++  "repository": {
++    "type": "git",
++    "url": "https://github.com/12dora/tmex-enhanced.git"
++  },
+   "publishConfig": {
+     "access": "public"
+   },
+@@ -15,9 +19,9 @@
+     "bundle:resources": "bash ./scripts/bundle-resources.sh",
+     "build:runtime": "bun scripts/build-runtime.ts",
+     "build:artifacts": "bun scripts/build-artifacts.ts",
+-    "build:cli": "bun build src/cli-node.ts --outfile ./dist/cli-node.js --target node --format esm",
++    "build:cli": "bun build src/cli-node.ts --outfile ./dist/cli-node.js --target node --format esm --packages bundle",
+     "build": "bun run clean && bun run bundle:resources && bun run build:runtime && bun run build:cli",
+-    "release": "npm publish",
++    "pack": "npm pack",
+     "test": "bun test src"
+   },
+   "dependencies": {
+diff --git a/packages/app/src/commands/enroll.test.ts b/packages/app/src/commands/enroll.test.ts
+index bee66d71..a334228b 100644
+--- a/packages/app/src/commands/enroll.test.ts
++++ b/packages/app/src/commands/enroll.test.ts
+@@ -83,7 +83,7 @@ describe('enroll', () => {
+       },
+     });
+     expect(result.token).toHaveLength(JOIN_TOKEN_CHARS);
+-    expect(result.joinCommand).toContain('npx tmex-cli hub join');
++    expect(result.joinCommand).toContain('tmex hub join');
+     expect(result.admitted).toBe(true);
+     const user = auth.userStore.getByUsername('frank');
+     if (!user) throw new Error('missing frank');
+diff --git a/packages/app/src/commands/enroll.ts b/packages/app/src/commands/enroll.ts
+index 59ebdf8f..787ad428 100644
+--- a/packages/app/src/commands/enroll.ts
++++ b/packages/app/src/commands/enroll.ts
+@@ -483,7 +483,7 @@ export async function runEnroll(
+       user.keyLogHeadHash,
+       caFingerprint
+     );
+-    const joinCommand = `npx tmex-cli hub join ${hubJoinUrl(ctx, io)} --token ${token}`;
++    const joinCommand = `tmex hub join ${hubJoinUrl(ctx, io)} --token ${token}`;
+     log(io, `join token: ${token}`);
+     log(io, joinCommand);
+     if (io.wait === false) {
+diff --git a/packages/app/src/commands/init.ts b/packages/app/src/commands/init.ts
+index 07b46958..90095ee1 100644
+--- a/packages/app/src/commands/init.ts
++++ b/packages/app/src/commands/init.ts
+@@ -9,6 +9,7 @@ import {
+ } from '../constants';
+ import { t } from '../i18n';
+ import { checkBunVersion, readExplicitBunPath } from '../lib/bun';
++import { deployCliAndShim } from '../lib/cli-shim';
+ import {
+   type DepInstallPlan,
+   executeDependencyInstall,
+@@ -269,6 +270,7 @@ export async function runInit(parsed: ParsedArgs): Promise<void> {
+   await ensureDir(dirname(config.databasePath));
+ 
+   await deployRuntimeFiles(packageLayout, installLayout);
++  const shim = await deployCliAndShim(packageLayout, installLayout, bun.path);
+   await enableDirectAfterInit(config);
+ 
+   const masterKey = generateMasterKey();
+@@ -313,4 +315,8 @@ export async function runInit(parsed: ParsedArgs): Promise<void> {
+     `- ${t('init.summary.autostart')}: ${config.autostart ? t('init.summary.autostart.on') : t('init.summary.autostart.off')}`
+   );
+   console.log(`- ${t('init.summary.serviceHint')}: ${await serviceHint(config.serviceName)}`);
++  console.log(`- ${t('cli.shim.ready', { shimPath: shim.shimPath })}`);
++  if (shim.pathHint) {
++    console.log(`- ${shim.pathHint}`);
++  }
+ }
+diff --git a/packages/app/src/commands/uninstall.ts b/packages/app/src/commands/uninstall.ts
+index 00fb0fb1..0b92b890 100644
+--- a/packages/app/src/commands/uninstall.ts
++++ b/packages/app/src/commands/uninstall.ts
+@@ -1,6 +1,7 @@
+ import { rm } from 'node:fs/promises';
+ import { defaultInstallDir } from '../constants';
+ import { t } from '../i18n';
++import { removeTmexShims } from '../lib/cli-shim';
+ import { readEnvFile } from '../lib/env-file';
+ import { pathExists, resolvePath } from '../lib/fs-utils';
+ import { createInstallLayout, resolveInstallDir } from '../lib/install-layout';
+@@ -55,8 +56,10 @@ export async function runUninstall(parsed: ParsedArgs): Promise<void> {
+   if (removeProgram) {
+     await removeIfExists(installLayout.runtimeDir);
+     await removeIfExists(installLayout.resourcesDir);
++    await removeIfExists(installLayout.cliDir);
+     await removeIfExists(installLayout.runScriptPath);
+     await removeIfExists(installLayout.metaPath);
++    await removeTmexShims();
+   }
+ 
+   if (removeEnv) {
+diff --git a/packages/app/src/commands/upgrade.test.ts b/packages/app/src/commands/upgrade.test.ts
+index ba34e64c..290f9956 100644
+--- a/packages/app/src/commands/upgrade.test.ts
++++ b/packages/app/src/commands/upgrade.test.ts
+@@ -1,5 +1,8 @@
+ import { describe, expect, test } from 'bun:test';
+-import { reenableDirectAfterUpgrade } from './upgrade';
++import { releaseTarballUrl } from '../../../shared/src/release/source';
++import { packNpmTarball } from '../lib/native-tarball';
++import { runCommand } from '../lib/process';
++import { delegateUpgrade, reenableDirectAfterUpgrade } from './upgrade';
+ 
+ describe('reenableDirectAfterUpgrade', () => {
+   test('calls reenableDirectIfNeeded with installDir', async () => {
+@@ -37,3 +40,70 @@ describe('reenableDirectAfterUpgrade', () => {
+     });
+   });
+ });
++
++describe('delegateUpgrade', () => {
++  test('downloads the GitHub release tarball and re-execs upgrade --apply-current-package', async () => {
++    const tarball = packNpmTarball({
++      'package/package.json': '{"name":"tmex-cli","version":"1.1.0"}\n',
++      'package/bin/tmex.js': 'export {}\n',
++    });
++    const spawned: Array<{ command: string; args: string[] }> = [];
++
++    await delegateUpgrade({ command: 'upgrade', positionals: [], flags: { lang: 'en' } }, '1.1.0', {
++      fetch: async (url) => {
++        expect(String(url)).toBe(releaseTarballUrl('1.1.0'));
++        return new Response(tarball, { status: 200 });
++      },
++      runCommand: async (command, args, options) => {
++        spawned.push({ command, args });
++        if (command === 'tar') {
++          return runCommand(command, args, options);
++        }
++        return { code: 0, stdout: '', stderr: '' };
++      },
++      execPath: '/usr/local/bin/node',
++    });
++
++    const extract = spawned.find((call) => call.command === 'tar');
++    expect(extract).toBeDefined();
++    expect(extract?.args[0]).toBe('-xzf');
++
++    const apply = spawned.find((call) => call.command === '/usr/local/bin/node');
++    expect(apply).toBeDefined();
++    expect(apply?.args[0]).toMatch(/package\/bin\/tmex\.js$/);
++    expect(apply?.args.slice(1, 3)).toEqual(['upgrade', '--apply-current-package']);
++    expect(apply?.args).toContain('--lang');
++    expect(apply?.args).toContain('en');
++    expect(spawned.some((call) => call.command === 'npx')).toBe(false);
++  });
++
++  test('propagates the extracted CLI exit code', async () => {
++    const tarball = packNpmTarball({
++      'package/bin/tmex.js': 'export {}\n',
++    });
++    await expect(
++      delegateUpgrade({ command: 'upgrade', positionals: [], flags: {} }, '1.1.0', {
++        fetch: async () => new Response(tarball, { status: 200 }),
++        runCommand: async (command, args, options) => {
++          if (command === 'tar') return runCommand(command, args, options);
++          return { code: 7, stdout: '', stderr: '' };
++        },
++        execPath: '/usr/bin/node',
++      })
++    ).rejects.toThrow(/7/);
++  });
++
++  test('does not spawn npx on 404', async () => {
++    const spawned: string[] = [];
++    await expect(
++      delegateUpgrade({ command: 'upgrade', positionals: [], flags: {} }, '9.9.9', {
++        fetch: async () => new Response('Not Found', { status: 404 }),
++        runCommand: async (command) => {
++          spawned.push(command);
++          return { code: 0, stdout: '', stderr: '' };
++        },
++      })
++    ).rejects.toThrow(/9\.9\.9/);
++    expect(spawned).toEqual([]);
++  });
++});
+diff --git a/packages/app/src/commands/upgrade.ts b/packages/app/src/commands/upgrade.ts
+index fbaab570..2a706d07 100644
+--- a/packages/app/src/commands/upgrade.ts
++++ b/packages/app/src/commands/upgrade.ts
+@@ -2,12 +2,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import { formatHttpEndpoint, rewriteWildcardBindHost } from '../../../shared/src/network';
++import { releaseTarballName } from '../../../shared/src/release/source';
+ import { defaultInstallDir } from '../constants';
+ import { t } from '../i18n';
+ import { checkBunVersion, readExplicitBunPath } from '../lib/bun';
++import { deployCliAndShim } from '../lib/cli-shim';
+ import { getInstallHint } from '../lib/dep-install';
+ import { mergeMissingEnvFileKeys, readEnvFile } from '../lib/env-file';
+-import { pathExists } from '../lib/fs-utils';
++import { ensureDir, pathExists } from '../lib/fs-utils';
+ import {
+   backupInstallArtifacts,
+   deployRuntimeFiles,
+@@ -22,7 +24,12 @@ import {
+   resolvePackageLayout,
+ } from '../lib/install-layout';
+ import { readJsonFile } from '../lib/json-file';
+-import { runCommand } from '../lib/process';
++import { type RunCommandResult, runCommand } from '../lib/process';
++import {
++  type ReleaseFetch,
++  downloadReleaseTarball,
++  resolveReleaseVersion,
++} from '../lib/release-fetch';
+ import { installService, stopService } from '../lib/service';
+ import { asBoolean, asString } from '../lib/validate';
+ import { readPackageVersion } from '../lib/version';
+@@ -55,24 +62,65 @@ export async function reenableDirectAfterUpgrade(
+   }
+ }
+ 
+-async function delegateUpgrade(parsed: ParsedArgs, targetVersion: string): Promise<void> {
+-  const args = ['--yes', `tmex-cli@${targetVersion}`, 'upgrade', '--apply-current-package'];
++export type DelegateUpgradeDeps = {
++  fetch?: ReleaseFetch;
++  runCommand?: (
++    command: string,
++    args: string[],
++    options?: { cwd?: string; stdio?: 'inherit' | 'pipe' }
++  ) => Promise<RunCommandResult>;
++  execPath?: string;
++};
+ 
++function passthroughUpgradeFlags(parsed: ParsedArgs): string[] {
++  const args: string[] = [];
+   const passthrough = ['install-dir', 'service-name', 'yes', 'lang'];
+   for (const key of passthrough) {
+     const value = parsed.flags[key];
+     if (value === undefined) continue;
+-
+     if (value === true) {
+       args.push(`--${key}`);
+     } else {
+       args.push(`--${key}`, String(value));
+     }
+   }
++  return args;
++}
++
++export async function delegateUpgrade(
++  parsed: ParsedArgs,
++  targetVersion: string,
++  deps: DelegateUpgradeDeps = {}
++): Promise<void> {
++  const fetchFn = deps.fetch ?? fetch;
++  const run = deps.runCommand ?? runCommand;
++  const execPath = deps.execPath ?? process.execPath;
++  const version = await resolveReleaseVersion(targetVersion, fetchFn);
++  const workDir = await mkdtemp(join(tmpdir(), 'tmex-cli-upgrade-'));
++
++  try {
++    const tarballPath = join(workDir, releaseTarballName(version));
++    await downloadReleaseTarball(version, tarballPath, fetchFn);
++
++    const extractDir = join(workDir, 'extract');
++    await ensureDir(extractDir);
++    const tarResult = await run('tar', ['-xzf', tarballPath, '-C', extractDir]);
++    if (tarResult.code !== 0) {
++      throw new Error(t('upgrade.extractFailed', { code: tarResult.code }));
++    }
++
++    const cliJs = join(extractDir, 'package', 'bin', 'tmex.js');
++    if (!(await pathExists(cliJs))) {
++      throw new Error(t('upgrade.assetMissing', { version }));
++    }
+ 
+-  const result = await runCommand('npx', args, { stdio: 'inherit' });
+-  if (result.code !== 0) {
+-    throw new Error(t('upgrade.delegateFailed', { code: result.code }));
++    const args = [cliJs, 'upgrade', '--apply-current-package', ...passthroughUpgradeFlags(parsed)];
++    const result = await run(execPath, args, { stdio: 'inherit' });
++    if (result.code !== 0) {
++      throw new Error(t('upgrade.delegateFailed', { code: result.code }));
++    }
++  } finally {
++    await rm(workDir, { recursive: true, force: true }).catch(() => null);
+   }
+ }
+ 
+@@ -144,6 +192,7 @@ export async function runUpgrade(parsed: ParsedArgs): Promise<void> {
+     await backupInstallArtifacts(installLayout, backupDir);
+ 
+     await deployRuntimeFiles(packageLayout, installLayout);
++    const shim = await deployCliAndShim(packageLayout, installLayout, bun.path);
+     await reenableDirectAfterUpgrade(installDir);
+     if (await pathExists(installLayout.envPath)) {
+       await mergeMissingEnvFileKeys(installLayout.envPath, hubEnvDefaults());
+@@ -168,6 +217,10 @@ export async function runUpgrade(parsed: ParsedArgs): Promise<void> {
+     console.log(`[tmex] ${t('upgrade.done')}`);
+     console.log(`- ${t('upgrade.summary.targetVersion')}: ${targetVersion}`);
+     console.log(`- ${t('upgrade.summary.installDir')}: ${installDir}`);
++    console.log(`- ${t('cli.shim.ready', { shimPath: shim.shimPath })}`);
++    if (shim.pathHint) {
++      console.log(`- ${shim.pathHint}`);
++    }
+   } catch (error) {
+     console.error(`[tmex] ${t('upgrade.failedRollingBack')}`);
+     await restoreInstallArtifacts(installLayout, backupDir);
+diff --git a/packages/app/src/i18n/index.test.ts b/packages/app/src/i18n/index.test.ts
+index 14e61a4c..04587def 100644
+--- a/packages/app/src/i18n/index.test.ts
++++ b/packages/app/src/i18n/index.test.ts
+@@ -35,4 +35,14 @@ describe('i18n', () => {
+     expect(t('cli.help')).toContain('tmex hub join');
+     expect(t('cli.help')).toContain('--no-restart');
+   });
++
++  test('path hint exists in both languages and zh-CN avoids 你', () => {
++    setLang('en');
++    expect(t('cli.shim.pathHint', { binDir: '/tmp/bin' })).toContain('/tmp/bin');
++    setLang('zh-CN');
++    const zh = t('cli.shim.pathHint', { binDir: '/tmp/bin' });
++    expect(zh).toContain('/tmp/bin');
++    expect(zh).toContain('PATH');
++    expect(zh).not.toContain('你');
++  });
+ });
+diff --git a/packages/app/src/i18n/index.ts b/packages/app/src/i18n/index.ts
+index 34e8fc93..ce236fcb 100644
+--- a/packages/app/src/i18n/index.ts
++++ b/packages/app/src/i18n/index.ts
+@@ -102,9 +102,19 @@ const MESSAGES: Record<CliLang, Record<string, string>> = {
+     'upgrade.failedRollingBack': 'Upgrade failed; rolling back.',
+     'upgrade.summary.targetVersion': 'Target version',
+     'upgrade.summary.installDir': 'Install dir',
++    'upgrade.versionNotFound': 'Release not found: {{version}} (HTTP 404).',
++    'upgrade.networkFailed': 'Failed to reach GitHub Releases: {{detail}}',
++    'upgrade.latestLookupFailed': 'GitHub latest-release response is missing tag_name.',
++    'upgrade.assetMissing':
++      'Extracted release is missing package/bin/tmex.js for version {{version}}.',
++    'upgrade.extractFailed': 'Failed to extract the release tarball (exit {{code}}).',
++
++    'cli.shim.pathHint':
++      '{{binDir}} is not on PATH. Add it so the tmex command is available: export PATH="{{binDir}}:$PATH"',
++    'cli.shim.ready': 'CLI command: tmex ({{shimPath}})',
+ 
+     'uninstall.prompt.removeService': 'Uninstall system service',
+-    'uninstall.prompt.removeProgram': 'Remove program files (runtime/resources/run.sh/meta)',
++    'uninstall.prompt.removeProgram': 'Remove program files (runtime/resources/cli/run.sh/meta)',
+     'uninstall.prompt.removeEnv': 'Remove app.env',
+     'uninstall.prompt.removeDatabase': 'Remove database file',
+     'uninstall.done': 'Uninstall completed.',
+@@ -231,9 +241,18 @@ const MESSAGES: Record<CliLang, Record<string, string>> = {
+     'upgrade.failedRollingBack': '升级失败，开始回滚。',
+     'upgrade.summary.targetVersion': '目标版本',
+     'upgrade.summary.installDir': '安装目录',
++    'upgrade.versionNotFound': '未找到版本 {{version}}（HTTP 404）。',
++    'upgrade.networkFailed': '无法访问 GitHub Releases：{{detail}}',
++    'upgrade.latestLookupFailed': 'GitHub latest-release 响应缺少 tag_name。',
++    'upgrade.assetMissing': '版本 {{version}} 的解压结果缺少 package/bin/tmex.js。',
++    'upgrade.extractFailed': '解压发行包失败（退出码 {{code}}）。',
++
++    'cli.shim.pathHint':
++      '{{binDir}} 不在 PATH 中。加入后即可使用 tmex 命令：export PATH="{{binDir}}:$PATH"',
++    'cli.shim.ready': 'CLI 命令：tmex（{{shimPath}}）',
+ 
+     'uninstall.prompt.removeService': '是否卸载系统服务',
+-    'uninstall.prompt.removeProgram': '是否删除程序文件（runtime/resources/run.sh/meta）',
++    'uninstall.prompt.removeProgram': '是否删除程序文件（runtime/resources/cli/run.sh/meta）',
+     'uninstall.prompt.removeEnv': '是否删除 app.env',
+     'uninstall.prompt.removeDatabase': '是否删除数据库文件',
+     'uninstall.done': '卸载完成。',
+diff --git a/packages/app/src/lib/cli-shim.test.ts b/packages/app/src/lib/cli-shim.test.ts
+new file mode 100644
+index 00000000..91dbcbec
+--- /dev/null
++++ b/packages/app/src/lib/cli-shim.test.ts
+@@ -0,0 +1,190 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { spawnSync } from 'node:child_process';
++import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { setLang, t } from '../i18n';
++import {
++  TMEX_SHIM_MARKER,
++  deployCliPackage,
++  installTmexShim,
++  isDirOnPath,
++  removeTmexShims,
++} from './cli-shim';
++import { createInstallLayout } from './install-layout';
++import type { PackageLayout } from './install-layout';
++
++const tempDirs: string[] = [];
++
++afterEach(async () => {
++  setLang('en');
++  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
++});
++
++async function makePackageRoot(): Promise<PackageLayout> {
++  const packageRoot = await mkdtemp(join(tmpdir(), 'tmex-pkg-'));
++  tempDirs.push(packageRoot);
++  await mkdir(join(packageRoot, 'bin'), { recursive: true });
++  await mkdir(join(packageRoot, 'dist'), { recursive: true });
++  await writeFile(
++    join(packageRoot, 'package.json'),
++    `${JSON.stringify({ name: 'tmex-cli', version: '1.1.0', bin: { tmex: './bin/tmex.js' } }, null, 2)}\n`
++  );
++  await writeFile(
++    join(packageRoot, 'bin', 'tmex.js'),
++    "#!/usr/bin/env node\nimport { main } from '../dist/cli-node.js';\n"
++  );
++  await writeFile(join(packageRoot, 'dist', 'cli-node.js'), 'export async function main() {}\n');
++  return {
++    packageRoot,
++    cliDistPath: join(packageRoot, 'dist', 'cli-node.js'),
++    runtimeDirPath: join(packageRoot, 'dist', 'runtime'),
++    resourceFePath: join(packageRoot, 'resources', 'fe-dist'),
++    resourceDrizzlePath: join(packageRoot, 'resources', 'gateway-drizzle'),
++  };
++}
++
++describe('isDirOnPath', () => {
++  test('matches an exact PATH entry after resolve', () => {
++    expect(isDirOnPath('/tmp/local-bin', '/usr/bin:/tmp/local-bin:/bin')).toBe(true);
++    expect(isDirOnPath('/tmp/local-bin', '/usr/bin:/bin')).toBe(false);
++    expect(isDirOnPath('/tmp/local-bin', '')).toBe(false);
++  });
++});
++
++describe('deployCliPackage', () => {
++  test('copies package.json, bin/, and dist/cli-node.js into <installDir>/cli', async () => {
++    const packageLayout = await makePackageRoot();
++    const installDir = await mkdtemp(join(tmpdir(), 'tmex-install-'));
++    tempDirs.push(installDir);
++    const installLayout = createInstallLayout(installDir);
++
++    await deployCliPackage(packageLayout, installLayout);
++
++    expect(await readFile(join(installLayout.cliDir, 'package.json'), 'utf8')).toContain(
++      '"name": "tmex-cli"'
++    );
++    expect(await readFile(join(installLayout.cliDir, 'bin', 'tmex.js'), 'utf8')).toContain(
++      'cli-node.js'
++    );
++    expect(await readFile(join(installLayout.cliDir, 'dist', 'cli-node.js'), 'utf8')).toContain(
++      'export async function main'
++    );
++  });
++});
++
++describe('installTmexShim', () => {
++  test('writes an executable shim that prefers node then baked-in bun path', async () => {
++    const packageLayout = await makePackageRoot();
++    const root = await mkdtemp(join(tmpdir(), 'tmex-shim-'));
++    tempDirs.push(root);
++    const installDir = join(root, 'install');
++    const localBinDir = join(root, 'local-bin');
++    const bunBinDir = join(root, 'no-bun-bin');
++    const bunPath = join(root, 'fake-bun');
++    await writeFile(bunPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
++    const installLayout = createInstallLayout(installDir);
++    await deployCliPackage(packageLayout, installLayout);
++
++    const result = await installTmexShim({
++      installLayout,
++      bunPath,
++      localBinDir,
++      bunBinDir,
++      pathEnv: '/usr/bin:/bin',
++    });
++
++    expect(result.shimPath).toBe(join(localBinDir, 'tmex'));
++    expect(result.bunLinkPath).toBeNull();
++    expect(result.pathHint).toContain(localBinDir);
++
++    const shim = await readFile(result.shimPath, 'utf8');
++    expect(shim.startsWith('#!/usr/bin/env bash')).toBe(true);
++    expect(shim).toContain(TMEX_SHIM_MARKER);
++    expect(shim).toContain('command -v node');
++    expect(shim).toContain(join(installLayout.cliDir, 'bin', 'tmex.js'));
++    expect(shim).toContain(bunPath);
++
++    const mode = (await stat(result.shimPath)).mode;
++    expect((mode & 0o111) !== 0).toBe(true);
++
++    const syntax = spawnSync('bash', ['-n', result.shimPath], { encoding: 'utf8' });
++    expect(syntax.status).toBe(0);
++    expect(syntax.stderr).toBe('');
++  });
++
++  test('symlinks the shim into ~/.bun/bin when that directory exists', async () => {
++    const packageLayout = await makePackageRoot();
++    const root = await mkdtemp(join(tmpdir(), 'tmex-shim-bun-'));
++    tempDirs.push(root);
++    const installDir = join(root, 'install');
++    const localBinDir = join(root, 'local-bin');
++    const bunBinDir = join(root, 'bun-bin');
++    await mkdir(bunBinDir, { recursive: true });
++    const installLayout = createInstallLayout(installDir);
++    await deployCliPackage(packageLayout, installLayout);
++
++    const result = await installTmexShim({
++      installLayout,
++      bunPath: '/usr/bin/bun',
++      localBinDir,
++      bunBinDir,
++      pathEnv: `${localBinDir}:/usr/bin`,
++    });
++
++    expect(result.bunLinkPath).toBe(join(bunBinDir, 'tmex'));
++    expect(result.pathHint).toBeNull();
++    const link = spawnSync('readlink', [result.bunLinkPath as string], { encoding: 'utf8' });
++    expect(link.stdout.trim()).toBe(result.shimPath);
++  });
++
++  test('prints zh-CN PATH hint when local bin is missing from PATH', async () => {
++    setLang('zh-CN');
++    const packageLayout = await makePackageRoot();
++    const root = await mkdtemp(join(tmpdir(), 'tmex-shim-zh-'));
++    tempDirs.push(root);
++    const installLayout = createInstallLayout(join(root, 'install'));
++    await deployCliPackage(packageLayout, installLayout);
++    const localBinDir = join(root, 'local-bin');
++
++    const result = await installTmexShim({
++      installLayout,
++      bunPath: '/usr/bin/bun',
++      localBinDir,
++      bunBinDir: join(root, 'missing-bun-bin'),
++      pathEnv: '/usr/bin',
++    });
++
++    expect(result.pathHint).toBe(t('cli.shim.pathHint', { binDir: localBinDir }));
++    expect(result.pathHint).toContain('PATH');
++    expect(result.pathHint).not.toContain('你');
++  });
++});
++
++describe('removeTmexShims', () => {
++  test('removes managed shim and bun symlink, leaves foreign binaries', async () => {
++    const packageLayout = await makePackageRoot();
++    const root = await mkdtemp(join(tmpdir(), 'tmex-shim-rm-'));
++    tempDirs.push(root);
++    const localBinDir = join(root, 'local-bin');
++    const bunBinDir = join(root, 'bun-bin');
++    await mkdir(bunBinDir, { recursive: true });
++    const installLayout = createInstallLayout(join(root, 'install'));
++    await deployCliPackage(packageLayout, installLayout);
++    await installTmexShim({
++      installLayout,
++      bunPath: '/usr/bin/bun',
++      localBinDir,
++      bunBinDir,
++      pathEnv: localBinDir,
++    });
++    const foreign = join(localBinDir, 'other');
++    await writeFile(foreign, '#!/bin/sh\necho hi\n', { mode: 0o755 });
++
++    await removeTmexShims({ localBinDir, bunBinDir });
++
++    await expect(stat(join(localBinDir, 'tmex'))).rejects.toThrow();
++    await expect(stat(join(bunBinDir, 'tmex'))).rejects.toThrow();
++    expect(await readFile(foreign, 'utf8')).toContain('echo hi');
++  });
++});
+diff --git a/packages/app/src/lib/cli-shim.ts b/packages/app/src/lib/cli-shim.ts
+new file mode 100644
+index 00000000..308bcba3
+--- /dev/null
++++ b/packages/app/src/lib/cli-shim.ts
+@@ -0,0 +1,165 @@
++import { chmod, copyFile, lstat, readlink, rm, symlink } from 'node:fs/promises';
++import { homedir } from 'node:os';
++import { join } from 'node:path';
++import { t } from '../i18n';
++import { ensureDir, pathExists, readText, writeText } from './fs-utils';
++import { quotePosixShellArg } from './install';
++import type { InstallLayout, PackageLayout } from './install-layout';
++
++export const TMEX_SHIM_MARKER = '# tmex-cli shim; managed by tmex init/upgrade';
++
++export function defaultLocalBinDir(): string {
++  return join(homedir(), '.local', 'bin');
++}
++
++export function defaultBunBinDir(): string {
++  return join(homedir(), '.bun', 'bin');
++}
++
++export function isDirOnPath(dir: string, pathEnv: string = process.env.PATH ?? ''): boolean {
++  const needle = dir.replace(/\/+$/, '');
++  return pathEnv.split(':').some((entry) => entry.replace(/\/+$/, '') === needle);
++}
++
++export async function deployCliPackage(
++  packageLayout: PackageLayout,
++  installLayout: InstallLayout
++): Promise<void> {
++  await rm(installLayout.cliDir, { recursive: true, force: true });
++  await ensureDir(join(installLayout.cliDir, 'bin'));
++  await ensureDir(join(installLayout.cliDir, 'dist'));
++  await copyFile(
++    join(packageLayout.packageRoot, 'package.json'),
++    join(installLayout.cliDir, 'package.json')
++  );
++  await copyFile(
++    join(packageLayout.packageRoot, 'bin', 'tmex.js'),
++    join(installLayout.cliDir, 'bin', 'tmex.js')
++  );
++  await copyFile(packageLayout.cliDistPath, join(installLayout.cliDir, 'dist', 'cli-node.js'));
++}
++
++export interface InstallTmexShimOptions {
++  installLayout: InstallLayout;
++  bunPath: string;
++  localBinDir?: string;
++  bunBinDir?: string;
++  pathEnv?: string;
++}
++
++export interface InstallTmexShimResult {
++  shimPath: string;
++  bunLinkPath: string | null;
++  pathHint: string | null;
++}
++
++function buildShimScript(cliJsPath: string, bunPath: string): string {
++  const quotedCli = quotePosixShellArg(cliJsPath);
++  const quotedBun = quotePosixShellArg(bunPath);
++  return [
++    '#!/usr/bin/env bash',
++    TMEX_SHIM_MARKER,
++    'set -euo pipefail',
++    `CLI_JS=${quotedCli}`,
++    'if command -v node >/dev/null 2>&1; then',
++    '  exec node "$CLI_JS" "$@"',
++    'fi',
++    `BUN_PATH=${quotedBun}`,
++    'if [[ -n "$BUN_PATH" && -x "$BUN_PATH" ]]; then',
++    '  exec "$BUN_PATH" "$CLI_JS" "$@"',
++    'fi',
++    'if command -v bun >/dev/null 2>&1; then',
++    '  exec bun "$CLI_JS" "$@"',
++    'fi',
++    'echo "tmex: node or bun is required" >&2',
++    'exit 127',
++    '',
++  ].join('\n');
++}
++
++async function isManagedShim(path: string): Promise<boolean> {
++  try {
++    const info = await lstat(path);
++    if (info.isSymbolicLink()) {
++      const text = await readText(path).catch(() => '');
++      return text.includes(TMEX_SHIM_MARKER);
++    }
++    if (!info.isFile()) {
++      return false;
++    }
++    const text = await readText(path);
++    return text.includes(TMEX_SHIM_MARKER);
++  } catch {
++    return false;
++  }
++}
++
++export async function installTmexShim(
++  options: InstallTmexShimOptions
++): Promise<InstallTmexShimResult> {
++  const localBinDir = options.localBinDir ?? defaultLocalBinDir();
++  const bunBinDir = options.bunBinDir ?? defaultBunBinDir();
++  const pathEnv = options.pathEnv ?? process.env.PATH ?? '';
++  const cliJsPath = join(options.installLayout.cliDir, 'bin', 'tmex.js');
++
++  await ensureDir(localBinDir);
++  const shimPath = join(localBinDir, 'tmex');
++  await writeText(shimPath, buildShimScript(cliJsPath, options.bunPath), 0o755);
++  await chmod(shimPath, 0o755);
++
++  let bunLinkPath: string | null = null;
++  if (await pathExists(bunBinDir)) {
++    const linkPath = join(bunBinDir, 'tmex');
++    await rm(linkPath, { force: true });
++    await symlink(shimPath, linkPath);
++    bunLinkPath = linkPath;
++  }
++
++  const pathHint = isDirOnPath(localBinDir, pathEnv)
++    ? null
++    : t('cli.shim.pathHint', { binDir: localBinDir });
++
++  return { shimPath, bunLinkPath, pathHint };
++}
++
++export async function deployCliAndShim(
++  packageLayout: PackageLayout,
++  installLayout: InstallLayout,
++  bunPath: string,
++  options?: Omit<InstallTmexShimOptions, 'installLayout' | 'bunPath'>
++): Promise<InstallTmexShimResult> {
++  await deployCliPackage(packageLayout, installLayout);
++  return await installTmexShim({
++    installLayout,
++    bunPath,
++    ...options,
++  });
++}
++
++export async function removeTmexShims(options?: {
++  localBinDir?: string;
++  bunBinDir?: string;
++}): Promise<void> {
++  const localBinDir = options?.localBinDir ?? defaultLocalBinDir();
++  const bunBinDir = options?.bunBinDir ?? defaultBunBinDir();
++  const shimPath = join(localBinDir, 'tmex');
++  const bunLinkPath = join(bunBinDir, 'tmex');
++
++  if (await isManagedShim(shimPath)) {
++    await rm(shimPath, { force: true });
++  }
++
++  try {
++    const info = await lstat(bunLinkPath);
++    if (info.isSymbolicLink()) {
++      const target = await readlink(bunLinkPath).catch(() => '');
++      if (target === shimPath || (await isManagedShim(bunLinkPath))) {
++        await rm(bunLinkPath, { force: true });
++      }
++    } else if (await isManagedShim(bunLinkPath)) {
++      await rm(bunLinkPath, { force: true });
++    }
++  } catch {
++    // bun bin dir or link may not exist
++  }
++}
+diff --git a/packages/app/src/lib/install-layout.test.ts b/packages/app/src/lib/install-layout.test.ts
+index a73e7581..f4198504 100644
+--- a/packages/app/src/lib/install-layout.test.ts
++++ b/packages/app/src/lib/install-layout.test.ts
+@@ -12,5 +12,6 @@ describe('createInstallLayout', () => {
+     );
+     expect(layout.runtimeServerPath).toBe(join('/tmp/tmex-install-test', 'runtime', 'server.js'));
+     expect(layout.envPath).toBe(join('/tmp/tmex-install-test', 'app.env'));
++    expect(layout.cliDir).toBe(join('/tmp/tmex-install-test', 'cli'));
+   });
+ });
+diff --git a/packages/app/src/lib/install-layout.ts b/packages/app/src/lib/install-layout.ts
+index 3be98704..8a16cd74 100644
+--- a/packages/app/src/lib/install-layout.ts
++++ b/packages/app/src/lib/install-layout.ts
+@@ -24,6 +24,7 @@ export interface InstallLayout {
+   envPath: string;
+   runScriptPath: string;
+   metaPath: string;
++  cliDir: string;
+ }
+ 
+ export function createInstallLayout(installDir: string): InstallLayout {
+@@ -39,6 +40,7 @@ export function createInstallLayout(installDir: string): InstallLayout {
+     envPath: join(installDir, 'app.env'),
+     runScriptPath: join(installDir, 'run.sh'),
+     metaPath: join(installDir, 'install-meta.json'),
++    cliDir: join(installDir, 'cli'),
+   };
+ }
+ 
+diff --git a/packages/app/src/lib/install-script.test.ts b/packages/app/src/lib/install-script.test.ts
+new file mode 100644
+index 00000000..66f41c5d
+--- /dev/null
++++ b/packages/app/src/lib/install-script.test.ts
+@@ -0,0 +1,62 @@
++import { describe, expect, test } from 'bun:test';
++import { spawnSync } from 'node:child_process';
++import { resolve } from 'node:path';
++
++const installSh = resolve(import.meta.dir, '../../../../install.sh');
++
++function sourceEval(
++  fnCall: string,
++  extra = ''
++): { status: number; stdout: string; stderr: string } {
++  const script = `${extra}
++source ${JSON.stringify(installSh)}
++${fnCall}
++`;
++  const result = spawnSync('bash', ['-c', script], { encoding: 'utf8' });
++  return {
++    status: result.status ?? 1,
++    stdout: result.stdout,
++    stderr: result.stderr,
++  };
++}
++
++describe('install.sh helpers', () => {
++  test('bash -n passes', () => {
++    const result = spawnSync('bash', ['-n', installSh], { encoding: 'utf8' });
++    expect(result.status).toBe(0);
++    expect(result.stderr).toBe('');
++  });
++
++  test('tmex_parse_tag_name reads compact and pretty GitHub JSON', () => {
++    const compact = sourceEval(`tmex_parse_tag_name '{"tag_name":"v1.1.0","name":"x"}'`);
++    expect(compact.status).toBe(0);
++    expect(compact.stdout.trim()).toBe('v1.1.0');
++
++    const pretty = sourceEval(`tmex_parse_tag_name "$(cat <<'JSON'
++{
++  "url": "https://api.github.com/repos/12dora/tmex-enhanced/releases/1",
++  "tag_name": "v2.3.4",
++  "assets": []
++}
++JSON
++)"`);
++    expect(pretty.status).toBe(0);
++    expect(pretty.stdout.trim()).toBe('v2.3.4');
++  });
++
++  test('tmex_version_from_tag strips a leading v', () => {
++    const result = sourceEval(
++      'tmex_version_from_tag v1.1.0; printf "\\n"; tmex_version_from_tag 1.1.0'
++    );
++    expect(result.status).toBe(0);
++    expect(result.stdout.trim().split('\n')).toEqual(['1.1.0', '1.1.0']);
++  });
++
++  test('tmex_version_ge compares dotted versions', () => {
++    const ge = sourceEval(
++      'tmex_version_ge 1.3.0 1.3.0 && tmex_version_ge 1.3.1 1.3.0 && ! tmex_version_ge 1.2.9 1.3.0 && echo ok'
++    );
++    expect(ge.status).toBe(0);
++    expect(ge.stdout.trim()).toBe('ok');
++  });
++});
+diff --git a/packages/app/src/lib/install.ts b/packages/app/src/lib/install.ts
+index 0dd8baa6..d89aa7b9 100644
+--- a/packages/app/src/lib/install.ts
++++ b/packages/app/src/lib/install.ts
+@@ -164,6 +164,10 @@ export async function backupInstallArtifacts(
+   if (await pathExists(installLayout.metaPath)) {
+     await copyFile(installLayout.metaPath, resolve(backupDir, 'install-meta.json'));
+   }
++
++  if (await pathExists(installLayout.cliDir)) {
++    await copyDirectory(installLayout.cliDir, resolve(backupDir, 'cli'));
++  }
+ }
+ 
+ export async function restoreInstallArtifacts(
+@@ -174,9 +178,11 @@ export async function restoreInstallArtifacts(
+   const resourcesBackup = resolve(backupDir, 'resources');
+   const runScriptBackup = resolve(backupDir, 'run.sh');
+   const metaBackup = resolve(backupDir, 'install-meta.json');
++  const cliBackup = resolve(backupDir, 'cli');
+ 
+   await rm(installLayout.runtimeDir, { recursive: true, force: true });
+   await rm(installLayout.resourcesDir, { recursive: true, force: true });
++  await rm(installLayout.cliDir, { recursive: true, force: true });
+ 
+   if (await pathExists(runtimeBackup)) {
+     await copyDirectory(runtimeBackup, installLayout.runtimeDir);
+@@ -193,4 +199,8 @@ export async function restoreInstallArtifacts(
+   if (await pathExists(metaBackup)) {
+     await copyFile(metaBackup, installLayout.metaPath);
+   }
++
++  if (await pathExists(cliBackup)) {
++    await copyDirectory(cliBackup, installLayout.cliDir);
++  }
+ }
+diff --git a/packages/app/src/lib/release-fetch.test.ts b/packages/app/src/lib/release-fetch.test.ts
+new file mode 100644
+index 00000000..3997dce3
+--- /dev/null
++++ b/packages/app/src/lib/release-fetch.test.ts
+@@ -0,0 +1,102 @@
++import { describe, expect, test } from 'bun:test';
++import { mkdtemp, readFile, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import {
++  RELEASE_API_LATEST_URL,
++  releaseTarballName,
++  releaseTarballUrl,
++} from '../../../shared/src/release/source';
++import { t } from '../i18n';
++import {
++  downloadReleaseTarball,
++  parseLatestReleaseVersion,
++  resolveReleaseVersion,
++  versionFromTagName,
++} from './release-fetch';
++
++function jsonResponse(status: number, body: string | Uint8Array): Response {
++  return new Response(body, { status, headers: { 'Content-Type': 'application/json' } });
++}
++
++describe('versionFromTagName', () => {
++  test('strips a leading v', () => {
++    expect(versionFromTagName('v1.1.0')).toBe('1.1.0');
++    expect(versionFromTagName('1.1.0')).toBe('1.1.0');
++    expect(versionFromTagName('v1.1.0-beta.1')).toBe('1.1.0-beta.1');
++  });
++});
++
++describe('parseLatestReleaseVersion', () => {
++  test('reads tag_name from GitHub latest-release JSON', () => {
++    expect(parseLatestReleaseVersion('{"tag_name":"v1.1.0","name":"1.1.0"}')).toBe('1.1.0');
++    expect(
++      parseLatestReleaseVersion('{\n  "url": "https://example",\n  "tag_name": "v2.0.0"\n}')
++    ).toBe('2.0.0');
++  });
++
++  test('rejects JSON without tag_name', () => {
++    expect(() => parseLatestReleaseVersion('{"name":"nope"}')).toThrow();
++  });
++});
++
++describe('resolveReleaseVersion', () => {
++  test('uses an explicit version without calling the API', async () => {
++    const calls: string[] = [];
++    const version = await resolveReleaseVersion('v1.2.3', async (url) => {
++      calls.push(String(url));
++      return jsonResponse(500, '{}');
++    });
++    expect(version).toBe('1.2.3');
++    expect(calls).toEqual([]);
++  });
++
++  test('fetches latest when requested version is latest or empty', async () => {
++    const version = await resolveReleaseVersion('latest', async (url) => {
++      expect(String(url)).toBe(RELEASE_API_LATEST_URL);
++      return jsonResponse(200, '{"tag_name":"v1.4.0"}');
++    });
++    expect(version).toBe('1.4.0');
++  });
++
++  test('maps HTTP 404 to a version-not-found error', async () => {
++    await expect(
++      resolveReleaseVersion('latest', async () => jsonResponse(404, '{"message":"Not Found"}'))
++    ).rejects.toThrow(t('upgrade.versionNotFound', { version: 'latest' }));
++  });
++
++  test('maps network failure to a clear error', async () => {
++    await expect(
++      resolveReleaseVersion('latest', async () => {
++        throw new Error('getaddrinfo ENOTFOUND');
++      })
++    ).rejects.toThrow(/GitHub|网络|getaddrinfo/i);
++  });
++});
++
++describe('downloadReleaseTarball', () => {
++  test('writes the tarball body for a successful download', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'tmex-dl-'));
++    try {
++      const dest = join(dir, releaseTarballName('1.1.0'));
++      await downloadReleaseTarball('1.1.0', dest, async (url) => {
++        expect(String(url)).toBe(releaseTarballUrl('1.1.0'));
++        return new Response(Buffer.from('tarball-bytes'), { status: 200 });
++      });
++      expect(await readFile(dest, 'utf8')).toBe('tarball-bytes');
++    } finally {
++      await rm(dir, { recursive: true, force: true });
++    }
++  });
++
++  test('maps HTTP 404 to version/asset missing', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'tmex-dl-404-'));
++    try {
++      await expect(
++        downloadReleaseTarball('9.9.9', join(dir, 'x.tgz'), async () => jsonResponse(404, 'nope'))
++      ).rejects.toThrow(t('upgrade.versionNotFound', { version: '9.9.9' }));
++    } finally {
++      await rm(dir, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/packages/app/src/lib/release-fetch.ts b/packages/app/src/lib/release-fetch.ts
+new file mode 100644
+index 00000000..b3af876b
+--- /dev/null
++++ b/packages/app/src/lib/release-fetch.ts
+@@ -0,0 +1,79 @@
++import { writeFile } from 'node:fs/promises';
++import { RELEASE_API_LATEST_URL, releaseTarballUrl } from '../../../shared/src/release/source';
++import { t } from '../i18n';
++
++const GITHUB_HEADERS = {
++  Accept: 'application/vnd.github+json',
++  'User-Agent': 'tmex-cli',
++};
++
++export type ReleaseFetch = (url: string | URL, init?: RequestInit) => Promise<Response>;
++
++export function versionFromTagName(tagName: string): string {
++  return tagName.trim().replace(/^v/i, '');
++}
++
++export function parseLatestReleaseVersion(body: string): string {
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(body);
++  } catch {
++    throw new Error(t('upgrade.latestLookupFailed'));
++  }
++  if (typeof parsed !== 'object' || parsed === null) {
++    throw new Error(t('upgrade.latestLookupFailed'));
++  }
++  const tag = (parsed as { tag_name?: unknown }).tag_name;
++  if (typeof tag !== 'string' || !tag.trim()) {
++    throw new Error(t('upgrade.latestLookupFailed'));
++  }
++  return versionFromTagName(tag);
++}
++
++function networkError(detail: string): Error {
++  return new Error(t('upgrade.networkFailed', { detail }));
++}
++
++async function githubFetch(
++  url: string,
++  fetchFn: ReleaseFetch,
++  versionLabel: string
++): Promise<Response> {
++  let response: Response;
++  try {
++    response = await fetchFn(url, { headers: GITHUB_HEADERS, redirect: 'follow' });
++  } catch (error) {
++    const detail = error instanceof Error ? error.message : String(error);
++    throw networkError(detail);
++  }
++  if (response.status === 404) {
++    throw new Error(t('upgrade.versionNotFound', { version: versionLabel }));
++  }
++  if (!response.ok) {
++    throw networkError(`HTTP ${response.status}`);
++  }
++  return response;
++}
++
++export async function resolveReleaseVersion(
++  requested: string,
++  fetchFn: ReleaseFetch = fetch
++): Promise<string> {
++  const trimmed = requested.trim();
++  if (trimmed && trimmed !== 'latest') {
++    return versionFromTagName(trimmed);
++  }
++  const response = await githubFetch(RELEASE_API_LATEST_URL, fetchFn, 'latest');
++  const body = await response.text();
++  return parseLatestReleaseVersion(body);
++}
++
++export async function downloadReleaseTarball(
++  version: string,
++  destFile: string,
++  fetchFn: ReleaseFetch = fetch
++): Promise<void> {
++  const response = await githubFetch(releaseTarballUrl(version), fetchFn, version);
++  const buf = Buffer.from(await response.arrayBuffer());
++  await writeFile(destFile, buf);
++}
+diff --git a/scripts/release.ts b/scripts/release.ts
+index 4e5568f1..587f4861 100644
+--- a/scripts/release.ts
++++ b/scripts/release.ts
+@@ -197,8 +197,9 @@ function main(): void {
+   );
+   console.log('  3) bun run build && bun run test:tmex');
+   console.log(
+-    `  4) git commit -am "chore(release): tmex-cli ${args.version}" && bun run publish:tmex`
++    `  4) git commit -am "chore(release): tmex-cli ${args.version}" && git tag v${args.version} && git push origin v${args.version}`
+   );
++  console.log('     Pushing the v* tag publishes tmex-cli-<version>.tgz to GitHub Releases.');
+ }
+ 
+ main();

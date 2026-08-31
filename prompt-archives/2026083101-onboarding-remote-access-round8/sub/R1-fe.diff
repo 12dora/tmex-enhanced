@@ -1,0 +1,3500 @@
+diff --git a/apps/fe/src/components/page-layouts/components/app-sidebar-footer.test.tsx b/apps/fe/src/components/page-layouts/components/app-sidebar-footer.test.tsx
+new file mode 100644
+index 00000000..3d59bfc0
+--- /dev/null
++++ b/apps/fe/src/components/page-layouts/components/app-sidebar-footer.test.tsx
+@@ -0,0 +1,60 @@
++// 侧栏底部两个入口：「接入更多设备」（右侧滑出面板）与「管理设备」并排，样式同为 SidebarMenuButton。
++// 无 DOM 测试环境，用 react-dom/server 静态渲染（与 sidebar-title 测试同一套做法）。
++
++import { describe, expect, test } from 'bun:test';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++
++installWindowStorage();
++
++(globalThis.window as unknown as { matchMedia: unknown }).matchMedia = () => ({
++  matches: true,
++  addEventListener: () => undefined,
++  removeEventListener: () => undefined,
++});
++
++const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query');
++const { renderToStaticMarkup } = await import('react-dom/server');
++const { MemoryRouter } = await import('react-router');
++const { RuntimeProvider } = await import('@tmex/stores/react');
++const { SidebarProvider } = await import('@tmex/ui/sidebar');
++const { appNodeRuntimes } = await import('@/node/node-runtimes');
++const { GlobalDeviceProvider } = await import('@/components/global-device-provider');
++const { AppSidebar } = await import('./app-sidebar');
++
++function render(): string {
++  const runtime = appNodeRuntimes.get('self').runtime;
++  // 静态渲染不跑 effect，不会真的发请求；这里只是补上 GlobalDeviceProvider 需要的 provider 链。
++  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  const html = renderToStaticMarkup(
++    <MemoryRouter>
++      <RuntimeProvider runtime={runtime}>
++        <QueryClientProvider client={queryClient}>
++          <GlobalDeviceProvider>
++            <SidebarProvider>
++              <AppSidebar />
++            </SidebarProvider>
++          </GlobalDeviceProvider>
++        </QueryClientProvider>
++      </RuntimeProvider>
++    </MemoryRouter>
++  );
++  return html;
++}
++
++describe('AppSidebar 底部导航', () => {
++  test('「接入更多设备」入口指向当前页的 connect 面板，且带无障碍标签', () => {
++    const html = render();
++    expect(html).toContain('data-testid="sidebar-connect-devices"');
++    expect(html).toContain('href="/?panel=connect"');
++    expect(html).toContain('aria-label="nav.connectDevices"');
++  });
++
++  test('「管理设备」入口仍在，两者同为 SidebarMenuButton 并排一行', () => {
++    const html = render();
++    expect(html).toContain('href="/devices"');
++    expect(html).toContain('aria-label="nav.manageDevices"');
++    const buttons = html.split('data-slot="sidebar-menu-button"').length - 1;
++    expect(buttons).toBe(2);
++    expect(html).toContain('data-slot="sidebar-menu"');
++  });
++});
+diff --git a/apps/fe/src/components/page-layouts/components/app-sidebar.tsx b/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
+index 40a08723..1dd720fa 100644
+--- a/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
++++ b/apps/fe/src/components/page-layouts/components/app-sidebar.tsx
+@@ -1,7 +1,8 @@
+-import { Bot, FolderClosed, Monitor, PanelsTopLeft } from 'lucide-react';
++import { Bot, CirclePlus, FolderClosed, Monitor, PanelsTopLeft } from 'lucide-react';
+ import { type ComponentProps, Suspense, lazy } from 'react';
+ import { useTranslation } from 'react-i18next';
+ 
++import { SIDE_PANEL_LINK_STATE, useSidePanel } from '@/components/side-panels/use-side-panel';
+ import { useNodeOffline } from '@/node/node-offline';
+ import { useRouteNodeId } from '@/node/node-runtime-boundary';
+ import { NodeRuntimeScope } from '@/node/node-runtime-scope';
+@@ -10,7 +11,7 @@ import { useUIStore } from '@tmex/stores/react';
+ import { Reveal } from '@tmex/ui/motion';
+ import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader } from '@tmex/ui/sidebar';
+ import { Tabs, TabsList, TabsTrigger, pillTabTriggerClassName } from '@tmex/ui/tabs';
+-import { NavMain } from './nav-main';
++import { NavMain, type NavMainItem } from './nav-main';
+ import { SideBarDeviceList } from './sidebar-device-list';
+ import { SidebarTitle } from './sidebar-title';
+ 
+@@ -19,13 +20,11 @@ import { SidebarTitle } from './sidebar-title';
+ const AgentTab = lazy(() => import('@tmex/panels/agent').then((m) => ({ default: m.AgentTab })));
+ const FilesTab = lazy(() => import('@tmex/panels/files').then((m) => ({ default: m.FilesTab })));
+ 
+-const navMainItems = [
+-  {
+-    title: 'nav.manageDevices',
+-    url: '/devices',
+-    icon: Monitor,
+-  },
+-];
++const manageDevicesItem: NavMainItem = {
++  title: 'nav.manageDevices',
++  url: '/devices',
++  icon: Monitor,
++};
+ 
+ export function AppSidebar({ ...props }: ComponentProps<typeof Sidebar>) {
+   const { t } = useTranslation();
+@@ -35,6 +34,18 @@ export function AppSidebar({ ...props }: ComponentProps<typeof Sidebar>) {
+   // 单独套一层该 node 的运行时（切 node 时这两块重挂是预期的，设备树不受影响）
+   const routeNodeId = useRouteNodeId();
+   const routeNodeOffline = useNodeOffline(routeNodeId);
++  // 「接入更多设备」是右侧滑出面板：入口保持链接形态（可右键新开、可分享）。
++  const { hrefFor } = useSidePanel();
++  const footerItems: NavMainItem[] = [
++    {
++      title: 'nav.connectDevices',
++      url: hrefFor('connect'),
++      icon: CirclePlus,
++      testId: 'sidebar-connect-devices',
++      linkState: SIDE_PANEL_LINK_STATE,
++    },
++    manageDevicesItem,
++  ];
+ 
+   return (
+     <Sidebar variant="inset" {...props}>
+@@ -101,7 +112,7 @@ export function AppSidebar({ ...props }: ComponentProps<typeof Sidebar>) {
+         )}
+       </SidebarContent>
+       <SidebarFooter>
+-        <NavMain items={navMainItems} />
++        <NavMain items={footerItems} />
+         <div className="h-[var(--tmex-safe-area-bottom)]" />
+       </SidebarFooter>
+     </Sidebar>
+diff --git a/apps/fe/src/components/page-layouts/components/nav-main.tsx b/apps/fe/src/components/page-layouts/components/nav-main.tsx
+index db8f42bf..bee22de1 100644
+--- a/apps/fe/src/components/page-layouts/components/nav-main.tsx
++++ b/apps/fe/src/components/page-layouts/components/nav-main.tsx
+@@ -33,35 +33,44 @@ export function isPathActive(pathname: string, url: string): boolean {
+   return normalizeNavPath(pathname) === normalizeNavPath(url);
+ }
+ 
+-export function NavMain({
+-  items,
+-}: {
+-  items: {
++export interface NavMainItem {
++  title: string;
++  url: string;
++  icon: LucideIcon;
++  /** 面板入口这类只带查询串的目标（`?panel=…`）走这里带上 history state 与测试锚点。 */
++  testId?: string;
++  linkState?: unknown;
++  items?: {
+     title: string;
+     url: string;
+-    icon: LucideIcon;
+-    items?: {
+-      title: string;
+-      url: string;
+-    }[];
+   }[];
+-}) {
++}
++
++export function NavMain({ items }: { items: NavMainItem[] }) {
+   const { t } = useTranslation();
+   const { pathname } = useLocation();
+ 
+   return (
+     <SidebarGroup>
+-      <SidebarMenu>
++      {/* 底部两个入口并排；折叠成图标条时没有并排的宽度，改回竖排。 */}
++      <SidebarMenu className="flex-row gap-1 group-data-[collapsible=icon]:flex-col">
+         {items.map((item) => {
+           const active =
+-            isPathActive(pathname, item.url) ||
+-            Boolean(item.items?.some((subItem) => isPathActive(pathname, subItem.url)));
++            item.url.startsWith('/') &&
++            (isPathActive(pathname, item.url) ||
++              Boolean(item.items?.some((subItem) => isPathActive(pathname, subItem.url))));
+           return (
+-            <Collapsible key={item.title} defaultOpen={active} render={<SidebarMenuItem />}>
++            <Collapsible
++              key={item.title}
++              defaultOpen={active}
++              render={<SidebarMenuItem className="min-w-0 flex-1" />}
++            >
+               <SidebarMenuButton
+                 isActive={active}
+                 tooltip={t(item.title)}
+-                render={<NavLink to={item.url} />}
++                aria-label={t(item.title)}
++                data-testid={item.testId}
++                render={<NavLink to={item.url} state={item.linkState} />}
+               >
+                 <item.icon />
+                 <span>{t(item.title)}</span>
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-title.test.tsx b/apps/fe/src/components/page-layouts/components/sidebar-title.test.tsx
+index d13a3545..3c0024e8 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-title.test.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-title.test.tsx
+@@ -1,4 +1,4 @@
+-// 侧边栏标题行：mesh 时多一个「多节点互联」入口（打开右侧滑出面板 `?panel=nodes`），standalone / 未加载时没有。
++// 侧边栏标题行：品牌块 + 主题 / 设置两个图标入口。「多节点互联」入口已并入设置页与「接入更多设备」面板。
+ // 无 DOM 测试环境，用 react-dom/server 静态渲染（与 sidebar-device-list 测试同一套做法）。
+ 
+ import { describe, expect, test } from 'bun:test';
+@@ -57,31 +57,27 @@ describe('SidebarTitle', () => {
+     expect(html).toContain('href="/"');
+   });
+ 
+-  test('mesh 模式渲染节点入口，指向 `?panel=nodes` 而不是设置页', () => {
++  test('mesh 模式也不再渲染顶栏节点入口，设置入口仍在', () => {
+     const html = render(MESH_MODE);
+-    expect(html).toContain('data-testid="sidebar-nodes"');
+-    expect(html).toContain('href="/?panel=nodes"');
+-    expect(html).not.toContain('href="/settings?tab=nodes"');
+-    expect(html).toContain('data-testid="sidebar-settings"');
+-  });
+-
+-  test('standalone（mode:none）不渲染节点入口，设置入口仍在', () => {
+-    const html = render({ ...MESH_MODE, mode: 'none' });
+     expect(html).not.toContain('data-testid="sidebar-nodes"');
+     expect(html).not.toContain('panel=nodes');
+     expect(html).toContain('data-testid="sidebar-settings"');
++    expect(html).toContain('href="/settings"');
+   });
+ 
+-  test('mode 未加载完成时不渲染节点入口（不能先闪一下再消失）', () => {
+-    const html = render(null);
+-    expect(html).not.toContain('data-testid="sidebar-nodes"');
++  test('standalone（mode:none）与未加载时同样只有设置入口', () => {
++    for (const mode of [{ ...MESH_MODE, mode: 'none' as const }, null]) {
++      const html = render(mode);
++      expect(html).not.toContain('data-testid="sidebar-nodes"');
++      expect(html).toContain('data-testid="sidebar-settings"');
++    }
+   });
+ 
+-  test('纯图标入口都带 aria-label 与说明气泡（主题、节点、设置各一枚）', () => {
++  test('纯图标入口都带 aria-label 与说明气泡（主题、设置各一枚）', () => {
+     const html = render(MESH_MODE);
+-    for (const label of ['settings.theme', 'sidebar.nodes', 'sidebar.settings']) {
++    for (const label of ['settings.theme', 'sidebar.settings']) {
+       expect(html).toContain(`aria-label="${label}"`);
+     }
+-    expect(html.split('data-slot="tooltip-trigger"').length - 1).toBe(3);
++    expect(html.split('data-slot="tooltip-trigger"').length - 1).toBe(2);
+   });
+ });
+diff --git a/apps/fe/src/components/page-layouts/components/sidebar-title.tsx b/apps/fe/src/components/page-layouts/components/sidebar-title.tsx
+index 1898ad1a..01427336 100644
+--- a/apps/fe/src/components/page-layouts/components/sidebar-title.tsx
++++ b/apps/fe/src/components/page-layouts/components/sidebar-title.tsx
+@@ -1,25 +1,20 @@
+ import { Brand } from '@/components/brand';
+-import { SIDE_PANEL_LINK_STATE, useSidePanel } from '@/components/side-panels/use-side-panel';
+-import { useSharedAuthMode } from '@/node/mesh-nodes';
+ import { useSiteStore, useTmuxStore } from '@tmex/stores/react';
+ import { IconTooltip } from '@tmex/ui/icon-tooltip';
+ import { useSidebar } from '@tmex/ui/sidebar';
+-import { Network, Settings, X } from 'lucide-react';
++import { Settings, X } from 'lucide-react';
+ import { useEffect } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { NavLink } from './nav-link';
+ import { ThemeMenu } from './theme-menu';
+ 
+-/** 顶部动作按钮统一尺寸：mesh 下最多四个（延迟、主题、节点、设置），必须挤进一行。 */
++/** 顶部动作按钮统一尺寸：最多三个（延迟、主题、设置），必须挤进一行。 */
+ const ACTION_BUTTON_CLASS =
+   'inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent hover:text-foreground';
+ 
+ export function SidebarTitle() {
+   const { t } = useTranslation();
+   const { isMobile, setOpenMobile } = useSidebar();
+-  const { meshEnabled } = useSharedAuthMode();
+-  // 「多节点互联」改成右侧滑出面板：不离开当前页面，链接形态保留（可右键新开、可分享）。
+-  const { hrefFor } = useSidePanel();
+ 
+   // Fetch settings on mount if not loaded
+   const fetchSettings = useSiteStore((state) => state.fetchSettings);
+@@ -47,19 +42,6 @@ export function SidebarTitle() {
+       <div className="flex shrink-0 items-center gap-0.5 mr-[-8px]">
+         <WsLatency />
+         <ThemeMenu />
+-        {meshEnabled && (
+-          <IconTooltip label={t('sidebar.nodes')}>
+-            <NavLink
+-              to={hrefFor('nodes')}
+-              state={SIDE_PANEL_LINK_STATE}
+-              className={ACTION_BUTTON_CLASS}
+-              data-testid="sidebar-nodes"
+-              aria-label={t('sidebar.nodes')}
+-            >
+-              <Network className="h-4 w-4" />
+-            </NavLink>
+-          </IconTooltip>
+-        )}
+         <IconTooltip label={t('sidebar.settings')}>
+           <NavLink
+             to="/settings"
+diff --git a/apps/fe/src/components/side-panels/connect-devices/command-block.tsx b/apps/fe/src/components/side-panels/connect-devices/command-block.tsx
+new file mode 100644
+index 00000000..b842ee01
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/command-block.tsx
+@@ -0,0 +1,40 @@
++// 指引里的命令 / 地址块：等宽展示 + 一键复制。复制状态与播报沿用节点设置那套。
++
++import { CopyLabel, useCopyToClipboard } from '@/pages/settings/nodes/copy-feedback';
++import { Button } from '@tmex/ui/button';
++import { Check, Copy } from 'lucide-react';
++
++export function CommandBlock({
++  value,
++  testId,
++  label,
++}: {
++  value: string;
++  testId: string;
++  label?: string;
++}) {
++  const { copied, copy } = useCopyToClipboard(value);
++  return (
++    <div className="flex flex-col gap-1">
++      {label ? <span className="text-[11px] text-muted-foreground">{label}</span> : null}
++      <div className="flex items-start gap-1">
++        <code
++          className="min-w-0 flex-1 overflow-x-auto break-all rounded-lg bg-muted/50 p-2 font-mono text-[11px]"
++          data-testid={`command-block-${testId}`}
++        >
++          {value}
++        </code>
++        <Button
++          type="button"
++          size="xs"
++          variant="outline"
++          onClick={copy}
++          data-testid={`command-block-${testId}-copy`}
++        >
++          {copied ? <Check className="tmex-scale-in" /> : <Copy className="tmex-scale-in" />}
++          <CopyLabel copied={copied} />
++        </Button>
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/components/side-panels/connect-devices/computer-guide.tsx b/apps/fe/src/components/side-panels/connect-devices/computer-guide.tsx
+new file mode 100644
+index 00000000..671db205
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/computer-guide.tsx
+@@ -0,0 +1,141 @@
++// 「服务器或电脑」页：安装 → 选接入方式 → 两条分支各自的分步指引。
++// 分支步骤接着前两步继续编号，读起来是一条连续的流程。
++
++import { INSTALL_COMMAND } from '@tmex/shared';
++import { useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { CommandBlock } from './command-block';
++import { GuideLink, GuideStep } from './guide-step';
++import { GuideTabs } from './guide-tabs';
++
++type Mode = 'join' | 'host';
++
++const MODES: Mode[] = ['join', 'host'];
++const PATH_COMMAND = 'export PATH="$HOME/.local/bin:$PATH"';
++/** 安装、选择接入方式两步固定在前，分支步骤从 3 开始。 */
++const BRANCH_STEP_OFFSET = 3;
++
++export function JoinSteps() {
++  const { t } = useTranslation();
++  const prefix = 'connectDevices.computer.join';
++  return (
++    <>
++      <GuideStep
++        index={BRANCH_STEP_OFFSET}
++        testId="connect-step-join-hub"
++        title={t(`${prefix}.hub.title`)}
++        description={t(`${prefix}.hub.description`)}
++      />
++      <GuideStep
++        index={BRANCH_STEP_OFFSET + 1}
++        testId="connect-step-join-token"
++        title={t(`${prefix}.token.title`)}
++        description={t(`${prefix}.token.description`)}
++      >
++        <GuideLink to="/settings?tab=nodes" testId="connect-join-token-link">
++          {t(`${prefix}.token.link`)}
++        </GuideLink>
++      </GuideStep>
++      <GuideStep
++        index={BRANCH_STEP_OFFSET + 2}
++        testId="connect-step-join-run"
++        title={t(`${prefix}.run.title`)}
++        description={t(`${prefix}.run.description`)}
++      >
++        <CommandBlock value={t(`${prefix}.run.example`)} testId="join" />
++      </GuideStep>
++      <GuideStep
++        index={BRANCH_STEP_OFFSET + 3}
++        testId="connect-step-join-confirm"
++        title={t(`${prefix}.confirm.title`)}
++        description={t(`${prefix}.confirm.description`)}
++      />
++    </>
++  );
++}
++
++export function HostSteps() {
++  const { t } = useTranslation();
++  const prefix = 'connectDevices.computer.host';
++  return (
++    <>
++      <GuideStep
++        index={BRANCH_STEP_OFFSET}
++        testId="connect-step-host-entry"
++        title={t(`${prefix}.entry.title`)}
++        description={t(`${prefix}.entry.description`)}
++      >
++        <GuideLink to="/settings?tab=remoteAccess" testId="connect-host-entry-link">
++          {t(`${prefix}.entry.link`)}
++        </GuideLink>
++      </GuideStep>
++      <GuideStep
++        index={BRANCH_STEP_OFFSET + 1}
++        testId="connect-step-host-hub"
++        title={t(`${prefix}.hub.title`)}
++        description={t(`${prefix}.hub.description`)}
++      >
++        <p
++          className="rounded-lg bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400"
++          data-testid="connect-host-hub-warning"
++        >
++          {t(`${prefix}.hub.warning`)}
++        </p>
++        <GuideLink to="/settings?tab=nodes" testId="connect-host-hub-link">
++          {t(`${prefix}.hub.link`)}
++        </GuideLink>
++      </GuideStep>
++      <GuideStep
++        index={BRANCH_STEP_OFFSET + 2}
++        testId="connect-step-host-invite"
++        title={t(`${prefix}.invite.title`)}
++        description={t(`${prefix}.invite.description`)}
++      />
++    </>
++  );
++}
++
++export function ComputerGuide() {
++  const { t } = useTranslation();
++  const [mode, setMode] = useState<Mode>('join');
++
++  return (
++    <div className="space-y-3">
++      <p className="text-xs text-muted-foreground">{t('connectDevices.computer.intro')}</p>
++      <div className="space-y-2">
++        <GuideStep
++          index={1}
++          testId="connect-step-install"
++          title={t('connectDevices.computer.install.title')}
++          description={t('connectDevices.computer.install.description')}
++        >
++          <CommandBlock
++            value={INSTALL_COMMAND}
++            testId="install"
++            label={t('connectDevices.computer.install.command')}
++          />
++          <p className="text-xs text-muted-foreground">
++            {t('connectDevices.computer.install.pathHint')}
++          </p>
++          <CommandBlock value={PATH_COMMAND} testId="path" />
++        </GuideStep>
++        <GuideStep
++          index={2}
++          testId="connect-step-mode"
++          title={t('connectDevices.computer.mode.title')}
++        >
++          <GuideTabs
++            value={mode}
++            onValueChange={setMode}
++            options={MODES.map((value) => ({
++              value,
++              label: t(`connectDevices.computer.mode.${value}`),
++              testId: `connect-mode-${value}`,
++            }))}
++          />
++        </GuideStep>
++        {mode === 'join' ? <JoinSteps /> : <HostSteps />}
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx b/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx
+new file mode 100644
+index 00000000..9f9de897
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.test.tsx
+@@ -0,0 +1,97 @@
++// 「接入更多设备」面板：默认页（移动设备 / iOS）与两条分支的静态渲染断言。
++// 无 DOM 测试环境，用 react-dom/server 静态渲染，点不了标签；换页后的内容直接渲染对应子组件。
++
++import { describe, expect, test } from 'bun:test';
++import { INSTALL_COMMAND } from '@tmex/shared';
++import { installWindowStorage } from '@tmex/stores/test-utils';
++
++installWindowStorage();
++
++// SidebarProvider（NavLink 依赖）在构造 state 时就读 matchMedia。
++(globalThis.window as unknown as { matchMedia: unknown }).matchMedia = () => ({
++  matches: true,
++  addEventListener: () => undefined,
++  removeEventListener: () => undefined,
++});
++
++const { renderToStaticMarkup } = await import('react-dom/server');
++const { MemoryRouter } = await import('react-router');
++const { RuntimeProvider } = await import('@tmex/stores/react');
++const { SidebarProvider } = await import('@tmex/ui/sidebar');
++const { appNodeRuntimes } = await import('@/node/node-runtimes');
++const ConnectDevicesPanel = (await import('./connect-devices-panel')).default;
++const { MobilePlatformSteps } = await import('./mobile-guide');
++const { ComputerGuide, HostSteps } = await import('./computer-guide');
++
++const ORIGIN = 'http://localhost:9663';
++
++function render(node: React.ReactNode): string {
++  const runtime = appNodeRuntimes.get('self').runtime;
++  return renderToStaticMarkup(
++    <MemoryRouter>
++      <RuntimeProvider runtime={runtime}>
++        <SidebarProvider>{node}</SidebarProvider>
++      </RuntimeProvider>
++    </MemoryRouter>
++  );
++}
++
++describe('ConnectDevicesPanel', () => {
++  test('默认落在「移动设备」页，给出 iOS 三步与本机当前地址', () => {
++    const html = render(<ConnectDevicesPanel />);
++    expect(html).toContain('data-testid="connect-devices-panel"');
++    expect(html).toContain('data-testid="connect-tab-mobile"');
++    expect(html).toContain('data-testid="connect-tab-computer"');
++    expect(html).toContain('data-testid="connect-platform-ios"');
++    expect(html).toContain('data-testid="connect-platform-android"');
++    for (const step of ['open', 'add', 'launch']) {
++      expect(html).toContain(`data-testid="connect-step-ios-${step}"`);
++    }
++    expect(html).toContain('data-testid="command-block-origin"');
++    expect(html).toContain(ORIGIN);
++    expect(html).toContain('connectDevices.mobile.ios.open.title');
++  });
++
++  test('移动设备页给出远程访问入口，链接不带 panel 参数（跳转即关面板）', () => {
++    const html = render(<ConnectDevicesPanel />);
++    expect(html).toContain('href="/settings?tab=remoteAccess"');
++    expect(html).not.toContain('panel=connect');
++  });
++
++  test('Android 页换成 Android 三步', () => {
++    const html = render(<MobilePlatformSteps platform="android" />);
++    expect(html).toContain('data-testid="connect-step-android-add"');
++    expect(html).toContain('connectDevices.mobile.android.add.title');
++    expect(html).not.toContain('connect-step-ios-add');
++  });
++});
++
++describe('ComputerGuide', () => {
++  test('安装步骤给出安装命令与 PATH 兜底命令，默认展开「加入已有中继」四步', () => {
++    const html = render(<ComputerGuide />);
++    expect(html).toContain('data-testid="connect-step-install"');
++    expect(html).toContain('data-testid="command-block-install"');
++    expect(html).toContain('data-testid="command-block-install-copy"');
++    expect(html).toContain(INSTALL_COMMAND);
++    expect(html).toContain('export PATH=');
++    expect(html).toContain('data-testid="connect-mode-join"');
++    expect(html).toContain('data-testid="connect-mode-host"');
++    for (const step of ['hub', 'token', 'run', 'confirm']) {
++      expect(html).toContain(`data-testid="connect-step-join-${step}"`);
++    }
++    expect(html).toContain('data-testid="command-block-join"');
++    expect(html).toContain('connectDevices.computer.join.run.example');
++    expect(html).toContain('href="/settings?tab=nodes"');
++  });
++
++  test('「本机作为中继」分支给出三步、公开地址不可改的警示与两个设置入口', () => {
++    const html = render(<HostSteps />);
++    for (const step of ['entry', 'hub', 'invite']) {
++      expect(html).toContain(`data-testid="connect-step-host-${step}"`);
++    }
++    expect(html).toContain('data-testid="connect-host-hub-warning"');
++    expect(html).toContain('connectDevices.computer.host.hub.warning');
++    expect(html).toContain('href="/settings?tab=remoteAccess"');
++    expect(html).toContain('href="/settings?tab=nodes"');
++  });
++});
+diff --git a/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.tsx b/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.tsx
+new file mode 100644
+index 00000000..3f83faaa
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/connect-devices-panel.tsx
+@@ -0,0 +1,35 @@
++// 「接入更多设备」面板（右侧滑出，`?panel=connect`）：移动设备 / 服务器或电脑两套静态指引。
++//
++// 两页内容互斥渲染而不是走 TabsContent：内容里带受控子标签与命令块，
++// 条件渲染既省掉隐藏分支的开销，也让静态渲染的测试能直接断言当前页。
++
++import { useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { ComputerGuide } from './computer-guide';
++import { GuideTabs } from './guide-tabs';
++import { MobileGuide } from './mobile-guide';
++
++type ConnectTab = 'mobile' | 'computer';
++
++const TABS: ConnectTab[] = ['mobile', 'computer'];
++
++export default function ConnectDevicesPanel() {
++  const { t } = useTranslation();
++  const [tab, setTab] = useState<ConnectTab>('mobile');
++
++  return (
++    <div className="space-y-3" data-testid="connect-devices-panel">
++      <GuideTabs
++        value={tab}
++        onValueChange={setTab}
++        fullWidth
++        options={TABS.map((value) => ({
++          value,
++          label: t(`connectDevices.tabs.${value}`),
++          testId: `connect-tab-${value}`,
++        }))}
++      />
++      {tab === 'mobile' ? <MobileGuide /> : <ComputerGuide />}
++    </div>
++  );
++}
+diff --git a/apps/fe/src/components/side-panels/connect-devices/guide-step.tsx b/apps/fe/src/components/side-panels/connect-devices/guide-step.tsx
+new file mode 100644
+index 00000000..daa1c537
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/guide-step.tsx
+@@ -0,0 +1,56 @@
++// 接入指引的步骤卡：与远程访问向导同一套视觉（编号圆点 + 标题 + 说明），
++// 但这里的步骤是静态说明，没有待办 / 已完成状态。
++
++import { NavLink } from '@/components/page-layouts/components/nav-link';
++import type { ReactNode } from 'react';
++
++export function GuideStep({
++  index,
++  title,
++  description,
++  testId,
++  children,
++}: {
++  index: number;
++  title: string;
++  description?: string;
++  testId: string;
++  children?: ReactNode;
++}) {
++  return (
++    <section data-testid={testId} className="rounded-xl bg-card p-3 ring-1 ring-foreground/10">
++      <div className="flex items-start gap-2.5">
++        <span className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-[11px] font-medium text-muted-foreground">
++          {index}
++        </span>
++        <div className="min-w-0 flex-1 space-y-2">
++          <div className="space-y-0.5">
++            <h3 className="text-sm font-medium">{title}</h3>
++            {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
++          </div>
++          {children}
++        </div>
++      </div>
++    </section>
++  );
++}
++
++/**
++ * 指引里跳设置页的行内链接。走 NavLink 让 `/n/:nodeId` 边界下也指向本 node 的设置页；
++ * 目标地址不带 `?panel=`，跳转时面板自然关闭。
++ */
++export function GuideLink({
++  to,
++  testId,
++  children,
++}: {
++  to: string;
++  testId: string;
++  children: ReactNode;
++}) {
++  return (
++    <NavLink to={to} className="text-primary underline underline-offset-2" data-testid={testId}>
++      {children}
++    </NavLink>
++  );
++}
+diff --git a/apps/fe/src/components/side-panels/connect-devices/guide-tabs.tsx b/apps/fe/src/components/side-panels/connect-devices/guide-tabs.tsx
+new file mode 100644
+index 00000000..e5aa3f63
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/guide-tabs.tsx
+@@ -0,0 +1,41 @@
++// 指引里的分段选择器：一级（移动设备 / 服务器或电脑）铺满，二级（平台、接入方式）按内容宽度。
++// 视觉与侧栏的三个标签一致（灰轨道 + 药丸）。
++
++import { Tabs, TabsList, TabsTrigger, pillTabTriggerClassName } from '@tmex/ui/tabs';
++
++export interface GuideTabOption<T extends string> {
++  value: T;
++  label: string;
++  testId: string;
++}
++
++export function GuideTabs<T extends string>({
++  value,
++  onValueChange,
++  options,
++  fullWidth = false,
++}: {
++  value: T;
++  onValueChange: (next: T) => void;
++  options: GuideTabOption<T>[];
++  fullWidth?: boolean;
++}) {
++  return (
++    <Tabs value={value} onValueChange={(next) => onValueChange(next as T)}>
++      <TabsList
++        className={`rounded-xl border border-border/60 p-1 ${fullWidth ? 'w-full' : 'w-fit'}`}
++      >
++        {options.map((option) => (
++          <TabsTrigger
++            key={option.value}
++            value={option.value}
++            data-testid={option.testId}
++            className={pillTabTriggerClassName}
++          >
++            {option.label}
++          </TabsTrigger>
++        ))}
++      </TabsList>
++    </Tabs>
++  );
++}
+diff --git a/apps/fe/src/components/side-panels/connect-devices/mobile-guide.tsx b/apps/fe/src/components/side-panels/connect-devices/mobile-guide.tsx
+new file mode 100644
+index 00000000..6aa82cdf
+--- /dev/null
++++ b/apps/fe/src/components/side-panels/connect-devices/mobile-guide.tsx
+@@ -0,0 +1,70 @@
++// 「移动设备（仅控制）」页：iOS / Android 两套三步指引，第一步给出本机当前地址。
++
++import { useState } from 'react';
++import { useTranslation } from 'react-i18next';
++import { CommandBlock } from './command-block';
++import { GuideLink, GuideStep } from './guide-step';
++import { GuideTabs } from './guide-tabs';
++
++type Platform = 'ios' | 'android';
++
++const PLATFORMS: Platform[] = ['ios', 'android'];
++const MOBILE_STEPS = ['open', 'add', 'launch'] as const;
++
++/** 手机要访问的就是当前这份前端的来源地址；SSR / 测试静态渲染时兜底为空串。 */
++function currentOrigin(): string {
++  return typeof window === 'undefined' ? '' : window.location.origin;
++}
++
++export function MobilePlatformSteps({ platform }: { platform: Platform }) {
++  const { t } = useTranslation();
++  const origin = currentOrigin();
++  return (
++    <div className="space-y-2">
++      {MOBILE_STEPS.map((step, index) => (
++        <GuideStep
++          key={step}
++          index={index + 1}
++          testId={`connect-step-${platform}-${step}`}
++          title={t(`connectDevices.mobile.${platform}.${step}.title`)}
++          description={t(`connectDevices.mobile.${platform}.${step}.description`)}
++        >
++          {step === 'open' ? (
++            <CommandBlock
++              value={origin}
++              testId="origin"
++              label={t('connectDevices.mobile.addressLabel')}
++            />
++          ) : null}
++        </GuideStep>
++      ))}
++    </div>
++  );
++}
++
++export function MobileGuide() {
++  const { t } = useTranslation();
++  const [platform, setPlatform] = useState<Platform>('ios');
++
++  return (
++    <div className="space-y-3">
++      <p className="text-xs text-muted-foreground">{t('connectDevices.mobile.intro')}</p>
++      <GuideTabs
++        value={platform}
++        onValueChange={setPlatform}
++        options={PLATFORMS.map((value) => ({
++          value,
++          label: t(`connectDevices.mobile.platform.${value}`),
++          testId: `connect-platform-${value}`,
++        }))}
++      />
++      <MobilePlatformSteps platform={platform} />
++      <p className="text-xs text-muted-foreground">
++        {t('connectDevices.mobile.remoteHint')}{' '}
++        <GuideLink to="/settings?tab=remoteAccess" testId="connect-mobile-remote-link">
++          {t('connectDevices.mobile.remoteLink')}
++        </GuideLink>
++      </p>
++    </div>
++  );
++}
+diff --git a/apps/fe/src/components/side-panels/side-panel-host.tsx b/apps/fe/src/components/side-panels/side-panel-host.tsx
+index 035383b5..1922daf4 100644
+--- a/apps/fe/src/components/side-panels/side-panel-host.tsx
++++ b/apps/fe/src/components/side-panels/side-panel-host.tsx
+@@ -2,7 +2,7 @@
+ // 两块内容问的都是**本机**（`/api/local/*`、`/api/auth/*` 都不带 `/n/` 前缀），
+ // 所以用 AppRoot 提供的 entry（self）运行时与 QueryClient 即可，不跟路由 node 走。
+ //
+-// 两块内容都按需加载：它们原本分别属于设置页与已删除的 `/account/security` 页，
++// 两块内容都按需加载：接入指引是纯静态长文，账号安全原属已删除的 `/account/security` 页，
+ // 静态引入会把这两坨代码拖进首屏 chunk。
+ //
+ // 退场动画由 Base UI 负责——Popup 在 `data-ending-style` 期间保持挂载，动画跑完才卸载。
+@@ -17,13 +17,11 @@ import { useTranslation } from 'react-i18next';
+ import type { SidePanelName } from './side-panel-url';
+ import { useSidePanel } from './use-side-panel';
+ 
+-const NodesPanel = lazy(() =>
+-  import('@/pages/settings/nodes/nodes-tab').then((m) => ({ default: m.NodesTab }))
+-);
++const ConnectDevicesPanel = lazy(() => import('./connect-devices/connect-devices-panel'));
+ const AccountSecurityPanel = lazy(() => import('./account-security-panel'));
+ 
+ const PANEL_TITLE_KEY = {
+-  nodes: 'sidebar.nodes',
++  connect: 'nav.connectDevices',
+   security: 'auth.security.title',
+ } as const satisfies Record<SidePanelName, string>;
+ 
+@@ -47,7 +45,7 @@ export function SidePanelHost() {
+       {rendered ? (
+         <SheetContent
+           side="right"
+-          // 默认的 3/4 宽 + sm:max-w-sm 装不下节点管理表格；这里整段覆写（含 data-[side] 前缀，
++          // 默认的 3/4 宽 + sm:max-w-sm 装不下带命令块的分步指引；这里整段覆写（含 data-[side] 前缀，
+           // 否则 tailwind-merge 认不出是同一组类，两条 max-width 会同时生效）。
+           className="gap-0 data-[side=right]:w-full data-[side=right]:sm:max-w-xl data-[side=right]:md:max-w-2xl"
+           data-testid={`side-panel-${rendered}`}
+@@ -72,7 +70,7 @@ export function SidePanelHost() {
+             data-testid="side-panel-body"
+           >
+             <Suspense fallback={<PanelPending />}>
+-              {rendered === 'nodes' ? <NodesPanel /> : <AccountSecurityPanel />}
++              {rendered === 'connect' ? <ConnectDevicesPanel /> : <AccountSecurityPanel />}
+             </Suspense>
+           </div>
+         </SheetContent>
+diff --git a/apps/fe/src/components/side-panels/side-panel-url.test.tsx b/apps/fe/src/components/side-panels/side-panel-url.test.tsx
+index 1e87de72..5b2aba7f 100644
+--- a/apps/fe/src/components/side-panels/side-panel-url.test.tsx
++++ b/apps/fe/src/components/side-panels/side-panel-url.test.tsx
+@@ -14,7 +14,7 @@ const { useSidePanel } = await import('./use-side-panel');
+ 
+ describe('parseSidePanel', () => {
+   test('认识的面板名原样返回', () => {
+-    expect(parseSidePanel('nodes')).toBe('nodes');
++    expect(parseSidePanel('connect')).toBe('connect');
+     expect(parseSidePanel('security')).toBe('security');
+   });
+ 
+@@ -35,27 +35,27 @@ describe('nextSidePanelParams', () => {
+   });
+ 
+   test('切换面板是覆盖而不是追加', () => {
+-    const next = nextSidePanelParams(new URLSearchParams('panel=nodes'), 'security');
++    const next = nextSidePanelParams(new URLSearchParams('panel=connect'), 'security');
+     expect(next.getAll('panel')).toEqual(['security']);
+   });
+ 
+   test('关闭只删 panel，其它参数不动', () => {
+-    const next = nextSidePanelParams(new URLSearchParams('tab=nodes&panel=nodes'), null);
++    const next = nextSidePanelParams(new URLSearchParams('tab=nodes&panel=connect'), null);
+     expect(next.has('panel')).toBe(false);
+     expect(next.get('tab')).toBe('nodes');
+   });
+ 
+   test('不修改传入的参数对象', () => {
+     const current = new URLSearchParams('tab=nodes');
+-    nextSidePanelParams(current, 'nodes');
++    nextSidePanelParams(current, 'connect');
+     expect(current.has('panel')).toBe(false);
+   });
+ });
+ 
+ describe('sidePanelHref', () => {
+   test('只给查询串，pathname 交给 react-router 补当前页', () => {
+-    expect(sidePanelHref(new URLSearchParams(), 'nodes')).toBe('?panel=nodes');
+-    expect(sidePanelHref(new URLSearchParams('tab=x'), 'nodes')).toBe('?tab=x&panel=nodes');
++    expect(sidePanelHref(new URLSearchParams(), 'connect')).toBe('?panel=connect');
++    expect(sidePanelHref(new URLSearchParams('tab=x'), 'connect')).toBe('?tab=x&panel=connect');
+   });
+ });
+ 
+@@ -79,8 +79,8 @@ function renderProbe(entry: string): string {
+ 
+ describe('useSidePanel', () => {
+   test('读出当前面板；链接落在当前路由上并保留其它参数', () => {
+-    const html = renderProbe('/n/abc/devices?tab=x&panel=nodes');
+-    expect(html).toContain('data-panel="nodes"');
++    const html = renderProbe('/n/abc/devices?tab=x&panel=connect');
++    expect(html).toContain('data-panel="connect"');
+     expect(html).toContain('href="/n/abc/devices?tab=x&amp;panel=security"');
+   });
+ 
+diff --git a/apps/fe/src/components/side-panels/side-panel-url.ts b/apps/fe/src/components/side-panels/side-panel-url.ts
+index bf26f112..3ca941db 100644
+--- a/apps/fe/src/components/side-panels/side-panel-url.ts
++++ b/apps/fe/src/components/side-panels/side-panel-url.ts
+@@ -5,7 +5,7 @@
+ 
+ export const SIDE_PANEL_PARAM = 'panel';
+ 
+-export const SIDE_PANEL_NAMES = ['nodes', 'security'] as const;
++export const SIDE_PANEL_NAMES = ['connect', 'security'] as const;
+ 
+ export type SidePanelName = (typeof SIDE_PANEL_NAMES)[number];
+ 
+diff --git a/apps/fe/src/pages/DevicesPage.test.tsx b/apps/fe/src/pages/DevicesPage.test.tsx
+index 355f8e0e..75ee1f57 100644
+--- a/apps/fe/src/pages/DevicesPage.test.tsx
++++ b/apps/fe/src/pages/DevicesPage.test.tsx
+@@ -401,18 +401,18 @@ describe('PageActions（全页唯一的 +）', () => {
+     expect(resetTag).toContain('disabled=""');
+   });
+ 
+-  test('只有一个 ready node 时是直接打开该节点对话框的单按钮', () => {
++  test('只有一个 ready node 时也是下拉菜单（「添加远程节点」始终可达）', () => {
+     registerAddDeviceTarget(target({ runtimeNodeId: 'self', name: 'entry', isSelf: true }));
+     const html = renderToStaticMarkup(
+       <MemoryRouter>
+         <PageActions />
+       </MemoryRouter>
+     );
+-    expect(html).toContain('data-testid="device-actions"');
+-    expect(html).toContain('data-callback="true"');
++    expect(html).toContain('data-testid="devices-add"');
++    expect(html).not.toContain('data-testid="device-actions"');
+   });
+ 
+-  test('多个 ready node 时换成下拉菜单，触发器仍是 devices-add', () => {
++  test('多个 ready node 时同样是下拉菜单，触发器仍是 devices-add', () => {
+     registerAddDeviceTarget(target({ runtimeNodeId: 'self', name: 'entry', isSelf: true }));
+     registerAddDeviceTarget(target({ runtimeNodeId: REMOTE_ID, name: 'studio' }));
+     const html = renderToStaticMarkup(
+diff --git a/apps/fe/src/pages/DevicesPage.tsx b/apps/fe/src/pages/DevicesPage.tsx
+index 7a6033b6..a3e73a64 100644
+--- a/apps/fe/src/pages/DevicesPage.tsx
++++ b/apps/fe/src/pages/DevicesPage.tsx
+@@ -161,8 +161,9 @@ function ResetLayoutButton({ onConfirm, disabled }: { onConfirm: () => void; dis
+ // Page actions component
+ //
+ // 「新建分组」「恢复默认布局」由页面主体登记入口（两棵子树，见 devices/page-commands.ts），
+-// 没挂载就不显示。全页唯一的「+」：多个 ready 节点先选目标，单个直接开该节点的对话框；
+-// 一个都没登记（standalone / 单面板）时退回派发全局事件，与旧行为一致。
++// 没挂载就不显示。全页唯一的「+」：只要登记过 ready 节点就恒定展开下拉（「添加远程节点」
++// 与各节点目标都在里面，单节点也不再走快捷路径）；一个都没登记（standalone / 单面板）时
++// 退回派发全局事件，与旧行为一致。
+ export function PageActions() {
+   const { t } = useTranslation();
+   const targets = useAddDeviceTargets();
+@@ -186,11 +187,7 @@ export function PageActions() {
+           </IconTooltip>
+         </>
+       )}
+-      {targets.length > 1 ? (
+-        <AddDeviceMenu targets={targets} />
+-      ) : (
+-        <DeviceManagementActions onAddDevice={targets[0]?.open} />
+-      )}
++      {targets.length > 0 ? <AddDeviceMenu targets={targets} /> : <DeviceManagementActions />}
+     </div>
+   );
+ }
+diff --git a/apps/fe/src/pages/devices/add-device-menu.test.tsx b/apps/fe/src/pages/devices/add-device-menu.test.tsx
+index 7cfa8eeb..5e141cc3 100644
+--- a/apps/fe/src/pages/devices/add-device-menu.test.tsx
++++ b/apps/fe/src/pages/devices/add-device-menu.test.tsx
+@@ -3,10 +3,15 @@
+ // 直接对内容组件的元素树做结构断言，并用 SSR 证明这条约束本身成立。
+ 
+ import { describe, expect, test } from 'bun:test';
+-import { DropdownMenuGroup, DropdownMenuLabel } from '@tmex/ui/dropdown-menu';
++import {
++  DropdownMenuGroup,
++  DropdownMenuLabel,
++  DropdownMenuSeparator,
++} from '@tmex/ui/dropdown-menu';
+ import { Children, type ReactElement, type ReactNode, isValidElement } from 'react';
+ import { renderToStaticMarkup } from 'react-dom/server';
+-import { AddDeviceMenuList } from './add-device-menu';
++import { Link } from 'react-router';
++import { ADD_REMOTE_NODE_PATH, AddDeviceMenuList } from './add-device-menu';
+ import type { AddDeviceTarget } from './add-device-targets';
+ 
+ const TARGETS: AddDeviceTarget[] = [
+@@ -14,15 +19,22 @@ const TARGETS: AddDeviceTarget[] = [
+   { runtimeNodeId: 'node-b', name: 'b', isSelf: false, open: () => {} },
+ ];
+ 
+-function renderList(): ReactElement {
++function renderList(targets: AddDeviceTarget[] = TARGETS): ReactElement {
+   return AddDeviceMenuList({
+-    targets: TARGETS,
++    targets,
+     label: 'Add to',
+     selfLabel: 'this node',
++    remoteNodeLabel: 'Add remote node',
++    remoteNodeHref: ADD_REMOTE_NODE_PATH,
+     itemTitle: (target) => `add to ${target.name}`,
+   }) as ReactElement;
+ }
+ 
++function topLevel(targets?: AddDeviceTarget[]): ReactElement[] {
++  const root = renderList(targets) as ReactElement<{ children?: ReactNode }>;
++  return Children.toArray(root.props.children) as ReactElement[];
++}
++
+ /** 遍历元素树，收集每个 `type === needle` 节点的祖先 type 列表。 */
+ function ancestorsOf(node: ReactNode, needle: unknown, path: unknown[] = []): unknown[][] {
+   if (!isValidElement(node)) return [];
+@@ -42,9 +54,31 @@ describe('AddDeviceMenuList', () => {
+     expect(labels[0]).toContain(DropdownMenuGroup);
+   });
+ 
++  test('remote-node entry comes first, separated from the node group', () => {
++    const [remote, separator, group] = topLevel();
++    const remoteProps = remote.props as {
++      'data-testid'?: string;
++      render?: ReactElement<{ to?: string }>;
++    };
++    expect(remoteProps['data-testid']).toBe('devices-add-remote-node');
++    expect(remoteProps.render?.type).toBe(Link);
++    expect(remoteProps.render?.props.to).toBe('/settings?tab=nodes');
++    expect(separator.type).toBe(DropdownMenuSeparator);
++    expect(group.type).toBe(DropdownMenuGroup);
++  });
++
++  test('remote-node entry stays available with a single target', () => {
++    const [remote, , group] = topLevel([TARGETS[0]]);
++    expect((remote.props as { 'data-testid'?: string })['data-testid']).toBe(
++      'devices-add-remote-node'
++    );
++    const children = Children.toArray((group.props as { children?: ReactNode }).children);
++    expect(children).toHaveLength(2);
++  });
++
+   test('renders one item per target', () => {
+-    const group = renderList() as ReactElement<{ children?: ReactNode }>;
+-    const children = Children.toArray(group.props.children);
++    const [, , group] = topLevel();
++    const children = Children.toArray((group.props as { children?: ReactNode }).children);
+     expect(children).toHaveLength(1 + TARGETS.length);
+   });
+ });
+diff --git a/apps/fe/src/pages/devices/add-device-menu.tsx b/apps/fe/src/pages/devices/add-device-menu.tsx
+index b9854a91..bbe338a2 100644
+--- a/apps/fe/src/pages/devices/add-device-menu.tsx
++++ b/apps/fe/src/pages/devices/add-device-menu.tsx
+@@ -1,5 +1,8 @@
+-// 设备页顶栏的「+」：多个 ready 节点时展开下拉选目标节点，单个时直接开对话框。
++// 设备页顶栏的「+」：恒定展开下拉——首项跳设置页的多节点标签页添加远程节点，
++// 其下按 ready 节点列出「添加设备到已有节点」的目标。
+ 
++import { hostAppPath } from '@tmex/stores';
++import { useOptionalRuntime } from '@tmex/stores/react';
+ import { Button } from '@tmex/ui/button';
+ import {
+   DropdownMenu,
+@@ -7,16 +10,23 @@ import {
+   DropdownMenuGroup,
+   DropdownMenuItem,
+   DropdownMenuLabel,
++  DropdownMenuSeparator,
+   DropdownMenuTrigger,
+ } from '@tmex/ui/dropdown-menu';
+-import { Plus } from 'lucide-react';
++import { Network, Plus } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
++import { Link } from 'react-router';
+ import type { AddDeviceTarget } from './add-device-targets';
+ 
++/** 设置页的多节点标签页：新增远程节点的唯一入口。 */
++export const ADD_REMOTE_NODE_PATH = '/settings?tab=nodes';
++
+ export interface AddDeviceMenuListProps {
+   targets: AddDeviceTarget[];
+   label: string;
+   selfLabel: string;
++  remoteNodeLabel: string;
++  remoteNodeHref: string;
+   itemTitle: (target: AddDeviceTarget) => string;
+ }
+ 
+@@ -28,32 +38,49 @@ export function AddDeviceMenuList({
+   targets,
+   label,
+   selfLabel,
++  remoteNodeLabel,
++  remoteNodeHref,
+   itemTitle,
+ }: AddDeviceMenuListProps) {
+   return (
+-    <DropdownMenuGroup>
+-      <DropdownMenuLabel>{label}</DropdownMenuLabel>
+-      {targets.map((target) => (
+-        <DropdownMenuItem
+-          key={target.runtimeNodeId}
+-          data-testid={`devices-add-to-${target.runtimeNodeId}`}
+-          title={itemTitle(target)}
+-          onClick={target.open}
+-        >
+-          <span className="min-w-0 truncate">{target.name}</span>
+-          {target.isSelf && (
+-            <span className="ml-auto shrink-0 rounded border border-border/60 px-1 py-px text-[10px] leading-none text-muted-foreground">
+-              {selfLabel}
+-            </span>
+-          )}
+-        </DropdownMenuItem>
+-      ))}
+-    </DropdownMenuGroup>
++    <>
++      <DropdownMenuItem
++        data-testid="devices-add-remote-node"
++        title={remoteNodeLabel}
++        render={<Link to={remoteNodeHref} />}
++      >
++        <Network className="h-4 w-4" />
++        <span className="min-w-0 truncate">{remoteNodeLabel}</span>
++      </DropdownMenuItem>
++      <DropdownMenuSeparator />
++      <DropdownMenuGroup>
++        <DropdownMenuLabel>{label}</DropdownMenuLabel>
++        {targets.map((target) => (
++          <DropdownMenuItem
++            key={target.runtimeNodeId}
++            data-testid={`devices-add-to-${target.runtimeNodeId}`}
++            title={itemTitle(target)}
++            onClick={target.open}
++          >
++            <span className="min-w-0 truncate">{target.name}</span>
++            {target.isSelf && (
++              <span className="ml-auto shrink-0 rounded border border-border/60 px-1 py-px text-[10px] leading-none text-muted-foreground">
++                {selfLabel}
++              </span>
++            )}
++          </DropdownMenuItem>
++        ))}
++      </DropdownMenuGroup>
++    </>
+   );
+ }
+ 
+ export function AddDeviceMenu({ targets }: { targets: AddDeviceTarget[] }) {
+   const { t } = useTranslation();
++  const runtime = useOptionalRuntime();
++  const remoteNodeHref = runtime
++    ? hostAppPath(runtime.host, ADD_REMOTE_NODE_PATH)
++    : ADD_REMOTE_NODE_PATH;
+ 
+   return (
+     <DropdownMenu>
+@@ -75,6 +102,8 @@ export function AddDeviceMenu({ targets }: { targets: AddDeviceTarget[] }) {
+           targets={targets}
+           label={t('device.addTo.label')}
+           selfLabel={t('device.addTo.self')}
++          remoteNodeLabel={t('device.addTo.remoteNode')}
++          remoteNodeHref={remoteNodeHref}
+           itemTitle={(target) => t('devices.nodes.addDevice', { name: target.name })}
+         />
+       </DropdownMenuContent>
+diff --git a/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx b/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
+index 043b7b87..06328a91 100644
+--- a/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
++++ b/apps/fe/src/pages/settings/remote-access/remote-access-tab.test.tsx
+@@ -1,5 +1,5 @@
+ // 「远程访问」标签的静态渲染：远端路由拦截、加载 / 未登录 / 失败分支、状态与 Access 徽标矩阵、
+-// 向导步进（临时隧道与命名隧道两条路径）、暴露警示与确认、Cloudflare Access 区块、系统隧道接管。
++// 连接方式分叉（Cloudflare Tunnel / 直接连接）、向导步进、暴露警示与确认、Cloudflare Access 区块、系统隧道接管。
+ // 无 DOM 测试环境，用 react-dom/server 静态渲染（与 HttpsSection / SettingsPage 测试同一套做法）。
+ 
+ import { beforeEach, describe, expect, mock, test } from 'bun:test';
+@@ -58,6 +58,7 @@ const { renderToStaticMarkup } = await import('react-dom/server');
+ const { MemoryRouter } = await import('react-router');
+ const { resetMeshNodesStateForTest, setMeshNodesStateForTest } = await import('@/node/mesh-nodes');
+ const { RemoteAccessTab } = await import('./remote-access-tab');
++const { TunnelStatusCard } = await import('./status-card');
+ const { TunnelWizard } = await import('./wizard');
+ 
+ const SELF_ID = 'a'.repeat(32);
+@@ -231,7 +232,7 @@ describe('路由与加载分支', () => {
+ 
+ describe('状态徽标与操作按钮', () => {
+   test('未配置：徽标为未配置，且不出现启停 / 移除按钮', () => {
+-    const html = render();
++    const html = renderStatusCard();
+     expect(html).toContain('settings.remoteAccess.state.notConfigured');
+     expect(html).not.toContain('data-testid="remote-access-start"');
+     expect(html).not.toContain('data-testid="remote-access-remove"');
+@@ -329,7 +330,7 @@ describe('状态徽标与操作按钮', () => {
+ 
+ describe('Access 徽标', () => {
+   test('未配置 / 已配置但未强制 / 主机名不匹配 / 已保护四态', () => {
+-    expect(render()).toContain('settings.remoteAccess.accessState.notConfigured');
++    expect(renderStatusCard()).toContain('settings.remoteAccess.accessState.notConfigured');
+ 
+     status = configured('named', 'running', {
+       access: { ...tunnel().access, configured: true, enforceJwt: false },
+@@ -454,7 +455,7 @@ describe('系统隧道接管', () => {
+     expect(html).toContain('data-testid="remote-access-external-dismiss"');
+     // 接管卡排在第 1 步之前。
+     expect(html.indexOf('data-testid="remote-access-external"')).toBeLessThan(
+-      html.indexOf('data-testid="remote-access-step-install"')
++      html.indexOf('data-testid="remote-access-step-path"')
+     );
+   });
+ 
+@@ -529,9 +530,9 @@ describe('系统隧道接管', () => {
+ });
+ 
+ describe('暴露警示与确认', () => {
+-  test('未受保护时方式步骤上方给出警示与确认勾选，并链到多节点设置', () => {
++  test('未受保护时隧道类型步上方给出警示与确认勾选，并链到多节点设置', () => {
+     status = tunnel({ loginEnforced: false, exposureProtected: false });
+-    const html = render();
++    const html = renderWizard('off');
+     expect(html).toContain('data-testid="remote-access-exposure"');
+     expect(html).toContain('settings.remoteAccess.exposure.warning');
+     expect(html).toContain('data-testid="remote-access-exposure-ack"');
+@@ -543,7 +544,7 @@ describe('暴露警示与确认', () => {
+ 
+   test('未受保护不禁用临时隧道选项，也不禁用启动按钮', () => {
+     status = tunnel({ loginEnforced: false, exposureProtected: false });
+-    const html = render();
++    const html = renderWizard('off');
+     expect(isDisabled(html, 'remote-access-mode-quick-input')).toBe(false);
+ 
+     status = configured('quick', 'stopped', { loginEnforced: false, exposureProtected: false });
+@@ -593,7 +594,7 @@ describe('错误码映射', () => {
+       ...IDLE_ACTIONS,
+       error: { code: 'busy', message: 'another action is running' },
+     };
+-    const html = render();
++    const html = renderStatusCard();
+     expect(html).toContain('data-testid="remote-access-error"');
+     expect(html).toContain('settings.remoteAccess.errors.busy');
+   });
+@@ -603,19 +604,59 @@ describe('错误码映射', () => {
+       ...IDLE_ACTIONS,
+       error: { code: 'access_api_failed', message: 'token lacks permission' },
+     };
+-    expect(render()).toContain('settings.remoteAccess.errors.access_api_failed');
++    expect(renderStatusCard()).toContain('settings.remoteAccess.errors.access_api_failed');
+   });
+ 
+   test('未知错误码退回带原始 message 的兜底文案', () => {
+     actionState = { ...IDLE_ACTIONS, error: { code: 'unknown', message: 'network down' } };
+-    expect(render()).toContain('settings.remoteAccess.errors.unknown');
++    expect(renderStatusCard()).toContain('settings.remoteAccess.errors.unknown');
++  });
++});
++
++describe('连接方式', () => {
++  test('初始只给两张连接方式卡：没有安装步，也没有隧道状态卡', () => {
++    const html = render();
++    expect(stepOrder(html)).toEqual(['path']);
++    expect(html).toContain('data-testid="remote-access-path-chooser"');
++    expect(html).toContain('data-testid="remote-access-path-tunnel"');
++    expect(html).toContain('data-testid="remote-access-path-direct"');
++    expect(html).toContain('settings.remoteAccess.path.tunnel.description');
++    expect(html).not.toContain('data-testid="remote-access-step-install"');
++    expect(html).not.toContain('data-testid="remote-access-status"');
++    expect(stepStateOf(html, 'remote-access-step-path')).toBe('current');
++  });
++
++  test('选中 Cloudflare Tunnel 后才展开安装与隧道类型两步', () => {
++    const html = renderWizard('off');
++    expect(stepOrder(html)).toEqual(['path', 'install', 'mode', 'tunnel', 'proxy']);
++    expect(stepStateOf(html, 'remote-access-step-path')).toBe('done');
++    expect(html).toContain('data-testid="remote-access-mode-chooser"');
++  });
++
++  test('选中直接连接后只剩访问保护一步，且不出现隧道状态卡', () => {
++    const html = renderWizard('direct');
++    expect(stepOrder(html)).toEqual(['path', 'direct']);
++    expect(html).not.toContain('data-testid="remote-access-status"');
++    expect(html).not.toContain('data-testid="remote-access-step-proxy"');
++  });
++
++  test('已建好隧道时连接方式锁死在隧道：两张卡都禁用，状态卡照常渲染', () => {
++    status = configured('named', 'running');
++    const html = render();
++    expect(html).toContain('data-testid="remote-access-status"');
++    expect(isDisabled(html, 'remote-access-path-tunnel-input')).toBe(true);
++    expect(isDisabled(html, 'remote-access-path-direct-input')).toBe(true);
++    expect(/data-testid="remote-access-path-tunnel"[^>]*data-selected="true"/.test(html)).toBe(
++      true
++    );
+   });
+ });
+ 
+ describe('向导步进', () => {
+-  test('命名隧道的步骤顺序：安装 → 方式 → 登录 → 主机名 → 访问控制 → 创建 → 反向代理', () => {
++  test('命名隧道的步骤顺序：连接方式 → 安装 → 隧道类型 → 登录 → 主机名 → 访问控制 → 创建 → 反向代理', () => {
+     status = tunnel({ auth: { loggedIn: true, loginUrl: null } });
+     expect(stepOrder(renderWizard('named'))).toEqual([
++      'path',
+       'install',
+       'mode',
+       'login',
+@@ -627,7 +668,7 @@ describe('向导步进', () => {
+   });
+ 
+   test('临时隧道没有登录 / 主机名 / 访问控制三步', () => {
+-    expect(stepOrder(renderWizard('quick'))).toEqual(['install', 'mode', 'quick', 'proxy']);
++    expect(stepOrder(renderWizard('quick'))).toEqual(['path', 'install', 'mode', 'quick', 'proxy']);
+   });
+ 
+   test('访问控制步带「推荐」（未启用登录）或「可选」（已启用登录）标签', () => {
+@@ -638,9 +679,9 @@ describe('向导步进', () => {
+     expect(renderWizard('named')).toContain('settings.remoteAccess.access.tag.optional');
+   });
+ 
+-  test('未安装 cloudflared 时停在第 1 步并给安装按钮', () => {
++  test('未安装 cloudflared 时停在安装步并给安装按钮', () => {
+     status = tunnel({ binary: { installed: false, version: null, path: null, source: null } });
+-    const html = render();
++    const html = renderWizard('off');
+     expect(stepStateOf(html, 'remote-access-step-install')).toBe('current');
+     expect(stepStateOf(html, 'remote-access-step-mode')).toBe('todo');
+     expect(html).toContain('data-testid="remote-access-install"');
+@@ -652,7 +693,7 @@ describe('向导步进', () => {
+       platform: 'freebsd-x64',
+       binary: { installed: false, version: null, path: null, source: null },
+     });
+-    const html = render();
++    const html = renderWizard('off');
+     expect(html).toContain('data-testid="remote-access-unsupported"');
+     expect(html).not.toContain('data-testid="remote-access-install"');
+   });
+@@ -662,7 +703,7 @@ describe('向导步进', () => {
+       binary: { installed: false, version: null, path: null, source: null },
+       job: job({ kind: 'install', state: 'running', step: 'download' }),
+     });
+-    const html = render();
++    const html = renderWizard('off');
+     expect(html).toContain('data-testid="remote-access-install-progress"');
+     expect(html).toContain('settings.remoteAccess.jobStep.download');
+   });
+@@ -676,20 +717,21 @@ describe('向导步进', () => {
+         error: { code: 'download_failed', message: 'timeout' },
+       }),
+     });
+-    expect(render()).toContain('settings.remoteAccess.errors.download_failed');
++    expect(renderWizard('off')).toContain('settings.remoteAccess.errors.download_failed');
+   });
+ 
+-  test('装好后停在第 2 步：两张方式卡都在，第 3 步等待选择', () => {
+-    const html = render();
++  test('装好后停在隧道类型步：两张类型卡都在（没有直接连接卡），下一步等待选择', () => {
++    const html = renderWizard('off');
+     expect(stepStateOf(html, 'remote-access-step-install')).toBe('done');
+     expect(stepStateOf(html, 'remote-access-step-mode')).toBe('current');
+     expect(html).toContain('data-testid="remote-access-mode-quick"');
+     expect(html).toContain('data-testid="remote-access-mode-named"');
++    expect(html).not.toContain('data-testid="remote-access-mode-direct"');
+     expect(html).toContain('data-testid="remote-access-step-tunnel-idle"');
+     expect(html).toContain('data-testid="remote-access-binary"');
+   });
+ 
+-  test('已建好隧道时方式卡锁定，向导停在反向代理步', () => {
++  test('已建好隧道时类型卡锁定，向导停在反向代理步', () => {
+     status = configured('named', 'running');
+     const html = render();
+     expect(stepStateOf(html, 'remote-access-step-create')).toBe('done');
+@@ -888,24 +930,23 @@ describe('直接连接', () => {
+     ...overrides,
+   });
+ 
+-  test('方式步给出第三张卡，且不因为没装 cloudflared 就锁死', () => {
++  test('直接连接是顶层选项，且不因为没装 cloudflared 就锁死', () => {
+     status = tunnel({ binary: { installed: false, version: null, path: null, source: null } });
+     const html = render();
+-    expect(html).toContain('data-testid="remote-access-mode-direct"');
+-    expect(html).toContain('settings.remoteAccess.mode.direct.description');
+-    expect(isDisabled(html, 'remote-access-mode-direct-input')).toBe(false);
++    expect(html).toContain('data-testid="remote-access-path-direct"');
++    expect(html).toContain('settings.remoteAccess.path.direct.description');
++    expect(isDisabled(html, 'remote-access-path-direct-input')).toBe(false);
+   });
+ 
+-  test('已建隧道时第三张卡同样锁定：换方式要先移除隧道', () => {
++  test('已建隧道时直接连接卡锁定：换路径要先移除隧道', () => {
+     status = configured('named', 'running');
+-    expect(isDisabled(render(), 'remote-access-mode-direct-input')).toBe(true);
++    expect(isDisabled(render(), 'remote-access-path-direct-input')).toBe(true);
+   });
+ 
+-  test('选中后只剩方式与访问保护两步', () => {
+-    expect(stepOrder(renderWizard('direct', { localAuth: localAuth() }))).toEqual([
+-      'mode',
+-      'direct',
+-    ]);
++  test('选中后只剩连接方式与访问保护两步，安装步不出现', () => {
++    const html = renderWizard('direct', { localAuth: localAuth() });
++    expect(stepOrder(html)).toEqual(['path', 'direct']);
++    expect(html).not.toContain('data-testid="remote-access-step-install"');
+   });
+ 
+   test('hub / node 角色：已由节点登录保护，不再劝启用本机登录', () => {
+@@ -1270,17 +1311,17 @@ describe('未启用登录时的兼容提醒', () => {
+ describe('日志', () => {
+   test('有输出时渲染日志框，无输出时给空提示', () => {
+     status = tunnel({ log: ['2026-08-30 INF Registered tunnel connection'] });
+-    const html = render();
++    const html = renderStatusCard();
+     expect(html).toContain('data-testid="remote-access-log-box"');
+     expect(html).toContain('Registered tunnel connection');
+ 
+     status = tunnel();
+-    expect(render()).toContain('data-testid="remote-access-log-empty"');
++    expect(renderStatusCard()).toContain('data-testid="remote-access-log-empty"');
+   });
+ 
+   test('只渲染末尾 200 行', () => {
+     status = tunnel({ log: Array.from({ length: 260 }, (_, i) => `line ${i}`) });
+-    const html = render();
++    const html = renderStatusCard();
+     expect(html).not.toContain('line 59');
+     expect(html).toContain('line 60');
+     expect(html).toContain('line 259');
+@@ -1311,8 +1352,9 @@ function exposureState(overrides: Partial<ExposureState> = {}): ExposureState {
+ }
+ 
+ /**
+- * 方式与主机名草稿都由标签层的 `useState` 驱动，静态渲染点不了控件——命名隧道的子步骤
++ * 连接方式、隧道类型与主机名草稿都由标签层的 `useState` 驱动，静态渲染点不了控件——子步骤
+  * 直接渲染 `TunnelWizard` 并把它们传进去；`RemoteAccessTab` 只负责把 state 接上这些入参。
++ * `'off'` 表示「选了 Cloudflare Tunnel，但还没选类型」。
+  */
+ function renderWizard(
+   mode: TunnelMode | 'direct',
+@@ -1332,7 +1374,9 @@ function renderWizard(
+       <TunnelWizard
+         status={current}
+         actions={{ ...snapshot, run: () => undefined, clearError: () => undefined }}
+-        chosenMode={mode}
++        chosenPath={mode === 'direct' ? 'direct' : 'tunnel'}
++        onChoosePath={() => undefined}
++        chosenMode={mode === 'direct' || mode === 'off' ? null : mode}
+         onChooseMode={() => undefined}
+         draft={options.draft ?? namedDraft()}
+         isHub={options.isHub ?? false}
+@@ -1345,6 +1389,21 @@ function renderWizard(
+   );
+ }
+ 
++/** 状态卡只在选了隧道路径或已建过隧道时挂在标签上；未配置态的断言直接渲染卡片本体。 */
++function renderStatusCard(): string {
++  const current = status;
++  if (!current) throw new Error('status fixture is required');
++  return renderToStaticMarkup(
++    <MemoryRouter initialEntries={['/settings']}>
++      <TunnelStatusCard
++        status={current}
++        actions={{ ...actionState, run: () => undefined, clearError: () => undefined }}
++        exposure={exposureState()}
++      />
++    </MemoryRouter>
++  );
++}
++
+ function authMode(hubNodeId: string): AuthModeResponse {
+   return {
+     mode: 'mesh',
+diff --git a/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx b/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
+index c41c0117..bcda9d8a 100644
+--- a/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
++++ b/apps/fe/src/pages/settings/remote-access/remote-access-tab.tsx
+@@ -1,4 +1,4 @@
+-// 设置页「远程访问」标签：用 Cloudflare Tunnel 把本机的 tmex 暴露到公网。
++// 设置页「远程访问」标签：把本机的 tmex 开放到外网，走 Cloudflare Tunnel 或直接连接两条路径之一。
+ //
+ // `/api/tunnel/*` 与 TLS / LocalApi 一样只作用于浏览器直连的那台机器：它要落盘二进制、写 env、
+ // 起常驻进程，经 `/n/<id>` 转发过去只会改到入口机自己。因此浏览远端 node 时整块不渲染，只给提示。
+@@ -17,7 +17,13 @@ import type { ExposureState } from './exposure';
+ import type { NamedDraft } from './named-step';
+ import { TunnelStatusCard } from './status-card';
+ import { type TunnelActions, useTunnelActions } from './tunnel-actions';
+-import { type WizardMode, isExposureAckError, withExposureAck } from './tunnel-model';
++import {
++  type ConnectionPath,
++  type WizardMode,
++  effectivePath,
++  isExposureAckError,
++  withExposureAck,
++} from './tunnel-model';
+ import { useTunnelStatus } from './use-tunnel-status';
+ import { TunnelWizard } from './wizard';
+ 
+@@ -47,6 +53,7 @@ function SelfRemoteAccess() {
+   const { t } = useTranslation();
+   const tunnel = useTunnelStatus();
+   const { mode } = useSharedAuthMode();
++  const [chosenPath, setChosenPath] = useState<ConnectionPath | null>(null);
+   const [chosenMode, setChosenMode] = useState<WizardMode | null>(null);
+   // 开关本机登录后接口会带回最新状态：就地覆盖，`/api/auth/mode` 的共享快照是进程级缓存，拉不动。
+   const [localAuthOverride, setLocalAuthOverride] = useState<LocalAuthStatus | null>(null);
+@@ -127,12 +134,17 @@ function SelfRemoteAccess() {
+     run: (req) => rawActions.run(withExposureAck(req, acknowledged)),
+   };
+ 
++  // 状态卡讲的全是隧道：还没选或选了「直接连接」时它只会让人以为直连也要先建隧道。
++  const showStatus = effectivePath(status, chosenPath) === 'tunnel';
++
+   return (
+     <div className="flex w-full flex-col gap-4" data-testid="settings-remote-access-tab">
+-      <TunnelStatusCard status={status} actions={actions} exposure={exposure} />
++      {showStatus && <TunnelStatusCard status={status} actions={actions} exposure={exposure} />}
+       <TunnelWizard
+         status={status}
+         actions={actions}
++        chosenPath={chosenPath}
++        onChoosePath={setChosenPath}
+         chosenMode={chosenMode}
+         onChooseMode={setChosenMode}
+         draft={draft}
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts b/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
+index e34370ec..bd7d9944 100644
+--- a/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-model.test.ts
+@@ -10,6 +10,7 @@ import {
+   accessPill,
+   describeTunnelError,
+   effectiveMode,
++  effectivePath,
+   isAuthRequiredError,
+   isExposingAction,
+   isExposureAckError,
+@@ -119,21 +120,45 @@ describe('tunnelPill', () => {
+   });
+ });
+ 
+-describe('wizardSteps / effectiveMode', () => {
+-  test('命名隧道七步：访问控制排在主机名之后、创建之前', () => {
+-    expect(
+-      wizardSteps({ status: status(), chosenMode: 'named', hostnameConfirmed: false })
+-    ).toEqual(['install', 'mode', 'login', 'hostname', 'access', 'create', 'proxy']);
++describe('wizardSteps / effectivePath / effectiveMode', () => {
++  const ctx = (chosenPath: 'tunnel' | 'direct' | null, chosenMode: 'named' | 'quick' | null) => ({
++    status: status(),
++    chosenPath,
++    chosenMode,
++    hostnameConfirmed: false,
++  });
++
++  test('还没选连接方式时只有顶层的一步', () => {
++    expect(wizardSteps(ctx(null, null))).toEqual(['path']);
++    expect(wizardSteps(ctx(null, 'named'))).toEqual(['path']);
++  });
++
++  test('命名隧道八步：访问控制排在主机名之后、创建之前', () => {
++    expect(wizardSteps(ctx('tunnel', 'named'))).toEqual([
++      'path',
++      'install',
++      'mode',
++      'login',
++      'hostname',
++      'access',
++      'create',
++      'proxy',
++    ]);
+   });
+ 
+   test('临时隧道没有登录 / 主机名 / 访问控制', () => {
+-    expect(
+-      wizardSteps({ status: status(), chosenMode: 'quick', hostnameConfirmed: false })
+-    ).toEqual(['install', 'mode', 'quick', 'proxy']);
++    expect(wizardSteps(ctx('tunnel', 'quick'))).toEqual([
++      'path',
++      'install',
++      'mode',
++      'quick',
++      'proxy',
++    ]);
+   });
+ 
+-  test('还没选方式时第 3 步只是占位', () => {
+-    expect(wizardSteps({ status: status(), chosenMode: null, hostnameConfirmed: false })).toEqual([
++  test('选了隧道但还没选类型时第 4 步只是占位', () => {
++    expect(wizardSteps(ctx('tunnel', null))).toEqual([
++      'path',
+       'install',
+       'mode',
+       'tunnel',
+@@ -141,15 +166,23 @@ describe('wizardSteps / effectiveMode', () => {
+     ]);
+   });
+ 
+-  test('已经建好隧道后方式以服务端为准', () => {
++  test('已经建好隧道后连接方式与类型都以服务端为准', () => {
+     const s = status({ config: { ...status().config, mode: 'named', hostname: 'a.example.com' } });
++    expect(effectivePath(s, 'direct')).toBe('tunnel');
+     expect(effectiveMode(s, 'quick')).toBe('named');
+-    expect(wizardSteps({ status: s, chosenMode: 'quick', hostnameConfirmed: false })).toContain(
+-      'access'
+-    );
+-  });
+-
+-  test('未配置时方式取本地选择', () => {
++    expect(
++      wizardSteps({
++        status: s,
++        chosenPath: 'direct',
++        chosenMode: 'quick',
++        hostnameConfirmed: false,
++      })
++    ).toContain('access');
++  });
++
++  test('未配置时连接方式与类型都取本地选择', () => {
++    expect(effectivePath(status(), null)).toBeNull();
++    expect(effectivePath(status(), 'direct')).toBe('direct');
+     expect(effectiveMode(status(), 'quick')).toBe('quick');
+     expect(effectiveMode(status(), null)).toBe('off');
+   });
+@@ -160,7 +193,19 @@ describe('wizardStepState', () => {
+     s: TunnelStatusResponse,
+     chosenMode: 'named' | 'quick' | null,
+     hostnameConfirmed = false
+-  ) => ({ status: s, chosenMode, hostnameConfirmed });
++  ) => ({ status: s, chosenPath: 'tunnel' as const, chosenMode, hostnameConfirmed });
++
++  test('选好连接方式后第 1 步打勾，没选时停在第 1 步', () => {
++    expect(wizardStepState('path', ctx(status(), null))).toBe('done');
++    expect(
++      wizardStepState('path', {
++        status: status(),
++        chosenPath: null,
++        chosenMode: null,
++        hostnameConfirmed: false,
++      })
++    ).toBe('current');
++  });
+ 
+   test('没装 cloudflared 时停在安装步', () => {
+     const s = status({ binary: { installed: false, version: null, path: null, source: null } });
+@@ -235,24 +280,29 @@ describe('直接连接路径', () => {
+     auth?: LocalAuthStatus
+   ): Parameters<typeof wizardStepState>[1] => ({
+     status: s,
+-    chosenMode: 'direct',
++    chosenPath: 'direct',
++    chosenMode: null,
+     hostnameConfirmed: false,
+     localAuth: auth ?? null,
+   });
+ 
+-  test('只有方式与访问保护两步：不建隧道就不需要安装与反向代理', () => {
++  test('只有连接方式与访问保护两步：不建隧道就不需要安装与反向代理', () => {
+     expect(
+-      wizardSteps({ status: status(), chosenMode: 'direct', hostnameConfirmed: false })
+-    ).toEqual(['mode', 'direct']);
++      wizardSteps({
++        status: status(),
++        chosenPath: 'direct',
++        chosenMode: null,
++        hostnameConfirmed: false,
++      })
++    ).toEqual(['path', 'direct']);
+   });
+ 
+-  test('没装 cloudflared 也走得通：方式步直接算完成', () => {
++  test('没装 cloudflared 也走得通：连接方式步照样打勾', () => {
+     const s = status({ binary: notInstalled });
+-    expect(wizardSteps({ status: s, chosenMode: 'direct', hostnameConfirmed: false })).toEqual([
+-      'mode',
+-      'direct',
+-    ]);
+-    expect(wizardStepState('mode', ctx(s))).toBe('done');
++    expect(
++      wizardSteps({ status: s, chosenPath: 'direct', chosenMode: null, hostnameConfirmed: false })
++    ).toEqual(['path', 'direct']);
++    expect(wizardStepState('path', ctx(s))).toBe('done');
+   });
+ 
+   test('访问保护步：查到门才打勾', () => {
+@@ -270,21 +320,23 @@ describe('直接连接路径', () => {
+     expect(wizardStepState('direct', ctx(status()))).toBe('current');
+   });
+ 
+-  test('别的路径里访问保护步既不出现，也不会抢当前步', () => {
+-    const quick = { status: status(), chosenMode: 'quick' as const, hostnameConfirmed: false };
++  test('隧道路径里访问保护步既不出现，也不会抢当前步', () => {
++    const quick = {
++      status: status(),
++      chosenPath: 'tunnel' as const,
++      chosenMode: 'quick' as const,
++      hostnameConfirmed: false,
++    };
+     expect(wizardSteps(quick)).not.toContain('direct');
+     expect(wizardStepState('direct', quick)).toBe('todo');
+   });
+ 
+-  test('服务端已建隧道时本地的 direct 选择让位给服务端方式', () => {
++  test('服务端已建隧道时本地的 direct 选择让位给隧道路径', () => {
+     const s = status({ config: { ...status().config, mode: 'quick' } });
+-    expect(effectiveMode(s, 'direct')).toBe('quick');
+-    expect(wizardSteps({ status: s, chosenMode: 'direct', hostnameConfirmed: false })).toEqual([
+-      'install',
+-      'mode',
+-      'quick',
+-      'proxy',
+-    ]);
++    expect(effectivePath(s, 'direct')).toBe('tunnel');
++    expect(
++      wizardSteps({ status: s, chosenPath: 'direct', chosenMode: null, hostnameConfirmed: false })
++    ).toEqual(['path', 'install', 'mode', 'quick', 'proxy']);
+   });
+ });
+ 
+diff --git a/apps/fe/src/pages/settings/remote-access/tunnel-model.ts b/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
+index 2a77ac31..b3324586 100644
+--- a/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
++++ b/apps/fe/src/pages/settings/remote-access/tunnel-model.ts
+@@ -90,6 +90,7 @@ export function wouldDropLastProtection(status: TunnelStatusResponse): boolean {
+ }
+ 
+ export type WizardStepId =
++  | 'path'
+   | 'install'
+   | 'mode'
+   | 'login'
+@@ -102,14 +103,19 @@ export type WizardStepId =
+   | 'proxy';
+ 
+ /**
+- * 向导的展示路径：服务端的 `TunnelMode` 之外多一条纯前端的 `direct`（自行暴露，不建任何隧道）。
+- * 选中 `direct` 不会发出任何隧道动作，也永远不会写进 `status.config.mode`。
++ * 顶层连接方式：Cloudflare Tunnel 与「直接连接」是并列的两条路径，后者完全不碰 cloudflared。
++ * 纯前端概念，永远不会写进 `status.config.mode`。
+  */
+-export type WizardMode = TunnelMode | 'direct';
++export type ConnectionPath = 'tunnel' | 'direct';
++
++/** 隧道分支里的子方式（临时 / 命名），与服务端 `TunnelMode` 同构。 */
++export type WizardMode = TunnelMode;
+ 
+ export interface WizardContext {
+   status: TunnelStatusResponse;
+-  /** 本地选择的方式（尚未落库） */
++  /** 本地选择的连接方式；`null` = 还没选。 */
++  chosenPath: ConnectionPath | null;
++  /** 隧道分支里本地选择的子方式（尚未落库） */
+   chosenMode: WizardMode | null;
+   /** 主机名步骤已在本地确认——契约里没有单独保存主机名的动作，只能由向导自己记。 */
+   hostnameConfirmed: boolean;
+@@ -118,6 +124,7 @@ export interface WizardContext {
+ }
+ 
+ const NAMED_STEPS: WizardStepId[] = [
++  'path',
+   'install',
+   'mode',
+   'login',
+@@ -126,23 +133,38 @@ const NAMED_STEPS: WizardStepId[] = [
+   'create',
+   'proxy',
+ ];
+-const QUICK_STEPS: WizardStepId[] = ['install', 'mode', 'quick', 'proxy'];
++const QUICK_STEPS: WizardStepId[] = ['path', 'install', 'mode', 'quick', 'proxy'];
++const TUNNEL_STEPS: WizardStepId[] = ['path', 'install', 'mode', 'tunnel', 'proxy'];
+ /** 直接连接不装 cloudflared、不建隧道，也就没有安装与反向代理两步。 */
+-const DIRECT_STEPS: WizardStepId[] = ['mode', 'direct'];
+-const UNDECIDED_STEPS: WizardStepId[] = ['install', 'mode', 'tunnel', 'proxy'];
++const DIRECT_STEPS: WizardStepId[] = ['path', 'direct'];
++/** 还没选连接方式：只给顶层的两张卡，不要摆出一串与直接连接无关的隧道步骤。 */
++const PATH_ONLY_STEPS: WizardStepId[] = ['path'];
+ 
+-/** 步骤序列随方式变化：临时隧道没有登录 / 主机名 / 访问控制，直接连接只剩访问保护。 */
++/** 步骤序列先随连接方式分叉，隧道分支内再随子方式变化。 */
+ export function wizardSteps(ctx: WizardContext): WizardStepId[] {
++  const path = effectivePath(ctx.status, ctx.chosenPath);
++  if (path === null) return PATH_ONLY_STEPS;
++  if (path === 'direct') return DIRECT_STEPS;
+   const mode = effectiveMode(ctx.status, ctx.chosenMode);
+   if (mode === 'named') return NAMED_STEPS;
+   if (mode === 'quick') return QUICK_STEPS;
+-  if (mode === 'direct') return DIRECT_STEPS;
+-  return UNDECIDED_STEPS;
++  return TUNNEL_STEPS;
++}
++
++/**
++ * 已经建过隧道（含接管来的）时连接方式由服务端锁死：要走直接连接必须先移除隧道。
++ * 否则用本地选择，没选过就是 `null`。
++ */
++export function effectivePath(
++  status: TunnelStatusResponse,
++  chosenPath: ConnectionPath | null
++): ConnectionPath | null {
++  if (status.config.mode !== 'off') return 'tunnel';
++  return chosenPath;
+ }
+ 
+ /**
+- * 步骤 3 展示哪条路径：已配置隧道时以服务端为准（此时 `direct` 这条本地选择自动让位），
+- * 否则用本地选择。
++ * 隧道分支里展示哪种子方式：已配置隧道时以服务端为准，否则用本地选择。
+  */
+ export function effectiveMode(
+   status: TunnelStatusResponse,
+@@ -164,22 +186,24 @@ function tunnelReady(status: TunnelStatusResponse): boolean {
+  */
+ export function wizardStepState(step: WizardStepId, ctx: WizardContext): StepState {
+   const { status, hostnameConfirmed } = ctx;
++  const path = effectivePath(status, ctx.chosenPath);
+   const mode = effectiveMode(status, ctx.chosenMode);
+   const ready = tunnelReady(status);
+   const created = status.config.mode === 'named';
+ 
+   switch (step) {
++    case 'path':
++      return path === null ? 'current' : 'done';
+     case 'install':
+       return ready ? 'done' : 'current';
+     case 'mode':
+       return modeStepState(mode, ready);
+     case 'direct':
+-      return mode === 'direct' ? directStepState(ctx.localAuth) : 'todo';
++      return path === 'direct' ? directStepState(ctx.localAuth) : 'todo';
+     case 'tunnel':
+       return 'todo';
+     case 'quick':
+-      if (!ready || mode !== 'quick') return 'todo';
+-      return status.config.mode === 'quick' ? 'done' : 'current';
++      return quickStepState(status, mode, ready);
+     case 'login':
+       if (!ready || mode !== 'named') return 'todo';
+       return status.auth.loggedIn || created ? 'done' : 'current';
+@@ -196,13 +220,18 @@ export function wizardStepState(step: WizardStepId, ctx: WizardContext): StepSta
+   }
+ }
+ 
+-/** 「直接连接」与 cloudflared 无关：没装二进制也能选，方式步照样算完成。 */
++/** 隧道类型步：cloudflared 没就位时还轮不到它，选定之后就打勾。 */
+ function modeStepState(mode: WizardMode, ready: boolean): StepState {
+-  if (mode === 'direct') return 'done';
+   if (!ready) return 'todo';
+   return mode === 'off' ? 'current' : 'done';
+ }
+ 
++/** 临时隧道那一步：只在隧道分支且选了临时隧道时活跃，落库即打勾。 */
++function quickStepState(status: TunnelStatusResponse, mode: WizardMode, ready: boolean): StepState {
++  if (!ready || mode !== 'quick') return 'todo';
++  return status.config.mode === 'quick' ? 'done' : 'current';
++}
++
+ /** 查到确实有登录门才算这一步做完；`localAuth` 缺失（旧后端）时停在当前步等用户确认。 */
+ function directStepState(localAuth: LocalAuthStatus | null | undefined): StepState {
+   return directProtected(localAuth) ? 'done' : 'current';
+diff --git a/apps/fe/src/pages/settings/remote-access/wizard.tsx b/apps/fe/src/pages/settings/remote-access/wizard.tsx
+index c1e4c69c..16ad3766 100644
+--- a/apps/fe/src/pages/settings/remote-access/wizard.tsx
++++ b/apps/fe/src/pages/settings/remote-access/wizard.tsx
+@@ -1,7 +1,7 @@
+-// 远程访问向导。步骤序列随方式变化：
+-//   命名隧道 安装 → 方式 → 登录 → 主机名 → 访问控制 → 创建并启动 → 反向代理信任
+-//   临时隧道 安装 → 方式 → 启动 → 反向代理信任
+-//   直接连接 方式 → 访问保护（不建隧道，也就不需要 cloudflared 与反向代理信任两步）
++// 远程访问向导。第 1 步先选连接方式（Cloudflare Tunnel / 直接连接），之后按分支展开：
++//   命名隧道 连接方式 → 安装 → 隧道类型 → 登录 → 主机名 → 访问控制 → 创建并启动 → 反向代理信任
++//   临时隧道 连接方式 → 安装 → 隧道类型 → 启动 → 反向代理信任
++//   直接连接 连接方式 → 访问保护（不建隧道，也就不需要 cloudflared 与反向代理信任两步）
+ 
+ import type { LocalAuthStatus, TunnelStatusResponse } from '@tmex/shared';
+ import { Button } from '@tmex/ui/button';
+@@ -21,10 +21,12 @@ import { CreateStep, HostnameStep, LoginStep, type NamedDraft } from './named-st
+ import { DetailRow, JobProgress, WizardStepCard } from './step-shell';
+ import type { TunnelActions } from './tunnel-actions';
+ import {
++  type ConnectionPath,
+   type WizardMode,
+   type WizardStepId,
+   describeTunnelError,
+   effectiveMode,
++  effectivePath,
+   isAuthRequiredError,
+   trustProxyRestartRequired,
+   wizardStepState,
+@@ -34,6 +36,8 @@ import {
+ export interface TunnelWizardProps {
+   status: TunnelStatusResponse;
+   actions: TunnelActions;
++  chosenPath: ConnectionPath | null;
++  onChoosePath: (path: ConnectionPath) => void;
+   chosenMode: WizardMode | null;
+   onChooseMode: (mode: WizardMode) => void;
+   draft: NamedDraft;
+@@ -48,6 +52,8 @@ export interface TunnelWizardProps {
+ export function TunnelWizard({
+   status,
+   actions,
++  chosenPath,
++  onChoosePath,
+   chosenMode,
+   onChooseMode,
+   draft,
+@@ -60,7 +66,7 @@ export function TunnelWizard({
+   const { t } = useTranslation();
+   const [externalDismissed, setExternalDismissed] = useState(false);
+ 
+-  const ctx = { status, chosenMode, hostnameConfirmed: draft.confirmed, localAuth };
++  const ctx = { status, chosenPath, chosenMode, hostnameConfirmed: draft.confirmed, localAuth };
+   const steps = wizardSteps(ctx);
+   const authRequired = isAuthRequiredError(status, actions.error);
+   const showExternal =
+@@ -111,6 +117,8 @@ export function TunnelWizard({
+               draft={draft}
+               isHub={isHub}
+               exposure={exposure}
++              chosenPath={chosenPath}
++              onChoosePath={onChoosePath}
+               chosenMode={chosenMode}
+               onChooseMode={onChooseMode}
+               onRestarted={onRestarted}
+@@ -163,6 +171,8 @@ function StepContent({
+   draft,
+   isHub,
+   exposure,
++  chosenPath,
++  onChoosePath,
+   chosenMode,
+   onChooseMode,
+   onRestarted,
+@@ -175,6 +185,8 @@ function StepContent({
+   draft: NamedDraft;
+   isHub: boolean;
+   exposure: ExposureState;
++  chosenPath: ConnectionPath | null;
++  onChoosePath: (path: ConnectionPath) => void;
+   chosenMode: WizardMode | null;
+   onChooseMode: (mode: WizardMode) => void;
+   onRestarted: () => void;
+@@ -182,16 +194,25 @@ function StepContent({
+   onLocalAuth: (next: LocalAuthStatus) => void;
+ }) {
+   const { t } = useTranslation();
++  const locked = status.config.mode !== 'off';
+   switch (step) {
++    case 'path':
++      return (
++        <PathChooser
++          selected={effectivePath(status, chosenPath)}
++          locked={locked}
++          disabled={actions.busy}
++          onSelect={onChoosePath}
++        />
++      );
+     case 'install':
+       return <InstallStep status={status} actions={actions} />;
+     case 'mode':
+-      // 选方式只是本地选择，装不装 cloudflared 由后面的安装步把关；
+-      // 「直接连接」压根不需要它，按二进制状态锁死整块会让这条路径不可达。
++      // 选隧道类型只是本地选择，装不装 cloudflared 由安装步把关，这里不按二进制状态锁死。
+       return (
+         <ModeChooser
+           selected={effectiveMode(status, chosenMode)}
+-          locked={status.config.mode !== 'off'}
++          locked={locked}
+           disabled={actions.busy}
+           onSelect={onChooseMode}
+         />
+@@ -314,6 +335,46 @@ function InstallStep({
+   );
+ }
+ 
++function PathChooser({
++  selected,
++  locked,
++  disabled,
++  onSelect,
++}: {
++  selected: ConnectionPath | null;
++  /** 已经建过隧道：要改走直接连接必须先「移除」，这里只展示当前路径。 */
++  locked: boolean;
++  disabled: boolean;
++  onSelect: (path: ConnectionPath) => void;
++}) {
++  const { t } = useTranslation();
++  return (
++    <div
++      className="grid gap-3 sm:grid-cols-2"
++      role="radiogroup"
++      aria-label={t('settings.remoteAccess.steps.path.title')}
++      data-testid="remote-access-path-chooser"
++    >
++      <ChoiceCard
++        group="path"
++        value="tunnel"
++        icon={<Cloud className="size-4" />}
++        selected={selected === 'tunnel'}
++        disabled={disabled || locked}
++        onSelect={onSelect}
++      />
++      <ChoiceCard
++        group="path"
++        value="direct"
++        icon={<Server className="size-4" />}
++        selected={selected === 'direct'}
++        disabled={disabled || locked}
++        onSelect={onSelect}
++      />
++    </div>
++  );
++}
++
+ function ModeChooser({
+   selected,
+   locked,
+@@ -321,7 +382,7 @@ function ModeChooser({
+   onSelect,
+ }: {
+   selected: WizardMode;
+-  /** 已经建过隧道：换方式必须先「移除」，这里只展示当前方式。 */
++  /** 已经建过隧道：换类型必须先「移除」，这里只展示当前类型。 */
+   locked: boolean;
+   disabled: boolean;
+   onSelect: (mode: WizardMode) => void;
+@@ -329,53 +390,51 @@ function ModeChooser({
+   const { t } = useTranslation();
+   return (
+     <div
+-      className="grid gap-3 sm:grid-cols-3"
++      className="grid gap-3 sm:grid-cols-2"
+       role="radiogroup"
+       aria-label={t('settings.remoteAccess.steps.mode.title')}
+       data-testid="remote-access-mode-chooser"
+     >
+-      <ModeCard
+-        mode="quick"
++      <ChoiceCard
++        group="mode"
++        value="quick"
+         icon={<Zap className="size-4" />}
+         selected={selected === 'quick'}
+         disabled={disabled || locked}
+         onSelect={onSelect}
+       />
+-      <ModeCard
+-        mode="named"
++      <ChoiceCard
++        group="mode"
++        value="named"
+         icon={<Cloud className="size-4" />}
+         selected={selected === 'named'}
+         disabled={disabled || locked}
+         onSelect={onSelect}
+       />
+-      <ModeCard
+-        mode="direct"
+-        icon={<Server className="size-4" />}
+-        selected={selected === 'direct'}
+-        disabled={disabled || locked}
+-        onSelect={onSelect}
+-      />
+     </div>
+   );
+ }
+ 
+-function ModeCard({
+-  mode,
++/** 连接方式与隧道类型两组单选卡共用：`group` 同时决定 testid、单选组名与文案键前缀。 */
++function ChoiceCard<T extends string>({
++  group,
++  value,
+   icon,
+   selected,
+   disabled,
+   onSelect,
+ }: {
+-  mode: Exclude<WizardMode, 'off'>;
++  group: 'path' | 'mode';
++  value: T;
+   icon: ReactNode;
+   selected: boolean;
+   disabled: boolean;
+-  onSelect: (mode: WizardMode) => void;
++  onSelect: (value: T) => void;
+ }) {
+   const { t } = useTranslation();
+   return (
+     <label
+-      data-testid={`remote-access-mode-${mode}`}
++      data-testid={`remote-access-${group}-${value}`}
+       data-selected={selected ? 'true' : 'false'}
+       className={`flex cursor-pointer flex-col gap-1.5 rounded-xl p-3 text-left ring-1 transition-colors duration-(--tmex-motion-fast) ease-out motion-reduce:transition-none ${
+         selected ? 'bg-primary/5 ring-primary' : 'bg-card ring-foreground/10 hover:bg-muted/50'
+@@ -383,19 +442,19 @@ function ModeCard({
+     >
+       <input
+         type="radio"
+-        name="remote-access-mode"
+-        data-testid={`remote-access-mode-${mode}-input`}
++        name={`remote-access-${group}`}
++        data-testid={`remote-access-${group}-${value}-input`}
+         className="sr-only"
+         checked={selected}
+         disabled={disabled}
+-        onChange={() => onSelect(mode)}
++        onChange={() => onSelect(value)}
+       />
+       <span className="flex items-center gap-2 text-sm font-medium">
+         {icon}
+-        {t(`settings.remoteAccess.mode.${mode}.title`)}
++        {t(`settings.remoteAccess.${group}.${value}.title`)}
+       </span>
+       <span className="text-xs text-muted-foreground">
+-        {t(`settings.remoteAccess.mode.${mode}.description`)}
++        {t(`settings.remoteAccess.${group}.${value}.description`)}
+       </span>
+     </label>
+   );
+diff --git a/apps/fe/tests/devices.spec.ts b/apps/fe/tests/devices.spec.ts
+index 23107276..fe9f9387 100644
+--- a/apps/fe/tests/devices.spec.ts
++++ b/apps/fe/tests/devices.spec.ts
+@@ -7,6 +7,7 @@ test('devices: SSH Config field only appears for configRef auth mode (ui)', asyn
+   await expect(page.getByTestId('devices-page')).toBeVisible();
+ 
+   await page.getByTestId('devices-add').click();
++  await page.getByTestId('devices-add-to-self').click();
+   await expect(page.getByTestId('device-dialog')).toBeVisible();
+ 
+   // 切换到 SSH 远程设备类型（默认认证方式落到 agent，非 configRef）
+@@ -36,6 +37,7 @@ test('devices: create/edit/delete local device (ui)', async ({ page }) => {
+   await expect(page.getByTestId('devices-page')).toBeVisible();
+ 
+   await page.getByTestId('devices-add').click();
++  await page.getByTestId('devices-add-to-self').click();
+   await expect(page.getByTestId('device-dialog')).toBeVisible();
+ 
+   await page.getByTestId('device-name-input').fill(initialName);
+diff --git a/packages/shared/src/i18n/locales/en_US.json b/packages/shared/src/i18n/locales/en_US.json
+index 1acfc15f..a76748f5 100644
+--- a/packages/shared/src/i18n/locales/en_US.json
++++ b/packages/shared/src/i18n/locales/en_US.json
+@@ -41,6 +41,7 @@
+     },
+     "nav": {
+       "manageDevices": "Manage Devices",
++      "connectDevices": "Connect more devices",
+       "settings": "Settings",
+       "sidebarExpand": "Expand Sidebar",
+       "sidebarCollapse": "Collapse Sidebar",
+@@ -53,6 +54,102 @@
+       "refreshPage": "Refresh Page",
+       "refreshPageConfirm": "Are you sure you want to refresh the page? Unsaved content will be lost."
+     },
++    "connectDevices": {
++      "title": "Connect more devices",
++      "tabs": {
++        "mobile": "Mobile device (control only)",
++        "computer": "Server or computer"
++      },
++      "mobile": {
++        "intro": "A phone or tablet acts as a controller: it operates connected machines through the browser and does not run a terminal itself. Add tmex to the home screen for a full-screen, app-like experience.",
++        "platform": {
++          "ios": "iOS",
++          "android": "Android"
++        },
++        "addressLabel": "Current address",
++        "ios": {
++          "open": {
++            "title": "Open tmex in Safari",
++            "description": "On iOS only Safari can add to the home screen. Open on your phone:"
++          },
++          "add": {
++            "title": "Add to Home Screen",
++            "description": "Tap Share at the bottom, choose \"Add to Home Screen\", then tap Add."
++          },
++          "launch": {
++            "title": "Launch from the home screen",
++            "description": "Tap the tmex icon on the home screen. If sign-in is enabled, you will sign in once on first launch."
++          }
++        },
++        "android": {
++          "open": {
++            "title": "Open tmex in Chrome",
++            "description": "Open on your phone:"
++          },
++          "add": {
++            "title": "Install the app",
++            "description": "Tap the menu in the top-right corner, choose \"Install app\" (or \"Add to Home screen\"), then confirm."
++          },
++          "launch": {
++            "title": "Launch from the home screen",
++            "description": "Open tmex from the home screen or app drawer. If sign-in is enabled, you will sign in once on first launch."
++          }
++        },
++        "remoteHint": "If this address is only reachable on the local network, the phone must be on the same network. For access from anywhere, set up remote access first.",
++        "remoteLink": "Open remote access settings"
++      },
++      "computer": {
++        "intro": "After installing tmex on another server or computer, there are two ways to connect: join an existing relay (Hub), or make this machine the relay so other machines can join it.",
++        "install": {
++          "title": "Install tmex",
++          "description": "Run the install script on the target machine (installs Bun automatically; Linux needs tmux ≥ 3.0). The terminal prints the access address when done.",
++          "command": "Install command",
++          "pathHint": "The install script provides the tmex command. If it is not found, reopen the terminal or run:"
++        },
++        "mode": {
++          "title": "Choose how to connect",
++          "join": "Join an existing relay",
++          "host": "Use this machine as the relay"
++        },
++        "join": {
++          "hub": {
++            "title": "Prepare the relay server",
++            "description": "The relay (Hub) needs a machine with a public HTTPS address. If there is none yet, set one up on that machine following \"Use this machine as the relay\"."
++          },
++          "token": {
++            "title": "Generate a join token",
++            "description": "In the relay's tmex open Settings → Multi-node Mesh → Node management, click Add → Generate join token, then copy the join command. The token is valid for 10 minutes.",
++            "link": "Open multi-node mesh settings"
++          },
++          "run": {
++            "title": "Join from the new machine",
++            "description": "Run the join command in the new machine's terminal (example below; use the command you copied):",
++            "example": "tmex hub join https://tmex.example.com --token <join-token> --name <node-name>"
++          },
++          "confirm": {
++            "title": "Confirm the join",
++            "description": "Back on the relay's Node management page, click Confirm join. The new machine appears in the device list after it restarts."
++          }
++        },
++        "host": {
++          "entry": {
++            "title": "Set up a public entry",
++            "description": "Open Settings → Remote access and choose Cloudflare Tunnel (named tunnel) or Direct connection to get a fixed HTTPS address.",
++            "link": "Open remote access settings"
++          },
++          "hub": {
++            "title": "Make it the relay",
++            "description": "Open Settings → Multi-node Mesh, choose \"Make this machine the Hub\", enter the address from the previous step as the Hub public URL, create the first account and restart.",
++            "warning": "The Hub public URL cannot be changed afterwards. Decide on the final domain first.",
++            "link": "Open multi-node mesh settings"
++          },
++          "invite": {
++            "title": "Connect other machines",
++            "description": "After installing tmex on other machines, follow \"Join an existing relay\" using a join token generated on this machine."
++          }
++        }
++      }
++    },
+     "device": {
+       "title": "Device Management",
+       "devices": "Devices",
+@@ -130,7 +227,8 @@
+         "filesDisabledHint": "No directories configured for this device"
+       },
+       "addTo": {
+-        "label": "Add device to",
++        "label": "Add device to existing node",
++        "remoteNode": "Add remote node",
+         "self": "This machine"
+       },
+       "open": "Open",
+@@ -278,9 +376,9 @@
+       "remoteAccess": {
+         "title": "Remote access",
+         "wizardTitle": "Setup",
+-        "description": "Publish this machine's tmex on the internet through Cloudflare Tunnel — no public IP and no port forwarding.",
++        "description": "Reach this machine's tmex remotely over Cloudflare Tunnel or a direct connection.",
+         "remoteNodeNotice": "Remote access is configured on the machine your browser connects to directly. Switch to that machine and open this page there.",
+-        "loginRequired": "Sign in to this machine before configuring remote access.",
++        "loginRequired": "Sign in before configuring remote access.",
+         "loadFailed": "Couldn't load the remote access status. Make sure the tmex gateway is still running, then reload the page.",
+         "unsupported": "No cloudflared build is available for this platform ({{platform}}), so Cloudflare Tunnel can't be used here.",
+         "modeLabel": "Mode",
+@@ -301,58 +399,64 @@
+           },
+           "named": {
+             "title": "Named tunnel",
+-            "description": "Uses a domain you host on Cloudflare. The URL stays fixed and works with access control."
++            "description": "Uses a domain hosted on Cloudflare. The URL stays fixed — good for long-term use."
++          }
++        },
++        "path": {
++          "tunnel": {
++            "title": "Cloudflare Tunnel",
++            "description": "No public IP or port forwarding needed; tmex manages cloudflared."
+           },
+           "direct": {
+             "title": "Direct connection",
+-            "description": "Choose this when you expose tmex yourself — a static IP, port forwarding, or your own reverse proxy."
++            "description": "Connect over a static IP, port forwarding or a reverse proxy — no Cloudflare needed."
+           }
+         },
+         "direct": {
+           "protection": {
+             "node": {
+               "title": "Protected by node sign-in",
+-              "description": "This machine belongs to a multi-node mesh, so reaching it always requires signing in. Exposing it directly is covered by the same gate."
++              "description": "Sign-in protection is already on for this machine; reaching it requires signing in."
+             },
+             "local": {
+               "title": "Local sign-in is on",
+-              "description": "Reaching tmex requires signing in. Keep the password strong and serve the machine over HTTPS only."
++              "description": "Turns on sign-in protection. Keep the password strong and serve over HTTPS only."
+             },
+             "unprotected": {
+-              "title": "Nothing is protecting this machine",
+-              "description": "Exposed directly, anyone who finds the address can open and use the tmex running here — terminals and files included. Turning on local sign-in means reaching tmex requires signing in."
++              "title": "No access protection configured",
++              "description": "Anyone with the address can use the tmex on this machine. With sign-in protection on, access requires signing in."
+             },
+             "unknown": {
+               "title": "Can't confirm the protection state",
+-              "description": "This gateway did not report its local sign-in state, usually because it is out of date. Upgrade tmex and check again; until then, keep the machine off the public internet."
++              "description": "This gateway did not report its local sign-in state, usually because it is out of date. Upgrade tmex and try again."
+             }
+           },
+           "entryLabel": "Current entry",
+-          "entryHint": "This is the address you are on right now. When you expose tmex, point the public entry at port {{port}} on this machine, or at your own reverse proxy.",
++          "entryHint": "The address tmex is reached at. When exposing it, point the public entry at port {{port}} on this machine, or at a reverse proxy.",
+           "tls": {
+             "hint": "Always serve a direct exposure over HTTPS — plain HTTP puts passwords and session cookies on the wire.",
+             "link": "Set up HTTPS in node settings"
+           },
+           "enable": {
+             "title": "Turn on local sign-in",
+-            "bootstrapHint": "There is no account on this machine yet. Create the first user — this can only be done from the machine itself.",
++            "bootstrapHint": "This machine has no account yet. Create the first user — only possible from this machine.",
+             "username": "Username",
+             "usernameHint": "1–64 characters: letters, digits, dot, underscore and hyphen.",
+             "password": "Password",
+-            "passwordHint": "At least 8 characters. It is used for local sign-in only and never leaves this machine.",
++            "passwordHint": "At least 8 characters. Used for local sign-in only.",
+             "confirm": "Confirm password",
+             "invalid": {
+               "username": "Username must be 1–64 characters of letters, digits, dot, underscore or hyphen.",
+               "password": "The password needs at least 8 characters.",
+               "confirm": "The two passwords don't match."
+             },
+-            "warning": "Once this is on, reaching tmex requires signing in — every session you have open right now will have to sign in again.",
++            "warning": "Once on, reaching tmex requires signing in, and every open session has to sign in again.",
+             "acknowledge": "I understand every open session will have to sign in again",
+             "action": "Turn on local sign-in"
+           },
+           "errors": {
+-            "notStandalone": "This machine is part of a mesh: sign-in is handled by the node system and cannot be toggled here.",
+-            "localOnly": "For safety this setting can only be changed from the machine itself, not over a remote connection.",
++            "notStandalone": "This machine is part of a mesh: sign-in is handled by the node system, so this toggle is disabled.",
++            "localOnly": "For safety this setting can only be changed on this machine, not over a remote connection.",
+             "credentialsRequired": "There is no account to sign in with yet. Create the first user first.",
+             "alreadyEnabled": "Local sign-in is already on. Reload the page to see the current state.",
+             "credentialsExist": "This machine already has an account — just turn local sign-in on, no need to create another.",
+@@ -361,7 +465,7 @@
+             "malformed": "The request was malformed. Reload the page and try again.",
+             "unknown": "That didn't work. Try again in a moment."
+           },
+-          "caveat": "Note: local sign-in currently guarantees one thing — reaching tmex requires signing in. A stricter site-wide gate is still being finished, so don't relax your other defenses because of it."
++          "caveat": "Note: access protection only makes reaching tmex require a sign-in. Keep your other defenses in place."
+         },
+         "actions": {
+           "start": "Start",
+@@ -387,9 +491,13 @@
+           "empty": "No output yet."
+         },
+         "steps": {
++          "path": {
++            "title": "Connection method",
++            "description": "Choose how to reach this machine's tmex remotely."
++          },
+           "install": {
+             "title": "Install cloudflared",
+-            "description": "tmex downloads cloudflared into its own data directory and leaves any system install alone.",
++            "description": "Downloads cloudflared into the tmex data directory, leaving any existing install alone.",
+             "version": "Version",
+             "path": "Path",
+             "source": "Source",
+@@ -397,16 +505,16 @@
+               "managed": "Managed by tmex",
+               "system": "Found on PATH"
+             },
+-            "skipped": "cloudflared comes from the system service, so tmex doesn't need its own copy."
++            "skipped": "cloudflared comes from the system service; no second install needed."
+           },
+           "mode": {
+-            "title": "Choose a mode",
+-            "description": "To switch modes later, remove the current tunnel above first.",
+-            "pending": "Choose a mode to continue."
++            "title": "Tunnel type",
++            "description": "To switch type after the tunnel exists, remove the current tunnel first.",
++            "pending": "Pick a tunnel type first."
+           },
+           "tunnel": {
+             "title": "Create the tunnel",
+-            "description": "Finish setting it up here once you've picked a mode."
++            "description": "Finish creating it here once a type is picked."
+           },
+           "quick": {
+             "title": "Quick tunnel",
+@@ -423,11 +531,11 @@
+             },
+             "hostname": "Hostname",
+             "hostnamePlaceholder": "tmex.example.com",
+-            "hostnameHint": "Use a subdomain of a domain you host on Cloudflare.",
++            "hostnameHint": "Use a subdomain of a domain hosted on Cloudflare.",
+             "hostnameInvalid": "Enter a lowercase hostname such as tmex.example.com.",
+             "tunnelName": "Tunnel name",
+             "tunnelNamePlaceholder": "tmex",
+-            "tunnelNameHint": "Optional — tmex generates one if you leave it empty. Lowercase letters, digits, hyphens and underscores only.",
++            "tunnelNameHint": "Optional (tmex generates one). Lowercase letters, digits, hyphens and underscores only.",
+             "hubHint": "This machine is a Hub: set the Hub's public URL to this hostname so other nodes can connect through the tunnel.",
+             "hubHintLink": "Open multi-node settings",
+             "tunnelId": "Tunnel ID",
+@@ -455,7 +563,7 @@
+           },
+           "login": {
+             "title": "Sign in to Cloudflare",
+-            "description": "Authorize tmex to create tunnels and DNS records in your Cloudflare account. The certificate stays on this machine.",
++            "description": "Authorize tmex to create tunnels and DNS records. The credentials stay on this machine.",
+             "skipped": "The tunnel is run by a system service, so there's nothing to sign in to from tmex."
+           },
+           "hostname": {
+@@ -467,7 +575,7 @@
+           },
+           "access": {
+             "title": "Access",
+-            "description": "Allow visitors by email at the Cloudflare edge; rejected requests never reach this machine."
++            "description": "Set an email allowlist in Cloudflare; requests from anyone else are blocked at the edge."
+           },
+           "create": {
+             "title": "Create and start",
+@@ -477,7 +585,7 @@
+           },
+           "direct": {
+             "title": "Access protection",
+-            "description": "A direct connection never touches Cloudflare, so the only thing left to settle is whether this machine asks for a sign-in."
++            "description": "A direct connection needs no Cloudflare; this step only sets up local sign-in protection."
+           }
+         },
+         "jobStep": {
+@@ -499,17 +607,17 @@
+           "sync": "Syncing the Access application"
+         },
+         "errors": {
+-          "unsupported_platform": "No cloudflared build is available for this platform, so Cloudflare Tunnel can't be used here.",
+-          "binary_missing": "cloudflared wasn't found. Install it in the \"Install cloudflared\" step first.",
++          "unsupported_platform": "No cloudflared is available for this platform, so Cloudflare Tunnel can't be used.",
++          "binary_missing": "cloudflared wasn't found. Complete the \"Install cloudflared\" step first.",
+           "download_failed": "Downloading cloudflared failed. Check that this machine can reach github.com, then try again.",
+           "not_logged_in": "Cloudflare authorization isn't complete. Go back to \"Sign in to Cloudflare\" and finish it.",
+           "login_timeout": "The Cloudflare authorization timed out. Start the sign-in again and pick a domain on the page that opens.",
+           "invalid_hostname": "That hostname isn't valid. Use a lowercase name such as tmex.example.com.",
+-          "tunnel_exists": "A tunnel with this name already exists in Cloudflare. Pick another name, or delete the existing one in Cloudflare.",
+-          "dns_route_failed": "Adding the DNS record in Cloudflare failed. Confirm the domain is hosted in the same Cloudflare account and no conflicting record exists.",
+-          "process_failed": "cloudflared didn't start. Expand the cloudflared log below, check the last lines, then try again.",
++          "tunnel_exists": "A tunnel with this name already exists in Cloudflare. Pick another name, or delete the existing one.",
++          "dns_route_failed": "Adding the DNS record failed. Confirm the domain is hosted in the same Cloudflare account and no conflicting record exists.",
++          "process_failed": "cloudflared didn't start. Expand the cloudflared log to see why.",
+           "busy": "The previous operation hasn't finished yet. Try again in a moment.",
+-          "not_configured": "Remote access isn't configured yet. Pick a mode in the setup below.",
++          "not_configured": "Remote access isn't configured yet. Pick a method in the setup below.",
+           "invalid_request": "The request was rejected as invalid; this page may be out of date. Reload and try again.",
+           "unknown": "Operation failed: {{message}}",
+           "auth_required": "Sign-in isn't enabled on this machine. Enable it before going public, or anyone could walk straight into tmex.",
+@@ -522,7 +630,7 @@
+         },
+         "confirmRemove": {
+           "title": "Remove the named tunnel?",
+-          "description": "The tunnel stops, the credentials stored on this machine are deleted, and the tunnel itself is deleted in Cloudflare.",
++          "description": "The tunnel stops, and both the credentials stored on this machine and the tunnel in Cloudflare are deleted.",
+           "irreversible": "The tunnel in Cloudflare can't be restored, and the current public URL stops working immediately.",
+           "confirm": "Remove tunnel",
+           "cancel": "Cancel"
+@@ -536,14 +644,14 @@
+           "hostnameMismatch": "Access hostname mismatch"
+         },
+         "externallyManaged": "Run by a system service",
+-        "externallyManagedNotice": "A system service runs this tunnel. tmex only reports its state and never starts or stops it. Release it first to hand the tunnel back to tmex.",
++        "externallyManagedNotice": "A system service runs this tunnel. tmex only shows its state and can't start or stop it. Release it first to hand the tunnel back to tmex.",
+         "exposure": {
+-          "warning": "Nothing is protecting this machine right now: the tunnel URL is a public entrance, and anyone who has it can use tmex. Enable sign-in (multi-node), or configure Cloudflare Access for this hostname and turn on token verification.",
++          "warning": "No access protection is configured: anyone with the tunnel URL can use tmex. Enable sign-in (multi-node), or configure Access and turn on token verification.",
+           "warningShort": "Nothing is protecting this machine right now: anyone with the tunnel URL can use tmex.",
+           "acknowledge": "I understand the risk and want to expose tmex publicly",
+           "ackRequired": "This exposes tmex to the public internet. Tick the box above to confirm.",
+           "enableLogin": "Enable sign-in (multi-node)",
+-          "dropWarning": "This removes the last thing protecting the machine: the tunnel keeps running, and anyone will be able to use tmex."
++          "dropWarning": "Warning: the tunnel keeps running — once this is removed, anyone can use tmex."
+         },
+         "access": {
+           "tag": {
+@@ -554,7 +662,7 @@
+           "credentials": {
+             "title": "Cloudflare credentials",
+             "apiToken": "API token",
+-            "apiTokenHint": "A Cloudflare API token with Access: Apps and Policies (Edit) and Access: Organizations, Identity Providers, and Groups (Read). It is stored only on this machine.",
++            "apiTokenHint": "A Cloudflare API token with Access: Apps and Policies (Edit) and Access: Organizations, Identity Providers, and Groups (Read) is required.",
+             "accountId": "Account ID",
+             "accountIdHint": "The Account ID shown in the Cloudflare dashboard sidebar.",
+             "save": "Save",
+@@ -584,7 +692,7 @@
+           },
+           "sync": {
+             "action": "Sync from Cloudflare",
+-            "hint": "Credentials are saved, but tmex has no Access application on record. If you already created one for {{hostname}} in the Cloudflare dashboard, sync it in first so you don't end up with a duplicate."
++            "hint": "Credentials are saved, but tmex has no Access application on record. If you already created one for {{hostname}} in the Cloudflare dashboard, sync it in first to avoid a duplicate."
+           },
+           "probe": {
+             "unknown": "Can't check Cloudflare Access for {{hostname}}: no usable Cloudflare credentials, or the lookup failed. This does not mean Access is unconfigured. Save an API token and account ID below and tmex will check again.",
+@@ -602,7 +710,7 @@
+             "noRules": "None",
+             "enforce": "Verify Access tokens at the gateway",
+             "enforceHint": "Validate Cf-Access-Jwt-Assertion on requests arriving through the tunnel and reject the ones that fail.",
+-            "enforceOff": "Token verification is off. Cloudflare still blocks unauthorized visitors at the edge, but requests that reach the tunnel around Access won't be stopped by this machine.",
++            "enforceOff": "Token verification is off. Cloudflare still blocks unauthorized visitors at the edge, but requests that reach the tunnel around Access are let through.",
+             "remove": "Remove Access application",
+             "hostnameMismatch": "This application covers a different hostname than the current tunnel, so token verification has no effect. Apply the rules again to bind it to the current hostname."
+           },
+@@ -615,7 +723,7 @@
+         },
+         "external": {
+           "title": "Existing Cloudflare Tunnel detected",
+-          "description": "This machine already runs a tunnel that tmex doesn't manage. Adopt it, or ignore it and let tmex create its own.",
++          "description": "This machine already runs a tunnel outside tmex's management. Let tmex adopt it, or ignore it and create a new one.",
+           "source": "Detected from",
+           "sourceValue": {
+             "launchd": "launchd service",
+@@ -629,22 +737,22 @@
+             "on": "Running",
+             "off": "Not running"
+           },
+-          "accessLabel": "Cloudflare Access",
++          "accessLabel": "Access",
+           "accessValue": {
+-            "covered": "An application covers this hostname (dashboard)",
+-            "absent": "No application covers this hostname",
++            "covered": "An Access application covers this hostname",
++            "absent": "No Access application covers this hostname",
+             "unknown": "Can't check — no usable credentials"
+           },
+           "noHostname": "Its configuration has no hostname pointing at this tmex (127.0.0.1:{{port}}), so it can't be adopted. Check its ingress rules, or let tmex create its own tunnel.",
+           "chooseHostname": "Choose the hostname to adopt",
+-          "adopt": "Adopt this tunnel",
+-          "adoptHint": "Adopting records this hostname as tmex's public address and shows the tunnel's state and access control here. The tunnel process keeps running under the system service — tmex never starts, stops, or rewrites its configuration. You can release it at any time; the system service is unaffected.",
+-          "dismiss": "Ignore and let tmex create a new tunnel"
++          "adopt": "Adopt the existing tunnel",
++          "adoptHint": "Adopting sets this hostname as the public address and shows the tunnel's state and access control here. The tunnel process keeps running under the system service — tmex never starts, stops, or rewrites its configuration, and you can release it at any time.",
++          "dismiss": "Ignore and create a new tunnel"
+         }
+       },
+       "deviceManagement": {
+         "title": "Device Management",
+-        "description": "Add, edit, and connect to your local and SSH devices.",
++        "description": "Add, edit, and connect to local and SSH devices.",
+         "openButton": "Open Device Management"
+       },
+       "saveSettings": "Save Settings",
+@@ -1100,7 +1208,6 @@
+       "openSettings": "Open Settings",
+       "manageDevices": "Manage Devices",
+       "settings": "Settings",
+-      "nodes": "Multi-node Mesh",
+       "currentWindow": "Current Window",
+       "currentPane": "Current terminal",
+       "newWindow": "Create Window",
+diff --git a/packages/shared/src/i18n/locales/ja_JP.json b/packages/shared/src/i18n/locales/ja_JP.json
+index 659975ab..dd77573e 100644
+--- a/packages/shared/src/i18n/locales/ja_JP.json
++++ b/packages/shared/src/i18n/locales/ja_JP.json
+@@ -41,6 +41,7 @@
+     },
+     "nav": {
+       "manageDevices": "デバイス管理",
++      "connectDevices": "デバイスを追加",
+       "settings": "設定",
+       "sidebarExpand": "サイドバーを展開",
+       "sidebarCollapse": "サイドバーを折りたたむ",
+@@ -53,6 +54,102 @@
+       "refreshPage": "ページを更新",
+       "refreshPageConfirm": "ページを更新してもよろしいですか？保存されていない内容は失われます。"
+     },
++    "connectDevices": {
++      "title": "デバイスを追加",
++      "tabs": {
++        "mobile": "モバイル端末（操作のみ）",
++        "computer": "サーバーまたはパソコン"
++      },
++      "mobile": {
++        "intro": "スマートフォンやタブレットは操作端末として動作します。ブラウザーから接続済みのマシンを操作し、端末上でターミナルを実行することはありません。ホーム画面に追加すると、全画面のネイティブアプリに近い操作感になります。",
++        "platform": {
++          "ios": "iOS",
++          "android": "Android"
++        },
++        "addressLabel": "現在のアドレス",
++        "ios": {
++          "open": {
++            "title": "Safari で tmex を開く",
++            "description": "iOS でホーム画面に追加できるのは Safari のみです。端末で次のアドレスを開きます："
++          },
++          "add": {
++            "title": "ホーム画面に追加",
++            "description": "下部の「共有」をタップし、「ホーム画面に追加」を選んで「追加」をタップします。"
++          },
++          "launch": {
++            "title": "ホーム画面から起動",
++            "description": "ホーム画面の tmex アイコンをタップして起動します。ログインが有効な場合は、初回のみログインが必要です。"
++          }
++        },
++        "android": {
++          "open": {
++            "title": "Chrome で tmex を開く",
++            "description": "端末で次のアドレスを開きます："
++          },
++          "add": {
++            "title": "アプリをインストール",
++            "description": "右上のメニューをタップし、「アプリをインストール」（または「ホーム画面に追加」）を選んで確認します。"
++          },
++          "launch": {
++            "title": "ホーム画面から起動",
++            "description": "ホーム画面またはアプリ一覧から tmex を開きます。ログインが有効な場合は、初回のみログインが必要です。"
++          }
++        },
++        "remoteHint": "現在のアドレスがローカルネットワーク内でのみ到達可能な場合は、端末を同じネットワークに接続してください。どこからでもアクセスするには、先にリモートアクセスを設定します。",
++        "remoteLink": "リモートアクセス設定を開く"
++      },
++      "computer": {
++        "intro": "別のサーバーやパソコンに tmex をインストールした後、接続方法は 2 つあります。既存の中継（Hub）に参加するか、本機を中継にして他のマシンを参加させます。",
++        "install": {
++          "title": "tmex をインストール",
++          "description": "対象のマシンでインストールスクリプトを実行します（Bun は自動でインストールされます。Linux では tmux 3.0 以上が必要です）。完了するとターミナルにアクセスアドレスが表示されます。",
++          "command": "インストールコマンド",
++          "pathHint": "インストールスクリプトが tmex コマンドを用意します。コマンドが見つからない場合は、ターミナルを開き直すか次を実行します："
++        },
++        "mode": {
++          "title": "接続方法を選択",
++          "join": "既存の中継に参加",
++          "host": "本機を中継にする"
++        },
++        "join": {
++          "hub": {
++            "title": "中継サーバーを準備",
++            "description": "中継（Hub）には公開 HTTPS アドレスを持つマシンが必要です。まだない場合は、そのマシンで「本機を中継にする」の手順を先に実施してください。"
++          },
++          "token": {
++            "title": "参加コードを作成",
++            "description": "中継側の tmex で「設定 → マルチノード連携 → ノード管理」を開き、「追加」→「参加コードを作成」をクリックして参加コマンドをコピーします。参加コードの有効期限は 10 分です。",
++            "link": "マルチノード連携設定を開く"
++          },
++          "run": {
++            "title": "新しいマシンで参加",
++            "description": "新しいマシンのターミナルで参加コマンドを実行します（以下は例です。コピーしたコマンドを使用してください）：",
++            "example": "tmex hub join https://tmex.example.com --token <参加コード> --name <ノード名>"
++          },
++          "confirm": {
++            "title": "参加を承認",
++            "description": "中継側のノード管理ページに戻り、「承認」をクリックします。新しいマシンは再起動後にデバイス一覧に表示されます。"
++          }
++        },
++        "host": {
++          "entry": {
++            "title": "公開エントリを用意",
++            "description": "「設定 → リモートアクセス」を開き、Cloudflare Tunnel（名前付きトンネル）または直接接続を選んで、固定の HTTPS アドレスを取得します。",
++            "link": "リモートアクセス設定を開く"
++          },
++          "hub": {
++            "title": "中継に設定",
++            "description": "「設定 → マルチノード連携」を開き、「このマシンをハブにする」を選択します。前の手順のアドレスを「ハブの公開アドレス」に入力し、最初のアカウントを作成して再起動します。",
++            "warning": "ハブの公開アドレスは設定後に変更できません。最終的なドメインを先に確定してください。",
++            "link": "マルチノード連携設定を開く"
++          },
++          "invite": {
++            "title": "他のマシンを接続",
++            "description": "他のマシンに tmex をインストールしたら、「既存の中継に参加」の手順に従い、本機で作成した参加コードで接続します。"
++          }
++        }
++      }
++    },
+     "device": {
+       "title": "デバイス管理",
+       "devices": "デバイス",
+@@ -130,7 +227,8 @@
+         "filesDisabledHint": "このデバイスにはディレクトリが設定されていません"
+       },
+       "addTo": {
+-        "label": "デバイスの追加先",
++        "label": "既存ノードにデバイスを追加",
++        "remoteNode": "リモートノードを追加",
+         "self": "このマシン"
+       },
+       "open": "開く",
+@@ -278,9 +376,9 @@
+       "remoteAccess": {
+         "title": "リモートアクセス",
+         "wizardTitle": "セットアップ",
+-        "description": "Cloudflare Tunnel を使って、このマシンの tmex をインターネットに公開します。グローバル IP もポート開放も不要です。",
++        "description": "Cloudflare Tunnel または直接接続で、このマシンの tmex にリモートアクセスします。",
+         "remoteNodeNotice": "リモートアクセスは、ブラウザが直接接続しているマシンでのみ設定できます。対象のマシンに切り替えてから、このページを開いてください。",
+-        "loginRequired": "リモートアクセスを設定する前に、このマシンにログインしてください。",
++        "loginRequired": "リモートアクセスを設定する前にログインしてください。",
+         "loadFailed": "リモートアクセスの状態を取得できませんでした。tmex ゲートウェイが稼働しているか確認し、ページを再読み込みしてください。",
+         "unsupported": "このプラットフォーム（{{platform}}）向けの cloudflared がないため、Cloudflare Tunnel は利用できません。",
+         "modeLabel": "方式",
+@@ -301,58 +399,64 @@
+           },
+           "named": {
+             "title": "名前付きトンネル",
+-            "description": "Cloudflare で管理しているドメインを使います。アドレスは固定で、アクセス制御と併用できます。"
++            "description": "Cloudflare で管理しているドメインを使います。アドレスは固定で、長期運用に向きます。"
++          }
++        },
++        "path": {
++          "tunnel": {
++            "title": "Cloudflare Tunnel",
++            "description": "グローバル IP やポート開放は不要です。cloudflared は tmex が管理します。"
+           },
+           "direct": {
+             "title": "直接接続",
+-            "description": "固定 IP・ポート転送・自前のリバースプロキシで tmex を自分で公開する場合はこちらを選びます。"
++            "description": "固定 IP・ポート転送・リバースプロキシ経由で接続します。Cloudflare は不要です。"
+           }
+         },
+         "direct": {
+           "protection": {
+             "node": {
+               "title": "ノードのログインで保護されています",
+-              "description": "このマシンはマルチノード構成に参加しているため、アクセスには必ずログインが必要です。直接公開しても同じ関門を通ります。"
++              "description": "このマシンではログイン保護が有効で、アクセスにはログインが必要です。"
+             },
+             "local": {
+               "title": "ローカルログインが有効です",
+-              "description": "tmex へのアクセスにはログインが必要です。十分に強いパスワードを使い、公開は HTTPS のみで行ってください。"
++              "description": "ログイン保護を有効にします。十分に強いパスワードを使い、公開は HTTPS のみで行ってください。"
+             },
+             "unprotected": {
+-              "title": "アクセス保護がありません",
+-              "description": "このまま公開すると、アドレスを知った人は誰でもこのマシンの tmex を——ターミナルもファイルも——そのまま使えます。ローカルログインを有効にすると、tmex へのアクセスにログインが必要になります。"
++              "title": "アクセス保護が未設定です",
++              "description": "アドレスを知った人は誰でもこのマシンの tmex を使えます。ログイン保護を有効にすると、アクセスにログインが必要になります。"
+             },
+             "unknown": {
+               "title": "アクセス保護の状態を確認できません",
+-              "description": "ゲートウェイがローカルログインの状態を返していません。多くはバージョンが古いためです。tmex を更新して確認するまでは、このマシンを公開しないでください。"
++              "description": "ゲートウェイがローカルログインの状態を返していません。多くはバージョンが古いためです。tmex を更新してから再度お試しください。"
+             }
+           },
+           "entryLabel": "現在の入口",
+-          "entryHint": "いま tmex を開いているアドレスです。公開するときは、外部からの入口をこのマシンの {{port}} 番ポート、または自前のリバースプロキシに向けてください。",
++          "entryHint": "tmex のアクセスアドレスです。外部に公開する場合は、このマシンの {{port}} 番ポートまたはリバースプロキシに向けてください。",
+           "tls": {
+             "hint": "直接公開するときは必ず HTTPS を使ってください。平文の HTTP ではパスワードとセッション情報が経路上に流れます。",
+             "link": "ノード設定で HTTPS を設定する"
+           },
+           "enable": {
+             "title": "ローカルログインを有効にする",
+-            "bootstrapHint": "このマシンにはまだアカウントがありません。最初のユーザーを作成します。この操作はマシン上でのみ実行できます。",
++            "bootstrapHint": "このマシンにはまだアカウントがありません。最初のユーザーを作成します。この操作はこのマシン上でのみ実行できます。",
+             "username": "ユーザー名",
+             "usernameHint": "1〜64 文字。英数字とピリオド・アンダースコア・ハイフンが使えます。",
+             "password": "パスワード",
+-            "passwordHint": "8 文字以上。ローカルログイン専用で、このマシンの外には出ません。",
++            "passwordHint": "8 文字以上。ローカルログイン専用です。",
+             "confirm": "パスワード（確認）",
+             "invalid": {
+               "username": "ユーザー名は 1〜64 文字で、英数字とピリオド・アンダースコア・ハイフンのみ使えます。",
+               "password": "パスワードは 8 文字以上にしてください。",
+               "confirm": "パスワードが一致しません。"
+             },
+-            "warning": "有効にすると tmex へのアクセスにログインが必要になり、いま開いているセッションはすべてログインし直しになります。",
++            "warning": "有効にすると tmex へのアクセスにログインが必要になり、開いているセッションはすべてログインし直しになります。",
+             "acknowledge": "開いているセッションがすべてログインし直しになることを理解しました",
+             "action": "ローカルログインを有効にする"
+           },
+           "errors": {
+-            "notStandalone": "このマシンはマルチノード構成に参加しています。ログインはノード側が担うため、ここでは切り替えられません。",
+-            "localOnly": "安全のため、この設定はマシン上でのみ変更できます。リモートアクセス経由では変更できません。",
++            "notStandalone": "このマシンはマルチノード構成に参加しています。ログインはノード側が担うため、この切り替えは無効です。",
++            "localOnly": "安全のため、この設定はこのマシン上でのみ変更でき、リモートアクセス経由では変更できません。",
+             "credentialsRequired": "ログインできるアカウントがまだありません。先に最初のユーザーを作成してください。",
+             "alreadyEnabled": "ローカルログインはすでに有効です。ページを再読み込みして最新の状態を確認してください。",
+             "credentialsExist": "このマシンにはすでにアカウントがあります。作成せずにローカルログインを有効にしてください。",
+@@ -361,7 +465,7 @@
+             "malformed": "リクエストの形式が正しくありません。ページを再読み込みしてやり直してください。",
+             "unknown": "処理に失敗しました。しばらくしてからやり直してください。"
+           },
+-          "caveat": "補足：ローカルログインが現時点で保証するのは「tmex へのアクセスにログインが必要になる」ことだけです。サイト全体の遮断は対応中のため、これを理由に他の対策を緩めないでください。"
++          "caveat": "補足：アクセス保護が保証するのは「tmex へのアクセスにログインが必要になる」ことのみです。他の安全対策と併用してください。"
+         },
+         "actions": {
+           "start": "開始",
+@@ -387,9 +491,13 @@
+           "empty": "出力はありません。"
+         },
+         "steps": {
++          "path": {
++            "title": "接続方法",
++            "description": "このマシンの tmex にリモートアクセスする方法を選びます。"
++          },
+           "install": {
+             "title": "cloudflared のインストール",
+-            "description": "tmex は cloudflared を自身のデータディレクトリに配置します。システムに導入済みのものには手を加えません。",
++            "description": "cloudflared を tmex のデータディレクトリにダウンロードします。既存のインストールには手を加えません。",
+             "version": "バージョン",
+             "path": "パス",
+             "source": "取得元",
+@@ -397,16 +505,16 @@
+               "managed": "tmex が管理",
+               "system": "システムに導入済み（PATH）"
+             },
+-            "skipped": "cloudflared はシステムサービスが提供しているため、tmex 側でのインストールは不要です。"
++            "skipped": "cloudflared はシステムサービスが提供しているため、再インストールは不要です。"
+           },
+           "mode": {
+-            "title": "方式の選択",
+-            "description": "方式を変更する場合は、先に上で現在のトンネルを削除してください。",
+-            "pending": "方式を選択してください。"
++            "title": "トンネルの種類",
++            "description": "トンネル作成後に種類を変更するには、先に現在のトンネルを削除してください。",
++            "pending": "先にトンネルの種類を選んでください。"
+           },
+           "tunnel": {
+             "title": "トンネルの作成",
+-            "description": "方式を選んだあと、ここで作成を完了します。"
++            "description": "種類を選んだあと、ここで作成を完了します。"
+           },
+           "quick": {
+             "title": "一時トンネル",
+@@ -427,7 +535,7 @@
+             "hostnameInvalid": "tmex.example.com のような小文字のホスト名を入力してください。",
+             "tunnelName": "トンネル名",
+             "tunnelNamePlaceholder": "tmex",
+-            "tunnelNameHint": "空欄可。空欄の場合は tmex が生成します。使用できるのは小文字・数字・ハイフン・アンダースコアのみです。",
++            "tunnelNameHint": "空欄可（tmex が生成します）。使用できるのは小文字・数字・ハイフン・アンダースコアのみです。",
+             "hubHint": "このマシンは Hub です。Hub の公開アドレスをこのホスト名に設定すると、他のノードがトンネル経由で接続できます。",
+             "hubHintLink": "マルチノード設定を開く",
+             "tunnelId": "トンネル ID",
+@@ -455,7 +563,7 @@
+           },
+           "login": {
+             "title": "Cloudflare にログイン",
+-            "description": "Cloudflare アカウントでトンネルと DNS レコードを作成する権限を tmex に付与します。証明書はこのマシン内に保存されます。",
++            "description": "トンネルと DNS レコードを作成する権限を tmex に付与します。認可情報はこのマシンにのみ保存されます。",
+             "skipped": "トンネルはシステムサービスが実行しているため、tmex 内でのログインは不要です。"
+           },
+           "hostname": {
+@@ -467,7 +575,7 @@
+           },
+           "access": {
+             "title": "アクセス制御（Access）",
+-            "description": "Cloudflare のエッジでメールアドレスにより許可します。拒否されたリクエストはこのマシンに届きません。"
++            "description": "Cloudflare でメールアドレスの許可リストを設定します。リストにないリクエストは遮断されます。"
+           },
+           "create": {
+             "title": "作成して起動",
+@@ -477,7 +585,7 @@
+           },
+           "direct": {
+             "title": "アクセス保護",
+-            "description": "直接接続は Cloudflare を経由しないため、ここで確かめるのはこのマシンがログインを求めるかどうかだけです。"
++            "description": "直接接続に Cloudflare は不要です。ここではローカルのログイン保護のみを設定します。"
+           }
+         },
+         "jobStep": {
+@@ -499,17 +607,17 @@
+           "sync": "Access アプリケーションを同期中"
+         },
+         "errors": {
+-          "unsupported_platform": "このプラットフォーム向けの cloudflared がないため、Cloudflare Tunnel は利用できません。",
+-          "binary_missing": "cloudflared が見つかりません。「cloudflared のインストール」で先にインストールしてください。",
++          "unsupported_platform": "このプラットフォームで利用できる cloudflared がないため、Cloudflare Tunnel は利用できません。",
++          "binary_missing": "cloudflared が見つかりません。「cloudflared のインストール」を先に完了してください。",
+           "download_failed": "cloudflared のダウンロードに失敗しました。このマシンから github.com に到達できるか確認して、再試行してください。",
+           "not_logged_in": "Cloudflare の認可が完了していません。「Cloudflare にログイン」に戻って認可を済ませてください。",
+           "login_timeout": "Cloudflare の認可がタイムアウトしました。ログインをやり直し、開いたページでドメインを選択してください。",
+           "invalid_hostname": "ホスト名の形式が正しくありません。tmex.example.com のような小文字のホスト名を入力してください。",
+-          "tunnel_exists": "同名のトンネルが Cloudflare に既に存在します。別の名前を指定するか、Cloudflare 側で削除してください。",
+-          "dns_route_failed": "Cloudflare への DNS レコード追加に失敗しました。同じ Cloudflare アカウントでドメインが管理されているか、既存レコードと競合していないか確認してください。",
+-          "process_failed": "cloudflared が起動できませんでした。下の cloudflared ログを開き、末尾の出力を確認してから再試行してください。",
++          "tunnel_exists": "同名のトンネルが Cloudflare に既に存在します。別の名前を指定するか、既存のトンネルを削除してください。",
++          "dns_route_failed": "DNS レコードの追加に失敗しました。同じ Cloudflare アカウントでドメインが管理されているか、既存レコードと競合していないか確認してください。",
++          "process_failed": "cloudflared が起動できませんでした。cloudflared ログを開いて原因を確認してください。",
+           "busy": "前の操作がまだ完了していません。少し待ってから再試行してください。",
+-          "not_configured": "リモートアクセスは未設定です。下のセットアップで方式を選んでください。",
++          "not_configured": "リモートアクセスは未設定です。下のセットアップで接続方法を選んでください。",
+           "invalid_request": "リクエストが不正として拒否されました。ページの内容が古い可能性があります。再読み込みしてから操作してください。",
+           "unknown": "操作に失敗しました：{{message}}",
+           "auth_required": "このマシンではログインが有効になっていません。公開する前に有効化しないと、誰でも tmex に入れてしまいます。",
+@@ -522,7 +630,7 @@
+         },
+         "confirmRemove": {
+           "title": "名前付きトンネルを削除しますか？",
+-          "description": "トンネルを停止し、このマシンに保存された資格情報を削除し、Cloudflare 上のトンネルも削除します。",
++          "description": "トンネルを停止し、このマシンに保存された資格情報と Cloudflare 上のトンネルを削除します。",
+           "irreversible": "Cloudflare 上のトンネルは復元できず、現在の公開アドレスは直ちに使えなくなります。",
+           "confirm": "トンネルを削除",
+           "cancel": "キャンセル"
+@@ -536,14 +644,14 @@
+           "hostnameMismatch": "Access ホスト名不一致"
+         },
+         "externallyManaged": "システムサービスが実行",
+-        "externallyManagedNotice": "このトンネルはシステムサービスが実行しており、tmex は状態を表示するだけで起動・停止は行いません。tmex で管理するには、先に引き継ぎを解除してください。",
++        "externallyManagedNotice": "トンネルはシステムサービスが実行しており、tmex は状態を表示するだけで起動・停止はできません。tmex で管理するには、先に引き継ぎを解除してください。",
+         "exposure": {
+-          "warning": "現在、アクセス保護がありません。トンネルの URL は公開の入口であり、URL を知っている人は誰でも tmex を使えます。ログイン（マルチノード）を有効にするか、このホスト名に Cloudflare Access を設定してトークン検証を有効にしてください。",
++          "warning": "アクセス保護が未設定です。トンネルのアドレスを知っている人は誰でも tmex を使えます。ログイン（マルチノード）を有効にするか、Access を設定してトークン検証を有効にしてください。",
+           "warningShort": "現在、アクセス保護がありません。トンネルの URL を知っている人は誰でも tmex を使えます。",
+           "acknowledge": "リスクを理解した上でインターネットに公開する",
+           "ackRequired": "この操作は tmex をインターネットに公開します。上のチェックを入れて確認してください。",
+           "enableLogin": "ログインを有効にする（マルチノード）",
+-          "dropWarning": "最後のアクセス保護が外れます。トンネルは動作したままで、以降は誰でも tmex を使えるようになります。"
++          "dropWarning": "警告：トンネルは動作したままで、解除すると誰でも tmex を使えるようになります。"
+         },
+         "access": {
+           "tag": {
+@@ -554,7 +662,7 @@
+           "credentials": {
+             "title": "Cloudflare 認証情報",
+             "apiToken": "API トークン",
+-            "apiTokenHint": "Access: Apps and Policies（編集）と Access: Organizations, Identity Providers, and Groups（読み取り）の権限を持つ Cloudflare API トークンが必要です。トークンはこのマシンにのみ保存されます。",
++            "apiTokenHint": "Access: Apps and Policies（編集）と Access: Organizations, Identity Providers, and Groups（読み取り）の権限を持つ Cloudflare API トークンが必要です。",
+             "accountId": "アカウント ID",
+             "accountIdHint": "Cloudflare ダッシュボードのサイドバーに表示される Account ID です。",
+             "save": "保存",
+@@ -584,7 +692,7 @@
+           },
+           "sync": {
+             "action": "Cloudflare から同期",
+-            "hint": "認証情報は保存済みですが、tmex 側に Access アプリケーションの記録がありません。{{hostname}} 用のアプリケーションを Cloudflare ダッシュボードで作成済みの場合は、重複作成を避けるため先に同期してください。"
++            "hint": "認証情報は保存済みですが、tmex 側に Access アプリケーションの記録がありません。{{hostname}} 用のアプリケーションを Cloudflare ダッシュボードで作成済みの場合は、重複を避けるため先に同期してください。"
+           },
+           "probe": {
+             "unknown": "{{hostname}} の Cloudflare Access 状態を確認できません。利用できる Cloudflare 認証情報がないか、照会に失敗しました。未設定という意味ではありません。下で API トークンとアカウント ID を保存すると、自動的に再確認します。",
+@@ -602,7 +710,7 @@
+             "noRules": "なし",
+             "enforce": "ゲートウェイで Access トークンを検証",
+             "enforceHint": "トンネル経由のリクエストで Cf-Access-Jwt-Assertion を検証し、通らないものを拒否します。",
+-            "enforceOff": "トークン検証は無効です。Cloudflare のエッジでは引き続き未認可のアクセスを遮断しますが、Access を迂回してトンネルに届いたリクエストはこのマシンでは拒否されません。",
++            "enforceOff": "トークン検証は無効です。Cloudflare のエッジでは引き続き未認可のアクセスを遮断しますが、Access を迂回してトンネルに届いたリクエストは通過します。",
+             "remove": "Access アプリケーションを削除",
+             "hostnameMismatch": "このアプリケーションの対象ホスト名が現在のトンネルと異なるため、トークン検証は有効になりません。ルールを適用し直して、現在のホスト名に紐づけてください。"
+           },
+@@ -615,7 +723,7 @@
+         },
+         "external": {
+           "title": "システム上の Cloudflare Tunnel を検出しました",
+-          "description": "このマシンでは tmex の管理外のトンネルが既に稼働しています。tmex に引き継がせることも、無視して別途作成することもできます。",
++          "description": "このマシンには tmex の管理外のトンネルがあります。tmex に引き継がせるか、無視して新規作成できます。",
+           "source": "検出元",
+           "sourceValue": {
+             "launchd": "launchd サービス",
+@@ -629,17 +737,17 @@
+             "on": "実行中",
+             "off": "停止中"
+           },
+-          "accessLabel": "Cloudflare Access",
++          "accessLabel": "Access",
+           "accessValue": {
+-            "covered": "このホスト名を対象とするアプリあり（ダッシュボード）",
+-            "absent": "このホスト名を対象とするアプリは未検出",
++            "covered": "このホスト名を対象とする Access アプリあり",
++            "absent": "このホスト名を対象とする Access アプリは未検出",
+             "unknown": "検出不可（利用できる認証情報がありません）"
+           },
+           "noHostname": "このトンネルの設定に、このマシンの tmex（127.0.0.1:{{port}}）を指すホスト名が見つからないため、引き継げません。ingress の設定を確認するか、tmex で別のトンネルを作成してください。",
+           "chooseHostname": "引き継ぐホスト名を選択",
+-          "adopt": "このトンネルを引き継ぐ",
+-          "adoptHint": "引き継ぐと、tmex はこのホスト名を自身の公開アドレスとして記録し、トンネルの状態とアクセス制御をここに表示します。トンネル自体はシステムサービスが実行したままで、tmex が起動・停止したり設定を書き換えたりすることはありません。引き継ぎはいつでも解除でき、システムサービスには影響しません。",
+-          "dismiss": "無視して tmex で新規作成"
++          "adopt": "既存のトンネルを引き継ぐ",
++          "adoptHint": "引き継ぐと、このホスト名を公開アドレスとして設定し、トンネルの状態とアクセス制御を表示します。トンネル自体はシステムサービスが実行したままで、tmex が起動・停止や設定変更を行うことはありません。引き継ぎはいつでも解除できます。",
++          "dismiss": "無視して新規作成"
+         }
+       },
+       "deviceManagement": {
+@@ -1100,7 +1208,6 @@
+       "openSettings": "設定を開く",
+       "manageDevices": "デバイス管理",
+       "settings": "設定",
+-      "nodes": "マルチノード連携",
+       "currentWindow": "現在のウィンドウ",
+       "currentPane": "現在のターミナル",
+       "newWindow": "ウィンドウを作成",
+diff --git a/packages/shared/src/i18n/locales/zh_CN.json b/packages/shared/src/i18n/locales/zh_CN.json
+index eececc66..7ad1a328 100644
+--- a/packages/shared/src/i18n/locales/zh_CN.json
++++ b/packages/shared/src/i18n/locales/zh_CN.json
+@@ -41,6 +41,7 @@
+     },
+     "nav": {
+       "manageDevices": "管理设备",
++      "connectDevices": "接入更多设备",
+       "settings": "设置",
+       "sidebarExpand": "展开侧边栏",
+       "sidebarCollapse": "收起侧边栏",
+@@ -53,6 +54,102 @@
+       "refreshPage": "刷新页面",
+       "refreshPageConfirm": "确定要刷新页面吗？未保存的内容将会丢失。"
+     },
++    "connectDevices": {
++      "title": "接入更多设备",
++      "tabs": {
++        "mobile": "移动设备（仅控制）",
++        "computer": "服务器或电脑"
++      },
++      "mobile": {
++        "intro": "手机或平板只作为控制端：通过浏览器操作已接入的机器，不在本机运行终端。添加到主屏幕后可获得全屏、接近原生应用的体验。",
++        "platform": {
++          "ios": "iOS",
++          "android": "Android"
++        },
++        "addressLabel": "当前地址",
++        "ios": {
++          "open": {
++            "title": "在 Safari 中打开 tmex",
++            "description": "iOS 仅 Safari 支持添加到主屏幕。在手机上访问："
++          },
++          "add": {
++            "title": "添加到主屏幕",
++            "description": "点按底部「分享」，选择「添加到主屏幕」，再点「添加」。"
++          },
++          "launch": {
++            "title": "从主屏幕打开",
++            "description": "点按主屏幕上的 tmex 图标启动。若已启用登录，首次打开需登录一次。"
++          }
++        },
++        "android": {
++          "open": {
++            "title": "在 Chrome 中打开 tmex",
++            "description": "在手机上访问："
++          },
++          "add": {
++            "title": "安装应用",
++            "description": "点按右上角菜单，选择「安装应用」（或「添加到主屏幕」），确认安装。"
++          },
++          "launch": {
++            "title": "从主屏幕打开",
++            "description": "在主屏幕或应用列表中打开 tmex。若已启用登录，首次打开需登录一次。"
++          }
++        },
++        "remoteHint": "当前地址若仅限局域网访问，手机需连接同一网络。需要随时随地访问，请先配置远程访问。",
++        "remoteLink": "前往远程访问设置"
++      },
++      "computer": {
++        "intro": "在另一台服务器或电脑上安装 tmex 后，有两种接入方式：加入已有中继（Hub），或把本机设为中继让其他机器接入。",
++        "install": {
++          "title": "安装 tmex",
++          "description": "在目标机器上执行安装脚本（自动安装 Bun，Linux 需 tmux ≥ 3.0）。安装完成后终端会输出访问地址。",
++          "command": "安装命令",
++          "pathHint": "安装脚本会提供 tmex 命令。若提示找不到命令，重新打开终端或执行："
++        },
++        "mode": {
++          "title": "选择接入方式",
++          "join": "加入已有中继",
++          "host": "本机作为中继"
++        },
++        "join": {
++          "hub": {
++            "title": "准备中继服务器",
++            "description": "中继（Hub）需要一台有公网 HTTPS 地址的机器。若还没有，请先在该机器上按「本机作为中继」完成配置。"
++          },
++          "token": {
++            "title": "生成加入码",
++            "description": "在中继的 tmex 中打开「设置 → 多节点互联 → 节点管理」，点「添加」→「生成加入码」，复制加入命令。加入码 10 分钟内有效。",
++            "link": "前往多节点互联设置"
++          },
++          "run": {
++            "title": "在新机器上加入",
++            "description": "在新机器的终端执行加入命令（以下为示例，请以复制的命令为准）：",
++            "example": "tmex hub join https://tmex.example.com --token <加入码> --name <节点名称>"
++          },
++          "confirm": {
++            "title": "确认加入",
++            "description": "回到中继的节点管理页，点「确认加入」。新机器重启后即出现在设备列表。"
++          }
++        },
++        "host": {
++          "entry": {
++            "title": "配置公网入口",
++            "description": "打开「设置 → 远程访问」，选择 Cloudflare Tunnel（命名隧道）或直接连接，获得一个固定的 HTTPS 地址。",
++            "link": "前往远程访问设置"
++          },
++          "hub": {
++            "title": "设为中继",
++            "description": "打开「设置 → 多节点互联」，选择「把本机设为 Hub」，将上一步的地址填入「Hub 公开地址」，创建首个账号并重启。",
++            "warning": "Hub 公开地址设定后不可修改，请先确定最终域名。",
++            "link": "前往多节点互联设置"
++          },
++          "invite": {
++            "title": "接入其他机器",
++            "description": "在其他机器上安装 tmex 后，按「加入已有中继」的步骤，用本机生成的加入码接入。"
++          }
++        }
++      }
++    },
+     "device": {
+       "title": "设备管理",
+       "devices": "设备",
+@@ -130,7 +227,8 @@
+         "filesDisabledHint": "尚未为该设备配置目录"
+       },
+       "addTo": {
+-        "label": "添加设备到",
++        "label": "添加设备到已有节点",
++        "remoteNode": "添加远程节点",
+         "self": "本机"
+       },
+       "open": "打开",
+@@ -278,9 +376,9 @@
+       "remoteAccess": {
+         "title": "远程访问",
+         "wizardTitle": "配置向导",
+-        "description": "通过 Cloudflare Tunnel 把这台机器上的 tmex 发布到公网，无需公网 IP 或端口映射。",
++        "description": "通过 Cloudflare Tunnel 或直接连接远程访问本机 tmex。",
+         "remoteNodeNotice": "远程访问只能在浏览器直连的那台机器上配置。请先切换到那台机器，再打开本页。",
+-        "loginRequired": "请先登录这台机器，再配置远程访问。",
++        "loginRequired": "请先登录，再配置远程访问。",
+         "loadFailed": "读取远程访问状态失败。请确认 tmex 网关仍在运行，然后刷新页面重试。",
+         "unsupported": "当前系统（{{platform}}）没有可用的 cloudflared 构建，无法使用 Cloudflare Tunnel。",
+         "modeLabel": "方式",
+@@ -297,71 +395,77 @@
+         "mode": {
+           "quick": {
+             "title": "临时隧道",
+-            "description": "不需要 Cloudflare 账号，每次启动分配一个新的临时地址，适合演示与排查。"
++            "description": "无需 Cloudflare 账号，每次启动分配一个新的临时地址，适合演示与排查。"
+           },
+           "named": {
+             "title": "命名隧道",
+-            "description": "使用你托管在 Cloudflare 的域名，地址固定，可配合访问控制长期使用。"
++            "description": "使用托管在 Cloudflare 的域名，地址固定，适合长期使用。"
++          }
++        },
++        "path": {
++          "tunnel": {
++            "title": "Cloudflare Tunnel",
++            "description": "无需公网 IP 或端口映射，cloudflared 由 tmex 管理。"
+           },
+           "direct": {
+             "title": "直接连接",
+-            "description": "自行通过固定 IP、端口映射或反向代理暴露 tmex 时选择此方式。"
++            "description": "通过固定 IP、端口映射或反向代理连接，适合无 Cloudflare 的情况。"
+           }
+         },
+         "direct": {
+           "protection": {
+             "node": {
+               "title": "已由节点登录保护",
+-              "description": "这台机器已加入多节点互联，访问它必须先登录；直接暴露到公网同样要过登录这一关。"
++              "description": "本机已启用登录保护，访问它必须先登录。"
+             },
+             "local": {
+               "title": "本机登录已启用",
+-              "description": "访问 tmex 需要登录。请确保口令强度足够，并只通过 HTTPS 对外提供服务。"
++              "description": "启用登录保护。请确保口令强度足够，并只通过 HTTPS 对外提供服务。"
+             },
+             "unprotected": {
+-              "title": "当前没有任何访问保护",
+-              "description": "公网直连意味着任何人拿到地址就能打开并使用这台机器上的 tmex，包括其中的终端与文件。启用本机登录后，访问 tmex 需要登录。"
++              "title": "访问保护未配置",
++              "description": "任何人拿到地址就能使用本机 tmex。启用登录保护后，访问需要登录。"
+             },
+             "unknown": {
+               "title": "无法确认访问保护状态",
+-              "description": "当前网关没有下发本机登录状态，通常是版本过旧。升级 tmex 后再确认；在确认之前不要把这台机器暴露到公网。"
++              "description": "当前网关没有下发本机登录状态，通常是版本过旧。升级 tmex 后再试。"
+             }
+           },
+           "entryLabel": "当前入口",
+-          "entryHint": "这是你此刻访问 tmex 用的地址。对外暴露时，把公网入口指向本机的 {{port}} 端口，或指向你自己的反向代理。",
++          "entryHint": "tmex 的访问地址。对外暴露时，需指向本机的 {{port}} 端口，或指向反向代理。",
+           "tls": {
+             "hint": "直接暴露请务必启用 HTTPS：明文 HTTP 会把登录口令与会话凭证暴露在链路上。",
+             "link": "前往节点设置配置 HTTPS"
+           },
+           "enable": {
+             "title": "启用本机登录",
+-            "bootstrapHint": "这台机器还没有任何账号，先创建第一位用户。该操作只能在这台机器上完成。",
++            "bootstrapHint": "本机还没有任何账号，先创建第一位用户。该操作只能在本机完成。",
+             "username": "用户名",
+             "usernameHint": "1–64 个字符，只能使用字母、数字、点、下划线与连字符。",
+             "password": "口令",
+-            "passwordHint": "至少 8 个字符。口令只用于本机登录，不会离开这台机器。",
++            "passwordHint": "至少 8 个字符。口令只用于本机登录。",
+             "confirm": "确认口令",
+             "invalid": {
+               "username": "用户名格式不正确：1–64 个字符，只能使用字母、数字、点、下划线与连字符。",
+               "password": "口令至少需要 8 个字符。",
+               "confirm": "两次输入的口令不一致。"
+             },
+-            "warning": "启用后访问 tmex 需要登录，当前所有已打开的会话都要重新登录一次。",
++            "warning": "启用后访问 tmex 需要登录，所有已打开的会话都需要重新登录。",
+             "acknowledge": "我知道所有已打开的会话都需要重新登录",
+             "action": "启用本机登录"
+           },
+           "errors": {
+-            "notStandalone": "这台机器已加入多节点互联，登录由节点体系负责，无需也无法在此开关。",
+-            "localOnly": "出于安全考虑，这项设置只能在这台机器上操作，不能通过远程访问修改。",
++            "notStandalone": "本机已加入多节点互联，登录由节点体系负责，此开关已禁用。",
++            "localOnly": "出于安全考虑，这项设置只能在本机操作，不能通过远程访问修改。",
+             "credentialsRequired": "还没有可登录的账号，请先创建第一位用户。",
+             "alreadyEnabled": "本机登录已经启用，请刷新页面查看最新状态。",
+-            "credentialsExist": "这台机器上已有账号，直接启用本机登录即可，无需再创建。",
++            "credentialsExist": "本机已有账号，直接启用本机登录即可，无需再创建。",
+             "invalidUsername": "用户名格式不正确：1–64 个字符，只能使用字母、数字、点、下划线与连字符。",
+             "weakPassword": "口令至少需要 8 个字符。",
+             "malformed": "请求格式不正确，请刷新页面后重试。",
+             "unknown": "操作失败，请稍后重试。"
+           },
+-          "caveat": "说明：本机登录当前保证的是「访问 tmex 需要登录」这一条；更严格的整站拦截仍在完善中，请不要据此放宽其他防护措施。"
++          "caveat": "说明：访问保护仅保证「访问 tmex 需要登录」，建议配合其他安全措施使用。"
+         },
+         "actions": {
+           "start": "启动",
+@@ -387,9 +491,13 @@
+           "empty": "暂无输出。"
+         },
+         "steps": {
++          "path": {
++            "title": "连接方式",
++            "description": "选择远程访问本机 tmex 的方式。"
++          },
+           "install": {
+             "title": "安装 cloudflared",
+-            "description": "tmex 把 cloudflared 下载到自己的数据目录，不改动系统里已有的安装。",
++            "description": "将 cloudflared 下载到 tmex 数据目录，不改动已有安装。",
+             "version": "版本",
+             "path": "路径",
+             "source": "来源",
+@@ -397,16 +505,16 @@
+               "managed": "由 tmex 管理",
+               "system": "系统已安装（PATH）"
+             },
+-            "skipped": "cloudflared 由系统服务提供，tmex 无需再装一份。"
++            "skipped": "cloudflared 由系统服务提供，无需再次安装。"
+           },
+           "mode": {
+-            "title": "选择方式",
+-            "description": "隧道建好后如需换方式，先在上方移除当前隧道。",
+-            "pending": "先选择一种方式。"
++            "title": "隧道类型",
++            "description": "隧道建好后如需切换类型，须先移除当前隧道。",
++            "pending": "先选择隧道类型。"
+           },
+           "tunnel": {
+             "title": "建立隧道",
+-            "description": "选好方式后在这里完成建立。"
++            "description": "选好类型后在此完成建立。"
+           },
+           "quick": {
+             "title": "临时隧道",
+@@ -423,12 +531,12 @@
+             },
+             "hostname": "主机名",
+             "hostnamePlaceholder": "tmex.example.com",
+-            "hostnameHint": "填写一个已托管在 Cloudflare 的域名下的子域。",
+-            "hostnameInvalid": "主机名格式不正确，请填写形如 tmex.example.com 的小写域名。",
++            "hostnameHint": "填写一个已托管在 Cloudflare 的域名下的子域名。",
++            "hostnameInvalid": "主机名格式不正确，请填写如 tmex.example.com 的小写域名。",
+             "tunnelName": "隧道名称",
+             "tunnelNamePlaceholder": "tmex",
+-            "tunnelNameHint": "可留空，留空时由 tmex 生成。只能使用小写字母、数字、连字符与下划线。",
+-            "hubHint": "这台机器是 Hub：把 Hub 的公开地址设为该主机名，其他节点才能经隧道接入。",
++            "tunnelNameHint": "可留空(由 tmex 生成)。只能使用小写字母、数字、连字符与下划线。",
++            "hubHint": "本机为 Hub：把 Hub 的公开地址设为该主机名，其他节点才能经隧道接入。",
+             "hubHintLink": "前往多节点互联设置",
+             "tunnelId": "隧道 ID",
+             "configured": "命名隧道已创建。",
+@@ -455,7 +563,7 @@
+           },
+           "login": {
+             "title": "登录 Cloudflare",
+-            "description": "授权 tmex 用你的 Cloudflare 账号创建隧道与 DNS 记录。授权凭证只保存在这台机器上。",
++            "description": "授权 tmex 创建隧道与 DNS 记录。授权凭证仅保存在本机。",
+             "skipped": "隧道由系统服务托管，无需在 tmex 内登录 Cloudflare。"
+           },
+           "hostname": {
+@@ -467,7 +575,7 @@
+           },
+           "access": {
+             "title": "访问控制（Access）",
+-            "description": "在 Cloudflare 边缘按邮箱放行访问者，未通过的请求到不了这台机器。"
++            "description": "在 Cloudflare 设置邮箱白名单，不在白名单的登录请求将被阻止。"
+           },
+           "create": {
+             "title": "创建并启动",
+@@ -477,7 +585,7 @@
+           },
+           "direct": {
+             "title": "访问保护",
+-            "description": "直连暴露不经过 Cloudflare，这一步只确认这台机器是否要求登录。"
++            "description": "直连访问无需 Cloudflare，此处仅配置本机登录保护。"
+           }
+         },
+         "jobStep": {
+@@ -499,31 +607,31 @@
+           "sync": "正在同步 Access 应用"
+         },
+         "errors": {
+-          "unsupported_platform": "当前系统没有可用的 cloudflared 构建，无法使用 Cloudflare Tunnel。",
+-          "binary_missing": "找不到 cloudflared。请先在「安装 cloudflared」一步完成安装。",
+-          "download_failed": "下载 cloudflared 失败。请检查这台机器的网络是否能访问 github.com，然后重试。",
+-          "not_logged_in": "尚未完成 Cloudflare 授权。请回到「登录 Cloudflare」一步完成授权。",
++          "unsupported_platform": "当前系统没有可用的 cloudflared，无法使用 Cloudflare Tunnel。",
++          "binary_missing": "找不到 cloudflared。请先在「安装 cloudflared」完成安装。",
++          "download_failed": "下载 cloudflared 失败。请检查本机网络是否能访问 github.com，然后重试。",
++          "not_logged_in": "尚未完成 Cloudflare 授权。请回到「登录 Cloudflare」完成授权。",
+           "login_timeout": "Cloudflare 授权超时。请重新发起登录，并在打开的页面里选择域名完成授权。",
+           "invalid_hostname": "主机名格式不正确，请填写形如 tmex.example.com 的小写域名。",
+-          "tunnel_exists": "Cloudflare 上已有同名隧道。请换一个隧道名称，或先在 Cloudflare 删除它。",
+-          "dns_route_failed": "在 Cloudflare 添加 DNS 记录失败。请确认该域名托管在同一个 Cloudflare 账号下，且没有同名记录冲突。",
+-          "process_failed": "cloudflared 没能正常启动。请展开下方的 cloudflared 日志查看最后几行输出，处理后重试。",
+-          "busy": "上一项操作还没结束，请稍候再试。",
+-          "not_configured": "还没有配置远程访问，请先在下方向导里选择一种方式。",
++          "tunnel_exists": "Cloudflare 上已有同名隧道。请换一个名称，或先删除已有隧道。",
++          "dns_route_failed": "添加 DNS 记录失败。请确认该域名托管在同一个 Cloudflare 账号下，且没有同名记录冲突。",
++          "process_failed": "cloudflared 未能正常启动。请展开 cloudflared 日志查看具体原因。",
++          "busy": "上一项操作还未结束，请稍候再试。",
++          "not_configured": "还未配置远程访问，请先在下方向导里选择一种方式。",
+           "invalid_request": "请求无效，页面数据可能已过期。请刷新页面后重试。",
+           "unknown": "操作失败：{{message}}",
+-          "auth_required": "这台机器还没有启用登录。开放公网访问前请先启用登录，否则任何人都能直接进入 tmex。",
++          "auth_required": "本机还未启用登录。开放公网访问前请先启用登录，否则任何人都能直接进入 tmex。",
+           "access_api_failed": "调用 Cloudflare API 失败：{{message}}。请确认 API 令牌的权限与账户 ID 无误后重试。",
+           "exposure_ack_required": "该操作会把 tmex 开放到公网，请先勾选风险确认。"
+         },
+         "authRequired": {
+-          "notice": "这台机器还没有启用登录。开放公网访问前请先启用登录，否则任何人都能直接进入 tmex。",
++          "notice": "本机还未启用登录。开放公网访问前请先启用，否则任何人都能直接进入 tmex。",
+           "link": "前往多节点互联设置"
+         },
+         "confirmRemove": {
+           "title": "移除命名隧道？",
+-          "description": "隧道会被停止，本机保存的凭证会被删除，Cloudflare 上的这条隧道也会一并删除。",
+-          "irreversible": "Cloudflare 上的隧道无法恢复，当前公网地址会立即失效。",
++          "description": "隧道将被停止，本机保存的凭证及 Cloudflare 上的隧道会被删除。",
++          "irreversible": "Cloudflare 上的隧道删除后无法恢复，当前公网地址会立即失效。",
+           "confirm": "移除隧道",
+           "cancel": "取消"
+         },
+@@ -536,14 +644,14 @@
+           "hostnameMismatch": "Access 主机名不匹配"
+         },
+         "externallyManaged": "由系统服务托管",
+-        "externallyManagedNotice": "这条隧道由系统服务运行，tmex 只显示它的状态，不会启动或停止它。要交回 tmex 管理，请先取消接管。",
++        "externallyManagedNotice": "隧道由系统服务运行，tmex 仅显示状态，无法启动或停止。要交回 tmex 管理，请先取消接管。",
+         "exposure": {
+-          "warning": "当前没有任何访问保护：隧道地址就是公网入口，任何人拿到它都能直接使用 tmex。请启用登录（多节点互联），或为该主机名配置 Cloudflare Access 并开启令牌校验。",
++          "warning": "当前未配置访问保护：任何人拿到隧道地址, 都能直接使用 tmex。请启用登录（多节点互联），或配置 Access 并开启令牌校验。",
+           "warningShort": "当前没有任何访问保护：拿到隧道地址的人都能直接使用 tmex。",
+           "acknowledge": "我已了解风险，仍要开放公网访问",
+           "ackRequired": "该操作会把 tmex 开放到公网，请先勾选上面的确认。",
+           "enableLogin": "启用登录（多节点互联）",
+-          "dropWarning": "这会移除最后一道访问保护：隧道仍在运行，之后任何人都能直接使用 tmex。"
++          "dropWarning": "警告：隧道仍在运行，移除后任何人都能直接使用 tmex。"
+         },
+         "access": {
+           "tag": {
+@@ -554,7 +662,7 @@
+           "credentials": {
+             "title": "Cloudflare 凭证",
+             "apiToken": "API 令牌",
+-            "apiTokenHint": "需要一个 Cloudflare API 令牌，权限为 Access: Apps and Policies（编辑）与 Access: Organizations, Identity Providers, and Groups（读取）。令牌只保存在这台机器上。",
++            "apiTokenHint": "需要 Cloudflare API 令牌，权限为 Access: Apps and Policies（编辑）与 Access: Organizations, Identity Providers, and Groups（读取）。",
+             "accountId": "账户 ID",
+             "accountIdHint": "Cloudflare 控制台侧栏里的 Account ID。",
+             "save": "保存",
+@@ -584,7 +692,7 @@
+           },
+           "sync": {
+             "action": "从 Cloudflare 同步",
+-            "hint": "凭证已保存，但 tmex 这边没有 Access 应用记录。如果你已在 Cloudflare 控制台为 {{hostname}} 建过应用，请先同步把它接入 tmex，避免重复创建。"
++            "hint": "凭证已保存，但 tmex 无 Access 应用记录。如果你已在 Cloudflare 控制台为 {{hostname}} 建过应用，请先同步把它接入 tmex，避免重复创建。"
+           },
+           "probe": {
+             "unknown": "无法检测 {{hostname}} 的 Cloudflare Access 状态：当前没有可用的 Cloudflare 凭证，或查询 API 失败。这不代表未配置。保存下方的 API 令牌与账户 ID 后会自动重新检测。",
+@@ -602,7 +710,7 @@
+             "noRules": "无",
+             "enforce": "网关校验 Access 令牌",
+             "enforceHint": "对经隧道进来的请求校验 Cf-Access-Jwt-Assertion，未通过直接拒绝。",
+-            "enforceOff": "已关闭令牌校验。Cloudflare 仍会在边缘拦截未授权访问，但绕过 Access 直接打到隧道的请求，这台机器不会再拦。",
++            "enforceOff": "已关闭令牌校验。Cloudflare 仍会在边缘拦截未授权访问，但会放行绕过 Access 直接打到隧道的请求。",
+             "remove": "移除 Access 应用",
+             "hostnameMismatch": "该应用覆盖的主机名与当前隧道不一致，令牌校验不会生效。请重新应用规则，把它绑到当前主机名。"
+           },
+@@ -615,7 +723,7 @@
+         },
+         "external": {
+           "title": "检测到系统里已有的 Cloudflare Tunnel",
+-          "description": "这台机器上已经跑着一条不由 tmex 管理的隧道。可以让 tmex 接管它，也可以忽略并另建一条。",
++          "description": "本机上已经有未纳入 tmex 管理的隧道。可以由 tmex 接管，或忽略并新建隧道。",
+           "source": "检测来源",
+           "sourceValue": {
+             "launchd": "launchd 服务",
+@@ -629,22 +737,22 @@
+             "on": "运行中",
+             "off": "未运行"
+           },
+-          "accessLabel": "Cloudflare Access",
++          "accessLabel": "Access",
+           "accessValue": {
+-            "covered": "已有应用覆盖该主机名（控制台）",
+-            "absent": "未检测到覆盖该主机名的应用",
++            "covered": "已有 Access 应用覆盖该主机名",
++            "absent": "未检测到覆盖该主机名的 Access 应用",
+             "unknown": "无法检测（缺少可用凭证）"
+           },
+           "noHostname": "这条隧道的配置里没有指向本机 tmex（127.0.0.1:{{port}}）的主机名，因此无法接管。请检查它的 ingress 配置，或让 tmex 另建一条隧道。",
+           "chooseHostname": "选择要接管的主机名",
+-          "adopt": "接管这条隧道",
+-          "adoptHint": "接管后，tmex 把该主机名记为自己的公网地址，并在这里显示隧道状态与访问控制。隧道进程仍由系统服务运行——tmex 不会启动、停止或改写它的配置。随时可以取消接管，系统服务不受影响。",
+-          "dismiss": "忽略，由 tmex 新建隧道"
++          "adopt": "接管已有隧道",
++          "adoptHint": "接管后，自动将该主机名设为公网地址，并显示隧道状态与访问控制。隧道进程仍由系统服务运行——tmex 不会启动、停止或改写它的配置, 可随时取消接管。",
++          "dismiss": "忽略并新建隧道"
+         }
+       },
+       "deviceManagement": {
+         "title": "设备管理",
+-        "description": "添加、编辑并连接你的本地与 SSH 设备。",
++        "description": "添加、编辑并连接本地与 SSH 设备。",
+         "openButton": "打开设备管理"
+       },
+       "saveSettings": "保存设置",
+@@ -1100,7 +1208,6 @@
+       "openSettings": "打开设置",
+       "manageDevices": "管理设备",
+       "settings": "设置",
+-      "nodes": "多节点互联",
+       "currentWindow": "当前窗口",
+       "currentPane": "当前终端",
+       "newWindow": "新建窗口",
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index a76ba2e9..6a7f2a2a 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -154,3 +154,4 @@ export {
+   roleNameFromFlags,
+   rolesFromName,
+ } from './roles';
++export * from './release/source';
+diff --git a/packages/shared/src/release/source.ts b/packages/shared/src/release/source.ts
+new file mode 100644
+index 00000000..c588f845
+--- /dev/null
++++ b/packages/shared/src/release/source.ts
+@@ -0,0 +1,24 @@
++// 发行来源：本仓库（fork）不再走上游 npm 包，安装 / 升级 / 更新检查一律指向本仓库的 GitHub Releases。
++// tarball 由 `npm pack` 产出并以 `tmex-cli-<version>.tgz` 作为 release 资产上传；tag 固定为 `v<version>`。
++
++export const RELEASE_REPO = '12dora/tmex-enhanced';
++export const RELEASE_REPO_URL = `https://github.com/${RELEASE_REPO}`;
++export const RELEASE_API_LATEST_URL = `https://api.github.com/repos/${RELEASE_REPO}/releases/latest`;
++export const INSTALL_SCRIPT_URL = `https://raw.githubusercontent.com/${RELEASE_REPO}/main/install.sh`;
++export const INSTALL_COMMAND = `curl -fsSL ${INSTALL_SCRIPT_URL} | bash`;
++
++export function releaseTag(version: string): string {
++  return `v${version}`;
++}
++
++export function releaseTarballName(version: string): string {
++  return `tmex-cli-${version}.tgz`;
++}
++
++export function releaseTarballUrl(version: string): string {
++  return `${RELEASE_REPO_URL}/releases/download/${releaseTag(version)}/${releaseTarballName(version)}`;
++}
++
++export function releaseApiUrl(version: string): string {
++  return `https://api.github.com/repos/${RELEASE_REPO}/releases/tags/${releaseTag(version)}`;
++}

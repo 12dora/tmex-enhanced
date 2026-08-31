@@ -1,0 +1,9 @@
+## Common rules (read first)
+
+- Worktree: /Users/konata/code/tmex-enhanced-wt-r8 (branch feat/round8-onboarding). Other agents are editing OTHER files in this same worktree in parallel. Touch ONLY the files listed in your scope. NEVER run git commands that change state (no add/commit/stash/checkout/reset). Do not touch files outside your scope; if you believe a change outside scope is required, describe it in your result file instead.
+- Runtime is Bun only. Tests: `bun test <path>` inside the package dir (for apps/fe use `bun test src/...`, never bare `bun test` there). Typecheck: `bunx tsc --noEmit -p .` in the package dir; count `error TS` lines before and after your change — must not increase (baselines: apps/fe 0, apps/gateway 21, packages/app 1). Lint only the files you changed: `bunx biome check <files>` from the repo root (fix with `--write`). macOS has no `timeout` command.
+- i18n: locale JSON lives in packages/shared/src/i18n/locales/{en_US,zh_CN,ja_JP}.json. Keys must stay in sync across all three. After editing JSON run `bun run --filter @tmex/shared build:i18n` from the repo root to regenerate resources.ts/types.ts (never hand-edit or lint those generated files). Edit JSON with targeted edits; do not reformat the whole file.
+- Copy style (all languages): short, professional, no filler. Chinese: use 「本机」 not 「这台机器」, avoid 「你/你的」, full-width Chinese punctuation. English: plain, direct. Japanese: polite です/ます form, concise.
+- Code comments: only where logic is non-obvious; write them in Simplified Chinese (project convention). Variable names in English.
+- No laziness: no TODOs, no "simplified version", no skipped tests. Finish the whole scope.
+- When done, write a concise Markdown result report (English) to the path given in your task: what changed (file list), test/tsc/lint results with numbers, anything out of scope you noticed. Write the result file as your LAST action.

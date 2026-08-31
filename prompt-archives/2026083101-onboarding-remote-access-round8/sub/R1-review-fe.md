@@ -1,0 +1,9 @@
+You are a senior code reviewer. READ-ONLY. Deliver the review as your FINAL MESSAGE (Markdown, English). Do not attempt to write files.
+
+Review the front-end diff at prompt-archives/2026083101-onboarding-remote-access-round8/sub/R1-fe.diff (Bun + React 19 + react-router 7 + Base UI + react-i18next monorepo; apps/fe). Context of the changes:
+1. Settings → Remote access wizard: new top-level "connection method" step (Cloudflare Tunnel vs Direct connection); tunnel branch keeps install/tunnel-type/login/hostname/access/create/proxy; direct branch only has the protection step; status card hidden unless tunnel path effective; configured tunnel locks the chooser.
+2. New right-side slide-in panel "Connect more devices" (`?panel=connect`) with mobile (iOS/Android PWA) and computer (install script, join existing hub, become hub) guides, command blocks with copy; sidebar footer gets a second button; header multi-node icon + `?panel=nodes` removed.
+3. Devices page "+" menu: new "Add remote node" item linking to /settings?tab=nodes; menu always opens.
+4. i18n: three locales (zh_CN/en_US/ja_JP) — check key parity issues visible in the diff and any obviously wrong/inconsistent copy (do not nitpick style).
+
+Focus on real defects: broken behavior, state bugs (e.g. chosen path/mode not resetting when the tunnel is removed, stale closures), accessibility regressions (radio group semantics, aria), routing mistakes (node-prefixed `/n/:id` routes, relative `?panel=` links, history state on close), SSR/static-render test assumptions that don't hold in the browser, and missed call sites (search the repo for usages of removed/renamed exports: `WizardMode`, `sidebar.nodes`, `'nodes'` panel name, `mode.direct` i18n key, `AddDeviceMenuList` props). Verify each claim against the actual source files in the worktree before reporting. Rank findings: BLOCKER / SHOULD-FIX / NIT, each with file:line and a concrete fix. Keep it tight; skip praise.

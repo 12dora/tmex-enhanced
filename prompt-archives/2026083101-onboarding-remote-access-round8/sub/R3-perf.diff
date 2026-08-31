@@ -1,0 +1,1445 @@
+diff --git a/apps/gateway/src/api/tunnel-routes.test.ts b/apps/gateway/src/api/tunnel-routes.test.ts
+index 1e621118..9f71705c 100644
+--- a/apps/gateway/src/api/tunnel-routes.test.ts
++++ b/apps/gateway/src/api/tunnel-routes.test.ts
+@@ -273,4 +273,44 @@ describe('tunnel routes', () => {
+     if (!localRes) throw new Error('no route');
+     expect((await localRes).status).toBe(200);
+   });
++
++  test('GET /api/tunnel/status returns a probing placeholder when first detect exceeds the wait cap', async () => {
++    const gate = Promise.withResolvers<void>();
++    const ctx = await setup();
++    dirs.push(ctx.dir);
++    const manager = new TunnelManager({
++      tunnelDir: ctx.dir,
++      homeDir: ctx.homeDir,
++      originPort: 19883,
++      platform: 'linux',
++      arch: 'x64',
++      store: new MemoryTunnelConfigStore(),
++      which: () => '/usr/bin/cloudflared',
++      sleep: (ms) => Bun.sleep(Math.min(ms, 5)),
++      loginEnforced: () => true,
++      registerAccessGuard: false,
++      externalDetectDeps: {
++        firstWaitMs: 20,
++        sleep: (ms) => Bun.sleep(ms),
++        listProcesses: async () => {
++          await gate.promise;
++          return '';
++        },
++        readFile: async () => null,
++        listDir: async () => [],
++        homedir: () => ctx.homeDir,
++        platform: 'linux',
++      },
++    });
++    managers.push(manager);
++    const routes = createTunnelRoutes(manager);
++    const t0 = Date.now();
++    const res = await dispatch(routes, 'GET', '/api/tunnel/status');
++    expect(Date.now() - t0).toBeLessThan(150);
++    expect(res.status).toBe(200);
++    const body = (await res.json()) as TunnelStatusResponse;
++    expect(body.external.detected).toBe(false);
++    expect(body.external.probing).toBe(true);
++    gate.resolve();
++  });
+ });
+diff --git a/apps/gateway/src/mesh/auth-routes.test.ts b/apps/gateway/src/mesh/auth-routes.test.ts
+index f948815c..0dac57f0 100644
+--- a/apps/gateway/src/mesh/auth-routes.test.ts
++++ b/apps/gateway/src/mesh/auth-routes.test.ts
+@@ -743,6 +743,136 @@ describe('auth-routes', () => {
+     }
+   });
+ 
++  test('GET /api/auth/mode reuses TLS derivation within TTL', async () => {
++    const mesh = await bootMesh();
++    try {
++      let tlsCalls = 0;
++      const fingerprint = 'ab'.repeat(32);
++      mesh.runtime.auth.setTlsInfo(() => {
++        tlsCalls += 1;
++        return { caFingerprint: fingerprint, caPem: 'pem' };
++      });
++      const first = await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      const second = await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      expect(first.status).toBe(200);
++      expect(second.status).toBe(200);
++      expect(((await first.json()) as { caFingerprint: string }).caFingerprint).toBe(fingerprint);
++      expect(((await second.json()) as { caFingerprint: string }).caFingerprint).toBe(fingerprint);
++      expect(tlsCalls).toBe(1);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('GET /api/auth/mode invalidates cached derivation after local-auth bootstrap', async () => {
++    const mesh = await bootMesh({
++      roles: { hub: false, node: false },
++      skipUserBootstrap: true,
++    });
++    try {
++      const store = new MemoryLocalAuthStore();
++      mesh.runtime.auth.setLocalAuthStore(store);
++      let tlsCalls = 0;
++      mesh.runtime.auth.setTlsInfo(() => {
++        tlsCalls += 1;
++        return { caFingerprint: null, caPem: null };
++      });
++      const before = await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      const beforeAgain = await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      const beforeBody = (await before.json()) as { mode: string; uid: string | null };
++      expect(beforeBody.mode).toBe('none');
++      expect(beforeBody.uid).toBeNull();
++      expect(((await beforeAgain.json()) as { mode: string }).mode).toBe('none');
++      expect(tlsCalls).toBe(1);
++
++      const boot = await call(mesh.runtime, 'http://localhost/api/auth/local/bootstrap', {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ username: 'owner', password: 'tmex-test' }),
++        clientIp: '127.0.0.1',
++      });
++      expect(boot.status).toBe(200);
++      const enable = await call(mesh.runtime, 'http://localhost/api/auth/local', {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ enabled: true }),
++        clientIp: '127.0.0.1',
++      });
++      expect(enable.status).toBe(200);
++
++      const after = await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      const afterBody = (await after.json()) as {
++        mode: string;
++        uid: string | null;
++        username: string;
++      };
++      expect(afterBody.mode).toBe('mesh');
++      expect(afterBody.username).toBe('owner');
++      expect(afterBody.uid).toBeTruthy();
++      expect(tlsCalls).toBe(2);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('GET /api/auth/mode keeps per-origin passkey fields off the shared cache', async () => {
++    const mesh = await bootMesh();
++    try {
++      let tlsCalls = 0;
++      mesh.runtime.auth.setTlsInfo(() => {
++        tlsCalls += 1;
++        return { caFingerprint: 'cd'.repeat(32), caPem: 'pem' };
++      });
++      insertPasskeyRow(mesh.userStore, mesh.boot.userId, {
++        origin: 'http://localhost:19663',
++        rpId: 'localhost',
++        fill: 3,
++      });
++      const local = await call(mesh.runtime, 'http://localhost/api/auth/mode', {
++        headers: { origin: 'http://localhost:19663' },
++      });
++      const remote = await call(mesh.runtime, 'http://192.168.1.8/api/auth/mode', {
++        headers: { origin: 'http://192.168.1.8' },
++      });
++      const localBody = (await local.json()) as {
++        passkeysForThisOrigin: boolean;
++        passkeyAvailable: boolean;
++      };
++      const remoteBody = (await remote.json()) as {
++        passkeysForThisOrigin: boolean;
++        passkeyAvailable: boolean;
++      };
++      expect(localBody.passkeysForThisOrigin).toBe(true);
++      expect(localBody.passkeyAvailable).toBe(true);
++      expect(remoteBody.passkeysForThisOrigin).toBe(false);
++      expect(remoteBody.passkeyAvailable).toBe(false);
++      expect(tlsCalls).toBe(1);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('GET /api/auth/mode derivation expires after TTL using injectable now', async () => {
++    let now = 1_000;
++    const mesh = await bootMesh({ now: () => now });
++    try {
++      let tlsCalls = 0;
++      mesh.runtime.auth.setTlsInfo(() => {
++        tlsCalls += 1;
++        return { caFingerprint: 'ef'.repeat(32), caPem: 'pem' };
++      });
++      await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      now += 4_999;
++      await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      expect(tlsCalls).toBe(1);
++      now += 2;
++      await call(mesh.runtime, 'http://localhost/api/auth/mode');
++      expect(tlsCalls).toBe(2);
++    } finally {
++      mesh.close();
++    }
++  });
++
+   test('GET /api/auth/keylog/head and /api/auth/passkeys require session', async () => {
+     const mesh = await bootMesh();
+     try {
+diff --git a/apps/gateway/src/mesh/auth-routes.ts b/apps/gateway/src/mesh/auth-routes.ts
+index ea961713..a4262046 100644
+--- a/apps/gateway/src/mesh/auth-routes.ts
++++ b/apps/gateway/src/mesh/auth-routes.ts
+@@ -44,6 +44,14 @@ import {
+   type LocalAuthStoreLike,
+   standaloneClosedModeFields,
+ } from '../db/local-auth-settings';
++import {
++  AuthModeCache,
++  findPrimaryUser,
++  invalidateAuthModeCache,
++  isPasskeyAvailable,
++  loadAuthModeTls,
++  withAuthModeInvalidation,
++} from './auth-mode-cache';
+ import {
+   type HubTlsInfoProvider,
+   type KeyLogHubAck,
+@@ -67,6 +75,7 @@ import {
+ } from './session-middleware';
+ 
+ export type { KeyLogHubAck };
++export { findPrimaryUser, invalidateAuthModeCache, isPasskeyAvailable };
+ 
+ export type AuthKeyLogPublisher = KeyLogPublisher;
+ 
+@@ -128,6 +137,7 @@ export class AuthRoutes {
+   private readonly verifyPasskey: VerifyDelegationPasskey;
+   private tlsInfoProvider: HubTlsInfoProvider | undefined;
+   private localAuth: LocalAuthStoreLike;
++  private readonly modeCache = new AuthModeCache();
+ 
+   constructor(private readonly deps: AuthRoutesDeps) {
+     this.localAuth = deps.localAuth ?? new LocalAuthStore();
+@@ -144,10 +154,12 @@ export class AuthRoutes {
+ 
+   setTlsInfo(provider: HubTlsInfoProvider | undefined): void {
+     this.tlsInfoProvider = provider;
++    invalidateAuthModeCache();
+   }
+ 
+   setLocalAuthStore(store: LocalAuthStoreLike): void {
+     this.localAuth = store;
++    invalidateAuthModeCache();
+   }
+ 
+   isLocalAuthEffective(): boolean {
+@@ -172,8 +184,10 @@ export class AuthRoutes {
+       'GET /api/auth/keylog/head': () => session((_r, uid) => this.handleKeyLogHead(uid)),
+       'GET /api/auth/passkeys': () => session((r, uid) => this.handlePasskeys(r, uid)),
+       'POST /api/auth/keylog': () => session((r, uid) => this.handleKeyLog(r, uid)),
+-      'POST /api/auth/local': () => handleLocalAuthToggle(req, this.localAuthCtx()),
+-      'POST /api/auth/local/bootstrap': () => handleLocalAuthBootstrap(req, this.localAuthCtx()),
++      'POST /api/auth/local': () =>
++        withAuthModeInvalidation(() => handleLocalAuthToggle(req, this.localAuthCtx())),
++      'POST /api/auth/local/bootstrap': () =>
++        withAuthModeInvalidation(() => handleLocalAuthBootstrap(req, this.localAuthCtx())),
+     };
+     const run = routes[`${req.method} ${path}`];
+     if (run) return run();
+@@ -183,22 +197,30 @@ export class AuthRoutes {
+ 
+   private async handleMode(req: Request): Promise<Response> {
+     const origin = requestOrigin(req);
+-    const tls = (await this.tlsInfoProvider?.()) ?? { caFingerprint: null, caPem: null };
+-    const localAuth = localAuthPayload(this.localAuthCtx());
++    const snapshot = await this.modeCache.get(this.now(), async () => {
++      const tls = await loadAuthModeTls(this.tlsInfoProvider);
++      const localAuth = localAuthPayload(this.localAuthCtx());
++      const closed = isStandaloneRoles(this.deps.roles) && !localAuth.effective;
++      return {
++        tls,
++        localAuth,
++        user: closed ? null : findPrimaryUser(this.deps.userStore, this.deps.primaryUserId),
++        hub: closed ? { nodeId: null, publicUrl: null } : this.resolveHub(),
++        closed,
++      };
++    });
+     const shared = {
+       nodeId: this.deps.nodeId,
+       passkeyAvailable: isPasskeyAvailable(origin),
+-      caFingerprint: tls.caFingerprint,
+-      localAuth,
++      caFingerprint: snapshot.tls.caFingerprint,
++      localAuth: snapshot.localAuth,
+     };
+-    const closed = isStandaloneRoles(this.deps.roles) && !localAuth.effective;
+-    if (closed) {
++    if (snapshot.closed) {
+       return jsonBody({ ...shared, ...standaloneClosedModeFields() });
+     }
+-    const user = findPrimaryUser(this.deps.userStore, this.deps.primaryUserId);
+     return jsonBody({
+       ...shared,
+-      ...meshAuthModeUserFields(user, origin, this.deps.userStore, this.resolveHub()),
++      ...meshAuthModeUserFields(snapshot.user, origin, this.deps.userStore, snapshot.hub),
+     });
+   }
+ 
+@@ -633,6 +655,7 @@ export class AuthRoutes {
+     hubAck?: boolean,
+     hubError?: string
+   ): Response {
++    invalidateAuthModeCache();
+     if (!hubSync) {
+       return jsonBody({
+         ok: true,
+@@ -797,22 +820,6 @@ export function resolveUser(store: UserStore, uid: string): UserRecord | null {
+   return store.getById(uid) ?? store.getByUsername(uid);
+ }
+ 
+-export function findPrimaryUser(store: UserStore, primaryUserId?: string): UserRecord | null {
+-  if (primaryUserId) {
+-    const direct = store.getById(primaryUserId) ?? store.getByUsername(primaryUserId);
+-    if (direct) return direct;
+-  }
+-  for (const cert of store.listCerts()) {
+-    const user = store.getById(cert.userId);
+-    if (user) return user;
+-  }
+-  for (const node of store.listNodes()) {
+-    const user = store.getById(node.userId);
+-    if (user) return user;
+-  }
+-  return store.listUsers()[0] ?? null;
+-}
+-
+ export function requestOrigin(req: Request): string {
+   return req.headers.get('origin') ?? publicRequestUrl(req).origin;
+ }
+@@ -825,19 +832,6 @@ export function rpIdFromOrigin(origin: string): string {
+   }
+ }
+ 
+-export function isPasskeyAvailable(origin: string): boolean {
+-  try {
+-    const url = new URL(origin);
+-    const host = url.hostname.toLowerCase();
+-    const secure = url.protocol === 'https:' || host === 'localhost' || host.endsWith('.localhost');
+-    const ip = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(':');
+-    const domainOrLocalhost = host === 'localhost' || host.endsWith('.localhost') || !ip;
+-    return secure && domainOrLocalhost;
+-  } catch {
+-    return false;
+-  }
+-}
+-
+ function seqToJson(seq: bigint | number): number | string {
+   const value = typeof seq === 'bigint' ? seq : BigInt(seq);
+   return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
+diff --git a/apps/gateway/src/tunnel/access-client.test.ts b/apps/gateway/src/tunnel/access-client.test.ts
+index e6448418..06a77985 100644
+--- a/apps/gateway/src/tunnel/access-client.test.ts
++++ b/apps/gateway/src/tunnel/access-client.test.ts
+@@ -9,6 +9,16 @@ function jsonRes(body: unknown, status = 200): Response {
+   });
+ }
+ 
++function hangUntilAbort(signal: AbortSignal | null | undefined): Promise<Response> {
++  return new Promise((_, reject) => {
++    signal?.addEventListener('abort', () => {
++      const err = new Error('The operation was aborted due to timeout');
++      err.name = 'TimeoutError';
++      reject(err);
++    });
++  });
++}
++
+ describe('CloudflareAccessClient', () => {
+   test('looks up organization auth_domain', async () => {
+     const urls: string[] = [];
+@@ -247,6 +257,54 @@ describe('CloudflareAccessClient', () => {
+       name: 'tmex-ext',
+     });
+   });
++
++  test('passes AbortSignal.timeout on every Cloudflare request', async () => {
++    let signal: AbortSignal | undefined;
++    const client = new CloudflareAccessClient(async (_input, init) => {
++      signal = init?.signal ?? undefined;
++      return jsonRes({ success: true, result: { auth_domain: 'team.cloudflareaccess.com' } });
++    });
++    await client.getOrganization('acc1', 'tok');
++    expect(signal).toBeInstanceOf(AbortSignal);
++    expect(signal?.aborted).toBe(false);
++  });
++
++  test('aborts a hung Cloudflare request at the per-request budget', async () => {
++    const client = new CloudflareAccessClient(
++      async (_input, init) => hangUntilAbort(init?.signal),
++      { requestTimeoutMs: 20 }
++    );
++    try {
++      await client.getOrganization('acc1', 'tok');
++      throw new Error('expected failure');
++    } catch (error) {
++      expect((error as { code?: string }).code).toBe('access_api_failed');
++      expect((error as Error).message).toMatch(/aborted|timeout/i);
++    }
++  });
++
++  test('listApps stops at the total deadline and marks the result truncated', async () => {
++    const pages: string[] = [];
++    const client = new CloudflareAccessClient(
++      async (input, init): Promise<Response> => {
++        const url = String(input);
++        pages.push(url);
++        if (/[?&]page=1(?:&|$)/.test(url)) {
++          return jsonRes({
++            success: true,
++            result: [{ id: 'app-a', aud: 'aud-a', domain: 'a.example.com', name: 'a' }],
++            result_info: { page: 1, per_page: 100, total_count: 200, total_pages: 2 },
++          });
++        }
++        return hangUntilAbort(init?.signal);
++      },
++      { requestTimeoutMs: 5_000, listAppsDeadlineMs: 15 }
++    );
++    const apps = await client.listApps('acc1', 'tok');
++    expect(apps.map((a) => a.id)).toEqual(['app-a']);
++    expect(apps.truncated).toBe(true);
++    expect(pages.some((u) => u.includes('page=2'))).toBe(true);
++  });
+ });
+ 
+ describe('access rule helpers', () => {
+diff --git a/apps/gateway/src/tunnel/access-client.ts b/apps/gateway/src/tunnel/access-client.ts
+index a567f96f..0dae8e02 100644
+--- a/apps/gateway/src/tunnel/access-client.ts
++++ b/apps/gateway/src/tunnel/access-client.ts
+@@ -14,6 +14,8 @@ import { redactSecrets } from './redact';
+ const CF_API = 'https://api.cloudflare.com/client/v4';
+ const SESSION_DURATION = '24h';
+ const AUTHORIZING_DECISIONS = new Set(['allow', 'bypass', 'service_auth']);
++export const CF_REQUEST_TIMEOUT_MS = 3_000;
++export const CF_LIST_APPS_DEADLINE_MS = 6_000;
+ 
+ export const ACCESS_TOKEN_PERMISSIONS =
+   'Access: Apps and Policies — Edit and Access: Organizations, Identity Providers, and Groups — Read';
+@@ -25,6 +27,14 @@ export type CloudflareApp = {
+   domain: string;
+ };
+ 
++/** listApps 触及总时限时带 truncated；无匹配不得当成「未覆盖」。 */
++export type CloudflareAppList = CloudflareApp[] & { truncated?: boolean };
++
++export type CloudflareAccessClientOptions = {
++  requestTimeoutMs?: number;
++  listAppsDeadlineMs?: number;
++};
++
+ export type CloudflarePolicy = {
+   id: string;
+   name: string;
+@@ -67,7 +77,10 @@ function policyLabel(policy: CloudflarePolicy): string {
+ }
+ 
+ export class CloudflareAccessClient {
+-  constructor(private readonly fetchImpl: TunnelFetch = fetch) {}
++  constructor(
++    private readonly fetchImpl: TunnelFetch = fetch,
++    private readonly timeouts: CloudflareAccessClientOptions = {}
++  ) {}
+ 
+   async getOrganization(accountId: string, apiToken: string): Promise<{ teamDomain: string }> {
+     let result: Record<string, unknown>;
+@@ -154,34 +167,34 @@ export class CloudflareAccessClient {
+     );
+   }
+ 
+-  async listApps(accountId: string, apiToken: string): Promise<CloudflareApp[]> {
+-    const apps: CloudflareApp[] = [];
++  async listApps(accountId: string, apiToken: string): Promise<CloudflareAppList> {
++    const apps: CloudflareAppList = [];
++    const deadlineAt = Date.now() + (this.timeouts.listAppsDeadlineMs ?? CF_LIST_APPS_DEADLINE_MS);
+     let page = 1;
+     for (;;) {
+-      const { result, result_info } = await this.requestEnvelope<unknown[]>(
+-        'GET',
+-        `/accounts/${encodeURIComponent(accountId)}/access/apps?page=${page}&per_page=100`,
+-        apiToken
+-      );
+-      const batch = Array.isArray(result) ? result : [];
+-      for (const item of batch) {
+-        try {
+-          apps.push(this.parseApp(asRecord(item) ?? {}));
+-        } catch {
+-          // skip malformed
+-        }
+-      }
+-      const total = result_info?.total_count;
+-      const totalPages = result_info?.total_pages;
+-      if (typeof totalPages === 'number') {
+-        if (page >= totalPages) break;
+-      } else if (typeof total === 'number') {
+-        if (apps.length >= total) break;
+-      } else if (batch.length < 100) {
++      if (Date.now() >= deadlineAt) {
++        apps.truncated = true;
+         break;
+       }
+-      page += 1;
+-      if (page > 50) break;
++      try {
++        const { result, result_info } = await this.requestEnvelope<unknown[]>(
++          'GET',
++          `/accounts/${encodeURIComponent(accountId)}/access/apps?page=${page}&per_page=100`,
++          apiToken,
++          undefined,
++          { deadlineAt }
++        );
++        const batchLen = this.pushAppBatch(apps, result);
++        if (appsPageComplete(page, batchLen, apps.length, result_info)) break;
++        page += 1;
++        if (page > 50) break;
++      } catch (error) {
++        if (apps.length > 0 && isAbortLike(error)) {
++          apps.truncated = true;
++          return apps;
++        }
++        throw error;
++      }
+     }
+     return apps;
+   }
+@@ -428,6 +441,24 @@ export class CloudflareAccessClient {
+     };
+   }
+ 
++  private pushAppBatch(apps: CloudflareAppList, result: unknown): number {
++    const batch = Array.isArray(result) ? result : [];
++    for (const item of batch) {
++      try {
++        apps.push(this.parseApp(asRecord(item) ?? {}));
++      } catch {
++        // skip malformed
++      }
++    }
++    return batch.length;
++  }
++
++  private requestSignal(deadlineAt?: number): AbortSignal {
++    const budget = this.timeouts.requestTimeoutMs ?? CF_REQUEST_TIMEOUT_MS;
++    const remaining = deadlineAt === undefined ? budget : deadlineAt - Date.now();
++    return AbortSignal.timeout(Math.max(1, Math.min(budget, remaining)));
++  }
++
+   private async request<T>(
+     method: string,
+     path: string,
+@@ -444,7 +475,7 @@ export class CloudflareAccessClient {
+     path: string,
+     apiToken: string,
+     body?: unknown,
+-    opts?: { notFoundOk?: boolean }
++    opts?: { notFoundOk?: boolean; deadlineAt?: number }
+   ): Promise<CfEnvelope<T>> {
+     let res: Response;
+     try {
+@@ -455,6 +486,7 @@ export class CloudflareAccessClient {
+           'Content-Type': 'application/json',
+         },
+         body: body === undefined ? undefined : JSON.stringify(body),
++        signal: this.requestSignal(opts?.deadlineAt),
+       });
+     } catch (error) {
+       const message = error instanceof Error ? error.message : String(error);
+@@ -480,6 +512,27 @@ export class CloudflareAccessClient {
+   }
+ }
+ 
++function appsPageComplete(
++  page: number,
++  batchLen: number,
++  appsLen: number,
++  info: CfEnvelope<unknown>['result_info']
++): boolean {
++  const totalPages = info?.total_pages;
++  if (typeof totalPages === 'number') return page >= totalPages;
++  const total = info?.total_count;
++  if (typeof total === 'number') return appsLen >= total;
++  return batchLen < 100;
++}
++
++function isAbortLike(error: unknown): boolean {
++  if (!error || typeof error !== 'object') return false;
++  const name = 'name' in error ? String(error.name) : '';
++  if (name === 'AbortError' || name === 'TimeoutError') return true;
++  const message = error instanceof Error ? error.message : String(error);
++  return /aborted|timeout/i.test(message);
++}
++
+ function rulesMatch(got: TunnelAccessPolicyRule[], want: TunnelAccessPolicyRule[]): boolean {
+   if (got.length !== want.length) return false;
+   const key = (r: TunnelAccessPolicyRule) => `${r.kind}:${r.value}`;
+diff --git a/apps/gateway/src/tunnel/external-detect.test.ts b/apps/gateway/src/tunnel/external-detect.test.ts
+index 6eacb850..301ebe10 100644
+--- a/apps/gateway/src/tunnel/external-detect.test.ts
++++ b/apps/gateway/src/tunnel/external-detect.test.ts
+@@ -2,26 +2,25 @@ import { describe, expect, test } from 'bun:test';
+ import {
+   EMPTY_EXTERNAL,
+   ExternalTunnelDetector,
+-  hostnamesFromLog,
+   parseArgv,
+-  parseCloudflaredConfigYml,
++  parseCloudflaredYml,
++  parseCommandLine,
++  parseIngressFromLog,
+   parsePlistProgramArguments,
+-  parseProcessList,
+-  parseTunnelToken,
++  parsePsOutput,
++  parseTokenFileMeta,
+   serviceHitsOrigin,
+   toExternalStatus,
+ } from './external-detect';
+ 
+ describe('external tunnel parsing', () => {
+   test('parses token-file / logfile flags and token payload without exposing the secret', () => {
+-    const parsed = parseProcessList(
++    const procs = parsePsOutput(
+       '42 /opt/homebrew/bin/cloudflared tunnel --logfile /tmp/cf.log run --token-file /tmp/token\n'
+     );
+-    expect(parsed[0]).toMatchObject({
+-      pid: '42',
+-      tokenFile: '/tmp/token',
+-    });
+-    const payload = parseTunnelToken(
++    expect(procs[0]?.pid).toBe(42);
++    expect(parseCommandLine(procs[0]?.command ?? '').tokenFile).toBe('/tmp/token');
++    const payload = parseTokenFileMeta(
+       Buffer.from(JSON.stringify({ a: 'acct', t: 'tun-id', s: 'super-secret' })).toString('base64')
+     );
+     expect(payload).toEqual({ accountId: 'acct', tunnelId: 'tun-id' });
+@@ -29,7 +28,7 @@ describe('external tunnel parsing', () => {
+   });
+ 
+   test('parses config.yml ingress and keeps hostnames whose service hits originPort', () => {
+-    const yml = parseCloudflaredConfigYml(`
++    const yml = parseCloudflaredYml(`
+ tunnel: 550e8400-e29b-41d4-a716-446655440000
+ credentials-file: /tmp/cred.json
+ ingress:
+@@ -39,10 +38,12 @@ ingress:
+     service: http://127.0.0.1:80
+   - service: http_status:404
+ `);
+-    expect(yml.tunnel).toBe('550e8400-e29b-41d4-a716-446655440000');
+-    expect(yml.credentialsFile).toBe('/tmp/cred.json');
++    expect(yml?.tunnelId).toBe('550e8400-e29b-41d4-a716-446655440000');
++    expect(yml?.credentialsFile).toBe('/tmp/cred.json');
+     expect(
+-      yml.ingress.filter((row) => serviceHitsOrigin(row.service, 19883)).map((r) => r.hostname)
++      (yml?.ingress ?? [])
++        .filter((row) => serviceHitsOrigin(row.service, 19883))
++        .map((r) => r.hostname)
+     ).toEqual(['tmex.example.com']);
+   });
+ 
+@@ -62,7 +63,7 @@ ingress:
+ </dict></plist>`);
+     expect(args[0]).toContain('cloudflared');
+     expect(args).toContain('--token-file');
+-    const hosts = hostnamesFromLog(
++    const hosts = parseIngressFromLog(
+       'noise\n{"ingress":[{"hostname":"old.example","service":"http://127.0.0.1:1"}]}\nfinal {"ingress":[{"hostname":"tmex.example.com","service":"http://127.0.0.1:19883"}]}\n',
+       19883
+     );
+@@ -393,15 +394,15 @@ describe('token-tunnel log + Access probe', () => {
+   test('parses escaped config JSON string from token-tunnel logs', () => {
+     const line = escapedConfigLogLine('tmex.konata.tv', 9883);
+     expect(line).toContain('\\"ingress\\"');
+-    expect(hostnamesFromLog(line, 9883)).toEqual(['tmex.konata.tv']);
+-    expect(hostnamesFromLog(line, 19883)).toEqual([]);
++    expect(parseIngressFromLog(line, 9883)).toEqual(['tmex.konata.tv']);
++    expect(parseIngressFromLog(line, 19883)).toEqual([]);
+   });
+ 
+   test('prefers the last escaped ingress in a tailed multi-MB log', () => {
+     const prefix = `${'noise\n'.repeat(20_000)}${'x'.repeat(200_000)}\n`;
+     const old = escapedConfigLogLine('old.example.com', 19883);
+     const latest = escapedConfigLogLine('tmex.konata.tv', 19883);
+-    expect(hostnamesFromLog(`${prefix}${old}\n${latest}\n`, 19883)).toEqual(['tmex.konata.tv']);
++    expect(parseIngressFromLog(`${prefix}${old}\n${latest}\n`, 19883)).toEqual(['tmex.konata.tv']);
+   });
+ 
+   test('detector uses escaped log ingress when token tunnel has no config.yml', async () => {
+@@ -670,3 +671,164 @@ describe('外部 Access 探测的凭证来源区分', () => {
+     expect(found.externalAccess?.hostnameMatch).toBe(false);
+   });
+ });
++
++describe('external detector stale-while-revalidate', () => {
++  test('serves stale cache and coalesces concurrent refreshes into one run', async () => {
++    let scans = 0;
++    let now = 1_000;
++    const gate = Promise.withResolvers<void>();
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => now,
++      homedir: () => '/no-home',
++      platform: 'linux',
++      listProcesses: async () => {
++        scans += 1;
++        if (scans > 1) await gate.promise;
++        return '';
++      },
++      readFile: async () => null,
++      listDir: async () => [],
++    });
++    await d.detect();
++    expect(scans).toBe(1);
++    now += 40_000;
++    const [a, b] = await Promise.all([d.detect(), d.detect()]);
++    expect(a.detected).toBe(false);
++    expect(b.detected).toBe(false);
++    expect(a.probing).toBe(true);
++    expect(b.probing).toBe(true);
++    expect(scans).toBe(2);
++    gate.resolve();
++    await Bun.sleep(20);
++  });
++
++  test('first detect returns placeholder after wait cap then later call sees result', async () => {
++    const gate = Promise.withResolvers<void>();
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => 1,
++      firstWaitMs: 20,
++      sleep: (ms) => Bun.sleep(ms),
++      homedir: () => '/no-home',
++      platform: 'linux',
++      listProcesses: async () => {
++        await gate.promise;
++        return '7 /usr/bin/cloudflared tunnel run --token-file /tmp/token\n';
++      },
++      readFile: async (path) => {
++        if (path === '/tmp/token') {
++          return Buffer.from(JSON.stringify({ a: 'acct', t: 'tid', s: 's' })).toString('base64');
++        }
++        if (path === '/tmp/hostname') return 'tmex.example.com\n';
++        return null;
++      },
++      listDir: async () => [],
++    });
++    const first = await d.detect();
++    expect(first.detected).toBe(false);
++    expect(first.probing).toBe(true);
++    gate.resolve();
++    await Bun.sleep(20);
++    const second = await d.detect();
++    expect(second.detected).toBe(true);
++    expect(second.hostnames).toEqual(['tmex.example.com']);
++    expect(second.probing).toBeUndefined();
++  });
++
++  test('force detect awaits a fresh run even when cache is warm', async () => {
++    let scans = 0;
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => 1,
++      homedir: () => '/no-home',
++      platform: 'linux',
++      listProcesses: async () => {
++        scans += 1;
++        return '';
++      },
++      readFile: async () => null,
++      listDir: async () => [],
++    });
++    await d.detect();
++    await d.detect();
++    expect(scans).toBe(1);
++    await d.detect({ force: true });
++    expect(scans).toBe(2);
++  });
++
++  test('Access probe timeout degrades to unknown, not not-covered', async () => {
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => 1,
++      homedir: () => '/no-home',
++      platform: 'linux',
++      listProcesses: async () => '7 /usr/bin/cloudflared tunnel run --token-file /tmp/token\n',
++      readFile: async (path) => {
++        if (path === '/tmp/token') {
++          return Buffer.from(JSON.stringify({ a: 'acct', t: 'tid', s: 's' })).toString('base64');
++        }
++        if (path === '/tmp/hostname') return 'tmex.example.com\n';
++        return null;
++      },
++      listDir: async () => [],
++      getCredentials: async () => ({
++        accountId: 'acct',
++        apiToken: 'tok',
++        source: 'store' as const,
++      }),
++      accessClient: {
++        getTunnelIngress: async () => [],
++        listApps: async () => {
++          const err = new Error('The operation was aborted due to timeout');
++          err.name = 'TimeoutError';
++          throw err;
++        },
++      },
++    });
++    const found = await d.detect();
++    expect(found.externalAccess).toEqual({
++      checked: false,
++      hostnameMatch: false,
++      appId: null,
++      aud: null,
++      teamDomain: null,
++    });
++  });
++
++  test('Access probe truncated app list without match is unknown, not not-covered', async () => {
++    const d = new ExternalTunnelDetector({
++      originPort: 19883,
++      now: () => 1,
++      homedir: () => '/no-home',
++      platform: 'linux',
++      listProcesses: async () => '7 /usr/bin/cloudflared tunnel run --token-file /tmp/token\n',
++      readFile: async (path) => {
++        if (path === '/tmp/token') {
++          return Buffer.from(JSON.stringify({ a: 'acct', t: 'tid', s: 's' })).toString('base64');
++        }
++        if (path === '/tmp/hostname') return 'tmex.example.com\n';
++        return null;
++      },
++      listDir: async () => [],
++      getCredentials: async () => ({
++        accountId: 'acct',
++        apiToken: 'tok',
++        source: 'store' as const,
++      }),
++      accessClient: {
++        getTunnelIngress: async () => [],
++        listApps: async () =>
++          Object.assign(
++            [{ id: 'other', aud: 'aud-x', name: 'other', domain: 'other.example.com' }],
++            {
++              truncated: true,
++            }
++          ),
++      },
++    });
++    const found = await d.detect();
++    expect(found.externalAccess?.checked).toBe(false);
++    expect(found.externalAccess?.hostnameMatch).toBe(false);
++  });
++});
+diff --git a/apps/gateway/src/tunnel/external-detect.ts b/apps/gateway/src/tunnel/external-detect.ts
+index 28814411..21eba901 100644
+--- a/apps/gateway/src/tunnel/external-detect.ts
++++ b/apps/gateway/src/tunnel/external-detect.ts
+@@ -77,9 +77,12 @@ export type ExternalDetectDeps = {
+   getCredentials?: () => Promise<{ accountId: string; apiToken: string } | null>;
+   configuredHostnames?: string[] | (() => string[]);
+   warn?: (message: string) => void;
++  firstWaitMs?: number;
++  sleep?: (ms: number) => Promise<void>;
+ };
+ 
+ const CACHE_MS = 30_000;
++const FIRST_WAIT_MS = 1_500;
+ const MAX_LOG_SCAN_BYTES = 256 * 1024;
+ 
+ export function defaultListProcesses(): ExternalProcess[] {
+@@ -543,13 +546,13 @@ async function probeExternalAccess(opts: {
+   if (!creds) return { ...EMPTY_EXTERNAL_ACCESS };
+   try {
+     const apps = await opts.accessApi.listApps(creds.accountId, creds.apiToken);
+-    // 实测：cert.pem 的 ARGO 令牌对 Zero Trust 权限不足时，apps 接口不报 403 而是静默返回
+-    // 空列表（同凭证访问 organizations 会 403）。空结果无法证伪「dashboard 已配置」，
+-    // 只有 accessStore 里用户提供的 Access 令牌的空列表才可信。
++    const truncated = (apps as { truncated?: boolean }).truncated === true;
++    // cert 回退令牌空列表无法证伪 dashboard 配置；分页截断同样不能当成「未覆盖」。
+     if (apps.length === 0 && creds.source === 'cert') {
+       return { ...EMPTY_EXTERNAL_ACCESS };
+     }
+     const match = apps.find((app) => opts.hostnames.some((h) => appMatchesHostname(app.domain, h)));
++    if (!match && truncated) return { ...EMPTY_EXTERNAL_ACCESS };
+     let teamDomain: string | null = null;
+     if (opts.accessApi.getOrganization) {
+       try {
+@@ -823,6 +826,7 @@ export function toExternalStatus(detected: DetectedTunnel): TunnelExternalStatus
+     hasOriginCert: detected.hasOriginCert,
+     running: detected.running,
+     externalAccess: { ...(detected.externalAccess ?? EMPTY_EXTERNAL_ACCESS) },
++    ...(detected.probing ? { probing: true } : {}),
+   };
+ }
+ 
+@@ -832,6 +836,7 @@ function normalizeProcesses(raw: ExternalProcess[] | string): ExternalProcess[]
+ 
+ export class ExternalTunnelDetector {
+   private localCache: { at: number; value: ExternalDetection } | null = null;
++  private inFlight: Promise<ExternalDetection> | null = null;
+ 
+   constructor(private readonly deps: ExternalDetectDeps) {}
+ 
+@@ -839,55 +844,42 @@ export class ExternalTunnelDetector {
+     this.localCache = null;
+   }
+ 
+-  async detect(): Promise<ExternalDetection> {
++  async detect(opts?: { force?: boolean }): Promise<ExternalDetection> {
+     const now = this.deps.now ?? Date.now;
+-    if (this.localCache && now() - this.localCache.at < CACHE_MS) {
+-      return this.localCache.value;
+-    }
+-    const detected = await detectUncached(this.deps);
+-    const value: ExternalDetection = { ...detected, tokenAccountId: detected.accountId };
+-    this.localCache = { at: now(), value };
+-    return value;
++    const cached = this.localCache;
++    if (!opts?.force && cached && now() - cached.at < CACHE_MS) return this.withProbe(cached.value);
++    const pending = this.refresh();
++    if (opts?.force) return pending;
++    if (cached) return this.withProbe(cached.value);
++    const cap = this.deps.firstWaitMs ?? FIRST_WAIT_MS;
++    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
++    await Promise.race([pending, sleep(cap)]);
++    return this.localCache?.value ?? { ...EMPTY_EXTERNAL, probing: true };
+   }
+-}
+ 
+-export function parseProcessList(raw: string): Array<{
+-  pid: string;
+-  command: string;
+-  tokenFile: string | null;
+-  configPath: string | null;
+-  runName: string | null;
+-  running: boolean;
+-}> {
+-  return parsePsOutput(raw)
+-    .filter((p) => isCloudflaredTunnelCommand(p.command))
+-    .map((p) => {
+-      const parsed = parseCommandLine(p.command);
+-      return {
+-        pid: String(p.pid),
+-        command: p.command,
+-        tokenFile: parsed.tokenFile,
+-        configPath: parsed.configPath,
+-        runName: parsed.tunnelName ?? parsed.tunnelId,
+-        running: true,
+-      };
+-    });
+-}
++  private withProbe(value: ExternalDetection): ExternalDetection {
++    return this.inFlight ? { ...value, probing: true } : value;
++  }
+ 
+-export function parseCloudflaredConfigYml(text: string): {
+-  tunnel: string | null;
+-  credentialsFile: string | null;
+-  ingress: Array<{ hostname: string | null; service: string }>;
+-} {
+-  const parsed = parseCloudflaredYml(text);
+-  return {
+-    tunnel: parsed?.tunnelId ?? parsed?.tunnelName ?? null,
+-    credentialsFile: parsed?.credentialsFile ?? null,
+-    ingress: (parsed?.ingress ?? [])
+-      .filter((row) => row.service)
+-      .map((row) => ({ hostname: row.hostname, service: row.service as string })),
+-  };
++  private refresh(): Promise<ExternalDetection> {
++    if (this.inFlight) return this.inFlight;
++    const now = this.deps.now ?? Date.now;
++    this.inFlight = detectUncached(this.deps)
++      .then((detected) => {
++        const value: ExternalDetection = { ...detected, tokenAccountId: detected.accountId };
++        this.localCache = { at: now(), value };
++        return value;
++      })
++      .catch((error) => {
++        const message = error instanceof Error ? error.message : String(error);
++        this.deps.warn?.(`external tunnel detection failed: ${message}`);
++        const value = this.localCache?.value ?? { ...EMPTY_EXTERNAL };
++        this.localCache = { at: now(), value };
++        return value;
++      })
++      .finally(() => {
++        this.inFlight = null;
++      });
++    return this.inFlight;
++  }
+ }
+-
+-export const parseTunnelToken = parseTokenFileMeta;
+-export const hostnamesFromLog = parseIngressFromLog;
+diff --git a/apps/gateway/src/tunnel/manager.test.ts b/apps/gateway/src/tunnel/manager.test.ts
+index e3e29c0d..83b68401 100644
+--- a/apps/gateway/src/tunnel/manager.test.ts
++++ b/apps/gateway/src/tunnel/manager.test.ts
+@@ -1174,4 +1174,33 @@ describe('TunnelManager', () => {
+     expect(status.config.hostname).toBe('tmex.konata.tv');
+     expect(status.external.hostnames).toEqual(['tmex.konata.tv']);
+   });
++
++  test('start warms external detection without throwing on unsupported platform', async () => {
++    const ctx = await setup({ platform: 'win32', arch: 'x64' });
++    dirs.push(ctx.dir);
++    await expect(ctx.manager.start()).resolves.toBeUndefined();
++    expect(ctx.manager.status().supported).toBe(false);
++  });
++
++  test('start does not await a slow external detection', async () => {
++    let finished = false;
++    const ctx = await setup({
++      externalDetectDeps: {
++        listProcesses: async () => {
++          await Bun.sleep(200);
++          finished = true;
++          return '';
++        },
++        readFile: async () => null,
++        listDir: async () => [],
++        homedir: () => '/no-home',
++        platform: 'linux',
++      },
++    });
++    dirs.push(ctx.dir);
++    const t0 = Date.now();
++    await ctx.manager.start();
++    expect(Date.now() - t0).toBeLessThan(150);
++    expect(finished).toBe(false);
++  });
+ });
+diff --git a/apps/gateway/src/tunnel/manager.ts b/apps/gateway/src/tunnel/manager.ts
+index 0fd1d17c..5bd774da 100644
+--- a/apps/gateway/src/tunnel/manager.ts
++++ b/apps/gateway/src/tunnel/manager.ts
+@@ -260,7 +260,7 @@ export class TunnelManager {
+       await this.probeVersion();
+     }
+     const persisted = this.store.get();
+-    await this.refreshExternal();
++    void this.refreshExternal().catch((e) => this.warn(`[tunnel] external warmup failed: ${e}`));
+     if (persisted.autoStart && persisted.mode !== 'off') {
+       if (persisted.externallyManaged) {
+         // 系统服务托管，不拉起子进程
+@@ -575,9 +575,9 @@ export class TunnelManager {
+     }
+   }
+ 
+-  async refreshExternal(): Promise<void> {
++  async refreshExternal(opts?: { force?: boolean }): Promise<void> {
+     try {
+-      this.lastExternal = await this.externalDetector.detect();
++      this.lastExternal = await this.externalDetector.detect(opts);
+     } catch {
+       this.lastExternal = { ...EMPTY_EXTERNAL };
+     }
+@@ -1078,7 +1078,7 @@ export class TunnelManager {
+     if (!apiToken || !accountId) {
+       throw new TunnelError('not_configured', 'Cloudflare Access credentials are not saved');
+     }
+-    await this.refreshExternal();
++    await this.refreshExternal({ force: true });
+     const hostname = this.resolveAccessHostname(hostnameRaw, true);
+     try {
+       const apps = await this.accessClient.listApps(accountId, apiToken);
+@@ -1113,7 +1113,7 @@ export class TunnelManager {
+       throw new TunnelError('invalid_hostname', 'hostname is not a valid RFC 1123 name');
+     }
+     this.externalDetector.invalidate();
+-    await this.refreshExternal();
++    await this.refreshExternal({ force: true });
+     if (!this.lastExternal.hostnames.includes(hostname)) {
+       throw new TunnelError('invalid_request', 'hostname is not in the detected external tunnel');
+     }
+diff --git a/packages/app/src/runtime/local-routes.test.ts b/packages/app/src/runtime/local-routes.test.ts
+index 5dd8509f..647ca6f4 100644
+--- a/packages/app/src/runtime/local-routes.test.ts
++++ b/packages/app/src/runtime/local-routes.test.ts
+@@ -172,6 +172,57 @@ describe('GET /api/local/status', () => {
+     ).toBeNull();
+   });
+ 
++  test('getLocalStatus and tlsStatus overlap instead of waiting on each other', async () => {
++    let releaseLocal!: () => void;
++    const localStarted = new Promise<void>((resolve) => {
++      releaseLocal = resolve;
++    });
++    let releaseTls!: () => void;
++    const tlsStarted = new Promise<void>((resolve) => {
++      releaseTls = resolve;
++    });
++    const hung = new Promise<never>((_, reject) => {
++      setTimeout(() => reject(new Error('status and tlsStatus did not overlap')), 1000);
++    });
++    const handled = handleLocalRequest(
++      new Request('http://127.0.0.1/api/local/status'),
++      deps({
++        readNativeManifest: async () => {
++          releaseLocal();
++          await tlsStarted;
++          return null;
++        },
++        tlsStatus: async () => {
++          releaseTls();
++          await localStarted;
++          return { mode: 'none', listenerRunning: false, tlsPort: 9443 };
++        },
++      })
++    );
++    const res = await Promise.race([handled, hung]);
++    const { status, body } = await jsonOf(res);
++    expect(status).toBe(200);
++    expect((body as { tls: { mode: string } }).tls.mode).toBe('none');
++  });
++
++  test('tlsStatus rejection still maps to direct_failed', async () => {
++    const { status, body } = await jsonOf(
++      await handleLocalRequest(
++        new Request('http://127.0.0.1/api/local/status'),
++        deps({
++          tlsStatus: async () => {
++            throw new Error('tls boom');
++          },
++        })
++      )
++    );
++    expect(status).toBe(500);
++    expect((body as { error: { code: string; message: string } }).error).toEqual({
++      code: 'direct_failed',
++      message: 'tls boom',
++    });
++  });
++
+   test('standalone 把鉴权交给 authenticate：拒绝则 401，放行则 200', async () => {
+     const denied = await jsonOf(
+       await handleLocalRequest(
+diff --git a/packages/app/src/runtime/local-routes.ts b/packages/app/src/runtime/local-routes.ts
+index 4834bed8..537ab62e 100644
+--- a/packages/app/src/runtime/local-routes.ts
++++ b/packages/app/src/runtime/local-routes.ts
+@@ -70,8 +70,10 @@ export async function handleLocalRequest(
+       return jsonErr('method_not_allowed', 'GET required', 405);
+     }
+     try {
+-      const status: LocalStatus = await getLocalStatus(deps);
+-      const tls = await deps.tlsStatus();
++      const [status, tls]: [LocalStatus, LocalTlsStatus] = await Promise.all([
++        getLocalStatus(deps),
++        deps.tlsStatus(),
++      ]);
+       return jsonOk({
+         ...status,
+         tls: {
+diff --git a/packages/app/src/tls/tls-service.test.ts b/packages/app/src/tls/tls-service.test.ts
+index 3c5d8d63..c7dea9f7 100644
+--- a/packages/app/src/tls/tls-service.test.ts
++++ b/packages/app/src/tls/tls-service.test.ts
+@@ -70,6 +70,7 @@ function dummyMaterial(overrides: Partial<AcmeIssuedMaterial> = {}): AcmeIssuedM
+ async function setup(overrides?: {
+   envPath?: string;
+   issueAcme?: (input: unknown) => Promise<AcmeIssuedMaterial>;
++  now?: () => number;
+ }) {
+   const { db, close } = createMigratedAuthDb();
+   const dir = await mkdtemp(join(tmpdir(), 'tmex-tls-'));
+@@ -88,6 +89,7 @@ async function setup(overrides?: {
+     setTimeoutFn: () => 1,
+     clearTimeoutFn: () => {},
+     issueAcme: overrides?.issueAcme ?? (async () => dummyMaterial()),
++    now: overrides?.now,
+   });
+   return {
+     service,
+@@ -492,4 +494,83 @@ describe('TlsService', () => {
+     expect(status.caFingerprint).toMatch(/^[0-9a-f]{64}$/);
+     expect(status.caFingerprint).not.toBe(oldFingerprint);
+   });
++
++  test('status reuses the projection within TTL', async () => {
++    const ctx = await setup();
++    cleanups.push(ctx.close);
++    const originalGet = ctx.store.get.bind(ctx.store);
++    let gets = 0;
++    ctx.store.get = async () => {
++      gets += 1;
++      return originalGet();
++    };
++    const first = await ctx.service.status();
++    const second = await ctx.service.status();
++    expect(gets).toBe(1);
++    expect(second).toEqual(first);
++  });
++
++  test('status cache is per service instance', async () => {
++    const a = await setup();
++    const b = await setup();
++    cleanups.push(a.close, b.close);
++    const wrap = (store: TlsConfigStore) => {
++      const originalGet = store.get.bind(store);
++      let gets = 0;
++      store.get = async () => {
++        gets += 1;
++        return originalGet();
++      };
++      return () => gets;
++    };
++    const aGets = wrap(a.store);
++    const bGets = wrap(b.store);
++    await a.service.status();
++    await a.service.status();
++    await b.service.status();
++    expect(aGets()).toBe(1);
++    expect(bGets()).toBe(1);
++  });
++
++  test('status cache is invalidated by applyMode', async () => {
++    const ctx = await setup();
++    cleanups.push(ctx.close);
++    const originalGet = ctx.store.get.bind(ctx.store);
++    let gets = 0;
++    ctx.store.get = async () => {
++      gets += 1;
++      return originalGet();
++    };
++    await ctx.service.status();
++    expect(gets).toBe(1);
++    await ctx.service.applyMode({
++      mode: 'selfsigned',
++      sans: ['localhost'],
++      tlsPort: 9443,
++      bindHost: '127.0.0.1',
++    });
++    expect(gets).toBeGreaterThan(1);
++    const afterApply = gets;
++    await ctx.service.status();
++    expect(gets).toBe(afterApply);
++  });
++
++  test('status cache expires after TTL using injectable now', async () => {
++    let now = 1_000;
++    const ctx = await setup({ now: () => now });
++    cleanups.push(ctx.close);
++    const originalGet = ctx.store.get.bind(ctx.store);
++    let gets = 0;
++    ctx.store.get = async () => {
++      gets += 1;
++      return originalGet();
++    };
++    await ctx.service.status();
++    now += 9_999;
++    await ctx.service.status();
++    expect(gets).toBe(1);
++    now += 2;
++    await ctx.service.status();
++    expect(gets).toBe(2);
++  });
+ });
+diff --git a/packages/app/src/tls/tls-service.ts b/packages/app/src/tls/tls-service.ts
+index be8d51a7..17df23e3 100644
+--- a/packages/app/src/tls/tls-service.ts
++++ b/packages/app/src/tls/tls-service.ts
+@@ -2,6 +2,7 @@ import { isIP } from 'node:net';
+ import type { TlsConfigStore } from '../../../../apps/gateway/src/tls/tls-config-store';
+ import type {
+   AcmeChallengeType,
++  TlsConfigPatch,
+   TlsConfigPublic,
+   TlsMode,
+ } from '../../../../apps/gateway/src/tls/types';
+@@ -30,6 +31,7 @@ import { TlsApiError } from './errors';
+ import type { HttpsListenerConfig, HttpsListenerState } from './https-listener';
+ 
+ const SELF_SIGNED_DAYS = 398;
++const TLS_STATUS_CACHE_TTL_MS = 10_000;
+ const HOSTNAME_RE =
+   /^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$/;
+ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+@@ -130,6 +132,8 @@ export class TlsService {
+   private epoch = 0;
+   private abortController = new AbortController();
+   private acmeInFlight: Promise<void> | null = null;
++  private statusCache: { value: TlsStatus; expiresAt: number; generation: number } | null = null;
++  private statusGeneration = 0;
+   private readonly mutex = new SerialQueue();
+   private readonly scheduler: RenewalScheduler;
+   private readonly now: () => number;
+@@ -168,7 +172,10 @@ export class TlsService {
+ 
+   async load(): Promise<TlsConfigPublic> {
+     const fromEnv = await readTrustProxy(this.opts.envPath);
+-    if (fromEnv !== null) this.trustProxy = fromEnv;
++    if (fromEnv !== null) {
++      if (fromEnv !== this.trustProxy) this.invalidateStatusCache();
++      this.trustProxy = fromEnv;
++    }
+     return this.opts.store.get();
+   }
+ 
+@@ -195,6 +202,19 @@ export class TlsService {
+   }
+ 
+   async status(): Promise<TlsStatus> {
++    const now = this.now();
++    if (this.statusCache && now < this.statusCache.expiresAt) {
++      return this.statusCache.value;
++    }
++    const generation = this.statusGeneration;
++    const value = await this.computeStatus();
++    if (generation === this.statusGeneration) {
++      this.statusCache = { value, expiresAt: now + TLS_STATUS_CACHE_TTL_MS, generation };
++    }
++    return value;
++  }
++
++  private async computeStatus(): Promise<TlsStatus> {
+     const row = await this.opts.store.get();
+     let certificate: TlsStatus['certificate'] = null;
+     if (row.certPem) {
+@@ -236,6 +256,16 @@ export class TlsService {
+     };
+   }
+ 
++  private invalidateStatusCache(): void {
++    this.statusGeneration += 1;
++    this.statusCache = null;
++  }
++
++  private upsert(partial: TlsConfigPatch): Promise<TlsConfigPublic> {
++    this.invalidateStatusCache();
++    return this.opts.store.upsert(partial);
++  }
++
+   async caPem(): Promise<string | null> {
+     const row = await this.opts.store.get();
+     return row.mode === 'selfsigned' && row.caCertPem ? row.caCertPem : null;
+@@ -255,7 +285,7 @@ export class TlsService {
+         await this.reissueSelfSigned(row.sans);
+         return this.status();
+       }
+-      await this.opts.store.upsert({
++      await this.upsert({
+         acmeStatus: 'pending',
+         acmeLastError: null,
+         acmeNextRenewAt: this.now() + RENEWAL_BACKOFF_MIN_MS,
+@@ -270,6 +300,7 @@ export class TlsService {
+   }
+ 
+   stop(): void {
++    this.invalidateStatusCache();
+     this.invalidateActiveWork();
+     this.scheduler.stop();
+   }
+@@ -299,7 +330,7 @@ export class TlsService {
+ 
+     if (input.mode === 'selfsigned') {
+       const sans = validateSans(input.sans);
+-      await this.opts.store.upsert({
++      await this.upsert({
+         mode: 'selfsigned',
+         sans,
+         tlsPort: validatePort(input.tlsPort),
+@@ -324,7 +355,7 @@ export class TlsService {
+       );
+     }
+     const directoryUrl = acmeDirectoryUrl(Boolean(input.staging));
+-    await this.opts.store.upsert({
++    await this.upsert({
+       mode: 'acme',
+       tlsPort: validatePort(input.tlsPort),
+       bindHost: validateBindHost(input.bindHost),
+@@ -346,7 +377,7 @@ export class TlsService {
+   }
+ 
+   private async stopTls(mode: 'none' | 'external'): Promise<void> {
+-    await this.opts.store.upsert({ mode });
++    await this.upsert({ mode });
+     this.scheduler.stop();
+     await this.opts.listener.apply(null);
+   }
+@@ -417,7 +448,7 @@ export class TlsService {
+     ) {
+       await this.runIfJob(epoch, tuple, async () => {
+         await this.applyListenerOrFail();
+-        await this.opts.store.upsert({
++        await this.upsert({
+           acmeStatus: 'ok',
+           acmeLastError: null,
+           acmeLastAttemptAt: this.now(),
+@@ -429,7 +460,7 @@ export class TlsService {
+     }
+ 
+     await this.runIfJob(epoch, tuple, async () => {
+-      await this.opts.store.upsert({
++      await this.upsert({
+         acmeStatus: 'pending',
+         acmeLastAttemptAt: this.now(),
+         acmeLastError: null,
+@@ -464,7 +495,7 @@ export class TlsService {
+       epoch,
+       tuple,
+       async () => {
+-        await this.opts.store.upsert({
++        await this.upsert({
+           certPem: material.certPem,
+           keyPem: material.keyPem,
+           certNotBefore: material.notBefore,
+@@ -519,7 +550,7 @@ export class TlsService {
+   }
+ 
+   private async persistAcmeFailure(message: string): Promise<void> {
+-    await this.opts.store.upsert({
++    await this.upsert({
+       acmeStatus: 'error',
+       acmeLastError: message,
+       acmeLastAttemptAt: this.now(),
+@@ -531,7 +562,7 @@ export class TlsService {
+     const ca = await this.ensureCa();
+     const leaf = await issueLeaf({ ca, sans, days: SELF_SIGNED_DAYS, now: this.now() });
+     const parsed = parseCertificate(leaf.certPem);
+-    await this.opts.store.upsert({
++    await this.upsert({
+       certPem: `${leaf.certPem.trim()}\n${ca.certPem.trim()}\n`,
+       keyPem: leaf.keyPem,
+       certNotBefore: parsed.notBefore,
+@@ -553,11 +584,12 @@ export class TlsService {
+       );
+     }
+     const ca = await createCa({ name: 'tmex local CA', now: this.now() });
+-    await this.opts.store.upsert({ caCertPem: ca.certPem, caKeyPem: ca.keyPem });
++    await this.upsert({ caCertPem: ca.certPem, caKeyPem: ca.keyPem });
+     return ca;
+   }
+ 
+   private async applyListener(): Promise<void> {
++    this.invalidateStatusCache();
+     const row = await this.opts.store.get();
+     const secrets = await this.opts.store.getPrivateMaterial();
+     if (!row.certPem || !secrets.keyPem) return this.opts.listener.apply(null);
+diff --git a/packages/shared/src/contracts/tunnel.ts b/packages/shared/src/contracts/tunnel.ts
+index d7304c7e..2b40c2c0 100644
+--- a/packages/shared/src/contracts/tunnel.ts
++++ b/packages/shared/src/contracts/tunnel.ts
+@@ -122,6 +122,11 @@ export interface TunnelExternalStatus {
+    * 可选以保持旧客户端/夹具的线兼容。
+    */
+   externalAccess?: TunnelExternalAccessProbe;
++  /**
++   * 后台探测进行中，当前字段可能是缓存或尚未探测的占位。
++   * 仅在刷新进行中时出现。
++   */
++  probing?: boolean;
+ }
+ 
+ /** 外部隧道上的 Cloudflare Access 只读探测结果（不写入本地 access 库）。 */
