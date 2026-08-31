@@ -61,6 +61,11 @@
 - **升级 Hub 后本机 key-log 立即补齐 seq 5/6，`peer_cache` 刷新（list_version 7）**——任务 4 的根因（旧 Hub 不广播新 node.list）确认修复；在办公网内可望 ws-secure 直连，家中仍走中转。
 - 清理：三台机器的 `/tmp/tmex-ops` 与临时文件根均已删除。
 
+## 1.1.5 热修（2026-09-01 凌晨）
+- 线上报告：切换终端 tab 后右侧仍显示旧终端（title 正常更新），刷新才恢复。根因：保活槽用 `visibility: hidden` 隐藏，但 ghostty mount 在 `activateRenderTarget()` 里显式写 `visibility: visible`——CSS 后代可反选祖先的 hidden；槽按 MRU 排序时路由 pane 画在最底层，旧 pane 整个盖在上面。V1/M1/e2e 的探针都按 DOM 取值而非「最顶层命中元素」，全部漏过。
+- 修复：槽改用 `opacity: 0` + `z-index`（后代无法反选、可见槽恒在最上层）；加 `KEEP_ALIVE_ENABLED` 应急开关。复现脚本 `sub/bugfix-stale-switch/`（elementFromPoint 断言）：修复前 31/120 错帧，修复后 0/200。
+- v1.1.5 已发布并上线：本机 + Hub + jiefa-app + jiefa-dns-1 全部 1.1.5（docker-node 仍 1.0.2）。
+
 ## 遗留 / 需用户决定
 - 本机生产 `~/Library/Application Support/tmex/staging/`（约 58MB，误触事故遗留）可手动 `rm -rf` 清理（本会话不动生产目录）。
 - docker-node 仍 1.0.2（需重建镜像）。
