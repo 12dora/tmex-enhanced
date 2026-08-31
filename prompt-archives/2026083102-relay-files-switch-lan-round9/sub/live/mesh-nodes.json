@@ -1,0 +1,54 @@
+{
+  "nodes": [
+    {
+      "id": "503e85a2e306273e54f49586cf6d99b6",
+      "name": "tmex",
+      "publicKey": "_qA8dIHPEIkd7VbXkWNRJXXVzauQ__aM6zGRRTmUBiE",
+      "online": true,
+      "reach": null,
+      "transport": null,
+      "rttMs": null,
+      "version": "1.1.3",
+      "direct_capable": false,
+      "inventory": {
+        "version": "1.1.3"
+      },
+      "loggedIn": true,
+      "isHub": true,
+      "peerAddress": null,
+      "linkSinceAt": null,
+      "endpoints": [],
+      "directFailure": null
+    },
+    {
+      "id": "9e035912f7c1f6376c0f8d7bc2602807",
+      "name": "r9-remote-node",
+      "publicKey": "N020N1i_Hq4umV4X_Jr8GcIJjhkOBqwNLewUMfkU9nM",
+      "online": true,
+      "reach": "relay",
+      "transport": "relay",
+      "rttMs": 1,
+      "version": "1.1.3",
+      "direct_capable": false,
+      "inventory": {
+        "version": "1.1.3"
+      },
+      "loggedIn": true,
+      "isHub": false,
+      "peerAddress": "localhost:29600",
+      "linkSinceAt": 1788184034312,
+      "endpoints": [
+        "ws://[240e:390:5e0e:d820:10c3:b591:6b3:c485]:39112/peer",
+        "ws://[240e:390:5e0e:d820:806d:283:7502:23e]:39112/peer",
+        "ws://192.168.3.23:39112/peer",
+        "ws://[240e:390:5e0e:d820:fc86:2a5a:8738:7]:39112/peer",
+        "ws://198.18.0.1:39112/peer"
+      ],
+      "directFailure": {
+        "at": 1788184219149,
+        "ws": "refused ws://[240e:390:5e0e:d820:fc86:2a5a:8738:7]:39112/peer",
+        "dc": "direct_capable=false"
+      }
+    }
+  ]
+}
