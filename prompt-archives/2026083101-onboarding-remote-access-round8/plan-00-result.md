@@ -67,3 +67,9 @@ fe 995 / panels 650 / gateway 2965 / app 475+1 既有 fail（build-runtime 需�
 - Ubuntu 26.04 / tmux 3.6 / 无 node、bun；`loginctl enable-linger ubuntu`；`apt install unzip`（bun 安装器依赖）；`curl -fsSL …/install.sh | bash -s -- --no-interactive --install-dir ~/.local/share/tmex --host 127.0.0.1 --port 9883 --db-path … --autostart true --lang zh-CN` 一次成功（Bun 1.4.0、tmex 1.1.3、systemd user 服务 active、`~/.local/bin/tmex`）。
 - 用户在本机面板生成加入码（Hub `https://ai.jiefakj.com:18443`），远端 `tmex hub join … --name jiefa-app` → `TMEX_ROLES=node`，首连 `auth_rejected`（待准入），约 50s 后 Hub 侧 admit 落 key-log（seq 5），`[uplink] online`。
 - install.sh 发现并修复：无 TTY 时 `exec 3</dev/tty` 的 bash 报错未被抑制（`788065dc`）。
+
+## 第二台应用服务器（10.110.88.5，jiefa-dns-1）
+
+- 首次探测 sshd 未起（机器未开机；本机经代理连 22 表现为"建立后即断"，从 .3 内网直连才看出 Connection refused——排障时优先从同网段机器探测）。
+- 开机后同流程：unzip + linger + `install.sh --no-interactive` → tmex 1.1.3 active；`tmex hub join … --name jiefa-dns-1` 成功，`auth_rejected` 持续 ~6 分钟——用户本机面板已关闭，无人签 admit；用户在面板/节点管理确认后 `[uplink] online`（key-log seq 6）。教训：加入后要提醒用户保持 Hub 侧页面打开或手动确认。
+- 文案规范落到 `/Users/konata/code/tmex-copy-guidelines.md`。

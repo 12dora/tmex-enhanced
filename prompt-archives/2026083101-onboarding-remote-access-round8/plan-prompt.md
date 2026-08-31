@@ -51,3 +51,9 @@
 > 技术后顺便在应用服务器 10.110.88.3（ubuntu 用户，口令见对话，不入档）这台机器上安装tmex,并加入hub
 
 > tmex hub join 'https://ai.jiefakj.com:18443' --token <redacted> --name jiefa-app
+
+> 给10.110.88.5这台服务器也装上tmex并接入,账号密码和之前那台一样
+
+> 刚才还没开机,现在开机了,请你把我的文案要求写到md文件中,方便后续其他agent参考,就放到code文件夹中
+
+> tmex hub join 'https://ai.jiefakj.com:18443' --token <redacted> --name jiefa-dns-1
