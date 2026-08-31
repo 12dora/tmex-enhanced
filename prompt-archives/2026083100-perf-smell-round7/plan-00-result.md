@@ -56,3 +56,14 @@
 1. **link-detector lookbehind**：`FILE_PATH_PATTERN` 构造包进 `buildFilePathPattern()` try/catch，不支持 lookbehind 的引擎（iOS Safari <16.4）返回 null，文件路径检测优雅降级、URL 检测不受影响，模块不再求值即抛。
 2. **encodeMouseEvent 模式查询实测**（Bun + 真实 wasm，M 系列桌面）：`isTerminalModeEnabled` 34.8 ns/次、完整 `encodeMouseEvent`（motion+SGR+1003）218 ns/次；120Hz 持续鼠标移动 = 0.026 ms/s，240Hz = 0.052 ms/s。按低端移动设备 50× 放大也仅 ~1.3 ms/s（单核 0.13%）。**结论：非热点，不修**，wasm bindings 签名保持不动；此项从待办中移除。
 3. **ws-client 溢出 toast**：`pending-overflow` 事件接 `notifications.error`，新增 i18n key `websocket.inputDropped`（zh：「连接中断，刚才的输入未能发送。连接恢复后请重新输入或粘贴。」，en/ja 同义），测试断言 toast 触发。
+
+## 附 3：后续 bug 会话（同日，用户逐项报告）
+
+1. **iOS 选择工具条折行**：按钮补 whitespace-nowrap/shrink-0。
+2. **侧栏设备展开触发无谓重连**：折叠只藏树是设计；展开无条件 connect()（先置 pending）是 bug，改为未连接才自动连。
+3. **绿色文字染色残留**：OL 以像素 oracle（8000 帧 + 1700 控制器场景）证明渲染管线在"同字形改色必须重绘"（ASCII/CJK）与 wasm 视图路径上均正确，未做投机修复；固化 4 条回归测试；另修真实缺口——canvas 位图属性被外部改写时 clean 帧也强制全量重建（iOS 位图丢失防护）；发现 1 次内核脏位漏报（像素无差，未修，已记录）。复现待用户观察是否伴随切 app/键盘/熄屏。
+4. **远程访问页（BK+BL+指挥官真机验证）**：
+   - 侦测：token 模式隧道支持（转义日志 ingress 解析、token 旁 hostname 约定文件、accessStore→cert.pem 凭证链只读探测）；真机确认 tmex.konata.tv 正确识别、接管可用
+   - 登录：cloudflared 写默认路径 cert 被接受并拷入管理目录（修复"授权成功仍报进程失败"）
+   - Access：新增 external.externalAccess 三态；真机实测 cert 令牌权限不足时 CF apps 接口静默返回空（organizations 同凭证 403），故 cert 来源空列表降级 checked:false（不可证伪），仅用户令牌的空列表可信
+   - 文案：settings.remoteAccess 三语专业化重写（新增 14 key 零改名，错误文案均含可执行下一步）
