@@ -33,3 +33,9 @@
 > 在下载中状态,刷新页面又变成待升级, 你应该能在刷新后preserve当前状态,并在升级中提供停止按钮, incase用户想要打断
 
 计划：后端 G7（`DELETE /api/system/upgrade` 取消下载、入口 `DELETE /api/mesh/nodes/:id/upgrade` 取消本地 job 或转发、`UPGRADE_CANCELLED`/`UPGRADE_NOT_CANCELLABLE`/`UPGRADE_CANCEL_UNSUPPORTED`），前端 O3（挂载时按节点回读升级状态恢复行内进度并续接轮询、下载阶段提供停止按钮、安装阶段禁用并说明）。
+
+> 下载取消后要注意不能残留下载到一半的垃圾
+
+已并入 G7：取消下载/推送/暂存各路径都必须把目标侧 txn 目录、`.part`、暂存包与入口侧缓存 `.part` 清干净（新增 `DELETE /api/system/upgrade/package`），测试逐路径断言目录为空；崩溃中途由启动时 prune 修复。
+
+> 结束后按点列出当前遗留待做的任务,每个任务描述简洁

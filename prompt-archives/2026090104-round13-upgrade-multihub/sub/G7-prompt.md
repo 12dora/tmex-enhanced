@@ -36,3 +36,17 @@ A 1.1.10 target whose own GitHub download stalled stayed in `{state:'downloading
 ## Result file
 
 `/Users/konata/code/tmex-enhanced-wt-r13/prompt-archives/2026090104-round13-upgrade-multihub/sub/G7-result.md` — exact request/response shapes for DELETE (local / job / forwarded / old target), status strings, tests. Write it, then exit.
+
+## Hard requirement added by the user: no half-downloaded garbage may remain after a cancel
+
+Treat every cancellation path as "leave the disk exactly as before the upgrade started", and prove it with tests that assert the directories are empty afterwards:
+
+- **Target-side download cancel** (`UpgradeController.cancel()` in `downloading`): abort the fetch, then remove the whole transaction dir `staging/<txnId>` (partial tarball, `.part`, extracted `package/`), and anything the download wrote into `release-cache/` for that version (`.part` and any unverified final file). Verified cached tarballs from earlier successful downloads may stay.
+- **Entry-side job cancel while downloading**: abort the fetch; remove `release-cache/tmex-cli-<v>.tgz.part`; never leave a final `.tgz` without its `.sha256` sidecar.
+- **Entry-side job cancel while pushing**: abort the forwarded PUT; the **target's** `PUT /api/system/upgrade/package` handler must treat a truncated/aborted body as failure and delete its `*.tgz.part-<id>` (add a test that aborts the body mid-stream over the in-memory link and asserts `staging/staged/` is empty afterwards).
+- **Entry-side job cancel after the push completed but before/while `POST source:'staged'`**: the staged package on the target must not linger — add `DELETE /api/system/upgrade/package?version=<v>` on the target (auth like PUT; removes the staged `.tgz` + sidecar; 404 if none) and have the entry call it as part of the cancel (best effort, logged). Old targets without the route → nothing to do.
+- **Target-side staged start cancel** (`source:'staged'` while still in `downloading`, i.e. verifying/extracting): remove the txn dir; the staged `.tgz` was already moved into the txn dir so it disappears with it.
+- Cancel must be idempotent and safe under races (cancel arriving while the download is finishing → either the upgrade proceeds to `executing` uncancelled with a 409 `UPGRADE_NOT_CANCELLABLE`, or it is cancelled with a full cleanup — never a torn state). Guard the transition with the existing controller mutex.
+- Extend the existing prune (24 h / max 2 staged packages, orphan `.part`) so a crash mid-cancel is repaired on the next start; add a test.
+
+Report in the result file, per path, which files are removed and the test that proves it.
