@@ -31,8 +31,11 @@ RV1（10 条）/RV2（10 条）/RV3（13 条）三轮 codex sol：采纳 27 条�
 
 复杂度门禁从 main 遗留 42 → 本轮峰值 73 → **exit 0**（4 处拆分 + allowlist 151 条 tighten）。
 
-（最终 test/tsc 数字在发版小节补记。）
+最终数字（2026-09-02）：gateway **3508** / fe **1434** / shared **430** / app **644**(src) / api-client **140** / ui **54**，全 0 fail；tsc：gateway/fe/shared/ui 0、app 1（既有 `@types/node`）、api-client 5（既有）；`bun run lint`（biome + 复杂度门禁）通过。
 
 ## 发版
 
-（发版与生产替换结果补记于此。）
+- `bun scripts/release.ts 1.1.13` → 双语 CHANGELOG 人话改写 → `bun run build` → `npm pack` 烟测（临时实例 healthz/首页 200）→ `chore(release): 1.1.13`（`10496e69`）→ 合并 main（`eebc3afb`）→ tag `v1.1.13` push，Release CI 成功（资产 `tmex-cli-1.1.13.tgz` 22.4 MB + SHA256SUMS）。
+- 本机生产 `tmex upgrade` 1.1.12 → **1.1.13**（committed，healthz/install-meta/日志验证）；docker-node 容器手动 `docker cp` + 覆盖 + 重启 → **1.1.13**。
+- hub `tmex`、jiefa-app、jiefa-dns-1 待用户在节点页「全选 → 更多 → 升级」推包（需登录会话，指挥官无凭据）。
+- 注意：`gh` 默认仓库指向上游 `krhougs/tmex`，查 fork 的 run/release 必须 `-R 12dora/tmex-enhanced`（本轮等待器曾因此空转）。
