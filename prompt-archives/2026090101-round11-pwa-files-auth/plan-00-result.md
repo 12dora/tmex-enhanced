@@ -35,4 +35,6 @@
 
 ## 上线
 
-（待补：release commit / tag / Actions / 本机 `tmex upgrade` 结果）
+- release commit `41c05a60`，merge `3648f495`，tag `v1.1.7`；GitHub Actions Release 成功（`tmex-cli-1.1.7.tgz` + `SHA256SUMS`）。
+- 本机生产：`node "$HOME/Library/Application Support/tmex/current/cli/bin/tmex.js" upgrade --yes --lang zh-CN` → `upgrade committed 1.1.6 -> 1.1.7`，`/healthz` 版本 1.1.7；升级前生产库三件套只读备份在 scratchpad `prod-backup-1.1.6/`。
+- 其余节点（Hub、jiefa-app、jiefa-dns-1）未升级，可在设置-节点管理用「升级」按钮逐台升级。
