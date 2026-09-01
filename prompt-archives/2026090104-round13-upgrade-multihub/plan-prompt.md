@@ -23,3 +23,13 @@
 > 趁还在工作,请你顺便升级一下docker-node和tmex上的版本,given你已经能够取得终端access via tmex
 
 执行：docker-node（本机容器 `tmex-node-docker`）`docker cp` 1.1.10 tarball 后原地 `tar -x --strip-components=1` 覆盖 `/opt/tmex` 并 `pkill` 让 entry 循环拉起；hub `tmex`（VPS 访问不了 GitHub）用 `scratchpad/hub-upgrade.ts`：经本机 tmex 登录 → `/n/<hub>/api/files/*` 上传 tarball 与脚本到 `/root/tmex-hub` → 临时终端设备 `nohup` 执行 `npx --yes ./tmex-cli-1.1.10.tgz upgrade --apply-current-package --yes --install-dir /root/tmex-hub/install` → 轮询 healthz 重启 → `/api/system/info` 报 1.1.10；随后删除临时文件根与设备。mesh 五节点全部 1.1.10。
+
+## 2026-09-01 追加：jiefa 节点卡在下载中 / 状态恢复与停止按钮
+
+> 设置-节点管理中的2个jiefa系列节点, 点击升级一直卡在下载中
+
+诊断：两台均为 1.1.10（无推包能力，走旧路径「目标自行下载」）；jiefa-dns-1 报 `SHA256SUMS network error: Unable to connect`（连不上 GitHub），jiefa-app 因 1.1.10 的下载 `fetch` 无超时而永远停在 `downloading`。处置：用 `scratchpad/node-upgrade.ts`（hub-upgrade 泛化版：自动从服务进程环境变量探测安装目录，无 node 时退回 bun）经本机 tmex 上传 tarball + 终端离线升级到 1.1.11；五节点全部 1.1.11。
+
+> 在下载中状态,刷新页面又变成待升级, 你应该能在刷新后preserve当前状态,并在升级中提供停止按钮, incase用户想要打断
+
+计划：后端 G7（`DELETE /api/system/upgrade` 取消下载、入口 `DELETE /api/mesh/nodes/:id/upgrade` 取消本地 job 或转发、`UPGRADE_CANCELLED`/`UPGRADE_NOT_CANCELLABLE`/`UPGRADE_CANCEL_UNSUPPORTED`），前端 O3（挂载时按节点回读升级状态恢复行内进度并续接轮询、下载阶段提供停止按钮、安装阶段禁用并说明）。
