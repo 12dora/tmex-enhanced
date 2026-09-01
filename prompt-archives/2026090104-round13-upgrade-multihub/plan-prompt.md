@@ -17,3 +17,9 @@
 > 3. codex（gpt-5.6-luna,  xhigh)探索代码
 > 4. codex（gpt-5.6-sol,  high)担任code reviewer, codex存在过度防御的问题, 你应该自行判断问题是否修复
 > 5. 你担任指挥官和planner, 激进并行, 合理控制每个agent的工作量, 避免单一agent上下文过大
+
+## 2026-09-01 追加：顺手升级远端节点
+
+> 趁还在工作,请你顺便升级一下docker-node和tmex上的版本,given你已经能够取得终端access via tmex
+
+执行：docker-node（本机容器 `tmex-node-docker`）`docker cp` 1.1.10 tarball 后原地 `tar -x --strip-components=1` 覆盖 `/opt/tmex` 并 `pkill` 让 entry 循环拉起；hub `tmex`（VPS 访问不了 GitHub）用 `scratchpad/hub-upgrade.ts`：经本机 tmex 登录 → `/n/<hub>/api/files/*` 上传 tarball 与脚本到 `/root/tmex-hub` → 临时终端设备 `nohup` 执行 `npx --yes ./tmex-cli-1.1.10.tgz upgrade --apply-current-package --yes --install-dir /root/tmex-hub/install` → 轮询 healthz 重启 → `/api/system/info` 报 1.1.10；随后删除临时文件根与设备。mesh 五节点全部 1.1.10。
