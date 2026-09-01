@@ -1,0 +1,13 @@
+## Findings
+
+No **blocker**, **should-fix**, or **nit** findings.
+
+The stated runtime-neutral cleanup is supported by the review:
+
+- Telegram’s `pollOffset` mirrors GramIO’s successful `getUpdates` logic, including retaining the prior value for empty responses and observing the `offset: -1` drop-pending request (`apps/gateway/src/telegram/service.ts:143`, `apps/gateway/node_modules/gramio/dist/index.js:352`, `apps/gateway/node_modules/gramio/dist/index.js:385`). The post-`start()` write remains effectively `0` initially, as GramIO’s private offset was initialized to `0`. `lastUpdateId` remains write-only and is not used to seed polling (`apps/gateway/src/telegram/service.ts:163`, `apps/gateway/src/telegram/service.ts:215`, `apps/gateway/src/db/telegram.ts:112`).
+- The new SSH `undefined` branch is unreachable: when `configAgent` is absent, `resolveSshAgentSocket('agent', …)` already throws the identical message (`apps/gateway/src/tmux-client/ssh-auth-resolvers.ts:312`, `apps/gateway/src/tmux/ssh-auth.ts:47`). It therefore does not replace an earlier `ssh2` call with `agent: undefined`.
+- The `Omit` correction matches the caller’s later assembly of both `text` and `historyText` (`apps/gateway/src/tmux-client/control-mode-capture.ts:113`, `apps/gateway/src/tmux-client/control-mode-capture.ts:186`).
+- `EnvLike | NodeJS.ProcessEnv` preserves plain-object callers while accepting `process.env`; all accessed properties are shared by both alternatives (`apps/gateway/src/tmux/ssh-auth.ts:14`, `apps/gateway/src/tmux/ssh-auth.test.ts:4`).
+- Test-only changes preserve behavior: boxed listener references invoke the same captured callbacks (`apps/gateway/src/push/supervisor.test.ts:121`, `apps/gateway/src/push/supervisor.test.ts:176`); the EventEmitter view registers and removes the identical function on the identical `process` object (`apps/gateway/src/tmux-client/local-external-connection.eagain.test.ts:556`, `apps/gateway/src/tmux-client/local-external-connection.test.ts:1646`, `apps/gateway/src/ws/index.test.ts:222`); `Promise.withResolvers()` retains the same pending gate and explicit release point (`apps/gateway/src/tmux-client/local-external-connection.test.ts:1895`, `apps/gateway/src/tmux-client/local-external-connection.test.ts:1946`). The typed SSH expectations and runtime mock helper retain the original assertions and exercised paths (`apps/gateway/src/tmux-client/ssh-connect-config.test.ts:157`, `apps/gateway/src/push/supervisor.test.ts:9`).
+
+Verification: `tsc -p apps/gateway/tsconfig.json --noEmit --pretty false` completed with exit code 0 and no diagnostics. Runtime tests were not executed because the sandbox is read-only.

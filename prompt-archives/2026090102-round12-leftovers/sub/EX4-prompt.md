@@ -1,0 +1,12 @@
+# EX4 — Sidebar agent session bootstrap: defer full session hydration
+
+Question: the sidebar agent provider is enabled by default and, at boot, loads the full `/api/agent/sessions` list and restores/resends active agent subscriptions before the user ever opens the Agent tab. Design a lazy path.
+
+Investigate and report:
+
+1. Current flow with citations: `apps/fe/src/components/page-layouts/components/sidebar-device-list-runtime.tsx`, `use-sidebar-agent-sessions.ts` (`loadSessions`), `packages/stores/src/agent-session-crud-actions.ts`, `packages/stores/src/agent.ts` (subscription restore on READY), `packages/stores/src/runtime.ts` (agent enabled default). Per remote node runtime too (round 11 made remote runtimes on-demand — confirm whether the agent bootstrap now only runs for the self node + expanded remote nodes, or still per node).
+2. What the sidebar actually renders from that data while the Terminals tab is active: agent decorations on device/pane rows (running badge, session count, unread?), the Agent tab list itself, anything in the header. For each, what is the minimal data needed (e.g. a set of `{sessionId, paneId, status}` vs the full session objects with messages/config)?
+3. Response shape and size: `apps/gateway/src/agent/**` sessions list route — fields per session, whether messages/history are included, pagination/filters available (`status=active`, `limit`, `since`?). How many sessions does a long-lived install accumulate (is there retention/cleanup)?
+4. Subscription restore: what `agent.ts:114-159` (line numbers from the old audit) resends on READY and why; cost per subscription; whether subscriptions to sessions in a hidden Agent tab are needed for notifications (browser bell / toast on session completion — check `packages/stores` notification wiring) — if notifications depend on them, lazy loading must keep a lightweight "active sessions" subscription.
+5. Options: (A) sidebar uses a compact endpoint / `?view=summary&status=active` and full hydration happens on Agent tab open; (B) keep the endpoint, just defer `loadSessions()` until the Agent tab is first opened, with decorations derived from a cheaper source (WS agent events for active sessions only); (C) do nothing if the list is already small/cheap. Quantify with the response shape.
+6. Recommend, list affected files (gateway route if a summary view is added, stores, fe sidebar, tests) and estimate diff size; flag any i18n or UX change (e.g. Agent tab shows a loading state on first open).
