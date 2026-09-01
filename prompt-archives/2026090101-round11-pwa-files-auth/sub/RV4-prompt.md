@@ -1,0 +1,5 @@
+# RV4 — Re-review: gateway viewport policy fixes (follow-up to RV3)
+
+The previous review (RV3) found: (1) sized `TMUX_SELECT` bypassed arbitration; (2) `lastAppliedViewport` suppressed legitimate re-apply after tmux-side changes; (3) same-window pane switch got no policy; (4) stale window keys after pane moves/window close. This diff (on top of the refactor that split `viewport-policy.ts`, `tmux-viewport-handlers.ts`, `session-close.ts`) claims to fix all four. Verify each fix against the code with `path:line`, and specifically hunt for **single-client regressions**: with exactly one browser, is every resize / sync-size / sized-select applied as before (first select after connect with size, split windows, `resizePane` vs `resizeWindow` selection, reconnect)? Also check: the snapshot geometry sync after apply cannot mask a real tmux-side resize that arrives later; claim re-binding cost on every claim (any O(panes×claims) hot path per output frame?); and that the rewritten mesh isolation tests actually reach `TARGET_MISMATCH` / `via_mismatch`.
+
+Diff: `DIFF_PATH`
