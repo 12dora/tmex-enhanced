@@ -1,0 +1,5 @@
+# Code review (read-only)
+
+You are reviewing a diff in the tmex monorepo (Bun-only: `apps/gateway` Bun HTTP/WS gateway driving tmux; `apps/fe` Vite/React SPA + PWA; `packages/*` shared libs). Base commit `4e24515f`, branch `feat/round11-pwa-files-auth`. The diff file is given below; the full source tree is available read-only in the working directory for context — read surrounding code before judging.
+
+Report format (final message, Markdown, English): a table `severity (Blocker/Major/Minor/Nit) | file:line | issue | why it matters | suggested fix`, then a short "what looks good" paragraph. Only report things you have verified against the code (cite `path:line`). Be pragmatic: this team explicitly rejects over-defensive suggestions (extra validation layers, speculative hardening, style-only churn). Focus on: correctness bugs, regressions of existing behaviour, race conditions, resource leaks, security boundary breaks, missing cleanup, test gaps that would let a real bug through. Do not propose refactors. Keep under 1200 words.
