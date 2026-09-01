@@ -1,0 +1,1947 @@
+commit 8692c19c650e392b6252adf7426743879d0d1e07
+Author: Konata <konata@KonatadeMacBook-Pro.local>
+Date:   Wed Sep 2 00:01:46 2026 +0800
+
+    feat(upgrade): 下载阶段可取消（本机/入口 job/转发目标），取消零残留
+    
+    - DELETE /api/system/upgrade：downloading 可取消（abort + 删 txn 目录与未校验缓存），executing 409 NOT_CANCELLABLE，idle 409 NOT_RUNNING
+    - DELETE /api/system/upgrade/package?version= 丢弃暂存包；入口 job 取消于推送完成后自动调用
+    - 入口 DELETE /api/mesh/nodes/:id/upgrade：取消本地 job（overlay UPGRADE_CANCELLED，随后可立即重发）或转发；旧目标 501 CANCEL_UNSUPPORTED
+    - PUT 体中断即删 .part；崩溃半取消由下次启动 prune 修复；取消与收尾竞态由 controller 互斥保证不撕裂
+    
+    Claude-Session: https://claude.ai/code/session_01XhSLkyskLHdE1at75LomAV
+
+diff --git a/apps/gateway/src/api/system.ts b/apps/gateway/src/api/system.ts
+index 0221d643..35c6a507 100644
+--- a/apps/gateway/src/api/system.ts
++++ b/apps/gateway/src/api/system.ts
+@@ -54,11 +54,21 @@ export function handleSystemApiRequest(
+     return handleStartUpgradeOpen(req);
+   }
+ 
++  if (path === '/api/system/upgrade' && req.method === 'DELETE') {
++    if (managed) return managedExternallyResponse();
++    return handleCancelUpgradeOpen();
++  }
++
+   if (path === '/api/system/upgrade/package' && req.method === 'PUT') {
+     if (managed) return managedExternallyResponse();
+     return handleStagePackageOpen(req);
+   }
+ 
++  if (path === '/api/system/upgrade/package' && req.method === 'DELETE') {
++    if (managed) return managedExternallyResponse();
++    return handleDeleteStagedPackageOpen(req);
++  }
++
+   return undefined;
+ }
+ 
+@@ -135,6 +145,36 @@ async function handleStartUpgradeOpen(req: Request): Promise<Response> {
+   return json(result.status);
+ }
+ 
++async function handleCancelUpgradeOpen(): Promise<Response> {
++  const { upgradeController } = await import('../system/upgrade');
++  const result = await upgradeController.cancel();
++  if (!result.ok) {
++    return json({ code: result.code, ...result.status }, 409);
++  }
++  return json(result.status);
++}
++
++async function handleDeleteStagedPackageOpen(req: Request): Promise<Response> {
++  if (!requestIsStagedAuthenticated(req)) {
++    return stagedRequiresAuth();
++  }
++  const info = getSystemInfo();
++  if (!info.canSelfUpdate) {
++    return json({ error: t('apiError.upgradeNotAllowed') }, 403);
++  }
++  const url = new URL(req.url);
++  const version = (url.searchParams.get('version') ?? '').trim();
++  if (!version || !isReleaseVersion(version)) {
++    return json({ error: t('apiError.upgradeVersionRequired') }, 400);
++  }
++  const { upgradeController } = await import('../system/upgrade');
++  const result = await upgradeController.removeStagedPackage(version);
++  if (!result.ok) {
++    return json({ code: 'PACKAGE_NOT_STAGED' }, 404);
++  }
++  return json({ ok: true });
++}
++
+ const SHA256_HEX = /^[0-9a-fA-F]{64}$/;
+ 
+ async function handleStagePackageOpen(req: Request): Promise<Response> {
+diff --git a/apps/gateway/src/mesh/mesh-routes.ts b/apps/gateway/src/mesh/mesh-routes.ts
+index 032311e5..86db1dc4 100644
+--- a/apps/gateway/src/mesh/mesh-routes.ts
++++ b/apps/gateway/src/mesh/mesh-routes.ts
+@@ -233,6 +233,9 @@ export class MeshRoutes {
+     if (req.method === 'GET') {
+       return requireSession(this.sessionDeps, (r) => this.handleUpgradeStatus(r, nodeId))(req);
+     }
++    if (req.method === 'DELETE') {
++      return requireSession(this.sessionDeps, (r) => this.handleUpgradeCancel(r, nodeId))(req);
++    }
+     return undefined;
+   }
+ 
+@@ -266,6 +269,19 @@ export class MeshRoutes {
+     });
+   }
+ 
++  private async handleUpgradeCancel(req: Request, nodeId: string): Promise<Response> {
++    const { handleMeshNodeUpgradeCancel } = await import('../system/upgrade-service');
++    return handleMeshNodeUpgradeCancel({
++      req,
++      nodeId,
++      localNodeId: this.deps.nodeId,
++      userStore: this.deps.userStore,
++      forward: {
++        forwardAuthorizedHttp: (r, input) => this.forwardAuthorized(r, input),
++      },
++    });
++  }
++
+   private forwardAuthorized(
+     req: Request,
+     input: { nodeId: string; method: string; path: string; query?: string; body?: unknown }
+diff --git a/apps/gateway/src/system/release-download.ts b/apps/gateway/src/system/release-download.ts
+index fa73efdb..37c9166e 100644
+--- a/apps/gateway/src/system/release-download.ts
++++ b/apps/gateway/src/system/release-download.ts
+@@ -109,14 +109,15 @@ export function assertReleaseIntegrity(
+ export async function fetchReleaseSha256Sums(
+   version: string,
+   fileName: string,
+-  fetchFn: typeof fetch = fetch
++  fetchFn: typeof fetch = fetch,
++  signal?: AbortSignal
+ ): Promise<{ hex: string | null; missing: boolean }> {
+   let response: Response;
+   try {
+     response = await fetchFn(resolveReleaseSha256SumsUrl(version), {
+       redirect: 'follow',
+       cache: 'no-store',
+-      signal: AbortSignal.timeout(SHA256SUMS_FETCH_TIMEOUT_MS),
++      signal: mergeAbortSignals(AbortSignal.timeout(SHA256SUMS_FETCH_TIMEOUT_MS), signal),
+     });
+   } catch (error) {
+     const detail = error instanceof Error ? error.message : String(error);
+@@ -141,7 +142,7 @@ export type DownloadedRelease = {
+ 
+ export async function downloadVerifiedRelease(
+   version: string,
+-  opts: { cacheDir: string; fetchFn?: typeof fetch }
++  opts: { cacheDir: string; fetchFn?: typeof fetch; signal?: AbortSignal }
+ ): Promise<DownloadedRelease> {
+   const key = `${opts.cacheDir}::${version}`;
+   const existing = inflight.get(key);
+@@ -155,7 +156,7 @@ export async function downloadVerifiedRelease(
+ 
+ async function downloadVerifiedReleaseUncached(
+   version: string,
+-  opts: { cacheDir: string; fetchFn?: typeof fetch }
++  opts: { cacheDir: string; fetchFn?: typeof fetch; signal?: AbortSignal }
+ ): Promise<DownloadedRelease> {
+   await mkdir(opts.cacheDir, { recursive: true, mode: 0o700 });
+   const fileName = releaseTarballName(version);
+@@ -169,8 +170,15 @@ async function downloadVerifiedReleaseUncached(
+   await rm(part, { force: true }).catch(() => {});
+   let downloaded: { sha256: string; bytes: number };
+   try {
+-    downloaded = await downloadTarballToFile(resolveReleaseTarballUrl(version), part, fetchFn);
+-    const sums = await fetchReleaseSha256Sums(version, fileName, fetchFn);
++    throwIfAborted(opts.signal);
++    downloaded = await downloadTarballToFile(
++      resolveReleaseTarballUrl(version),
++      part,
++      fetchFn,
++      opts.signal
++    );
++    throwIfAborted(opts.signal);
++    const sums = await fetchReleaseSha256Sums(version, fileName, fetchFn, opts.signal);
+     assertReleaseSha256(version, downloaded.sha256, sums);
+   } catch (err) {
+     await rm(part, { force: true }).catch(() => {});
+@@ -178,8 +186,10 @@ async function downloadVerifiedReleaseUncached(
+   }
+   let renamed = false;
+   try {
++    throwIfAborted(opts.signal);
+     await rename(part, dest);
+     renamed = true;
++    throwIfAborted(opts.signal);
+     await writeFile(sidecar, `${downloaded.sha256}\n`, { mode: 0o600 });
+   } catch (err) {
+     await rm(part, { force: true }).catch(() => {});
+@@ -203,19 +213,40 @@ async function readVerifiedCache(dest: string, sidecar: string): Promise<Downloa
+   }
+ }
+ 
++function mergeAbortSignals(timeout: AbortSignal, user?: AbortSignal): AbortSignal {
++  if (!user) return timeout;
++  if (typeof AbortSignal.any === 'function') return AbortSignal.any([timeout, user]);
++  if (user.aborted) return user;
++  const ac = new AbortController();
++  const onAbort = (): void => ac.abort();
++  timeout.addEventListener('abort', onAbort, { once: true });
++  user.addEventListener('abort', onAbort, { once: true });
++  return ac.signal;
++}
++
++function throwIfAborted(signal?: AbortSignal): void {
++  if (!signal?.aborted) return;
++  const err = new Error('UPGRADE_CANCELLED');
++  err.name = 'AbortError';
++  throw err;
++}
++
+ async function downloadTarballToFile(
+   url: string,
+   destPath: string,
+-  fetchFn: typeof fetch
++  fetchFn: typeof fetch,
++  signal?: AbortSignal
+ ): Promise<{ sha256: string; bytes: number }> {
++  const combined = mergeAbortSignals(AbortSignal.timeout(TARBALL_FETCH_TIMEOUT_MS), signal);
+   const res = await fetchFn(url, {
+     cache: 'no-store',
+     redirect: 'follow',
+-    signal: AbortSignal.timeout(TARBALL_FETCH_TIMEOUT_MS),
++    signal: combined,
+   });
+   if (!res.ok) {
+     throw new Error(`GitHub release tarball HTTP ${res.status}`);
+   }
++  throwIfAborted(signal);
+   const hash = createHash('sha256');
+   let bytes = 0;
+   const hasher = new Transform({
+@@ -226,14 +257,24 @@ async function downloadTarballToFile(
+     },
+   });
+   const ws = createWriteStream(destPath, { mode: 0o600 });
++  const src = res.body
++    ? Readable.fromWeb(res.body as unknown as NodeWebReadableStream)
++    : Readable.from([Buffer.from(await res.arrayBuffer())]);
++  const onAbort = (): void => {
++    src.destroy();
++    hasher.destroy();
++    ws.destroy();
++    void res.body?.cancel().catch(() => {});
++  };
++  combined.addEventListener('abort', onAbort, { once: true });
+   try {
+-    const src = res.body
+-      ? Readable.fromWeb(res.body as unknown as NodeWebReadableStream)
+-      : Readable.from([Buffer.from(await res.arrayBuffer())]);
+     await pipeline(src, hasher, ws);
+   } catch (err) {
+     ws.destroy();
++    src.destroy();
+     throw err;
++  } finally {
++    combined.removeEventListener('abort', onAbort);
+   }
+   return { sha256: hash.digest('hex'), bytes };
+ }
+diff --git a/apps/gateway/src/system/remote-upgrade-job.ts b/apps/gateway/src/system/remote-upgrade-job.ts
+index bd054f56..3b7cc5d5 100644
+--- a/apps/gateway/src/system/remote-upgrade-job.ts
++++ b/apps/gateway/src/system/remote-upgrade-job.ts
+@@ -1,5 +1,8 @@
+-import { createReadStream, statSync } from 'node:fs';
++import { createReadStream, existsSync, statSync } from 'node:fs';
++import { rm } from 'node:fs/promises';
++import { join } from 'node:path';
+ import { Readable } from 'node:stream';
++import { UPGRADE_CANCELLED, releaseTarballName } from '@tmex/shared';
+ import { getInstallInfo } from './install-info';
+ import { downloadVerifiedRelease, resolveReleaseCacheDir } from './release-download';
+ import { resolveUpgradeInstallDir } from './upgrade';
+@@ -13,7 +16,7 @@ export const REMOTE_UPGRADE_TIMEOUTS = {
+   startMs: 60 * 1000,
+ };
+ 
+-export type RemoteUpgradeJobState = 'running' | 'failed' | 'handed-off';
++export type RemoteUpgradeJobState = 'running' | 'failed' | 'handed-off' | 'cancelled';
+ 
+ export type RemoteUpgradeJobSnapshot = {
+   state: RemoteUpgradeJobState;
+@@ -36,6 +39,16 @@ type Job = {
+   state: RemoteUpgradeJobState;
+   error: string | null;
+   finished: Promise<RemoteUpgradeJobSnapshot>;
++  abort: AbortController;
++  phase: 'download' | 'push' | 'start';
++  pushed: boolean;
++  fileStream: ReadableStream<Uint8Array> | null;
++};
++
++type InflightDownload = {
++  promise: Promise<DownloadedRelease>;
++  ac: AbortController;
++  refs: number;
+ };
+ 
+ type RemoteUpgradeTimeouts = {
+@@ -45,10 +58,16 @@ type RemoteUpgradeTimeouts = {
+ };
+ 
+ const jobs = new Map<string, Job>();
+-const downloadInflight = new Map<string, Promise<DownloadedRelease>>();
++const downloadInflight = new Map<string, InflightDownload>();
+ 
+ export function resetRemoteUpgradeJobsForTests(): void {
++  for (const job of jobs.values()) {
++    job.abort.abort();
++  }
+   jobs.clear();
++  for (const inflight of downloadInflight.values()) {
++    inflight.ac.abort();
++  }
+   downloadInflight.clear();
+ }
+ 
+@@ -58,7 +77,7 @@ export function getRemoteUpgradeJob(
+ ): RemoteUpgradeJobSnapshot | null {
+   const job = jobs.get(nodeId);
+   if (!job) return null;
+-  if (job.state === 'failed') {
++  if (job.state === 'failed' || job.state === 'cancelled') {
+     const failed = Date.parse(job.failedAt ?? job.startedAt);
+     if (!Number.isFinite(failed) || now - failed > FAILED_TTL_MS) {
+       jobs.delete(nodeId);
+@@ -90,7 +109,7 @@ export function startRemoteUpgradeJob(opts: {
+   version: string;
+   req: Request;
+   forward: AuthorizedUpgradeForward;
+-  download?: (version: string) => Promise<DownloadedRelease>;
++  download?: (version: string, signal?: AbortSignal) => Promise<DownloadedRelease>;
+   now?: () => number;
+   timeouts?: Partial<RemoteUpgradeTimeouts>;
+ }): RemoteUpgradeStartResult {
+@@ -112,6 +131,10 @@ export function startRemoteUpgradeJob(opts: {
+     state: 'running',
+     error: null,
+     finished,
++    abort: new AbortController(),
++    phase: 'download',
++    pushed: false,
++    fileStream: null,
+   };
+   jobs.set(opts.nodeId, job);
+ 
+@@ -126,51 +149,112 @@ export function startRemoteUpgradeJob(opts: {
+   return { ok: true, snapshot: snapshotOf(job) };
+ }
+ 
++export async function cancelRemoteUpgradeJob(opts: {
++  nodeId: string;
++  req: Request;
++  forward: AuthorizedUpgradeForward;
++}): Promise<{ handled: true; snapshot: RemoteUpgradeJobSnapshot } | { handled: false }> {
++  const job = jobs.get(opts.nodeId);
++  if (!job) return { handled: false };
++  if (job.state === 'handed-off' || job.state === 'failed') return { handled: false };
++  if (job.state === 'cancelled') return { handled: true, snapshot: snapshotOf(job) };
++  if (job.state !== 'running') return { handled: false };
++
++  job.abort.abort();
++  await job.fileStream?.cancel().catch(() => {});
++  job.fileStream = null;
++  if (job.phase === 'download') {
++    const inflight = downloadInflight.get(job.version);
++    if (!inflight || inflight.refs <= 0) {
++      if (inflight) await inflight.promise.catch(() => {});
++      await removeUnverifiedReleaseCache(job.version);
++    }
++  }
++  if (job.pushed) {
++    await deleteStagedBestEffort(job, opts.req, opts.forward);
++  }
++  return { handled: true, snapshot: markCancelled(job) };
++}
++
++async function removeUnverifiedReleaseCache(version: string): Promise<void> {
++  const cacheDir = resolveReleaseCacheDir(resolveUpgradeInstallDir(getInstallInfo()));
++  const dest = join(cacheDir, releaseTarballName(version));
++  await rm(`${dest}.part`, { force: true }).catch(() => {});
++  if (!existsSync(`${dest}.sha256`)) {
++    await rm(dest, { force: true }).catch(() => {});
++  }
++}
++
+ async function runJob(
+   job: Job,
+   req: Request,
+   forward: AuthorizedUpgradeForward,
+-  download: (version: string) => Promise<DownloadedRelease>,
++  download: (version: string, signal?: AbortSignal) => Promise<DownloadedRelease>,
+   timeouts: RemoteUpgradeTimeouts,
+   nowFn: () => number
+ ): Promise<RemoteUpgradeJobSnapshot> {
+   let downloaded: DownloadedRelease;
++  job.phase = 'download';
+   try {
+     downloaded = await withTimeout(
+-      sharedDownload(job.version, download),
++      Promise.race([
++        sharedDownload(job.version, download, job.abort.signal),
++        abortPromise(job.abort.signal),
++      ]),
+       timeouts.downloadMs,
+       'download timeout'
+     );
+   } catch (err) {
++    if (job.abort.signal.aborted) {
++      return markCancelled(job, nowFn);
++    }
+     return fail(job, `download failed: ${err instanceof Error ? err.message : String(err)}`, nowFn);
+   }
++  if (job.abort.signal.aborted) {
++    return markCancelled(job, nowFn);
++  }
+ 
+   let fileStream: ReadableStream<Uint8Array> | null = null;
++  job.phase = 'push';
+   try {
+     fileStream = fileReadableStream(downloaded.path);
++    job.fileStream = fileStream;
+     const pushed = await withTimeout(
+-      forward.forwardAuthorizedHttp(req, {
+-        nodeId: job.nodeId,
+-        method: 'PUT',
+-        path: '/api/system/upgrade/package',
+-        query: `?version=${encodeURIComponent(job.version)}&sha256=${downloaded.sha256}`,
+-        rawBody: fileStream,
+-        headers: {
+-          'content-type': 'application/octet-stream',
+-          'content-length': String(downloaded.bytes),
+-        },
+-        signal: AbortSignal.timeout(timeouts.pushMs),
+-      }),
++      Promise.race([
++        forward.forwardAuthorizedHttp(req, {
++          nodeId: job.nodeId,
++          method: 'PUT',
++          path: '/api/system/upgrade/package',
++          query: `?version=${encodeURIComponent(job.version)}&sha256=${downloaded.sha256}`,
++          rawBody: fileStream,
++          headers: {
++            'content-type': 'application/octet-stream',
++            'content-length': String(downloaded.bytes),
++          },
++          signal: mergeAbortSignals(AbortSignal.timeout(timeouts.pushMs), job.abort.signal),
++        }),
++        abortPromise(job.abort.signal),
++      ]),
+       timeouts.pushMs,
+       'push timeout'
+     );
+     fileStream = null;
++    job.fileStream = null;
++    if (job.abort.signal.aborted) {
++      await pushed.body?.cancel().catch(() => {});
++      return markCancelled(job, nowFn);
++    }
+     if (pushed.status < 200 || pushed.status >= 300) {
+       return fail(job, `push failed: ${await describeUpstream(pushed)}`, nowFn);
+     }
+     await pushed.body?.cancel().catch(() => {});
++    job.pushed = true;
+   } catch (err) {
+     await fileStream?.cancel().catch(() => {});
++    job.fileStream = null;
++    if (job.abort.signal.aborted) {
++      return markCancelled(job, nowFn);
++    }
+     const message = err instanceof Error ? err.message : String(err);
+     return fail(
+       job,
+@@ -179,23 +263,40 @@ async function runJob(
+     );
+   }
+ 
++  job.phase = 'start';
++  if (job.abort.signal.aborted) {
++    await deleteStagedBestEffort(job, req, forward);
++    return markCancelled(job, nowFn);
++  }
+   try {
+     const started = await withTimeout(
+-      forward.forwardAuthorizedHttp(req, {
+-        nodeId: job.nodeId,
+-        method: 'POST',
+-        path: '/api/system/upgrade',
+-        body: { version: job.version, source: 'staged', sha256: downloaded.sha256 },
+-        signal: AbortSignal.timeout(timeouts.startMs),
+-      }),
++      Promise.race([
++        forward.forwardAuthorizedHttp(req, {
++          nodeId: job.nodeId,
++          method: 'POST',
++          path: '/api/system/upgrade',
++          body: { version: job.version, source: 'staged', sha256: downloaded.sha256 },
++          signal: mergeAbortSignals(AbortSignal.timeout(timeouts.startMs), job.abort.signal),
++        }),
++        abortPromise(job.abort.signal),
++      ]),
+       timeouts.startMs,
+       'start timeout'
+     );
++    if (job.abort.signal.aborted) {
++      await started.body?.cancel().catch(() => {});
++      await deleteStagedBestEffort(job, req, forward);
++      return markCancelled(job, nowFn);
++    }
+     if (started.status < 200 || started.status >= 300) {
+       return fail(job, `start failed: ${await describeUpstream(started)}`, nowFn);
+     }
+     await started.body?.cancel().catch(() => {});
+   } catch (err) {
++    if (job.abort.signal.aborted) {
++      await deleteStagedBestEffort(job, req, forward);
++      return markCancelled(job, nowFn);
++    }
+     const message = err instanceof Error ? err.message : String(err);
+     return fail(
+       job,
+@@ -204,18 +305,77 @@ async function runJob(
+     );
+   }
+ 
++  if (job.abort.signal.aborted) {
++    return markCancelled(job, nowFn);
++  }
+   job.state = 'handed-off';
+   job.error = null;
+   return snapshotOf(job);
+ }
+ 
++function markCancelled(job: Job, nowFn: () => number = Date.now): RemoteUpgradeJobSnapshot {
++  if (job.state !== 'cancelled') {
++    job.state = 'cancelled';
++    job.error = UPGRADE_CANCELLED;
++    job.failedAt = new Date(nowFn()).toISOString();
++  }
++  return snapshotOf(job);
++}
++
+ function fail(job: Job, error: string, nowFn: () => number = Date.now): RemoteUpgradeJobSnapshot {
++  if (job.state === 'cancelled') return snapshotOf(job);
+   job.state = 'failed';
+   job.error = error;
+   job.failedAt = new Date(nowFn()).toISOString();
+   return snapshotOf(job);
+ }
+ 
++async function deleteStagedBestEffort(
++  job: Job,
++  req: Request,
++  forward: AuthorizedUpgradeForward
++): Promise<void> {
++  try {
++    const res = await forward.forwardAuthorizedHttp(req, {
++      nodeId: job.nodeId,
++      method: 'DELETE',
++      path: '/api/system/upgrade/package',
++      query: `?version=${encodeURIComponent(job.version)}`,
++    });
++    await res.body?.cancel().catch(() => {});
++  } catch (err) {
++    const detail = err instanceof Error ? err.message : String(err);
++    console.warn(
++      `[mesh][upgrade] cancel staged package failed node=${job.nodeId} version=${job.version} err=${detail}`
++    );
++  }
++}
++
++function mergeAbortSignals(timeout: AbortSignal, user: AbortSignal): AbortSignal {
++  if (typeof AbortSignal.any === 'function') return AbortSignal.any([timeout, user]);
++  if (user.aborted) return user;
++  const ac = new AbortController();
++  const onAbort = (): void => ac.abort();
++  timeout.addEventListener('abort', onAbort, { once: true });
++  user.addEventListener('abort', onAbort, { once: true });
++  return ac.signal;
++}
++
++function abortPromise(signal: AbortSignal): Promise<never> {
++  return new Promise((_, reject) => {
++    const fail = (): void => {
++      const err = new Error(UPGRADE_CANCELLED);
++      err.name = 'AbortError';
++      reject(err);
++    };
++    if (signal.aborted) {
++      fail();
++      return;
++    }
++    signal.addEventListener('abort', fail, { once: true });
++  });
++}
++
+ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+   let timer: ReturnType<typeof setTimeout> | undefined;
+   const timeout = new Promise<never>((_, reject) => {
+@@ -239,20 +399,36 @@ function snapshotOf(job: Job): RemoteUpgradeJobSnapshot {
+ 
+ function sharedDownload(
+   version: string,
+-  download: (version: string) => Promise<DownloadedRelease>
++  download: (version: string, signal?: AbortSignal) => Promise<DownloadedRelease>,
++  signal: AbortSignal
+ ): Promise<DownloadedRelease> {
+-  const existing = downloadInflight.get(version);
+-  if (existing) return existing;
+-  const pending = download(version).finally(() => {
+-    if (downloadInflight.get(version) === pending) downloadInflight.delete(version);
+-  });
+-  downloadInflight.set(version, pending);
+-  return pending;
++  let inflight = downloadInflight.get(version);
++  if (!inflight) {
++    const ac = new AbortController();
++    const created: InflightDownload = {
++      promise: download(version, ac.signal).finally(() => {
++        if (downloadInflight.get(version) === created) downloadInflight.delete(version);
++      }),
++      ac,
++      refs: 0,
++    };
++    inflight = created;
++    downloadInflight.set(version, created);
++  }
++  inflight.refs += 1;
++  const onAbort = (): void => {
++    inflight.refs -= 1;
++    if (inflight.refs <= 0) inflight.ac.abort();
++  };
++  if (signal.aborted) onAbort();
++  else signal.addEventListener('abort', onAbort, { once: true });
++  return inflight.promise;
+ }
+ 
+-async function defaultDownload(version: string): Promise<DownloadedRelease> {
++async function defaultDownload(version: string, signal?: AbortSignal): Promise<DownloadedRelease> {
+   return downloadVerifiedRelease(version, {
+     cacheDir: resolveReleaseCacheDir(resolveUpgradeInstallDir(getInstallInfo())),
++    signal,
+   });
+ }
+ 
+diff --git a/apps/gateway/src/system/upgrade-service.ts b/apps/gateway/src/system/upgrade-service.ts
+index 4880f1cd..1df5ce79 100644
+--- a/apps/gateway/src/system/upgrade-service.ts
++++ b/apps/gateway/src/system/upgrade-service.ts
+@@ -1,10 +1,11 @@
+-import type { UpgradeState, UpgradeStatus } from '@tmex/shared';
++import { UPGRADE_CANCELLED, type UpgradeState, type UpgradeStatus } from '@tmex/shared';
+ import { nodeSessionCookieName, parseCookies } from '../auth/cookies';
+ import type { UserStore } from '../auth/user-store';
+ import { MESH_VIA_SELF } from '../mesh/mesh-deps';
+ import { jsonBody, jsonError } from '../mesh/session-middleware';
+ import { getSystemInfo } from './info-public';
+ import {
++  cancelRemoteUpgradeJob,
+   consumeHandedOffJob,
+   getRemoteUpgradeJob,
+   hasRunningRemoteUpgradeJob,
+@@ -143,6 +144,14 @@ export async function handleMeshNodeUpgradeStatus(opts: {
+       startedAt: job.startedAt,
+     });
+   }
++  if (job?.state === 'cancelled') {
++    return jsonBody({
++      state: 'idle' as const,
++      targetVersion: null,
++      error: UPGRADE_CANCELLED,
++      startedAt: job.startedAt,
++    });
++  }
+   const upstream = await forward.forwardAuthorizedHttp(req, {
+     nodeId,
+     method: 'GET',
+@@ -151,6 +160,47 @@ export async function handleMeshNodeUpgradeStatus(opts: {
+   return mapForwardedUpgradeResponse(nodeId, upstream);
+ }
+ 
++export async function handleMeshNodeUpgradeCancel(opts: {
++  req: Request;
++  nodeId: string;
++  localNodeId: string;
++  userStore: UserStore;
++  forward: AuthorizedUpgradeForward;
++}): Promise<Response> {
++  const { req, nodeId, localNodeId, userStore, forward } = opts;
++  if (!isEnrolledUpgradeableNode(localNodeId, userStore, nodeId)) {
++    return jsonError('NOT_FOUND', 404, { nodeId });
++  }
++  const local = isLocalUpgradeNode(localNodeId, nodeId);
++  const resolvedId = local ? localNodeId : nodeId;
++  if (local) {
++    const { upgradeController } = await import('./upgrade');
++    const result = await upgradeController.cancel();
++    if (result.ok) return jsonBody(result.status);
++    return jsonError(result.code, 409, { ...result.status, nodeId: resolvedId });
++  }
++  if (!readNodeSession(req, nodeId)) {
++    return jsonError('NODE_LOGIN_REQUIRED', 401, { nodeId });
++  }
++
++  const jobCancel = await cancelRemoteUpgradeJob({ nodeId, req, forward });
++  if (jobCancel.handled) {
++    return jsonBody({
++      state: 'idle' as const,
++      targetVersion: null,
++      error: UPGRADE_CANCELLED,
++      startedAt: jobCancel.snapshot.startedAt,
++    });
++  }
++
++  const upstream = await forward.forwardAuthorizedHttp(req, {
++    nodeId,
++    method: 'DELETE',
++    path: '/api/system/upgrade',
++  });
++  return mapForwardedUpgradeCancelResponse(nodeId, upstream);
++}
++
+ export async function readLocalUpgradeStatus(): Promise<UpgradeStatus> {
+   const { upgradeController } = await import('./upgrade');
+   return upgradeController.status();
+@@ -184,6 +234,31 @@ export async function startLocalUpgradeAttempt(
+   return { ok: true, status };
+ }
+ 
++async function mapForwardedUpgradeCancelResponse(
++  nodeId: string,
++  upstream: Response
++): Promise<Response> {
++  if (upstream.status === 404) {
++    discardUpstreamBody(upstream);
++    return jsonError('UPGRADE_CANCEL_UNSUPPORTED', 501, { nodeId });
++  }
++  if (upstream.status === 403) {
++    discardUpstreamBody(upstream);
++    return jsonError('UPGRADE_NOT_ALLOWED', 403, { nodeId });
++  }
++  if (upstream.status === 409) {
++    const parsed = await readBoundedJsonObject(upstream);
++    const extra = parsed.ok ? pickUpgradeStatusFields(parsed.value) : {};
++    const rawCode = parsed.ok ? parsed.value.code : null;
++    const code =
++      rawCode === 'UPGRADE_NOT_CANCELLABLE' || rawCode === 'UPGRADE_NOT_RUNNING'
++        ? rawCode
++        : 'UPGRADE_NOT_CANCELLABLE';
++    return jsonError(code, 409, { ...extra, nodeId });
++  }
++  return upstream;
++}
++
+ export async function mapForwardedUpgradeResponse(
+   nodeId: string,
+   upstream: Response
+diff --git a/apps/gateway/src/system/upgrade.ts b/apps/gateway/src/system/upgrade.ts
+index d6ec90ce..b485839f 100644
+--- a/apps/gateway/src/system/upgrade.ts
++++ b/apps/gateway/src/system/upgrade.ts
+@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
+ import { closeSync, existsSync, openSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+ import { chmod, mkdir, open, rename, rm, writeFile } from 'node:fs/promises';
+ import { basename, dirname, join } from 'node:path';
+-import type { UpgradeState, UpgradeStatus } from '@tmex/shared';
++import { UPGRADE_CANCELLED, type UpgradeState, type UpgradeStatus } from '@tmex/shared';
+ import { releaseTarballName } from '@tmex/shared';
+ import { type InstallInfo, getInstallInfo } from './install-info';
+ import { downloadVerifiedRelease, resolveReleaseCacheDir, sha256File } from './release-download';
+@@ -50,7 +50,8 @@ export type ProcessStartIdentityFn = (pid: number) => string | null;
+ export type UpgradeControllerDeps = {
+   spawn?: UpgradeSpawnFn;
+   getInstallInfo?: () => InstallInfo;
+-  stageRelease?: (stageDir: string, version: string) => Promise<string>;
++  stageRelease?: (stageDir: string, version: string, signal?: AbortSignal) => Promise<string>;
++  extractPackage?: (tarballPath: string, stageDir: string, signal?: AbortSignal) => Promise<string>;
+   processCommandLine?: ProcessCommandLineFn;
+   processStartIdentity?: ProcessStartIdentityFn;
+   maxPackageBytes?: number;
+@@ -66,6 +67,14 @@ export type UpgradeStartResult =
+   | { ok: true }
+   | { ok: false; code: 'UPGRADE_IN_PROGRESS' | 'PACKAGE_NOT_STAGED' };
+ 
++export type UpgradeCancelResult =
++  | { ok: true; status: UpgradeStatus }
++  | {
++      ok: false;
++      code: 'UPGRADE_NOT_CANCELLABLE' | 'UPGRADE_NOT_RUNNING';
++      status: UpgradeStatus;
++    };
++
+ export type StagedPackageRecord = {
+   version: string;
+   sha256: string;
+@@ -135,6 +144,11 @@ export class UpgradeController {
+   private readonly staged = new Map<string, StagedPackageRecord>();
+   private stagedLoaded = false;
+   private stagingInFlight = false;
++  private abort: AbortController | null = null;
++  private cancelRequested = false;
++  private commitStarted = false;
++  private activeTxnDir: string | null = null;
++  private lock: Promise<void> = Promise.resolve();
+ 
+   constructor(private readonly deps: UpgradeControllerDeps = {}) {}
+ 
+@@ -160,6 +174,12 @@ export class UpgradeController {
+     this.staged.clear();
+     this.stagedLoaded = false;
+     this.stagingInFlight = false;
++    this.abort?.abort();
++    this.abort = null;
++    this.cancelRequested = false;
++    this.commitStarted = false;
++    this.activeTxnDir = null;
++    this.lock = Promise.resolve();
+   }
+ 
+   /** 进入升级流程；返回 false 表示已忙（并发触发）。下载/执行异步进行，不阻塞调用方。 */
+@@ -179,10 +199,55 @@ export class UpgradeController {
+     this.targetVersion = version;
+     this.error = null;
+     this.startedAt = new Date().toISOString();
++    this.cancelRequested = false;
++    this.commitStarted = false;
++    this.abort = new AbortController();
++    this.activeTxnDir = null;
+     void this.run(version, opts, staged);
+     return { ok: true };
+   }
+ 
++  async cancel(): Promise<UpgradeCancelResult> {
++    return this.withLock(async () => {
++      if (this.state === 'idle') {
++        return { ok: false, code: 'UPGRADE_NOT_RUNNING' as const, status: this.status() };
++      }
++      if (this.state === 'executing' || this.commitStarted) {
++        return { ok: false, code: 'UPGRADE_NOT_CANCELLABLE' as const, status: this.status() };
++      }
++      this.cancelRequested = true;
++      this.abort?.abort();
++      const txnDir = this.activeTxnDir;
++      const version = this.targetVersion;
++      const install = (this.deps.getInstallInfo ?? getInstallInfo)();
++      const installDir = resolveUpgradeInstallDir(install);
++      await this.cleanupCancelledUpgrade(installDir, txnDir, version);
++      this.state = 'idle';
++      this.error = UPGRADE_CANCELLED;
++      this.targetVersion = null;
++      this.activeTxnDir = null;
++      this.abort = null;
++      return { ok: true, status: this.status() };
++    });
++  }
++
++  async removeStagedPackage(version: string): Promise<{ ok: true } | { ok: false; status: 404 }> {
++    const install = (this.deps.getInstallInfo ?? getInstallInfo)();
++    const installDir = resolveUpgradeInstallDir(install);
++    if (!installDir) return { ok: false, status: 404 };
++    this.loadStagedFromDisk(installDir);
++    const record = this.staged.get(version);
++    const stagedDir = join(installDir, 'staging', 'staged');
++    const tgz = record?.path ?? join(stagedDir, releaseTarballName(version));
++    const sidecar = join(stagedDir, `tmex-cli-${version}.json`);
++    const had = Boolean(record) || existsSync(tgz) || existsSync(sidecar);
++    if (!had) return { ok: false, status: 404 };
++    this.staged.delete(version);
++    await rm(tgz, { force: true }).catch(() => {});
++    await rm(sidecar, { force: true }).catch(() => {});
++    return { ok: true };
++  }
++
+   async stagePackage(
+     version: string,
+     sha256: string,
+@@ -215,6 +280,7 @@ export class UpgradeController {
+     }
+     if (!body) return { ok: false, status: 400, code: 'BAD_REQUEST' };
+ 
++    await this.repairStagingArtifacts(installDir);
+     const stagedDir = join(installDir, 'staging', 'staged');
+     await mkdir(stagedDir, { recursive: true, mode: 0o700 });
+     const finalPath = join(stagedDir, releaseTarballName(version));
+@@ -401,6 +467,91 @@ export class UpgradeController {
+     }
+   }
+ 
++  private withLock<T>(fn: () => Promise<T> | T): Promise<T> {
++    const prev = this.lock;
++    let release!: () => void;
++    this.lock = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    return prev.then(async () => {
++      try {
++        return await fn();
++      } finally {
++        release();
++      }
++    });
++  }
++
++  private async cleanupCancelledUpgrade(
++    installDir: string | null,
++    txnDir: string | null,
++    version: string | null
++  ): Promise<void> {
++    if (txnDir) await rm(txnDir, { recursive: true, force: true }).catch(() => {});
++    if (!installDir || !version) return;
++    const cacheDir = resolveReleaseCacheDir(installDir);
++    await rm(join(cacheDir, `${releaseTarballName(version)}.part`), { force: true }).catch(
++      () => {}
++    );
++    const dest = join(cacheDir, releaseTarballName(version));
++    if (!existsSync(`${dest}.sha256`)) {
++      await rm(dest, { force: true }).catch(() => {});
++    }
++  }
++
++  private async repairStagingArtifacts(installDir: string): Promise<void> {
++    this.loadStagedFromDisk(installDir);
++    this.dropExpiredStaged(installDir);
++    await this.pruneOrphanStagedFiles(installDir);
++    await this.pruneOrphanReleaseCache(installDir);
++    await this.pruneOrphanTxnDirs(installDir);
++  }
++
++  private async pruneOrphanReleaseCache(installDir: string): Promise<void> {
++    const cacheDir = resolveReleaseCacheDir(installDir);
++    if (!existsSync(cacheDir)) return;
++    let names: string[] = [];
++    try {
++      names = readdirSync(cacheDir);
++    } catch {
++      return;
++    }
++    for (const name of names) {
++      const path = join(cacheDir, name);
++      if (name.includes('.part')) {
++        await rm(path, { force: true, recursive: true }).catch(() => {});
++        continue;
++      }
++      if (name.endsWith('.tgz') && !existsSync(`${path}.sha256`)) {
++        await rm(path, { force: true }).catch(() => {});
++      }
++    }
++  }
++
++  private async pruneOrphanTxnDirs(installDir: string): Promise<void> {
++    const root = join(installDir, 'staging');
++    if (!existsSync(root)) return;
++    const keep = new Set(['staged', 'release-cache']);
++    if (this.activeTxnDir) keep.add(basename(this.activeTxnDir));
++    let names: string[] = [];
++    try {
++      names = readdirSync(root);
++    } catch {
++      return;
++    }
++    for (const name of names) {
++      if (keep.has(name)) continue;
++      await rm(join(root, name), { recursive: true, force: true }).catch(() => {});
++    }
++  }
++
++  private throwIfCancelled(): void {
++    if (!this.cancelRequested && !this.abort?.signal.aborted) return;
++    const err = new Error(UPGRADE_CANCELLED);
++    err.name = 'AbortError';
++    throw err;
++  }
++
+   private async run(
+     version: string,
+     opts?: UpgradeStartOpts,
+@@ -409,14 +560,19 @@ export class UpgradeController {
+     const install = (this.deps.getInstallInfo ?? getInstallInfo)();
+     const installDir = resolveUpgradeInstallDir(install);
+     let stageDir: string | null = null;
++    const signal = this.abort?.signal;
+ 
+     try {
+       if (!installDir) {
+         throw new Error('install directory could not be resolved');
+       }
+ 
++      await this.repairStagingArtifacts(installDir);
++      this.throwIfCancelled();
++
+       const txnId = createTxnId();
+       stageDir = join(installDir, 'staging', txnId);
++      this.activeTxnDir = stageDir;
+       await mkdir(stageDir, { recursive: true, mode: 0o700 });
+       const source = opts?.source ?? 'release';
+       let binPath: string;
+@@ -429,6 +585,7 @@ export class UpgradeController {
+         await rm(join(installDir, 'staging', 'staged', `tmex-cli-${version}.json`), {
+           force: true,
+         }).catch(() => {});
++        this.throwIfCancelled();
+         const hashed = await sha256File(consumedPath);
+         if (hashed.sha256 !== record.sha256) {
+           throw new Error('PACKAGE_SHA256_MISMATCH');
+@@ -437,22 +594,44 @@ export class UpgradeController {
+         if (expected && expected !== hashed.sha256) {
+           throw new Error('PACKAGE_SHA256_MISMATCH');
+         }
+-        binPath = await extractCliTarball(consumedPath, stageDir);
++        this.throwIfCancelled();
++        const extractPackage = this.deps.extractPackage ?? extractCliTarball;
++        binPath = await extractPackage(consumedPath, stageDir, signal);
+       } else {
+         const stageRelease = this.deps.stageRelease ?? stageGithubRelease;
+-        binPath = await stageRelease(stageDir, version);
++        binPath = await stageRelease(stageDir, version, signal);
+       }
+-      await this.spawnUpgrade(binPath, installDir, version, txnId);
+-      this.state = 'executing';
+-      if (this.pendingEarlyExit) {
+-        this.error = this.pendingEarlyExit;
+-        this.state = 'idle';
+-        this.pendingEarlyExit = null;
++      this.throwIfCancelled();
++      const committed = await this.withLock(() => {
++        if (this.cancelRequested || this.state !== 'downloading') return false;
++        this.commitStarted = true;
++        return true;
++      });
++      if (!committed) {
++        await this.cleanupCancelledUpgrade(installDir, stageDir, version);
++        return;
+       }
++      await this.spawnUpgrade(binPath, installDir, version, txnId);
++      await this.withLock(() => {
++        if (this.state !== 'downloading') return;
++        this.state = 'executing';
++        if (this.pendingEarlyExit) {
++          this.error = this.pendingEarlyExit;
++          this.state = 'idle';
++          this.pendingEarlyExit = null;
++        }
++      });
+     } catch (err) {
+-      this.error = err instanceof Error ? err.message : String(err);
+-      this.state = 'idle';
+-      this.targetVersion = null;
++      await this.withLock(async () => {
++        if (this.cancelRequested || this.error === UPGRADE_CANCELLED) {
++          await this.cleanupCancelledUpgrade(installDir, stageDir, version);
++          return;
++        }
++        this.error = err instanceof Error ? err.message : String(err);
++        this.state = 'idle';
++        this.targetVersion = null;
++        this.activeTxnDir = null;
++      });
+       if (stageDir) await rm(stageDir, { recursive: true, force: true }).catch(() => {});
+     }
+   }
+@@ -752,16 +931,30 @@ export function parsePidFileContents(raw: string): number | null {
+  * 下载 GitHub Release tarball 并解压到 stageDir（npm pack 布局：package/）。
+  * 返回 CLI 入口路径 `<stageDir>/package/bin/tmex.js`。
+  */
+-export async function stageGithubRelease(stageDir: string, version: string): Promise<string> {
++export async function stageGithubRelease(
++  stageDir: string,
++  version: string,
++  signal?: AbortSignal
++): Promise<string> {
+   const installDir = resolveUpgradeInstallDir(getInstallInfo());
+   const cached = await downloadVerifiedRelease(version, {
+     cacheDir: resolveReleaseCacheDir(installDir),
++    signal,
+   });
+-  return extractCliTarball(cached.path, stageDir);
++  if (signal?.aborted) {
++    const err = new Error(UPGRADE_CANCELLED);
++    err.name = 'AbortError';
++    throw err;
++  }
++  return extractCliTarball(cached.path, stageDir, signal);
+ }
+ 
+-export async function extractCliTarball(tarballPath: string, stageDir: string): Promise<string> {
+-  await extractTarball(tarballPath, stageDir);
++export async function extractCliTarball(
++  tarballPath: string,
++  stageDir: string,
++  signal?: AbortSignal
++): Promise<string> {
++  await extractTarball(tarballPath, stageDir, signal);
+   const packageRoot = join(stageDir, 'package');
+   const binPath = join(packageRoot, 'bin', 'tmex.js');
+   if (!existsSync(binPath)) {
+@@ -771,15 +964,40 @@ export async function extractCliTarball(tarballPath: string, stageDir: string):
+   return binPath;
+ }
+ 
+-function extractTarball(tarballPath: string, stageDir: string): Promise<void> {
++function extractTarball(
++  tarballPath: string,
++  stageDir: string,
++  signal?: AbortSignal
++): Promise<void> {
+   return new Promise<void>((resolve, reject) => {
++    let settled = false;
++    const finish = (fn: () => void): void => {
++      if (settled) return;
++      settled = true;
++      fn();
++    };
+     const child = spawn('tar', ['-xzf', tarballPath, '-C', stageDir], {
+       stdio: 'ignore',
+     });
+-    child.on('error', reject);
++    const onAbort = (): void => {
++      child.kill('SIGTERM');
++      const err = new Error(UPGRADE_CANCELLED);
++      err.name = 'AbortError';
++      finish(() => reject(err));
++    };
++    if (signal?.aborted) {
++      onAbort();
++      return;
++    }
++    signal?.addEventListener('abort', onAbort, { once: true });
++    child.on('error', (err) => {
++      signal?.removeEventListener('abort', onAbort);
++      finish(() => reject(err));
++    });
+     child.on('close', (code) => {
+-      if (code === 0) resolve();
+-      else reject(new Error(`tar extract exited with code ${code ?? 'null'}`));
++      signal?.removeEventListener('abort', onAbort);
++      if (code === 0) finish(() => resolve());
++      else finish(() => reject(new Error(`tar extract exited with code ${code ?? 'null'}`)));
+     });
+   });
+ }
+diff --git a/packages/shared/src/contracts/system.ts b/packages/shared/src/contracts/system.ts
+index 527231d1..a1bb4b0a 100644
+--- a/packages/shared/src/contracts/system.ts
++++ b/packages/shared/src/contracts/system.ts
+@@ -53,6 +53,9 @@ export interface UpdateCheckResult {
+   publishedAt: string | null;
+ }
+ 
++/** 用户取消下载阶段的升级；FE 按此精确字符串识别 */
++export const UPGRADE_CANCELLED = 'UPGRADE_CANCELLED';
++
+ /** 升级状态（轮询） */
+ export interface UpgradeStatus {
+   state: UpgradeState;
+@@ -93,6 +96,9 @@ export type MeshUpgradeErrorCode =
+   | 'UPGRADE_IN_PROGRESS'
+   | 'UPGRADE_ALREADY_LATEST'
+   | 'UPGRADE_UNSUPPORTED'
++  | 'UPGRADE_CANCEL_UNSUPPORTED'
++  | 'UPGRADE_NOT_CANCELLABLE'
++  | 'UPGRADE_NOT_RUNNING'
+   | 'RELEASE_UNAVAILABLE'
+   | 'NOT_FOUND';
+ 
+
+commit fcf26ffd59086fa4b466b7ab23df44881a58e88b
+Author: Konata <konata@KonatadeMacBook-Pro.local>
+Date:   Tue Sep 1 23:38:33 2026 +0800
+
+    feat(fe): 刷新后恢复在途升级状态；下载阶段可停止升级
+    
+    - 挂载/新增节点时回读 GET /api/mesh/nodes/:id/upgrade，非 idle 行续接轮询（不重发 POST）
+    - 每节点独立 AbortController；cancel(row) 调 DELETE，200 即回静止态，409/501 按不可中断/不支持提示
+    - UPGRADE_CANCELLED 一律按「已取消」处理；批量汇总增加已取消计数；恢复期间「全部升级」置灰
+    
+    Claude-Session: https://claude.ai/code/session_01XhSLkyskLHdE1at75LomAV
+
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
+index 4f2b36f2..f30bf257 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
+@@ -91,7 +91,8 @@ export function NodesManagement({ mode: rawMode, api = defaultAuthApi }: NodesMa
+   }, [hub, refreshHubs, refreshNodes]);
+ 
+   // 升级状态机独立于 enrollment / rename / revoke：它走入口 → 目标的 peer link，hub 离线也能用。
+-  const upgrade = useNodeUpgrade(refreshAll);
++  // 传 rows 是为了刷新后能按行回读升级状态——状态只活在 React 里，页面一刷新就得重新问一遍。
++  const upgrade = useNodeUpgrade(rows, refreshAll);
+ 
+   const [enrollOpen, setEnrollOpen] = useState(false);
+   // 监听回路、admit 流水线与过期清理都在宿主级单例引擎里：侧滑面板同时开着时也只有一份，
+@@ -225,8 +226,8 @@ export function NodesManagement({ mode: rawMode, api = defaultAuthApi }: NodesMa
+ }
+ 
+ /**
+- * 「全部升级」：latest 未知、批量正在跑、已有行内升级在跑、没有可升级节点时禁用。
+- * 顺序、并发与汇总提示都在 `useNodeUpgrade` 里，这里只负责按钮态与进度文案。
++ * 「全部升级」：latest 未知、正在回读升级状态、批量正在跑、已有行内升级在跑、
++ * 没有可升级节点时禁用。顺序、并发与汇总提示都在 `useNodeUpgrade` 里，这里只负责按钮态与进度文案。
+  */
+ export function UpgradeAllButton({
+   rows,
+@@ -242,8 +243,13 @@ export function UpgradeAllButton({
+       type="button"
+       size="sm"
+       variant="outline"
+-      disabled={!latestVersion || running || upgrade.anyRunning || count === 0}
+-      title={upgradeAllHint(t, latestVersion, count, upgrade.anyRunning && !running)}
++      disabled={!latestVersion || running || upgrade.anyRunning || upgrade.restoring || count === 0}
++      title={upgradeAllHint(t, {
++        latestVersion,
++        count,
++        restoring: upgrade.restoring,
++        rowBusy: upgrade.anyRunning && !running,
++      })}
+       onClick={() => upgrade.startAll(rows)}
+       data-testid="nodes-upgrade-all"
+     >
+@@ -261,12 +267,11 @@ export function UpgradeAllButton({
+ 
+ function upgradeAllHint(
+   t: (key: string, options?: Record<string, unknown>) => string,
+-  latestVersion: string | null,
+-  count: number,
+-  rowBusy: boolean
++  state: { latestVersion: string | null; count: number; restoring: boolean; rowBusy: boolean }
+ ): string {
+-  if (rowBusy) return t('nodes.upgrade.allBusy');
+-  if (!latestVersion) return t('nodes.upgrade.releaseUnavailable');
+-  if (count === 0) return t('nodes.upgrade.allNone');
+-  return t('nodes.upgrade.allHint', { count, version: latestVersion });
++  if (state.restoring) return t('nodes.upgrade.restoring');
++  if (state.rowBusy) return t('nodes.upgrade.allBusy');
++  if (!state.latestVersion) return t('nodes.upgrade.releaseUnavailable');
++  if (state.count === 0) return t('nodes.upgrade.allNone');
++  return t('nodes.upgrade.allHint', { count: state.count, version: state.latestVersion });
+ }
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+index 400446a8..2778cd41 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+@@ -7,7 +7,7 @@ import { NodeLoginButton } from '@/auth/NodeLoginButton';
+ import type { NodeRow } from '@/node/mesh-nodes';
+ import { Button } from '@tmex/ui/button';
+ import { Input } from '@tmex/ui/input';
+-import { Download, Loader2, Pencil, ShieldAlert } from 'lucide-react';
++import { Download, Loader2, Pencil, ShieldAlert, Square } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import { hubDetailText, hubModeLabel } from './hub-strip';
+ import type { NodeActionDeps } from './types';
+@@ -143,6 +143,7 @@ function NodeRowView({ row, ...deps }: { row: NodeRow } & NodeActionDeps) {
+             {t('nodes.actions.revoke')}
+           </Button>
+           <UpgradeButton row={row} upgrade={deps.upgrade} />
++          <UpgradeCancelButton row={row} upgrade={deps.upgrade} />
+         </div>
+       </Td>
+     </tr>
+@@ -179,6 +180,36 @@ function UpgradeButton({ row, upgrade }: { row: NodeRow; upgrade: NodeActionDeps
+   );
+ }
+ 
++/**
++ * 「停止升级」：只在这一行有升级在跑时出现。下载阶段（含刚发出请求的 `pending`）可以打断；
++ * 进到安装 / 重启就只剩一个禁用的按钮说明原因——半路掐掉安装会留下一台装坏的机器。
++ */
++function UpgradeCancelButton({
++  row,
++  upgrade,
++}: { row: NodeRow; upgrade: NodeActionDeps['upgrade'] }) {
++  const { t } = useTranslation();
++  const { phase } = upgrade.entryOf(row.id);
++  if (!isUpgradeBusy(phase)) return null;
++  const interruptible = phase === 'pending' || phase === 'downloading';
++  const title = t(interruptible ? 'nodes.upgrade.cancel' : 'nodes.upgrade.cancelNotAllowed');
++
++  return (
++    <Button
++      type="button"
++      size="icon-xs"
++      variant="outline"
++      disabled={!interruptible}
++      title={title}
++      aria-label={title}
++      onClick={() => upgrade.cancel(row)}
++      data-testid={`node-upgrade-cancel-${row.id}`}
++    >
++      <Square />
++    </Button>
++  );
++}
++
+ export function upgradeBlockedHint(
+   row: NodeRow,
+   latestVersion: string | null,
+diff --git a/apps/fe/src/pages/settings/nodes/management/types.ts b/apps/fe/src/pages/settings/nodes/management/types.ts
+index 733d8041..d0bd690e 100644
+--- a/apps/fe/src/pages/settings/nodes/management/types.ts
++++ b/apps/fe/src/pages/settings/nodes/management/types.ts
+@@ -78,11 +78,15 @@ export interface NodeUpgradeController {
+   start: (row: NodeRow) => void;
+   /** 批量升级：内部按「普通节点 → 远端 hub → 本机」排序，逐组推进。 */
+   startAll: (rows: NodeRow[]) => void;
++  /** 中断这一行正在进行的升级；只有下载阶段能真正打断，安装阶段由后端拒绝。 */
++  cancel: (row: NodeRow) => void;
+   batch: NodeUpgradeBatchState;
+   /** 当前 latest 下可批量升级的节点数；latest 未知时为 0。 */
+   eligibleCount: (rows: NodeRow[]) => number;
+   /** 有任何节点的升级在跑（行内或批量）：工具栏据此变灰，与 `startAll` 的同步互斥判定一致。 */
+   anyRunning: boolean;
++  /** 刷新后正在向各节点回读升级状态：此时还不知道谁在升级，批量入口先锁住。 */
++  restoring: boolean;
+ }
+ 
+ export const IDLE_UPGRADE_BATCH: NodeUpgradeBatchState = {
+diff --git a/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts b/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts
+index d7f84eab..d185437f 100644
+--- a/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts
++++ b/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts
+@@ -69,6 +69,8 @@ export interface UpgradeBatchSummary {
+   succeeded: number;
+   failed: number;
+   failedNames: string[];
++  /** 用户中途按「停止升级」打断的节点数：既不算成功也不算失败，单独报一档。 */
++  cancelledCount: number;
+   /** 组件卸载 / 页面离开：结论不完整，不该弹汇总 toast。 */
+   cancelled: boolean;
+ }
+@@ -89,7 +91,9 @@ function tally(summary: UpgradeBatchSummary, row: NodeRow, outcome: UpgradeRunOu
+   if (outcome === 'failed' || outcome === 'timeout') {
+     summary.failed += 1;
+     summary.failedNames.push(row.name);
++    return;
+   }
++  summary.cancelledCount += 1;
+ }
+ 
+ async function runGroup(
+@@ -127,6 +131,7 @@ export async function runUpgradeBatch(p: UpgradeBatchParams): Promise<UpgradeBat
+     succeeded: 0,
+     failed: 0,
+     failedNames: [],
++    cancelledCount: 0,
+     cancelled: false,
+   };
+   const progress = { completed: 0 };
+diff --git a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
+index 6d6f1163..d4c7471b 100644
+--- a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
++++ b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
+@@ -9,7 +9,11 @@
+ // POST 一律不重试：目标可能已经开始升级却来不及回包，重发会撞上 `UPGRADE_IN_PROGRESS`。
+ // 同理，POST 的网络异常与 `NODE_UNREACHABLE` 都不是失败结论，只说明「结果未知」，要走轮询确认。
+ //
+-// 所有等待与请求都挂在同一个 `AbortSignal` 上：组件卸载即取消，取消后不再 toast / 刷新 / 轮询。
++// 状态只活在 React 里，刷新页面就没了，而升级还在目标机上跑：因此挂载时要按行回读
++// `GET /api/mesh/nodes/:id/upgrade`，非 idle 的行直接接上轮询（`resumeNodeUpgrade`）。
++//
++// 每一行一把 `AbortController`（`createNodeAbortRegistry`）：按「停止升级」只掐这一行的轮询，
++// 不波及同批的其他节点；组件卸载时一把全停，之后不再 toast / 刷新 / 轮询。
+ 
+ import { type NodeRow, getMeshNodesState, refreshMeshNodes } from '@/node/mesh-nodes';
+ import { defaultApiClient } from '@tmex/api-client';
+@@ -41,6 +45,11 @@ const POLL_MS = 2000;
+ const BUDGET_MS = 6 * 60_000;
+ /** POST 之后目标迟迟不进入非 idle：判定没真正开始，不要空等满预算。 */
+ const START_GRACE_MS = 30_000;
++/** 刷新后回读各节点升级状态的并发上限。 */
++export const RESTORE_CONCURRENCY = 3;
++
++/** 后端取消升级后留在 idle 状态上的标记；FE 必须按「已取消」而不是失败处理。 */
++export const UPGRADE_CANCELLED_ERROR = 'UPGRADE_CANCELLED';
+ 
+ type Translate = (key: string, options?: Record<string, unknown>) => string;
+ 
+@@ -128,10 +137,17 @@ export type UpgradePollOutcome =
+   | { kind: 'failed'; code: string }
+   | { kind: 'cancelled' };
+ 
++/** `DELETE /api/mesh/nodes/:id/upgrade` 的两种结论；`httpStatus` 只用于诊断，判定一律看 `code`。 */
++export type UpgradeCancelOutcome =
++  | { kind: 'cancelled'; status: UpgradeStatus }
++  | { kind: 'failed'; code: string; httpStatus: number };
++
+ /** 状态机与真实请求之间的接缝：单测注入假实现，不碰网络与计时器。 */
+ export interface UpgradeIo {
+   start(nodeId: string, signal: AbortSignal): Promise<UpgradeStartOutcome>;
++  /** 轮询与刷新后的状态回读共用同一个 GET。 */
+   poll(nodeId: string, signal: AbortSignal): Promise<UpgradePollOutcome>;
++  cancel(nodeId: string, signal: AbortSignal): Promise<UpgradeCancelOutcome>;
+   /** 刷新节点列表后回读目标版本；节点已不在列表返回 `undefined`。 */
+   nodeVersion(nodeId: string): Promise<string | null | undefined>;
+   wait(ms: number, signal: AbortSignal): Promise<boolean>;
+@@ -192,6 +208,38 @@ async function requestUpgradeStatus(
+   return { kind: 'failed', code };
+ }
+ 
++async function requestUpgradeCancel(
++  nodeId: string,
++  signal: AbortSignal
++): Promise<UpgradeCancelOutcome> {
++  let res: Response;
++  try {
++    res = await defaultApiClient.fetch(`/api/mesh/nodes/${nodeId}/upgrade`, {
++      method: 'DELETE',
++      signal,
++    });
++  } catch {
++    return { kind: 'failed', code: 'NODE_UNREACHABLE', httpStatus: 0 };
++  }
++  if (res.ok) {
++    try {
++      return { kind: 'cancelled', status: (await res.json()) as UpgradeStatus };
++    } catch {
++      // 回包读不出来不影响结论：200 就是已取消。
++      return {
++        kind: 'cancelled',
++        status: {
++          state: 'idle',
++          targetVersion: null,
++          error: UPGRADE_CANCELLED_ERROR,
++          startedAt: null,
++        },
++      };
++    }
++  }
++  return { kind: 'failed', code: await readCode(res), httpStatus: res.status };
++}
++
+ async function readNodeVersion(nodeId: string): Promise<string | null | undefined> {
+   await refreshMeshNodes();
+   const node = getMeshNodesState().nodes.find((item) => item.id === nodeId);
+@@ -201,6 +249,7 @@ async function readNodeVersion(nodeId: string): Promise<string | null | undefine
+ export const defaultUpgradeIo: UpgradeIo = {
+   start: requestUpgradeStart,
+   poll: requestUpgradeStatus,
++  cancel: requestUpgradeCancel,
+   nodeVersion: readNodeVersion,
+   wait: waitFor,
+   now: () => Date.now(),
+@@ -219,10 +268,12 @@ export interface UpgradeWatchContext {
+   phase: (phase: NodeUpgradePhase) => void;
+ }
+ 
++/** `stopped`：目标已被中断（`error === 'UPGRADE_CANCELLED'`），是良性结论，不能报失败。 */
+ export type UpgradeWatchResult =
+   | { kind: 'done' }
+   | { kind: 'failed'; error: string }
+   | { kind: 'timeout' }
++  | { kind: 'stopped' }
+   | { kind: 'cancelled' };
+ 
+ /**
+@@ -244,6 +295,7 @@ async function settleIdle(
+   elapsed: number
+ ): Promise<UpgradeWatchResult | null> {
+   // 状态不跨进程持久化：重启回来后 error 一定是空的，所以 idle 上还挂着 error 就是下载阶段失败。
++  if (status.error === UPGRADE_CANCELLED_ERROR) return { kind: 'stopped' };
+   if (status.error) return { kind: 'failed', error: status.error };
+   if (!sawActive) {
+     // POST 结果未知：目标可能已经升完重启回来，版本对上就是成功。
+@@ -338,6 +390,13 @@ function reportResult(p: UpgradeRunParams, version: string | null, result: Upgra
+     p.onChanged();
+     return;
+   }
++  if (result.kind === 'stopped') {
++    // 别处（本页的停止按钮、另一个标签页）已经把这次升级掐了：回到静止态，不留失败痕迹。
++    p.patch({ phase: 'idle', targetVersion: null, error: null });
++    p.toasts.info(p.t('nodes.upgrade.cancelled', { name: p.row.name }));
++    p.onChanged();
++    return;
++  }
+   if (result.kind === 'failed') {
+     p.patch({ phase: 'failed', error: result.error });
+     p.toasts.error(p.t('nodes.upgrade.failed', { error: result.error }));
+@@ -348,6 +407,10 @@ function reportResult(p: UpgradeRunParams, version: string | null, result: Upgra
+   p.onChanged();
+ }
+ 
++function outcomeOf(result: UpgradeWatchResult): UpgradeRunOutcome {
++  return result.kind === 'stopped' ? 'cancelled' : result.kind;
++}
++
+ /** 一次升级的完整流程：POST → 轮询 → 结论。取消（组件卸载）后一律静默返回。 */
+ export async function runNodeUpgrade(p: UpgradeRunParams): Promise<UpgradeRunOutcome> {
+   p.patch({ phase: 'pending', targetVersion: p.targetVersion, error: null });
+@@ -370,7 +433,34 @@ export async function runNodeUpgrade(p: UpgradeRunParams): Promise<UpgradeRunOut
+   });
+   if (result.kind === 'cancelled' || p.signal.aborted) return 'cancelled';
+   reportResult(p, version, result);
+-  return result.kind;
++  return outcomeOf(result);
++}
++
++export interface UpgradeResumeParams extends UpgradeRunParams {
++  /** 刷新时回读到的非 idle 状态。 */
++  status: UpgradeStatus;
++}
++
++/**
++ * 刷新页面后接上一次已经在跑的升级：先把回读到的阶段写回表格，再按「已见过非 idle」继续盯。
++ * 不重发 POST——目标正在升级，再来一次只会撞上 `UPGRADE_IN_PROGRESS`。
++ */
++export async function resumeNodeUpgrade(p: UpgradeResumeParams): Promise<UpgradeRunOutcome> {
++  const version = p.status.targetVersion ?? p.targetVersion;
++  p.patch({ phase: p.status.state, targetVersion: version, error: null });
++  const result = await watchUpgrade({
++    nodeId: p.row.id,
++    targetVersion: version,
++    sawActive: true,
++    unconfirmedStart: false,
++    io: p.io,
++    signal: p.signal,
++    describeError: (code) => upgradeErrorText(p.t, code),
++    phase: (phase) => p.patch({ phase }),
++  });
++  if (result.kind === 'cancelled' || p.signal.aborted) return 'cancelled';
++  reportResult(p, version, result);
++  return outcomeOf(result);
+ }
+ 
+ /** 批量升级期间用它顶掉每节点 toast：进度仍然逐行落到表格上，只是不再刷屏。 */
+@@ -389,6 +479,16 @@ export function reportBatchSummary(
+ ): void {
+   if (summary.cancelled) return;
+   const counts = { success: summary.succeeded, failed: summary.failed };
++  if (summary.cancelledCount > 0) {
++    // 有人中途按了停止：三个数一起报，失败节点名让位给「已取消」这一档。
++    const text = t('nodes.upgrade.allDoneWithCancelled', {
++      ...counts,
++      cancelled: summary.cancelledCount,
++    });
++    if (summary.failed === 0) toasts.info(text);
++    else toasts.warning(text);
++    return;
++  }
+   if (summary.failed === 0) {
+     toasts.success(t('nodes.upgrade.allDone', counts));
+     return;
+@@ -397,6 +497,119 @@ export function reportBatchSummary(
+   toasts.warning(t('nodes.upgrade.allDoneWithFailures', { ...counts, names }));
+ }
+ 
++/** 刷新后需要回读升级状态的行：在线，且是本机或已登录（否则 GET 只会吃一条 401）。 */
++export function restorableRows(rows: NodeRow[]): NodeRow[] {
++  return rows.filter((row) => row.online && (row.isSelf || row.loggedIn));
++}
++
++export interface UpgradeRestoreParams {
++  rows: NodeRow[];
++  io: UpgradeIo;
++  signal: AbortSignal;
++  concurrency?: number;
++  /** 本会话已经有升级在跑的行：跳过，别把自己的状态机覆盖一遍。 */
++  skip: (nodeId: string) => boolean;
++  /** 目标仍在升级：由调用方写回表格并接上轮询。 */
++  onActive: (row: NodeRow, status: UpgradeStatus) => void;
++}
++
++/**
++ * 刷新后按行回读 `GET /api/mesh/nodes/:id/upgrade`，把还在跑的升级交回调用方接管。
++ * idle 的行一律不复活：`UPGRADE_CANCELLED` 是良性结论，旧的失败也没必要在刷新后再报一次。
++ */
++export async function restoreUpgradeStates(p: UpgradeRestoreParams): Promise<void> {
++  const queue = restorableRows(p.rows);
++  let next = 0;
++  const limit = Math.min(p.concurrency ?? RESTORE_CONCURRENCY, queue.length);
++  const worker = async () => {
++    while (!p.signal.aborted) {
++      const row = queue[next++];
++      if (!row) return;
++      if (p.skip(row.id)) continue;
++      const outcome = await p.io.poll(row.id, p.signal);
++      if (p.signal.aborted || outcome.kind !== 'status') continue;
++      if (outcome.status.state === 'idle') continue;
++      p.onActive(row, outcome.status);
++    }
++  };
++  await Promise.allSettled(Array.from({ length: limit }, worker));
++}
++
++/** 「停止升级」被后端拒绝时的三种良性结论：说清原因即可，轮询照常继续。 */
++const CANCEL_REJECT_KEYS: Record<string, string> = {
++  UPGRADE_NOT_CANCELLABLE: 'nodes.upgrade.cancelNotAllowed',
++  UPGRADE_CANCEL_UNSUPPORTED: 'nodes.upgrade.cancelUnsupported',
++};
++
++export interface UpgradeCancelParams {
++  row: Pick<NodeRow, 'id' | 'name'>;
++  io: UpgradeIo;
++  signal: AbortSignal;
++  t: Translate;
++  toasts: UpgradeToasts;
++  patch: (entry: Partial<NodeUpgradeEntry>) => void;
++  /** 取消成功后立刻掐掉这一行的轮询，免得它把「回到 idle」再判一次。 */
++  stopWatch: () => void;
++  onChanged: () => void;
++}
++
++/** `DELETE /api/mesh/nodes/:id/upgrade`：成功即回到静止态，被拒绝时只说明原因、不动状态。 */
++export async function cancelNodeUpgrade(p: UpgradeCancelParams): Promise<'cancelled' | 'rejected'> {
++  const outcome = await p.io.cancel(p.row.id, p.signal);
++  if (p.signal.aborted) return 'rejected';
++  if (outcome.kind === 'cancelled') {
++    p.stopWatch();
++    p.patch({ phase: 'idle', targetVersion: null, error: null });
++    p.toasts.info(p.t('nodes.upgrade.cancelled', { name: p.row.name }));
++    p.onChanged();
++    return 'cancelled';
++  }
++  if (outcome.code === 'UPGRADE_NOT_RUNNING') {
++    p.toasts.info(p.t('nodes.upgrade.cancelNotRunning'));
++    return 'rejected';
++  }
++  const key = CANCEL_REJECT_KEYS[outcome.code];
++  if (key) p.toasts.warning(p.t(key));
++  else
++    p.toasts.error(
++      p.t('nodes.upgrade.cancelFailed', { error: upgradeErrorText(p.t, outcome.code) })
++    );
++  return 'rejected';
++}
++
++/** 每节点一把 `AbortController`：停一行不波及别的行，卸载时一把全停。 */
++export interface NodeAbortRegistry {
++  open(nodeId: string): AbortController;
++  stop(nodeId: string): void;
++  /** 归还自己那把；已经被下一次升级换掉时什么都不做。 */
++  release(nodeId: string, controller: AbortController): void;
++  stopAll(): void;
++}
++
++export function createNodeAbortRegistry(): NodeAbortRegistry {
++  const controllers = new Map<string, AbortController>();
++  return {
++    open(nodeId) {
++      const controller = new AbortController();
++      controllers.set(nodeId, controller);
++      return controller;
++    },
++    stop(nodeId) {
++      const controller = controllers.get(nodeId);
++      if (!controller) return;
++      controllers.delete(nodeId);
++      controller.abort();
++    },
++    release(nodeId, controller) {
++      if (controllers.get(nodeId) === controller) controllers.delete(nodeId);
++    },
++    stopAll() {
++      for (const controller of controllers.values()) controller.abort();
++      controllers.clear();
++    },
++  };
++}
++
+ export interface UpgradeBatchLaunch {
+   rows: NodeRow[];
+   latestVersion: string | null;
+@@ -482,6 +695,7 @@ export function isUpgradeBusy(phase: NodeUpgradePhase): boolean {
+ }
+ 
+ export function useNodeUpgrade(
++  rows: NodeRow[],
+   onChanged: () => void,
+   io: UpgradeIo = defaultUpgradeIo
+ ): NodeUpgradeController {
+@@ -491,15 +705,22 @@ export function useNodeUpgrade(
+   const [batch, setBatch] = useState<NodeUpgradeBatchState>(IDLE_UPGRADE_BATCH);
+   // ref 负责同一 tick 内的同步互斥判定，state 负责让工具栏按钮跟着变灰——两者必须一起改。
+   const [runningCount, setRunningCount] = useState(0);
++  const [restoringCount, setRestoringCount] = useState(0);
+   const abortRef = useRef<AbortController | null>(null);
++  const nodeAbortsRef = useRef<NodeAbortRegistry>(createNodeAbortRegistry());
+   const runningRef = useRef<Set<string>>(new Set());
+   const batchRunningRef = useRef(false);
++  /** 已经回读过状态的节点：列表每次刷新都会换引用，靠它保证只查新出现的行。 */
++  const restoredRef = useRef<Set<string>>(new Set());
++  const latestRef = useRef<string | null>(null);
+ 
+   useEffect(() => {
+     const controller = new AbortController();
+     abortRef.current = controller;
++    const nodeAborts = nodeAbortsRef.current;
+     return () => {
+       controller.abort();
++      nodeAborts.stopAll();
+       if (abortRef.current === controller) abortRef.current = null;
+     };
+   }, []);
+@@ -516,6 +737,10 @@ export function useNodeUpgrade(
+     };
+   }, []);
+ 
++  useEffect(() => {
++    latestRef.current = latest?.latestVersion ?? null;
++  }, [latest]);
++
+   /** 组件已卸载就不再改状态：升级流程比页面活得久，patch 到死组件上只会报 warning。 */
+   const alive = useCallback(() => abortRef.current?.signal.aborted === false, []);
+ 
+@@ -530,35 +755,81 @@ export function useNodeUpgrade(
+     [alive]
+   );
+ 
+-  const run = useCallback(
+-    (row: NodeRow, targetVersion: string | null, signal: AbortSignal, toasts: UpgradeToasts) =>
+-      runNodeUpgrade({
+-        row,
+-        targetVersion,
+-        io,
+-        signal,
+-        t,
+-        toasts,
+-        patch: (entry) => patch(row.id, entry),
+-        onChanged,
+-      }),
+-    [io, onChanged, patch, t]
+-  );
+-
+-  /** 同一个节点只能有一次升级在跑：行内按钮与批量共用这把锁。 */
+-  const runOnce = useCallback(
+-    (row: NodeRow, version: string | null, signal: AbortSignal, toasts: UpgradeToasts) => {
++  /**
++   * 同一个节点只能有一次升级在跑：行内按钮、批量与刷新恢复共用这把锁，
++   * 并在这里给它领一把自己的 `AbortController`——「停止升级」只掐这一行。
++   */
++  const runExclusive = useCallback(
++    (row: NodeRow, runner: (signal: AbortSignal) => Promise<UpgradeRunOutcome>) => {
+       if (runningRef.current.has(row.id)) return Promise.resolve<UpgradeRunOutcome>('cancelled');
++      const controller = nodeAbortsRef.current.open(row.id);
+       runningRef.current.add(row.id);
+       if (alive()) setRunningCount(runningRef.current.size);
+-      return run(row, version, signal, toasts).finally(() => {
++      return runner(controller.signal).finally(() => {
+         runningRef.current.delete(row.id);
++        nodeAbortsRef.current.release(row.id, controller);
+         if (alive()) setRunningCount(runningRef.current.size);
+       });
+     },
+-    [alive, run]
++    [alive]
+   );
+ 
++  const runOnce = useCallback(
++    (row: NodeRow, version: string | null, toasts: UpgradeToasts) =>
++      runExclusive(row, (signal) =>
++        runNodeUpgrade({
++          row,
++          targetVersion: version,
++          io,
++          signal,
++          t,
++          toasts,
++          patch: (entry) => patch(row.id, entry),
++          onChanged,
++        })
++      ),
++    [io, onChanged, patch, runExclusive, t]
++  );
++
++  const resumeOnce = useCallback(
++    (row: NodeRow, status: UpgradeStatus) =>
++      runExclusive(row, (signal) =>
++        resumeNodeUpgrade({
++          row,
++          status,
++          targetVersion: latestRef.current,
++          io,
++          signal,
++          t,
++          toasts: toast,
++          patch: (entry) => patch(row.id, entry),
++          onChanged,
++        })
++      ),
++    [io, onChanged, patch, runExclusive, t]
++  );
++
++  // 刷新页面后升级还在目标机上跑：回读一遍状态，非 idle 的行直接接上轮询。
++  useEffect(() => {
++    const signal = abortRef.current?.signal;
++    if (!signal || signal.aborted) return;
++    const pending = restorableRows(rows).filter((row) => !restoredRef.current.has(row.id));
++    if (pending.length === 0) return;
++    for (const row of pending) restoredRef.current.add(row.id);
++    setRestoringCount((value) => value + 1);
++    void restoreUpgradeStates({
++      rows: pending,
++      io,
++      signal,
++      skip: (nodeId) => runningRef.current.has(nodeId),
++      onActive: (row, status) => {
++        void resumeOnce(row, status);
++      },
++    }).finally(() => {
++      if (alive()) setRestoringCount((value) => value - 1);
++    });
++  }, [alive, io, resumeOnce, rows]);
++
+   const start = useCallback(
+     (row: NodeRow) => {
+       const signal = abortRef.current?.signal;
+@@ -570,12 +841,31 @@ export function useNodeUpgrade(
+         nodeRunning: runningRef.current.has(row.id),
+         t,
+         confirm: (message) => globalThis.confirm?.(message) === true,
+-        runOne: (target, version) => runOnce(target, version, signal, toast),
++        runOne: (target, version) => runOnce(target, version, toast),
+       });
+     },
+     [latest, runOnce, t]
+   );
+ 
++  const cancel = useCallback(
++    (row: NodeRow) => {
++      const signal = abortRef.current?.signal;
++      if (!signal || signal.aborted) return;
++      void cancelNodeUpgrade({
++        row,
++        io,
++        // DELETE 走宿主级 signal：这一行的 controller 一取消成功就会被掐掉。
++        signal,
++        t,
++        toasts: toast,
++        patch: (entry) => patch(row.id, entry),
++        stopWatch: () => nodeAbortsRef.current.stop(row.id),
++        onChanged,
++      });
++    },
++    [io, onChanged, patch, t]
++  );
++
+   const startAll = useCallback(
+     (rows: NodeRow[]) => {
+       const signal = abortRef.current?.signal;
+@@ -588,7 +878,7 @@ export function useNodeUpgrade(
+         t,
+         toasts: toast,
+         confirm: (message) => globalThis.confirm?.(message) === true,
+-        runOne: (row, version, toasts) => runOnce(row, version, signal, toasts),
++        runOne: (row, version, toasts) => runOnce(row, version, toasts),
+         onStart: (total) => {
+           batchRunningRef.current = true;
+           setBatch({ running: true, total, completed: 0 });
+@@ -613,5 +903,15 @@ export function useNodeUpgrade(
+     [latest]
+   );
+ 
+-  return { latest, entryOf, start, startAll, batch, eligibleCount, anyRunning: runningCount > 0 };
++  return {
++    latest,
++    entryOf,
++    start,
++    startAll,
++    cancel,
++    batch,
++    eligibleCount,
++    anyRunning: runningCount > 0,
++    restoring: restoringCount > 0,
++  };
+ }
+diff --git a/packages/shared/src/i18n/locales/en_US.json b/packages/shared/src/i18n/locales/en_US.json
+index 28282b5b..5a937a4d 100644
+--- a/packages/shared/src/i18n/locales/en_US.json
++++ b/packages/shared/src/i18n/locales/en_US.json
+@@ -2057,7 +2057,15 @@
+         "confirmAll_other": "Upgrade {{count}} nodes to {{version}}? The nodes restart one by one and their sessions drop.",
+         "allDone": "All upgrades finished: {{success}} succeeded, {{failed}} failed.",
+         "allDoneWithFailures": "All upgrades finished: {{success}} succeeded, {{failed}} failed. Failed: {{names}}.",
+-        "listSeparator": ", "
++        "allDoneWithCancelled": "All upgrades finished: {{success}} succeeded, {{failed}} failed, {{cancelled}} cancelled.",
++        "listSeparator": ", ",
++        "cancel": "Stop Upgrade",
++        "cancelled": "Upgrade of “{{name}}” cancelled.",
++        "cancelNotAllowed": "Installing; it cannot be interrupted.",
++        "cancelUnsupported": "This node's version cannot interrupt an upgrade.",
++        "cancelNotRunning": "No upgrade is running on this node.",
++        "cancelFailed": "Could not stop the upgrade: {{error}}",
++        "restoring": "Syncing upgrade status…"
+       },
+       "badge": {
+         "direct": "Direct",
+diff --git a/packages/shared/src/i18n/locales/ja_JP.json b/packages/shared/src/i18n/locales/ja_JP.json
+index c985716b..ce3241cb 100644
+--- a/packages/shared/src/i18n/locales/ja_JP.json
++++ b/packages/shared/src/i18n/locales/ja_JP.json
+@@ -2055,7 +2055,15 @@
+         "confirmAll": "{{count}} 個のノードを {{version}} にアップグレードしますか？ノードが順に再起動し、セッションは切断されます。",
+         "allDone": "すべてのアップグレードが完了しました：成功 {{success}}、失敗 {{failed}}。",
+         "allDoneWithFailures": "すべてのアップグレードが完了しました：成功 {{success}}、失敗 {{failed}}。失敗：{{names}}。",
+-        "listSeparator": "、"
++        "allDoneWithCancelled": "すべてのアップグレードが完了しました：成功 {{success}}、失敗 {{failed}}、中止 {{cancelled}}。",
++        "listSeparator": "、",
++        "cancel": "アップグレードを中止",
++        "cancelled": "「{{name}}」のアップグレードを中止しました。",
++        "cancelNotAllowed": "適用中のため中断できません。",
++        "cancelUnsupported": "このノードのバージョンはアップグレードの中断に対応していません。",
++        "cancelNotRunning": "このノードで実行中のアップグレードはありません。",
++        "cancelFailed": "アップグレードを中止できませんでした：{{error}}",
++        "restoring": "アップグレード状態を同期中…"
+       },
+       "badge": {
+         "direct": "ダイレクト",
+diff --git a/packages/shared/src/i18n/locales/zh_CN.json b/packages/shared/src/i18n/locales/zh_CN.json
+index c7e4d583..022514f9 100644
+--- a/packages/shared/src/i18n/locales/zh_CN.json
++++ b/packages/shared/src/i18n/locales/zh_CN.json
+@@ -2055,7 +2055,15 @@
+         "confirmAll": "升级 {{count}} 个节点到 {{version}}？节点会依次重启，其上的会话随之中断。",
+         "allDone": "全部升级完成：成功 {{success}}，失败 {{failed}}。",
+         "allDoneWithFailures": "全部升级完成：成功 {{success}}，失败 {{failed}}。失败：{{names}}。",
+-        "listSeparator": "、"
++        "allDoneWithCancelled": "全部升级完成：成功 {{success}}，失败 {{failed}}，已取消 {{cancelled}}。",
++        "listSeparator": "、",
++        "cancel": "停止升级",
++        "cancelled": "已取消「{{name}}」的升级。",
++        "cancelNotAllowed": "正在安装，无法中断。",
++        "cancelUnsupported": "该节点版本不支持中断升级。",
++        "cancelNotRunning": "该节点没有正在进行的升级。",
++        "cancelFailed": "停止升级失败：{{error}}",
++        "restoring": "正在同步升级状态…"
+       },
+       "badge": {
+         "direct": "直连",
+
+commit d70616baff430124bf161f1a566ee9f65f2b9be8
+Author: Konata <konata@KonatadeMacBook-Pro.local>
+Date:   Wed Sep 2 00:03:14 2026 +0800
+
+    refactor(fe): UPGRADE_CANCELLED 改从 @tmex/shared 引用
+    
+    Claude-Session: https://claude.ai/code/session_01XhSLkyskLHdE1at75LomAV
+
+diff --git a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
+index d4c7471b..81668813 100644
+--- a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
++++ b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
+@@ -17,7 +17,7 @@
+ 
+ import { type NodeRow, getMeshNodesState, refreshMeshNodes } from '@/node/mesh-nodes';
+ import { defaultApiClient } from '@tmex/api-client';
+-import type { UpgradeStatus } from '@tmex/shared';
++import { UPGRADE_CANCELLED, type UpgradeStatus } from '@tmex/shared';
+ import { useCallback, useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
+@@ -49,7 +49,7 @@ const START_GRACE_MS = 30_000;
+ export const RESTORE_CONCURRENCY = 3;
+ 
+ /** 后端取消升级后留在 idle 状态上的标记；FE 必须按「已取消」而不是失败处理。 */
+-export const UPGRADE_CANCELLED_ERROR = 'UPGRADE_CANCELLED';
++export const UPGRADE_CANCELLED_ERROR: string = UPGRADE_CANCELLED;
+ 
+ type Translate = (key: string, options?: Record<string, unknown>) => string;
+ 

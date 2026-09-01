@@ -36,3 +36,10 @@ docker-node（本机容器）与 hub `tmex` 已按用户追加要求先升到 1.
 ## 最终门禁（2026-09-01）
 
 gateway 3298 pass / fe 1205 / app 629 / shared 413 / api-client 140，0 fail；tsc：gateway 0、fe 0、shared 0、app 1（既有）、api-client 5（既有）、stores 1（既有）。
+
+## 追加批次（v1.1.12）：状态恢复 + 停止升级 + 零残留
+
+- 诊断 jiefa 两台「卡在下载中」：1.1.10 走目标自下载路径且连不上 GitHub（一台立即失败、一台因无超时永久 downloading）；已用 `sub/node-upgrade.ts` 离线升到 1.1.11，五节点齐平。
+- G7：`DELETE /api/system/upgrade`（仅 downloading 可取消；executing 409）、`DELETE /api/system/upgrade/package`、入口 `DELETE /api/mesh/nodes/:id/upgrade`（取消本地 job / 转发 / 旧目标 501）；所有取消路径清理 txn 目录、`.part`、暂存包、无 sidecar 缓存，崩溃半取消由启动 prune 修复；`UPGRADE_CANCELLED` 契约。
+- O3：挂载/新增节点回读升级状态续接轮询；每节点独立 AbortController；下载阶段停止按钮、安装阶段禁用；批量汇总「已取消」计数。
+- 实测 `sub/live-cancel.ts`：下载中刷新 → 行内恢复「Downloading」+ 停止按钮；停止 → `UPGRADE_CANCELLED`、入口缓存 `.part` 消失、目标 staged 为空、toast「已取消」；立即重发 → 200；完整推送后仅留已校验缓存。
