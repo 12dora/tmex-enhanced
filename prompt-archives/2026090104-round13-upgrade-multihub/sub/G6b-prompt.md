@@ -4,6 +4,8 @@ Read `/private/tmp/claude-501/-Users-konata-code-tmex-enhanced/833abb75-c031-4d7
 
 ## Task
 
+NOTE: G2b already adapted the harness (dual-role via `wsFactory`, `hubPeers` pre-authorization with `createPendingNode()`, E/twin omit A from their own `hubPeers`, G2 test un-skipped; suite currently 11 pass / 0 skip). Items 1–3 below are therefore DONE — verify quickly and focus on item 4 (new security scenarios) and item 5.
+
 `apps/gateway/src/mesh/integration/multi-hub.integration.test.ts` + `multi-hub-harness.ts` currently fail (0 pass / 10 fail / 1 skip) because:
 
 1. Hub A never authorizes B / E: pass `config.hubPeers: [B.nodeId, E.nodeId]` (the harness must therefore create the identities of B and E **before** constructing A, or reconstruct A — pick the cleanest deterministic approach; `bootAbcdTopology` waits for B's row in A's `mesh_hubs`, which only appears when B is authorized).
