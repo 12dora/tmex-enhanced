@@ -1,0 +1,11 @@
+# RV1 — Code review (read-only). Output the full report as your final message.
+
+You are reviewing a diff on branch `feat/round14-multihub-phase2-nodes-mgmt` of the tmex monorepo (Bun runtime). Read the diff file given below, then open the surrounding source files in the worktree as needed to verify. Do not propose stylistic nits; focus on: correctness bugs, race conditions, security (threat model: any single compromised point affects only itself; hub is not a trust root; never expose secrets in logs/UI), state that is lost on refresh, contract mismatches between backend and frontend, and untested failure paths. For each finding: severity (blocker / should-fix / nit), file:line, what is wrong, how to reproduce or why it fails, and a concrete fix. Be terse. Do not pad. If something is fine, do not comment on it.
+
+Context of the changes:
+1. Cloudflare Tunnel robustness: cloudflared connector health via local metrics `/ready` (`apps/gateway/src/tunnel/connector-health.ts`, `manager.ts`, `supervisor.ts`, `external-detect.ts`, `provider.ts`, `spawn.ts`), new contract fields in `packages/shared/src/contracts/tunnel.ts` (`connector`, process state `degraded`, error `connector_down`, check steps `ok|access_protected|access_protected_unverified`), FE rendering in `apps/fe/src/pages/settings/remote-access/**` and `apps/fe/src/components/side-panels/connect-devices/host-status.ts`.
+2. Nodes management FE: multi-select + bulk menu + remote uninstall UI (`apps/fe/src/pages/settings/nodes/management/**`, `apps/fe/src/node/mesh-nodes.ts`, `mesh-hubs.ts`, new `packages/ui/src/components/checkbox.tsx`), coded against `packages/shared/src/contracts/system.ts` (uninstall/operation types) whose backend is being written in parallel (not in this diff).
+3. Batch upgrade persistence in localStorage (`upgrade-batch-storage.ts`, `upgrade-batch.ts`, `use-node-upgrade.ts`).
+4. Node uplink pool: event-driven fail-back probe + RTT diagnostics (`apps/gateway/src/mesh/uplink-pool.ts`), api-client types.
+
+Diff files (unified diffs, tests excluded): `/private/tmp/claude-501/-Users-konata-code-tmex-enhanced/c87e7d41-4167-4f04-b03f-99760894dfcc/scratchpad/rv1-backend.diff`, `/private/tmp/claude-501/-Users-konata-code-tmex-enhanced/c87e7d41-4167-4f04-b03f-99760894dfcc/scratchpad/rv1-frontend.diff`. Worktree: `/Users/konata/code/tmex-enhanced-wt-r14`.
