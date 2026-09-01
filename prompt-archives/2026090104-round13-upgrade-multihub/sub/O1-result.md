@@ -79,3 +79,57 @@
 - `MIN_REMOTE_UPGRADE_VERSION` 只是前端的乐观拦截：版本字符串无法解析（开发态 `X.Y.Z_dev`）时不拦，仍由后端返回 `UPGRADE_UNSUPPORTED` 兜底，文案已与 tooltip 对齐。
 - 批量的顺序保证依赖 `NodeRow.isHub` / `isSelf` 正确：`isHub` 由 `mergeNodes` 依 `hubNodeId` 标注，hub 不可达时 `hubNodeId` 仍来自 `/api/auth/mode`，不受影响。
 - 批量期间若组件卸载，`AbortController` 一 abort，`runUpgradeBatch` 立刻停止启动后续节点、`summary.cancelled` 为真、不弹汇总 toast，`setBatch` 也被 `alive()` 挡住——与既有单节点路径的取消语义一致。
+
+---
+
+## Review fixes（评审两条问题的修复）
+
+### 1（blocker）行内升级与批量升级现在双向互斥
+
+**原问题**：`startAll` 不看 `runningRef`。用户先点远端 hub 的「升级」再点「全部升级」，批量里 hub 那次 `runOnce` 会命中 `runningRef` 直接返回 `cancelled`——记进 `completed` 却既不算成功也不算失败，且 hub 组「秒收尾」，本机在 hub 还在升级时就重启，`hub → self` 的次序保证被打破，汇总计数也对不上 `total`。反向同理：`start` 不看 `batchRunningRef`。
+
+**修法**（同 `launchUpgradeBatch` 的做法，把决策链抽成可测的纯函数）：
+
+- 新增导出 `launchRowUpgrade(p: UpgradeRowLaunch)`（`use-node-upgrade.ts`）：`batchRunning || nodeRunning` 时直接返回 `null`，**连确认框都不弹**；否则确认后交给 `runOne`。`useNodeUpgrade.start` 改为调用它，`batchRunning` 取 `batchRunningRef.current`、`nodeRunning` 取 `runningRef.current.has(row.id)`，都是同一 tick 内的同步判定。
+- `UpgradeBatchLaunch` 新增 `rowRunning: boolean`；`launchUpgradeBatch` 第一件事就是 `if (p.rowRunning) { toasts.info('nodes.upgrade.allBusy'); return null; }`——不筛候选、不弹确认框、不进 running 态。`startAll` 传 `runningRef.current.size > 0`。
+- 控制器新增**响应式** `anyRunning: boolean`（`types.ts` 的 `NodeUpgradeController`）。hook 里 `runningRef`（同步互斥用）与新的 `runningCount` state（渲染用）在 `runOnce` 的入口与 `finally` 里成对更新，因此工具栏按钮在行内升级一开始就变灰，不用等下一次自然渲染。
+- `UpgradeAllButton` 的 `disabled` 加上 `upgrade.anyRunning`；`title` 在「有行内任务但批量没跑」时显示 `nodes.upgrade.allBusy`，批量自身跑起来时仍显示 `allHint` + 进度文案（避免自己把自己说成「有别的任务在跑」）。为便于单测，`UpgradeAllButton` 已从 `nodes-management.tsx` 导出。
+- 新增 i18n 键 `nodes.upgrade.allBusy`（三语），已重跑 `bun run build:i18n`。
+
+### 2（should-fix）单节点异常不再带塌整批
+
+**原问题**：`runGroup` 里 `p.run(row)` 没有异常边界，`Promise.all` 遇到第一个 rejection 就整体 reject——兄弟 worker 还在跑、下一组永远轮不到、汇总 toast 不弹、外层 `finally` 提前把 `batch.running` 清掉，还会留一个 unhandled rejection。
+
+**修法**（`upgrade-batch.ts`）：
+
+- 新增 `settleOne(p, row)`：`try { return await p.run(row) } catch { return 'failed' }`，异常在单节点边界就地转成 `failed`（节点名照常进 `failedNames`）。
+- worker 池由 `Promise.all` 改为 `Promise.allSettled`，任何 worker 意外抛出都不会中断兄弟 worker，更不会让下一组提前开跑。
+
+### 新增测试（10 条）
+
+`use-node-upgrade.test.ts`：
+- 「单个节点抛异常只算它自己失败」——`concurrency: 1`，`boom` 抛错后 `a / hub / self` 仍按序跑完，`summary = { succeeded: 3, failed: 1, failedNames: ['boom'] }`，`progress` 为 `[1,2,3,4]` 不断档。
+- 「已有行内升级在跑：不启动、不弹确认框，只给一条 info」（`launchUpgradeBatch({ rowRunning: true })`）。
+- 新 describe `launchRowUpgrade`：正常路径、`batchRunning: true` 拒绝且不弹确认框、`nodeRunning: true` 拒绝、用户取消确认框。
+
+`nodes-management.test.tsx`（直接渲染导出的 `UpgradeAllButton`）：
+- 有候选时可点且 `title=allHint`；
+- `anyRunning: true` 时变灰且 `title=allBusy`；
+- 批量自身进行中时变灰、`title=allHint` 且显示 `allProgress`；
+- 无候选时变灰且 `title=allNone`。
+
+### 复验
+
+| 项 | 修复前（本任务首次交付） | 修复后 |
+|---|---|---|
+| `cd apps/fe && bun test src/` | 1168 pass / 0 fail | **1178 pass / 0 fail**（76 文件，3313 expect） |
+| `bunx tsc --noEmit -p apps/fe` | 0 | **0** |
+| `bunx tsc --noEmit -p packages/shared` | 0 | **0** |
+| `bunx biome check <本次改动文件 + 三个 locale>` | clean | **clean**（`--write` 无改动） |
+
+`bun run build:i18n` 已在收尾时重跑一次（新增 `allBusy` 键）。仍提醒：若其他 agent 之后还改 locale JSON，合并前需再跑一次。
+
+### 备注
+
+- `runOnce` 内部的 `runningRef.has(row.id) → 'cancelled'` 短路保留为纵深防御，但在新的双向互斥下它已不可能在批量路径上被触发（`startAll` 在有任何行内任务时就已经拒绝）。
+- 行内按钮在批量进行中仍整列禁用（`upgrade.batch.running`），与新的同步 `batchRunning` 守卫互为 UI / 逻辑两层。
