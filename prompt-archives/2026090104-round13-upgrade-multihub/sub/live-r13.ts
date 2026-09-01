@@ -317,6 +317,11 @@ async function main() {
   });
   log(`A nodes: ${JSON.stringify(nodes.map((n) => ({ id: n.id.slice(0, 6), online: n.online, loggedIn: n.loggedIn, v: n.version })))}`);
 
+  if (PART === 'keep') {
+    log(`KEEP A_URL=${A.url} C_ID=${C.nodeId} LIVE_ROOT=${ROOT}`);
+    await Bun.write(`${ROOT}/keep.env`, `A_URL=${A.url}\nC_ID=${C.nodeId}\nLIVE_ROOT=${ROOT}\n`);
+    await new Promise(() => {});
+  }
   if (PART === 'A' || PART === 'all') await partA(pageA, C);
   if (PART === 'B' || PART === 'all') await partB(A, B, C, pageA);
   log('DONE');
