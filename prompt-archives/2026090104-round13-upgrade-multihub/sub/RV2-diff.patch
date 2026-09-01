@@ -1,0 +1,2663 @@
+commit f35358fe32f9a19d0d281c90f59cecc32c378342
+Author: Konata <konata@KonatadeMacBook-Pro.local>
+Date:   Tue Sep 1 19:43:26 2026 +0800
+
+    feat(upgrade): 远程升级改为入口下载并推送安装包，目标从暂存包升级
+    
+    - 目标：PUT /api/system/upgrade/package（流式写入、sha256 校验、256 MiB 上限、24h/2 份暂存）、POST /api/system/upgrade 支持 source=staged、/api/system/info 声明 upgradeCapabilities
+    - 入口：release-download（SHA256SUMS 校验 + 磁盘缓存 + 同版本单次下载）、remote-upgrade-job（每节点后台任务：download→push→start，状态叠加到 GET）
+    - forwarder 支持 rawBody/headers 流式转发；managed 面拒绝 package 路由
+    - 旧目标（无 capability）路径不变；解决 hub 所在 VPS 访问不了 GitHub 导致升级失败的问题
+    
+    Claude-Session: https://claude.ai/code/session_01XhSLkyskLHdE1at75LomAV
+
+diff --git a/apps/gateway/src/api/system-managed.test.ts b/apps/gateway/src/api/system-managed.test.ts
+index 7777a009..efffe98d 100644
+--- a/apps/gateway/src/api/system-managed.test.ts
++++ b/apps/gateway/src/api/system-managed.test.ts
+@@ -5,6 +5,7 @@ describe('managed system API', () => {
+   for (const [method, path] of [
+     ['GET', '/api/system/update-check'],
+     ['POST', '/api/system/upgrade'],
++    ['PUT', '/api/system/upgrade/package'],
+   ] as const) {
+     test(`${method} ${path} 始终拒绝进程内自更新`, async () => {
+       const response = handleManagedSystemApiRequest(
+diff --git a/apps/gateway/src/api/system-managed.ts b/apps/gateway/src/api/system-managed.ts
+index bb61c072..b51779ed 100644
+--- a/apps/gateway/src/api/system-managed.ts
++++ b/apps/gateway/src/api/system-managed.ts
+@@ -6,7 +6,11 @@ export function handleManagedSystemApiRequest(req: Request, path: string): Respo
+     return json(getSystemInfo());
+   }
+ 
+-  if (path === '/api/system/update-check' || path === '/api/system/upgrade') {
++  if (
++    path === '/api/system/update-check' ||
++    path === '/api/system/upgrade' ||
++    path === '/api/system/upgrade/package'
++  ) {
+     return json(
+       {
+         error: MANAGED_EXTERNALLY,
+diff --git a/apps/gateway/src/api/system.test.ts b/apps/gateway/src/api/system.test.ts
+index e0fc062b..452252ff 100644
+--- a/apps/gateway/src/api/system.test.ts
++++ b/apps/gateway/src/api/system.test.ts
+@@ -1,6 +1,23 @@
+-import { describe, expect, test } from 'bun:test';
++import { afterEach, describe, expect, spyOn, test } from 'bun:test';
++import { createHash } from 'node:crypto';
++import type { SystemInfo } from '@tmex/shared';
++import * as infoPublic from '../system/info-public';
++import { upgradeController } from '../system/upgrade';
+ import { handleSystemApiRequest, isReleaseVersion } from './system';
+ 
++function sha256Hex(bytes: Uint8Array): string {
++  return createHash('sha256').update(bytes).digest('hex');
++}
++
++function bytesStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
++  return new ReadableStream({
++    start(controller) {
++      controller.enqueue(bytes);
++      controller.close();
++    },
++  });
++}
++
+ describe('isReleaseVersion', () => {
+   test('accepts strict semver with optional prerelease', () => {
+     expect(isReleaseVersion('1.2.3')).toBe(true);
+@@ -47,3 +64,103 @@ describe('POST /api/system/upgrade version validation', () => {
+     expect(payload.error).toBeTruthy();
+   });
+ });
++
++describe('GET /api/system/info upgradeCapabilities', () => {
++  test('includes staged-package', async () => {
++    const response = await handleSystemApiRequest(
++      new Request('http://localhost/api/system/info'),
++      '/api/system/info'
++    );
++    expect(response?.status).toBe(200);
++    const body = (await response?.json()) as { upgradeCapabilities?: string[] };
++    expect(body.upgradeCapabilities).toEqual(['staged-package']);
++  });
++});
++
++describe('PUT /api/system/upgrade/package', () => {
++  afterEach(() => {
++    upgradeController.resetForTests();
++  });
++
++  test('rejects invalid version and sha256 with 400', async () => {
++    const infoSpy = spyOn(infoPublic, 'getSystemInfo').mockReturnValue({
++      version: '1.0.0',
++      baseVersion: '1.0.0',
++      isProd: true,
++      installedViaCli: true,
++      deployment: 'launchd',
++      canSelfUpdate: true,
++      serviceName: 'tmex',
++      transferMaxBytes: 1,
++    } satisfies SystemInfo);
++    try {
++      const bytes = new Uint8Array([1, 2, 3]);
++      const hex = sha256Hex(bytes);
++      for (const url of [
++        'http://localhost/api/system/upgrade/package',
++        `http://localhost/api/system/upgrade/package?version=latest&sha256=${hex}`,
++        `http://localhost/api/system/upgrade/package?version=1.2.3&sha256=${'z'.repeat(64)}`,
++        'http://localhost/api/system/upgrade/package?version=1.2.3&sha256=abcd',
++      ]) {
++        const response = await handleSystemApiRequest(
++          new Request(url, {
++            method: 'PUT',
++            headers: { 'content-type': 'application/octet-stream' },
++            body: bytesStream(bytes),
++          }),
++          '/api/system/upgrade/package'
++        );
++        expect(response?.status).toBe(400);
++      }
++    } finally {
++      infoSpy.mockRestore();
++    }
++  });
++
++  test('refuses when canSelfUpdate is false', async () => {
++    const bytes = new Uint8Array([1, 2, 3]);
++    const hex = sha256Hex(bytes);
++    const response = await handleSystemApiRequest(
++      new Request(`http://localhost/api/system/upgrade/package?version=1.2.3&sha256=${hex}`, {
++        method: 'PUT',
++        headers: { 'content-type': 'application/octet-stream' },
++        body: bytesStream(bytes),
++      }),
++      '/api/system/upgrade/package'
++    );
++    expect(response?.status).toBe(403);
++  });
++});
++
++describe('POST /api/system/upgrade source=staged', () => {
++  afterEach(() => {
++    upgradeController.resetForTests();
++  });
++
++  test('returns 409 PACKAGE_NOT_STAGED when no package is staged', async () => {
++    const infoSpy = spyOn(infoPublic, 'getSystemInfo').mockReturnValue({
++      version: '1.0.0',
++      baseVersion: '1.0.0',
++      isProd: true,
++      installedViaCli: true,
++      deployment: 'launchd',
++      canSelfUpdate: true,
++      serviceName: 'tmex',
++      transferMaxBytes: 1,
++    } satisfies SystemInfo);
++    try {
++      const response = await handleSystemApiRequest(
++        new Request('http://localhost/api/system/upgrade', {
++          method: 'POST',
++          headers: { 'content-type': 'application/json' },
++          body: JSON.stringify({ version: '9.9.9', source: 'staged' }),
++        }),
++        '/api/system/upgrade'
++      );
++      expect(response?.status).toBe(409);
++      expect(await response?.json()).toEqual({ code: 'PACKAGE_NOT_STAGED' });
++    } finally {
++      infoSpy.mockRestore();
++    }
++  });
++});
+diff --git a/apps/gateway/src/api/system.ts b/apps/gateway/src/api/system.ts
+index 7aa1c72a..669afdec 100644
+--- a/apps/gateway/src/api/system.ts
++++ b/apps/gateway/src/api/system.ts
+@@ -27,7 +27,7 @@ export function handleSystemApiRequest(
+   path: string
+ ): Response | Promise<Response> | undefined {
+   if (path === '/api/system/info' && req.method === 'GET') {
+-    return json(getSystemInfo());
++    return json({ ...getSystemInfo(), upgradeCapabilities: ['staged-package'] });
+   }
+ 
+   if (path === '/api/system/addresses' && req.method === 'GET') {
+@@ -51,6 +51,11 @@ export function handleSystemApiRequest(
+     return handleStartUpgradeOpen(req);
+   }
+ 
++  if (path === '/api/system/upgrade/package' && req.method === 'PUT') {
++    if (managed) return managedExternallyResponse();
++    return handleStagePackageOpen(req);
++  }
++
+   return undefined;
+ }
+ 
+@@ -77,9 +82,13 @@ export function isReleaseVersion(value: string): boolean {
+ 
+ async function handleStartUpgradeOpen(req: Request): Promise<Response> {
+   let version = '';
++  let source: 'release' | 'staged' = 'release';
++  let sha256: string | undefined;
+   try {
+     const body = (await req.json()) as StartUpgradeRequest;
+     version = (body?.version ?? '').trim();
++    if (body?.source === 'staged' || body?.source === 'release') source = body.source;
++    if (typeof body?.sha256 === 'string' && body.sha256.trim()) sha256 = body.sha256.trim();
+   } catch {
+     version = '';
+   }
+@@ -89,12 +98,39 @@ async function handleStartUpgradeOpen(req: Request): Promise<Response> {
+   }
+ 
+   const { startLocalUpgradeAttempt } = await import('../system/upgrade-service');
+-  const result = await startLocalUpgradeAttempt(version);
++  const result = await startLocalUpgradeAttempt(version, { source, sha256 });
+   if (!result.ok && result.code === 'UPGRADE_NOT_ALLOWED') {
+     return json({ error: t('apiError.upgradeNotAllowed') }, 403);
+   }
++  if (!result.ok && result.code === 'PACKAGE_NOT_STAGED') {
++    return json({ code: 'PACKAGE_NOT_STAGED' }, 409);
++  }
+   if (!result.ok) {
+     return json({ ...result.status, error: t('apiError.upgradeInProgress') }, 409);
+   }
+   return json(result.status);
+ }
++
++const SHA256_HEX = /^[0-9a-fA-F]{64}$/;
++
++async function handleStagePackageOpen(req: Request): Promise<Response> {
++  const info = getSystemInfo();
++  if (!info.canSelfUpdate) {
++    return json({ error: t('apiError.upgradeNotAllowed') }, 403);
++  }
++  const url = new URL(req.url);
++  const version = (url.searchParams.get('version') ?? '').trim();
++  const sha256 = (url.searchParams.get('sha256') ?? '').trim();
++  if (!version || !isReleaseVersion(version) || !SHA256_HEX.test(sha256)) {
++    return json({ error: t('apiError.upgradeVersionRequired') }, 400);
++  }
++  const { upgradeController } = await import('../system/upgrade');
++  const result = await upgradeController.stagePackage(version, sha256, req.body);
++  if (!result.ok && result.code === 'UPGRADE_IN_PROGRESS') {
++    return json({ code: 'UPGRADE_IN_PROGRESS' }, 409);
++  }
++  if (!result.ok) {
++    return json({ code: result.code }, result.status);
++  }
++  return json({ version: result.version, sha256: result.sha256, bytes: result.bytes });
++}
+diff --git a/apps/gateway/src/mesh/forwarder.test.ts b/apps/gateway/src/mesh/forwarder.test.ts
+index b99aa721..9bdc08f4 100644
+--- a/apps/gateway/src/mesh/forwarder.test.ts
++++ b/apps/gateway/src/mesh/forwarder.test.ts
+@@ -1232,6 +1232,169 @@ describe('forwardAuthorizedHttp', () => {
+     expect(await res.json()).toEqual({ code: 'NODE_LOGIN_REQUIRED', nodeId: OTHER });
+     expect(streams.lastOpen).toBeNull();
+   });
++
++  test('rawBody wins over JSON body and forwards custom headers', async () => {
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dummyLink);
++    const captured: {
++      headers: Record<string, string>;
++      body: Uint8Array | null;
++      method: string;
++      path: string;
++      query: string;
++    }[] = [];
++    const streams = new FakeStreams();
++    streams.openHttpStream = async (_link, open, body) => {
++      const bytes = body ? new Uint8Array(await new Response(body).arrayBuffer()) : null;
++      captured.push({
++        headers: open.headers,
++        body: bytes,
++        method: open.method,
++        path: open.path,
++        query: open.query,
++      });
++      return new Response(JSON.stringify({ ok: true }), {
++        status: 200,
++        headers: { 'content-type': 'application/json' },
++      });
++    };
++    const forwarder = new Forwarder({ nodeId: NODE_ID, peers, streams });
++    const raw = new Uint8Array([0, 1, 2, 3, 4]);
++    const res = await forwarder.forwardAuthorizedHttp(
++      new Request('http://localhost/api/mesh/nodes/x/upgrade', {
++        method: 'PUT',
++        headers: { cookie: `tmex_s_${OTHER}=remote-sid` },
++      }),
++      {
++        nodeId: OTHER,
++        method: 'PUT',
++        path: '/api/system/upgrade/package',
++        query: `?version=1.2.3&sha256=${'ab'.repeat(32)}`,
++        body: { version: 'should-not-send' },
++        rawBody: new ReadableStream({
++          start(controller) {
++            controller.enqueue(raw);
++            controller.close();
++          },
++        }),
++        headers: {
++          'content-type': 'application/octet-stream',
++          'content-length': String(raw.byteLength),
++        },
++      }
++    );
++    expect(res.status).toBe(200);
++    expect(captured).toHaveLength(1);
++    expect(captured[0]?.method).toBe('PUT');
++    expect(captured[0]?.path).toBe('/api/system/upgrade/package');
++    expect(captured[0]?.query).toBe(`?version=1.2.3&sha256=${'ab'.repeat(32)}`);
++    expect(captured[0]?.headers['content-type']).toBe('application/octet-stream');
++    expect(captured[0]?.headers['content-length']).toBe('5');
++    expect(captured[0]?.body).toEqual(raw);
++  });
++
++  test('JSON POST body path stays compatible when rawBody is omitted', async () => {
++    const peers = new FakePeers();
++    peers.links.set(OTHER, dummyLink);
++    const captured: { headers: Record<string, string>; body: string | null }[] = [];
++    const streams = new FakeStreams();
++    streams.openHttpStream = async (_link, open, body) => {
++      captured.push({
++        headers: open.headers,
++        body: body ? await new Response(body).text() : null,
++      });
++      return new Response(JSON.stringify({ ok: true }), {
++        status: 200,
++        headers: { 'content-type': 'application/json' },
++      });
++    };
++    const forwarder = new Forwarder({ nodeId: NODE_ID, peers, streams });
++    await forwarder.forwardAuthorizedHttp(
++      new Request('http://localhost/api/mesh/nodes/x/upgrade', {
++        method: 'POST',
++        headers: { cookie: `tmex_s_${OTHER}=remote-sid` },
++      }),
++      { nodeId: OTHER, method: 'POST', path: '/api/system/upgrade', body: { version: '9.9.9' } }
++    );
++    expect(captured[0]?.headers['content-type']).toBe('application/json');
++    expect(captured[0]?.body).toBe(JSON.stringify({ version: '9.9.9' }));
++  });
++});
++
++describe('forwardAuthorizedHttp multi-MiB raw body over in-memory link', () => {
++  test('streams a 3 MiB request body through link flow control', async () => {
++    const { createInMemoryLinkPair } = await import('@tmex/shared/link');
++    const { acceptHttpStream, openHttpStream } = await import('./stream-targets');
++    const [local, remote] = createInMemoryLinkPair();
++    let received = 0;
++    remote.onStream((stream) => {
++      void acceptHttpStream(stream, {
++        peerNodeId: 'entry',
++        sessionStore: {
++          verify: () => ({ ok: true, session: { userId: 'user-1' } }),
++        } as never,
++        async dispatchHttp(req) {
++          const reader = req.body?.getReader();
++          if (!reader) return new Response('no-body', { status: 400 });
++          while (true) {
++            const { done, value } = await reader.read();
++            if (done) break;
++            received += value?.byteLength ?? 0;
++          }
++          return new Response(JSON.stringify({ received }), {
++            status: 200,
++            headers: { 'content-type': 'application/json' },
++          });
++        },
++      });
++    });
++    const peers = new FakePeers();
++    peers.links.set(OTHER, local);
++    const forwarder = new Forwarder({
++      nodeId: NODE_ID,
++      peers,
++      streams: {
++        openHttpStream: (link, open, body, signal) => openHttpStream(link, open, body, signal),
++        openWsStream: async () => {
++          throw new Error('ws not used');
++        },
++      },
++    });
++    const total = 3 * 1024 * 1024;
++    const chunk = new Uint8Array(64 * 1024).fill(7);
++    let remaining = total;
++    const rawBody = new ReadableStream<Uint8Array>({
++      pull(controller) {
++        if (remaining <= 0) {
++          controller.close();
++          return;
++        }
++        const n = Math.min(chunk.byteLength, remaining);
++        controller.enqueue(n === chunk.byteLength ? chunk : chunk.subarray(0, n));
++        remaining -= n;
++      },
++    });
++    const res = await forwarder.forwardAuthorizedHttp(
++      new Request('http://localhost/api/mesh/nodes/x/upgrade', {
++        method: 'PUT',
++        headers: { cookie: `tmex_s_${OTHER}=remote-sid`, origin: 'http://localhost' },
++      }),
++      {
++        nodeId: OTHER,
++        method: 'PUT',
++        path: '/api/system/upgrade/package',
++        query: `?version=1.2.3&sha256=${'ab'.repeat(32)}`,
++        rawBody,
++        headers: {
++          'content-type': 'application/octet-stream',
++          'content-length': String(total),
++        },
++      }
++    );
++    expect(res.status).toBe(200);
++    expect(await res.json()).toEqual({ received: total });
++    expect(received).toBe(total);
++  });
+ });
+ 
+ function encodeHelloFrame(): Uint8Array {
+diff --git a/apps/gateway/src/mesh/forwarder.ts b/apps/gateway/src/mesh/forwarder.ts
+index 2d58d5f9..0bb681fb 100644
+--- a/apps/gateway/src/mesh/forwarder.ts
++++ b/apps/gateway/src/mesh/forwarder.ts
+@@ -253,7 +253,15 @@ export class Forwarder {
+ 
+   async forwardAuthorizedHttp(
+     req: Request,
+-    input: { nodeId: string; method: string; path: string; query?: string; body?: unknown },
++    input: {
++      nodeId: string;
++      method: string;
++      path: string;
++      query?: string;
++      body?: unknown;
++      rawBody?: ReadableStream<Uint8Array>;
++      headers?: Record<string, string>;
++    },
+     signal?: AbortSignal
+   ): Promise<Response> {
+     const auth =
+@@ -264,8 +272,8 @@ export class Forwarder {
+     const abort = signal ?? req.signal;
+     const method = input.method.toUpperCase();
+     const retryable = IDEMPOTENT_HTTP.has(method);
+-    const headers: Record<string, string> = {};
+-    const body = retryable ? null : buildJsonStreamBody(input.body, headers);
++    const headers: Record<string, string> = { ...(input.headers ?? {}) };
++    const body = retryable ? null : (input.rawBody ?? buildJsonStreamBody(input.body, headers));
+     const attempts = retryable ? HTTP_FAILOVER_MAX_ATTEMPTS : 1;
+     for (let attempt = 0; attempt < attempts; attempt += 1) {
+       if (abort.aborted) break;
+diff --git a/apps/gateway/src/mesh/mesh-routes.test.ts b/apps/gateway/src/mesh/mesh-routes.test.ts
+index b3072ace..a0062a4b 100644
+--- a/apps/gateway/src/mesh/mesh-routes.test.ts
++++ b/apps/gateway/src/mesh/mesh-routes.test.ts
+@@ -1,4 +1,5 @@
+ import { afterEach, describe, expect, test } from 'bun:test';
++import { createHash } from 'node:crypto';
+ import { releaseTarballName, wsBorsh } from '@tmex/shared';
+ import {
+   DOMAIN_CERTIFICATE,
+@@ -7,6 +8,11 @@ import {
+   hexToBytes,
+ } from '@tmex/shared/auth';
+ import type { LinkSession } from '@tmex/shared/link';
++import { resetReleaseDownloadForTests } from '../system/release-download';
++import {
++  resetRemoteUpgradeJobsForTests,
++  waitForRemoteUpgradeJob,
++} from '../system/remote-upgrade-job';
+ import {
+   FakePeers,
+   FakeStreams,
+@@ -566,6 +572,126 @@ describe('mesh-routes', () => {
+     }
+   });
+ 
++  test('GET /api/mesh/hubs requires a session and returns the persisted hub set', async () => {
++    const mesh = await bootMesh();
++    try {
++      const denied = await call(mesh.runtime, 'http://localhost/api/mesh/hubs');
++      expect(denied.status).toBe(401);
++      mesh.hubStore.replaceAll(
++        [
++          {
++            hubNodeId: NODE_ID,
++            publicUrl: 'https://writer.example',
++            name: 'writer',
++            mode: 'active',
++            priority: 10,
++            writerEpoch: 4,
++            caFingerprint: null,
++            online: true,
++            lastSeenAt: 9,
++          },
++          {
++            hubNodeId: PEER_ID,
++            publicUrl: 'https://standby.example',
++            name: 'standby',
++            mode: 'standby',
++            priority: 20,
++            writerEpoch: 1,
++            caFingerprint: null,
++            online: false,
++            lastSeenAt: null,
++          },
++        ],
++        1
++      );
++      const { sid } = await challengeAndLogin(mesh.runtime, mesh.boot);
++      const res = await call(mesh.runtime, 'http://localhost/api/mesh/hubs', {
++        headers: { cookie: `tmex_s_self=${sid}` },
++      });
++      expect(res.status).toBe(200);
++      const body = (await res.json()) as {
++        hubs: Array<{ nodeId: string; mode: string; online: boolean }>;
++        writerHubId: string | null;
++        attached: { publicUrl: string } | null;
++        candidates: string[];
++      };
++      expect(body.writerHubId).toBe(NODE_ID);
++      expect(body.hubs.map((h) => h.nodeId)).toEqual([NODE_ID, PEER_ID]);
++      expect(body.hubs.find((h) => h.nodeId === PEER_ID)?.mode).toBe('standby');
++      expect(body.attached).toBeNull();
++      expect(body.candidates).toEqual(['https://writer.example', 'https://standby.example']);
++    } finally {
++      mesh.close();
++    }
++  });
++
++  test('GET /api/mesh/nodes marks every MeshHubStore id as isHub with hubMode', async () => {
++    const mesh = await bootMesh();
++    try {
++      mesh.userStore.upsertCert({
++        nodeId: PEER_ID,
++        userId: mesh.boot.userId,
++        admitRecordSeq: 2,
++        certificateBytes: encodeCertificate({
++          domain: DOMAIN_CERTIFICATE,
++          uid: mesh.boot.userId,
++          node_id: hexToBytes(PEER_ID),
++          ed_pk: new Uint8Array(32).fill(4),
++          x25519_pk: new Uint8Array(32).fill(5),
++          enroll_pk: new Uint8Array(32).fill(6),
++          issued_at: 1n,
++        }),
++        certSig: new Uint8Array(64),
++        authorizationBytes: new Uint8Array(8),
++        authorizationSig: new Uint8Array(64),
++      });
++      mesh.hubStore.replaceAll(
++        [
++          {
++            hubNodeId: NODE_ID,
++            publicUrl: 'https://writer.example',
++            name: null,
++            mode: 'active',
++            priority: 10,
++            writerEpoch: 2,
++            caFingerprint: null,
++            online: true,
++            lastSeenAt: null,
++          },
++          {
++            hubNodeId: PEER_ID,
++            publicUrl: 'https://standby.example',
++            name: null,
++            mode: 'standby',
++            priority: 20,
++            writerEpoch: 1,
++            caFingerprint: null,
++            online: true,
++            lastSeenAt: null,
++          },
++        ],
++        1
++      );
++      const { sid } = await challengeAndLogin(mesh.runtime, mesh.boot);
++      const list = await call(mesh.runtime, 'http://localhost/api/mesh/nodes', {
++        headers: { cookie: `tmex_s_self=${sid}` },
++      });
++      const body = (await list.json()) as {
++        nodes: Array<{ id: string; isHub: boolean; hubMode?: 'active' | 'standby' }>;
++      };
++      expect(body.nodes.find((n) => n.id === NODE_ID)).toMatchObject({
++        isHub: true,
++        hubMode: 'active',
++      });
++      expect(body.nodes.find((n) => n.id === PEER_ID)).toMatchObject({
++        isHub: true,
++        hubMode: 'standby',
++      });
++    } finally {
++      mesh.close();
++    }
++  });
++
+   test('GET /api/mesh/rtc-config and POST /api/rtc/authorize', async () => {
+     const mesh = await bootMesh({
+       rtc: {
+@@ -904,6 +1030,8 @@ const dummyLink = {} as LinkSession;
+ 
+ afterEach(() => {
+   globalThis.fetch = originalFetch;
++  resetRemoteUpgradeJobsForTests();
++  resetReleaseDownloadForTests();
+ });
+ 
+ class RecordingStreams extends FakeStreams {
+@@ -912,6 +1040,7 @@ class RecordingStreams extends FakeStreams {
+     path: string;
+     auth: string | null;
+     body: string | null;
++    query: string;
+   }> = [];
+   responses: Response[] = [];
+   openErrors: Array<Error | null> = [];
+@@ -933,7 +1062,13 @@ class RecordingStreams extends FakeStreams {
+     if (body) {
+       text = await new Response(body).text();
+     }
+-    this.opens.push({ method: open.method, path: open.path, auth: open.auth, body: text });
++    this.opens.push({
++      method: open.method,
++      path: open.path,
++      auth: open.auth,
++      body: text,
++      query: open.query,
++    });
+     const err = this.openErrors.shift();
+     if (err) throw err;
+     const queued = this.responses.shift();
+@@ -1401,7 +1536,7 @@ describe('mesh upgrade routes', () => {
+         startedAt: null,
+       });
+       expect(streams.opens).toEqual([
+-        { method: 'GET', path: '/api/system/upgrade', auth: 'remote-sid', body: null },
++        { method: 'GET', path: '/api/system/upgrade', auth: 'remote-sid', body: null, query: '' },
+       ]);
+     } finally {
+       mesh.close();
+@@ -1477,6 +1612,71 @@ describe('mesh upgrade routes', () => {
+       mesh.close();
+     }
+   });
++
++  test('POST remote upgrade with staged-package capability returns immediately then PUTs and POSTs staged', async () => {
++    const tarball = new Uint8Array([1, 2, 3, 4, 5]);
++    const hex = createHash('sha256').update(tarball).digest('hex');
++    mockGithubLatest('9.9.9');
++    const latestFetch = globalThis.fetch;
++    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      if (url.includes('api.github.com')) return latestFetch(input, init);
++      if (url.includes('SHA256SUMS')) {
++        return new Response(`${hex}  ${releaseTarballName('9.9.9')}\n`, { status: 200 });
++      }
++      return new Response(Buffer.from(tarball), { status: 200 });
++    }) as typeof fetch;
++
++    const peers = new FakePeers();
++    peers.links.set(UPGRADE_PEER, dummyLink);
++    const streams = new RecordingStreams();
++    streams.responses.push(
++      jsonResponse({
++        baseVersion: '1.0.0',
++        canSelfUpdate: true,
++        upgradeCapabilities: ['staged-package'],
++      }),
++      jsonResponse({ version: '9.9.9', sha256: hex, bytes: tarball.byteLength }),
++      jsonResponse({
++        state: 'downloading',
++        targetVersion: '9.9.9',
++        error: null,
++        startedAt: '2026-09-01T00:00:00.000Z',
++      })
++    );
++    const mesh = await bootMesh({ peers, streams });
++    try {
++      enrollPeer(mesh, UPGRADE_PEER);
++      const { sid } = await challengeAndLogin(mesh.runtime, mesh.boot);
++      const res = await call(
++        mesh.runtime,
++        `http://localhost/api/mesh/nodes/${UPGRADE_PEER}/upgrade`,
++        {
++          method: 'POST',
++          headers: { cookie: `tmex_s_self=${sid}; tmex_s_${UPGRADE_PEER}=remote-sid` },
++        }
++      );
++      expect(res.status).toBe(200);
++      const body = (await res.json()) as { state: string; targetVersion: string };
++      expect(body.state).toBe('downloading');
++      expect(body.targetVersion).toBe('9.9.9');
++      expect(streams.opens.map((o) => `${o.method} ${o.path}`)).toEqual(['GET /api/system/info']);
++
++      await waitForRemoteUpgradeJob(UPGRADE_PEER);
++      expect(streams.opens.map((o) => `${o.method} ${o.path}`)).toEqual([
++        'GET /api/system/info',
++        'PUT /api/system/upgrade/package',
++        'POST /api/system/upgrade',
++      ]);
++      expect(streams.opens[1]?.query).toContain('version=9.9.9');
++      expect(streams.opens[1]?.query).toContain(`sha256=${hex}`);
++      expect(streams.opens[2]?.body).toBe(
++        JSON.stringify({ version: '9.9.9', source: 'staged', sha256: hex })
++      );
++    } finally {
++      mesh.close();
++    }
++  });
+ });
+ 
+ function encodeRtcSignal(from: number): Uint8Array {
+diff --git a/apps/gateway/src/system/release-download.test.ts b/apps/gateway/src/system/release-download.test.ts
+new file mode 100644
+index 00000000..315970b0
+--- /dev/null
++++ b/apps/gateway/src/system/release-download.test.ts
+@@ -0,0 +1,148 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { createHash } from 'node:crypto';
++import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { RELEASE_REPO_URL, releaseTarballName, releaseTarballUrl } from '@tmex/shared';
++import {
++  downloadVerifiedRelease,
++  resetReleaseDownloadForTests,
++  resolveReleaseSha256SumsUrl,
++  resolveReleaseTarballUrl,
++} from './release-download';
++
++const originalFetch = globalThis.fetch;
++const originalBase = process.env.TMEX_RELEASE_BASE_URL;
++const tempDirs: string[] = [];
++
++afterEach(() => {
++  globalThis.fetch = originalFetch;
++  if (originalBase === undefined) delete process.env.TMEX_RELEASE_BASE_URL;
++  else process.env.TMEX_RELEASE_BASE_URL = originalBase;
++  resetReleaseDownloadForTests();
++  for (const dir of tempDirs.splice(0)) {
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++function tempDir(prefix: string): string {
++  const dir = mkdtempSync(join(tmpdir(), prefix));
++  tempDirs.push(dir);
++  return dir;
++}
++
++function sha256Hex(bytes: Uint8Array): string {
++  return createHash('sha256').update(bytes).digest('hex');
++}
++
++function stubReleaseFetch(
++  tarball: Uint8Array,
++  version: string
++): { urls: string[]; tarballHits: number } {
++  const urls: string[] = [];
++  const hex = sha256Hex(tarball);
++  let tarballHits = 0;
++  globalThis.fetch = (async (input: RequestInfo | URL) => {
++    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++    urls.push(url);
++    if (url.includes('SHA256SUMS')) {
++      return new Response(`${hex}  ${releaseTarballName(version)}\n`, { status: 200 });
++    }
++    tarballHits += 1;
++    return new Response(Buffer.from(tarball), { status: 200 });
++  }) as typeof fetch;
++  return {
++    urls,
++    get tarballHits() {
++      return tarballHits;
++    },
++  };
++}
++
++describe('resolveReleaseTarballUrl', () => {
++  test('defaults to the GitHub release asset URL', () => {
++    delete process.env.TMEX_RELEASE_BASE_URL;
++    expect(resolveReleaseTarballUrl('1.2.3')).toBe(releaseTarballUrl('1.2.3'));
++    expect(resolveReleaseSha256SumsUrl('1.2.3')).toContain(
++      `${RELEASE_REPO_URL}/releases/download/v1.2.3/SHA256SUMS`
++    );
++  });
++
++  test('TMEX_RELEASE_BASE_URL overrides the GitHub host while keeping the path layout', () => {
++    process.env.TMEX_RELEASE_BASE_URL = 'http://127.0.0.1:19991';
++    expect(resolveReleaseTarballUrl('1.2.3')).toBe(
++      'http://127.0.0.1:19991/releases/download/v1.2.3/tmex-cli-1.2.3.tgz'
++    );
++  });
++});
++
++describe('downloadVerifiedRelease', () => {
++  test('downloads, verifies sha256, and writes the on-disk cache', async () => {
++    const version = '9.9.9';
++    const tarball = new Uint8Array([1, 2, 3, 4, 5]);
++    stubReleaseFetch(tarball, version);
++    const cacheDir = tempDir('tmex-rel-cache-');
++    const result = await downloadVerifiedRelease(version, { cacheDir });
++    expect(result.sha256).toBe(sha256Hex(tarball));
++    expect(result.bytes).toBe(tarball.byteLength);
++    expect(existsSync(join(cacheDir, releaseTarballName(version)))).toBe(true);
++    expect(
++      readFileSync(join(cacheDir, `${releaseTarballName(version)}.sha256`), 'utf8').trim()
++    ).toBe(result.sha256);
++  });
++
++  test('reuses a verified cache and does not re-fetch the tarball', async () => {
++    const version = '9.9.9';
++    const tarball = new Uint8Array([9, 8, 7]);
++    const stub = stubReleaseFetch(tarball, version);
++    const cacheDir = tempDir('tmex-rel-cache-');
++    await downloadVerifiedRelease(version, { cacheDir });
++    const firstHits = stub.tarballHits;
++    const again = await downloadVerifiedRelease(version, { cacheDir });
++    expect(again.sha256).toBe(sha256Hex(tarball));
++    expect(stub.tarballHits).toBe(firstHits);
++  });
++
++  test('concurrent callers for the same version share one download', async () => {
++    const version = '3.2.1';
++    const tarball = new Uint8Array(32).fill(4);
++    const stub = stubReleaseFetch(tarball, version);
++    const cacheDir = tempDir('tmex-rel-cache-');
++    const [a, b] = await Promise.all([
++      downloadVerifiedRelease(version, { cacheDir }),
++      downloadVerifiedRelease(version, { cacheDir }),
++    ]);
++    expect(a.path).toBe(b.path);
++    expect(a.sha256).toBe(b.sha256);
++    expect(stub.tarballHits).toBe(1);
++  });
++
++  test('rejects a sha256 mismatch and does not leave a cache file', async () => {
++    const version = '1.1.4';
++    const tarball = new Uint8Array([1, 2, 3]);
++    globalThis.fetch = (async (input: RequestInfo | URL) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      if (url.includes('SHA256SUMS')) {
++        return new Response(`${'0'.repeat(64)}  ${releaseTarballName(version)}\n`, { status: 200 });
++      }
++      return new Response(Buffer.from(tarball), { status: 200 });
++    }) as typeof fetch;
++    const cacheDir = tempDir('tmex-rel-cache-');
++    await expect(downloadVerifiedRelease(version, { cacheDir })).rejects.toThrow(
++      /sha256 mismatch/i
++    );
++    expect(existsSync(join(cacheDir, releaseTarballName(version)))).toBe(false);
++  });
++
++  test('ignores a cache file whose recorded sha256 no longer matches', async () => {
++    const version = '8.8.8';
++    const good = new Uint8Array([1, 1, 1]);
++    const cacheDir = tempDir('tmex-rel-cache-');
++    writeFileSync(join(cacheDir, releaseTarballName(version)), Buffer.from([9, 9, 9]));
++    writeFileSync(join(cacheDir, `${releaseTarballName(version)}.sha256`), `${'a'.repeat(64)}\n`);
++    stubReleaseFetch(good, version);
++    const result = await downloadVerifiedRelease(version, { cacheDir });
++    expect(result.sha256).toBe(sha256Hex(good));
++    expect(readFileSync(join(cacheDir, releaseTarballName(version)))).toEqual(Buffer.from(good));
++  });
++});
+diff --git a/apps/gateway/src/system/release-download.ts b/apps/gateway/src/system/release-download.ts
+new file mode 100644
+index 00000000..4721b337
+--- /dev/null
++++ b/apps/gateway/src/system/release-download.ts
+@@ -0,0 +1,231 @@
++import { createHash } from 'node:crypto';
++import { createWriteStream, existsSync, readFileSync } from 'node:fs';
++import type { WriteStream } from 'node:fs';
++import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
++import { basename, join } from 'node:path';
++import { RELEASE_REPO_URL, releaseTag, releaseTarballName, releaseTarballUrl } from '@tmex/shared';
++import { compareVersions } from './semver';
++
++const CHECKSUMS_REQUIRED_SINCE = '1.1.4';
++const TARBALL_FETCH_TIMEOUT_MS = 120_000;
++const SUM_LINE = /^([a-fA-F0-9]{64})\s+\*?(\S+)\s*$/;
++
++/** 覆盖 GitHub 仓库根 URL；缺省为当前发行源。路径布局保持 `/releases/download/v<ver>/...`。 */
++export const RELEASE_BASE_URL_ENV = 'TMEX_RELEASE_BASE_URL';
++
++const inflight = new Map<string, Promise<{ path: string; sha256: string; bytes: number }>>();
++
++export function resetReleaseDownloadForTests(): void {
++  inflight.clear();
++}
++
++export function sha256Hex(bytes: Uint8Array): string {
++  return createHash('sha256').update(bytes).digest('hex');
++}
++
++export function parseSha256Sums(text: string, fileName: string): string | null {
++  const want = basename(fileName);
++  for (const raw of text.split(/\r?\n/)) {
++    const match = raw.trim().match(SUM_LINE);
++    if (!match) continue;
++    if (basename(match[2]) === want) return match[1].toLowerCase();
++  }
++  return null;
++}
++
++export function resolveReleaseBaseUrl(): string {
++  const override = process.env[RELEASE_BASE_URL_ENV]?.trim().replace(/\/+$/, '');
++  return override && override.length > 0 ? override : RELEASE_REPO_URL;
++}
++
++export function resolveReleaseTarballUrl(version: string): string {
++  const base = resolveReleaseBaseUrl();
++  if (base === RELEASE_REPO_URL) return releaseTarballUrl(version);
++  return `${base}/releases/download/${releaseTag(version)}/${releaseTarballName(version)}`;
++}
++
++export function resolveReleaseSha256SumsUrl(version: string): string {
++  return resolveReleaseTarballUrl(version).replace(releaseTarballName(version), 'SHA256SUMS');
++}
++
++export function releaseSha256SumsUrl(version: string): string {
++  return resolveReleaseSha256SumsUrl(version);
++}
++
++export function assertReleaseIntegrity(
++  version: string,
++  bytes: Uint8Array,
++  sums: { hex: string | null; missing: boolean }
++): void {
++  if (sums.missing || !sums.hex) {
++    if (compareVersions(version, CHECKSUMS_REQUIRED_SINCE) >= 0) {
++      throw new Error(
++        `Release ${version} requires SHA256SUMS (HTTP 200, matching digest). Refusing to continue.`
++      );
++    }
++    throw new Error('Release SHA256SUMS is missing; tarball integrity is unverified.');
++  }
++  if (sha256Hex(bytes) !== sums.hex) {
++    throw new Error(`Release tarball sha256 mismatch for ${releaseTarballName(version)}.`);
++  }
++}
++
++export async function fetchReleaseSha256Sums(
++  version: string,
++  fileName: string,
++  fetchFn: typeof fetch = fetch
++): Promise<{ hex: string | null; missing: boolean }> {
++  let response: Response;
++  try {
++    response = await fetchFn(resolveReleaseSha256SumsUrl(version), {
++      redirect: 'follow',
++      cache: 'no-store',
++    });
++  } catch (error) {
++    const detail = error instanceof Error ? error.message : String(error);
++    throw new Error(`SHA256SUMS network error: ${detail}`);
++  }
++  if (response.status === 404) return { hex: null, missing: true };
++  if (!response.ok) {
++    throw new Error(`SHA256SUMS HTTP ${response.status}`);
++  }
++  const hex = parseSha256Sums(await response.text(), fileName || releaseTarballName(version));
++  if (!hex) {
++    throw new Error(`SHA256SUMS does not list ${fileName}`);
++  }
++  return { hex, missing: false };
++}
++
++export type DownloadedRelease = {
++  path: string;
++  sha256: string;
++  bytes: number;
++};
++
++export async function downloadVerifiedRelease(
++  version: string,
++  opts: { cacheDir: string; fetchFn?: typeof fetch }
++): Promise<DownloadedRelease> {
++  const key = `${opts.cacheDir}::${version}`;
++  const existing = inflight.get(key);
++  if (existing) return existing;
++  const pending = downloadVerifiedReleaseUncached(version, opts).finally(() => {
++    if (inflight.get(key) === pending) inflight.delete(key);
++  });
++  inflight.set(key, pending);
++  return pending;
++}
++
++async function downloadVerifiedReleaseUncached(
++  version: string,
++  opts: { cacheDir: string; fetchFn?: typeof fetch }
++): Promise<DownloadedRelease> {
++  await mkdir(opts.cacheDir, { recursive: true, mode: 0o700 });
++  const fileName = releaseTarballName(version);
++  const dest = join(opts.cacheDir, fileName);
++  const sidecar = `${dest}.sha256`;
++  const cached = readVerifiedCache(dest, sidecar);
++  if (cached) return cached;
++
++  const fetchFn = opts.fetchFn ?? fetch;
++  const part = `${dest}.part`;
++  await rm(part, { force: true }).catch(() => {});
++  let downloaded: { sha256: string; bytes: number };
++  try {
++    downloaded = await downloadTarballToFile(resolveReleaseTarballUrl(version), part, fetchFn);
++    const sums = await fetchReleaseSha256Sums(version, fileName, fetchFn);
++    const bytes = new Uint8Array(readFileSync(part));
++    assertReleaseIntegrity(version, bytes, sums);
++    if (downloaded.sha256 !== sha256Hex(bytes)) {
++      throw new Error(`Release tarball sha256 mismatch for ${fileName}.`);
++    }
++  } catch (err) {
++    await rm(part, { force: true }).catch(() => {});
++    throw err;
++  }
++  await rename(part, dest);
++  await writeFile(sidecar, `${downloaded.sha256}\n`, { mode: 0o600 });
++  return { path: dest, sha256: downloaded.sha256, bytes: downloaded.bytes };
++}
++
++function readVerifiedCache(dest: string, sidecar: string): DownloadedRelease | null {
++  if (!existsSync(dest) || !existsSync(sidecar)) return null;
++  try {
++    const expected = readFileSync(sidecar, 'utf8').trim().toLowerCase();
++    if (!/^[0-9a-f]{64}$/.test(expected)) return null;
++    const bytes = new Uint8Array(readFileSync(dest));
++    if (sha256Hex(bytes) !== expected) return null;
++    return { path: dest, sha256: expected, bytes: bytes.byteLength };
++  } catch {
++    return null;
++  }
++}
++
++async function downloadTarballToFile(
++  url: string,
++  destPath: string,
++  fetchFn: typeof fetch
++): Promise<{ sha256: string; bytes: number }> {
++  const res = await fetchFn(url, {
++    cache: 'no-store',
++    redirect: 'follow',
++    signal: AbortSignal.timeout(TARBALL_FETCH_TIMEOUT_MS),
++  });
++  if (!res.ok) {
++    throw new Error(`GitHub release tarball HTTP ${res.status}`);
++  }
++  const hash = createHash('sha256');
++  let bytes = 0;
++  const ws = createWriteStream(destPath, { mode: 0o600 });
++  try {
++    const reader = res.body?.getReader();
++    if (!reader) {
++      const buf = new Uint8Array(await res.arrayBuffer());
++      hash.update(buf);
++      bytes = buf.byteLength;
++      await writeAll(ws, buf);
++    } else {
++      while (true) {
++        const { done, value } = await reader.read();
++        if (done) break;
++        if (!value?.byteLength) continue;
++        hash.update(value);
++        bytes += value.byteLength;
++        await writeAll(ws, value);
++      }
++    }
++    await closeWriteStream(ws);
++  } catch (err) {
++    await closeWriteStream(ws).catch(() => {});
++    throw err;
++  }
++  return { sha256: hash.digest('hex'), bytes };
++}
++
++function writeAll(ws: WriteStream, chunk: Uint8Array): Promise<void> {
++  return new Promise((resolve, reject) => {
++    const onErr = (err: Error) => {
++      ws.off('error', onErr);
++      reject(err);
++    };
++    ws.once('error', onErr);
++    if (ws.write(chunk)) {
++      ws.off('error', onErr);
++      resolve();
++      return;
++    }
++    ws.once('drain', () => {
++      ws.off('error', onErr);
++      resolve();
++    });
++  });
++}
++
++function closeWriteStream(ws: WriteStream): Promise<void> {
++  return new Promise((resolve, reject) => {
++    ws.end((err?: Error | null) => {
++      if (err) reject(err);
++      else resolve();
++    });
++  });
++}
+diff --git a/apps/gateway/src/system/remote-upgrade-job.test.ts b/apps/gateway/src/system/remote-upgrade-job.test.ts
+new file mode 100644
+index 00000000..99c927fb
+--- /dev/null
++++ b/apps/gateway/src/system/remote-upgrade-job.test.ts
+@@ -0,0 +1,223 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import {
++  getRemoteUpgradeJob,
++  resetRemoteUpgradeJobsForTests,
++  startRemoteUpgradeJob,
++  waitForRemoteUpgradeJob,
++} from './remote-upgrade-job';
++import type { AuthorizedUpgradeForward } from './upgrade-service';
++
++const tempDirs: string[] = [];
++
++afterEach(() => {
++  resetRemoteUpgradeJobsForTests();
++  for (const dir of tempDirs.splice(0)) {
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++function tempFile(bytes: Uint8Array): string {
++  const dir = mkdtempSync(join(tmpdir(), 'tmex-job-pkg-'));
++  tempDirs.push(dir);
++  const path = join(dir, 'tmex-cli-9.9.9.tgz');
++  writeFileSync(path, bytes);
++  return path;
++}
++
++function authed(nodeId: string): Request {
++  return new Request('http://localhost/api/mesh/nodes/x/upgrade', {
++    method: 'POST',
++    headers: { cookie: `tmex_s_${nodeId}=remote-sid` },
++  });
++}
++
++describe('RemoteUpgradeJob', () => {
++  test('downloads, PUTs the tarball, POSTs staged, and hands off', async () => {
++    const nodeId = 'aa'.repeat(16);
++    const bytes = new Uint8Array([1, 2, 3, 4]);
++    const path = tempFile(bytes);
++    const sha256 = 'ab'.repeat(32);
++    const calls: Array<{
++      method: string;
++      path: string;
++      body?: unknown;
++      headers?: Record<string, string>;
++    }> = [];
++    const forward: AuthorizedUpgradeForward = {
++      async forwardAuthorizedHttp(_req, input) {
++        const raw = input.rawBody ? await new Response(input.rawBody).bytes() : null;
++        calls.push({
++          method: input.method,
++          path: input.path,
++          body: input.body,
++          headers: input.headers,
++        });
++        if (input.method === 'PUT') {
++          expect(raw).toEqual(bytes);
++          expect(input.headers?.['content-type']).toBe('application/octet-stream');
++          expect(input.headers?.['content-length']).toBe(String(bytes.byteLength));
++          expect(input.query).toContain('version=9.9.9');
++          expect(input.query).toContain(`sha256=${sha256}`);
++          return new Response(
++            JSON.stringify({ version: '9.9.9', sha256, bytes: bytes.byteLength }),
++            {
++              status: 200,
++              headers: { 'content-type': 'application/json' },
++            }
++          );
++        }
++        return new Response(
++          JSON.stringify({
++            state: 'downloading',
++            targetVersion: '9.9.9',
++            error: null,
++            startedAt: '2026-09-01T00:00:00.000Z',
++          }),
++          { status: 200, headers: { 'content-type': 'application/json' } }
++        );
++      },
++    };
++
++    const started = startRemoteUpgradeJob({
++      nodeId,
++      version: '9.9.9',
++      req: authed(nodeId),
++      forward,
++      download: async () => ({ path, sha256, bytes: bytes.byteLength }),
++    });
++    expect(started.ok).toBe(true);
++    if (!started.ok) throw new Error('expected start');
++    expect(started.snapshot.state).toBe('running');
++    expect(getRemoteUpgradeJob(nodeId)?.state).toBe('running');
++
++    const done = await waitForRemoteUpgradeJob(nodeId);
++    expect(done.state).toBe('handed-off');
++    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
++      'PUT /api/system/upgrade/package',
++      'POST /api/system/upgrade',
++    ]);
++    expect(calls[1]?.body).toEqual({ version: '9.9.9', source: 'staged', sha256 });
++  });
++
++  test('two nodes share one download', async () => {
++    const a = '11'.repeat(16);
++    const b = '22'.repeat(16);
++    const bytes = new Uint8Array([9]);
++    const path = tempFile(bytes);
++    let downloads = 0;
++    const download = async () => {
++      downloads += 1;
++      await new Promise((r) => setTimeout(r, 20));
++      return { path, sha256: 'cd'.repeat(32), bytes: 1 };
++    };
++    const forward: AuthorizedUpgradeForward = {
++      async forwardAuthorizedHttp() {
++        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
++      },
++    };
++    startRemoteUpgradeJob({
++      nodeId: a,
++      version: '1.0.0',
++      req: authed(a),
++      forward,
++      download,
++    });
++    startRemoteUpgradeJob({
++      nodeId: b,
++      version: '1.0.0',
++      req: authed(b),
++      forward,
++      download,
++    });
++    await Promise.all([waitForRemoteUpgradeJob(a), waitForRemoteUpgradeJob(b)]);
++    expect(downloads).toBe(1);
++  });
++
++  test('download failure records which step failed', async () => {
++    const nodeId = 'bb'.repeat(16);
++    const started = startRemoteUpgradeJob({
++      nodeId,
++      version: '9.9.9',
++      req: authed(nodeId),
++      forward: {
++        async forwardAuthorizedHttp() {
++          throw new Error('should not forward');
++        },
++      },
++      download: async () => {
++        throw new Error('GitHub release tarball HTTP 403');
++      },
++    });
++    expect(started.ok).toBe(true);
++    const done = await waitForRemoteUpgradeJob(nodeId);
++    expect(done.state).toBe('failed');
++    expect(done.error).toMatch(/download failed/i);
++    expect(done.error).toContain('HTTP 403');
++  });
++
++  test('push failure records status and upstream code', async () => {
++    const nodeId = 'cc'.repeat(16);
++    const path = tempFile(new Uint8Array([1]));
++    const started = startRemoteUpgradeJob({
++      nodeId,
++      version: '9.9.9',
++      req: authed(nodeId),
++      forward: {
++        async forwardAuthorizedHttp(_req, input) {
++          if (input.method === 'PUT') {
++            return new Response(JSON.stringify({ code: 'PACKAGE_SHA256_MISMATCH' }), {
++              status: 400,
++              headers: { 'content-type': 'application/json' },
++            });
++          }
++          throw new Error(`unexpected ${input.method}`);
++        },
++      },
++      download: async () => ({ path, sha256: 'ee'.repeat(32), bytes: 1 }),
++    });
++    expect(started.ok).toBe(true);
++    const done = await waitForRemoteUpgradeJob(nodeId);
++    expect(done.state).toBe('failed');
++    expect(done.error).toMatch(/push failed/i);
++    expect(done.error).toContain('400');
++    expect(done.error).toContain('PACKAGE_SHA256_MISMATCH');
++  });
++
++  test('a second start while a job is running is UPGRADE_IN_PROGRESS', async () => {
++    const nodeId = 'dd'.repeat(16);
++    const path = tempFile(new Uint8Array([1]));
++    let releaseDownload!: () => void;
++    const gate = new Promise<void>((resolve) => {
++      releaseDownload = resolve;
++    });
++    const forward: AuthorizedUpgradeForward = {
++      async forwardAuthorizedHttp() {
++        return new Response('{}', { status: 200 });
++      },
++    };
++    const first = startRemoteUpgradeJob({
++      nodeId,
++      version: '9.9.9',
++      req: authed(nodeId),
++      forward,
++      download: async () => {
++        await gate;
++        return { path, sha256: 'ff'.repeat(32), bytes: 1 };
++      },
++    });
++    expect(first.ok).toBe(true);
++    const second = startRemoteUpgradeJob({
++      nodeId,
++      version: '9.9.9',
++      req: authed(nodeId),
++      forward,
++      download: async () => ({ path, sha256: 'ff'.repeat(32), bytes: 1 }),
++    });
++    expect(second).toEqual({ ok: false, code: 'UPGRADE_IN_PROGRESS' });
++    releaseDownload();
++    await waitForRemoteUpgradeJob(nodeId);
++  });
++});
+diff --git a/apps/gateway/src/system/remote-upgrade-job.ts b/apps/gateway/src/system/remote-upgrade-job.ts
+new file mode 100644
+index 00000000..212ebf79
+--- /dev/null
++++ b/apps/gateway/src/system/remote-upgrade-job.ts
+@@ -0,0 +1,236 @@
++import { createReadStream, statSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { Readable } from 'node:stream';
++import { getInstallInfo } from './install-info';
++import { downloadVerifiedRelease } from './release-download';
++import { resolveUpgradeInstallDir } from './upgrade';
++import type { AuthorizedUpgradeForward } from './upgrade-service';
++
++const FAILED_TTL_MS = 10 * 60 * 1000;
++
++export type RemoteUpgradeJobState = 'running' | 'failed' | 'handed-off';
++
++export type RemoteUpgradeJobSnapshot = {
++  state: RemoteUpgradeJobState;
++  targetVersion: string;
++  error: string | null;
++  startedAt: string;
++};
++
++export type RemoteUpgradeStartResult =
++  | { ok: true; snapshot: RemoteUpgradeJobSnapshot }
++  | { ok: false; code: 'UPGRADE_IN_PROGRESS' };
++
++type DownloadedRelease = { path: string; sha256: string; bytes: number };
++
++type Job = {
++  nodeId: string;
++  version: string;
++  startedAt: string;
++  state: RemoteUpgradeJobState;
++  error: string | null;
++  finished: Promise<RemoteUpgradeJobSnapshot>;
++};
++
++const jobs = new Map<string, Job>();
++const downloadInflight = new Map<string, Promise<DownloadedRelease>>();
++
++export function resetRemoteUpgradeJobsForTests(): void {
++  jobs.clear();
++  downloadInflight.clear();
++}
++
++export function getRemoteUpgradeJob(
++  nodeId: string,
++  now = Date.now()
++): RemoteUpgradeJobSnapshot | null {
++  const job = jobs.get(nodeId);
++  if (!job) return null;
++  if (job.state === 'failed') {
++    const started = Date.parse(job.startedAt);
++    if (!Number.isFinite(started) || now - started > FAILED_TTL_MS) {
++      jobs.delete(nodeId);
++      return null;
++    }
++  }
++  return snapshotOf(job);
++}
++
++export function consumeHandedOffJob(nodeId: string): boolean {
++  const job = jobs.get(nodeId);
++  if (!job || job.state !== 'handed-off') return false;
++  jobs.delete(nodeId);
++  return true;
++}
++
++export function waitForRemoteUpgradeJob(nodeId: string): Promise<RemoteUpgradeJobSnapshot> {
++  const job = jobs.get(nodeId);
++  if (!job) return Promise.reject(new Error(`no remote upgrade job for ${nodeId}`));
++  return job.finished;
++}
++
++export function startRemoteUpgradeJob(opts: {
++  nodeId: string;
++  version: string;
++  req: Request;
++  forward: AuthorizedUpgradeForward;
++  download?: (version: string) => Promise<DownloadedRelease>;
++  now?: () => number;
++}): RemoteUpgradeStartResult {
++  const existing = jobs.get(opts.nodeId);
++  if (existing?.state === 'running') return { ok: false, code: 'UPGRADE_IN_PROGRESS' };
++
++  const startedAt = new Date((opts.now ?? Date.now)()).toISOString();
++  const detached = detachRequest(opts.req);
++  let resolveFinished!: (snapshot: RemoteUpgradeJobSnapshot) => void;
++  const finished = new Promise<RemoteUpgradeJobSnapshot>((resolve) => {
++    resolveFinished = resolve;
++  });
++  const job: Job = {
++    nodeId: opts.nodeId,
++    version: opts.version,
++    startedAt,
++    state: 'running',
++    error: null,
++    finished,
++  };
++  jobs.set(opts.nodeId, job);
++
++  const download = opts.download ?? defaultDownload;
++  void runJob(job, detached, opts.forward, download).then((snapshot) => resolveFinished(snapshot));
++  return { ok: true, snapshot: snapshotOf(job) };
++}
++
++async function runJob(
++  job: Job,
++  req: Request,
++  forward: AuthorizedUpgradeForward,
++  download: (version: string) => Promise<DownloadedRelease>
++): Promise<RemoteUpgradeJobSnapshot> {
++  let downloaded: DownloadedRelease;
++  try {
++    downloaded = await sharedDownload(job.version, download);
++  } catch (err) {
++    return fail(job, `download failed: ${err instanceof Error ? err.message : String(err)}`);
++  }
++
++  try {
++    const rawBody = fileReadableStream(downloaded.path);
++    const pushed = await forward.forwardAuthorizedHttp(req, {
++      nodeId: job.nodeId,
++      method: 'PUT',
++      path: '/api/system/upgrade/package',
++      query: `?version=${encodeURIComponent(job.version)}&sha256=${downloaded.sha256}`,
++      rawBody,
++      headers: {
++        'content-type': 'application/octet-stream',
++        'content-length': String(downloaded.bytes),
++      },
++    });
++    if (pushed.status < 200 || pushed.status >= 300) {
++      return fail(job, `push failed: ${await describeUpstream(pushed)}`);
++    }
++    await pushed.body?.cancel().catch(() => {});
++  } catch (err) {
++    return fail(job, `push failed: ${err instanceof Error ? err.message : String(err)}`);
++  }
++
++  try {
++    const started = await forward.forwardAuthorizedHttp(req, {
++      nodeId: job.nodeId,
++      method: 'POST',
++      path: '/api/system/upgrade',
++      body: { version: job.version, source: 'staged', sha256: downloaded.sha256 },
++    });
++    if (started.status < 200 || started.status >= 300) {
++      return fail(job, `start failed: ${await describeUpstream(started)}`);
++    }
++    await started.body?.cancel().catch(() => {});
++  } catch (err) {
++    return fail(job, `start failed: ${err instanceof Error ? err.message : String(err)}`);
++  }
++
++  job.state = 'handed-off';
++  job.error = null;
++  return snapshotOf(job);
++}
++
++function fail(job: Job, error: string): RemoteUpgradeJobSnapshot {
++  job.state = 'failed';
++  job.error = error;
++  return snapshotOf(job);
++}
++
++function snapshotOf(job: Job): RemoteUpgradeJobSnapshot {
++  return {
++    state: job.state,
++    targetVersion: job.version,
++    error: job.error,
++    startedAt: job.startedAt,
++  };
++}
++
++function sharedDownload(
++  version: string,
++  download: (version: string) => Promise<DownloadedRelease>
++): Promise<DownloadedRelease> {
++  const existing = downloadInflight.get(version);
++  if (existing) return existing;
++  const pending = download(version).finally(() => {
++    if (downloadInflight.get(version) === pending) downloadInflight.delete(version);
++  });
++  downloadInflight.set(version, pending);
++  return pending;
++}
++
++async function defaultDownload(version: string): Promise<DownloadedRelease> {
++  return downloadVerifiedRelease(version, { cacheDir: resolveReleaseCacheDir() });
++}
++
++export function resolveReleaseCacheDir(): string {
++  const override = process.env.TMEX_RELEASE_CACHE_DIR?.trim();
++  if (override) return override;
++  const installDir = resolveUpgradeInstallDir(getInstallInfo());
++  if (installDir) return join(installDir, 'staging', 'release-cache');
++  return join(tmpdir(), 'tmex-release-cache');
++}
++
++function detachRequest(req: Request): Request {
++  const headers = new Headers();
++  const cookie = req.headers.get('cookie');
++  if (cookie) headers.set('cookie', cookie);
++  const origin = req.headers.get('origin');
++  if (origin) headers.set('origin', origin);
++  return new Request(req.url, { headers });
++}
++
++function fileReadableStream(path: string): ReadableStream<Uint8Array> {
++  const size = statSync(path).size;
++  if (size === 0) {
++    return new ReadableStream({
++      start(controller) {
++        controller.close();
++      },
++    });
++  }
++  return Readable.toWeb(createReadStream(path)) as unknown as ReadableStream<Uint8Array>;
++}
++
++async function describeUpstream(res: Response): Promise<string> {
++  const text = (await res.text().catch(() => '')).slice(0, 800);
++  let extra = text;
++  try {
++    const parsed: unknown = JSON.parse(text);
++    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
++      const code = (parsed as { code?: unknown }).code;
++      const error = (parsed as { error?: unknown }).error;
++      extra = [typeof code === 'string' ? code : null, typeof error === 'string' ? error : null]
++        .filter(Boolean)
++        .join(' ');
++    }
++  } catch {
++    // keep raw text
++  }
++  return `HTTP ${res.status}${extra ? ` ${extra}` : ''}`.trim();
++}
+diff --git a/apps/gateway/src/system/upgrade-service.test.ts b/apps/gateway/src/system/upgrade-service.test.ts
+index 419be5d1..2b7fed80 100644
+--- a/apps/gateway/src/system/upgrade-service.test.ts
++++ b/apps/gateway/src/system/upgrade-service.test.ts
+@@ -3,9 +3,12 @@ import { releaseTarballName } from '@tmex/shared';
+ import type { SystemInfo } from '@tmex/shared';
+ import type { UserStore } from '../auth/user-store';
+ import * as infoPublic from './info-public';
++import { resetReleaseDownloadForTests } from './release-download';
++import { resetRemoteUpgradeJobsForTests, waitForRemoteUpgradeJob } from './remote-upgrade-job';
+ import { upgradeController } from './upgrade';
+ import {
+   handleMeshNodeUpgradeStart,
++  handleMeshNodeUpgradeStatus,
+   isAlreadyAtOrAboveLatest,
+   mapForwardedUpgradeResponse,
+ } from './upgrade-service';
+@@ -14,6 +17,8 @@ const originalFetch = globalThis.fetch;
+ 
+ afterEach(() => {
+   globalThis.fetch = originalFetch;
++  resetRemoteUpgradeJobsForTests();
++  resetReleaseDownloadForTests();
+ });
+ 
+ describe('isAlreadyAtOrAboveLatest', () => {
+@@ -289,6 +294,275 @@ describe('handleMeshNodeUpgradeStart remote info fail-closed', () => {
+   });
+ });
+ 
++describe('handleMeshNodeUpgradeStart staged-package job', () => {
++  const localNodeId = 'cd'.repeat(16);
++  const nodeId = 'ab'.repeat(16);
++
++  test('capability present returns downloading immediately and does not POST release', async () => {
++    mockGithubLatest('9.9.9');
++    const calls: string[] = [];
++    const res = await handleMeshNodeUpgradeStart({
++      req: authedRequest(nodeId),
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward: {
++        async forwardAuthorizedHttp(_req, input) {
++          calls.push(`${input.method} ${input.path}`);
++          if (input.path === '/api/system/info') {
++            return new Response(
++              JSON.stringify({
++                baseVersion: '1.0.0',
++                canSelfUpdate: true,
++                upgradeCapabilities: ['staged-package'],
++              }),
++              { status: 200, headers: { 'content-type': 'application/json' } }
++            );
++          }
++          return new Response(JSON.stringify({ code: 'not-reached' }), { status: 500 });
++        },
++      },
++    });
++    expect(res.status).toBe(200);
++    const body = (await res.json()) as { state: string; targetVersion: string; error: null };
++    expect(body.state).toBe('downloading');
++    expect(body.targetVersion).toBe('9.9.9');
++    expect(body.error).toBeNull();
++    expect(calls).toEqual(['GET /api/system/info']);
++  });
++
++  test('legacy target without the capability still POSTs {version} and waits', async () => {
++    mockGithubLatest('9.9.9');
++    const calls: Array<{ method: string; path: string; body?: unknown }> = [];
++    const res = await handleMeshNodeUpgradeStart({
++      req: authedRequest(nodeId),
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward: {
++        async forwardAuthorizedHttp(_req, input) {
++          calls.push({ method: input.method, path: input.path, body: input.body });
++          if (input.path === '/api/system/info') {
++            return new Response(JSON.stringify({ baseVersion: '1.0.0', canSelfUpdate: true }), {
++              status: 200,
++              headers: { 'content-type': 'application/json' },
++            });
++          }
++          return new Response(
++            JSON.stringify({
++              state: 'downloading',
++              targetVersion: '9.9.9',
++              error: null,
++              startedAt: '2026-08-30T00:00:00.000Z',
++            }),
++            { status: 200, headers: { 'content-type': 'application/json' } }
++          );
++        },
++      },
++    });
++    expect(res.status).toBe(200);
++    expect(calls).toEqual([
++      { method: 'GET', path: '/api/system/info', body: undefined },
++      { method: 'POST', path: '/api/system/upgrade', body: { version: '9.9.9' } },
++    ]);
++  });
++});
++
++describe('handleMeshNodeUpgradeStatus job overlay', () => {
++  const localNodeId = 'cd'.repeat(16);
++  const nodeId = 'ab'.repeat(16);
++
++  test('running job is reported as downloading without forwarding', async () => {
++    let releaseDownload!: () => void;
++    const gate = new Promise<void>((resolve) => {
++      releaseDownload = resolve;
++    });
++    mockGithubLatest('9.9.9');
++    const latestFetch = globalThis.fetch;
++    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      if (url.includes('api.github.com')) return latestFetch(input, init);
++      await gate;
++      return new Response('nope', { status: 500 });
++    }) as typeof fetch;
++    const forwarded: string[] = [];
++    const req = authedRequest(nodeId);
++    const forward = {
++      async forwardAuthorizedHttp(_req: Request, input: { method: string; path: string }) {
++        forwarded.push(`${input.method} ${input.path}`);
++        if (input.path === '/api/system/info') {
++          return new Response(
++            JSON.stringify({
++              baseVersion: '1.0.0',
++              canSelfUpdate: true,
++              upgradeCapabilities: ['staged-package'],
++            }),
++            { status: 200, headers: { 'content-type': 'application/json' } }
++          );
++        }
++        return new Response('{}', { status: 200 });
++      },
++    };
++    await handleMeshNodeUpgradeStart({
++      req,
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward,
++    });
++    const status = await handleMeshNodeUpgradeStatus({
++      req,
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward,
++    });
++    expect(status.status).toBe(200);
++    const body = (await status.json()) as { state: string; targetVersion: string; error: null };
++    expect(body.state).toBe('downloading');
++    expect(body.targetVersion).toBe('9.9.9');
++    expect(forwarded.filter((c) => c === 'GET /api/system/upgrade')).toEqual([]);
++    releaseDownload();
++    await waitForRemoteUpgradeJob(nodeId).catch(() => {});
++  });
++
++  test('failed job is reported as idle with the step error and does not forward', async () => {
++    mockGithubLatest('8.8.8');
++    const latestFetch = globalThis.fetch;
++    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      if (url.includes('api.github.com')) return latestFetch(input, init);
++      return new Response('nope', { status: 403 });
++    }) as typeof fetch;
++    const forwarded: string[] = [];
++    const req = authedRequest(nodeId);
++    const forward = {
++      async forwardAuthorizedHttp(_req: Request, input: { method: string; path: string }) {
++        forwarded.push(`${input.method} ${input.path}`);
++        if (input.path === '/api/system/info') {
++          return new Response(
++            JSON.stringify({
++              baseVersion: '1.0.0',
++              canSelfUpdate: true,
++              upgradeCapabilities: ['staged-package'],
++            }),
++            { status: 200, headers: { 'content-type': 'application/json' } }
++          );
++        }
++        return new Response('{}', { status: 200 });
++      },
++    };
++    await handleMeshNodeUpgradeStart({
++      req,
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward,
++    });
++    await waitForRemoteUpgradeJob(nodeId);
++    const status = await handleMeshNodeUpgradeStatus({
++      req,
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward,
++    });
++    expect(status.status).toBe(200);
++    const body = (await status.json()) as {
++      state: string;
++      targetVersion: null;
++      error: string;
++    };
++    expect(body.state).toBe('idle');
++    expect(body.targetVersion).toBeNull();
++    expect(body.error).toMatch(/download failed/i);
++    expect(forwarded.filter((c) => c === 'GET /api/system/upgrade')).toEqual([]);
++  });
++
++  test('handed-off job is dropped and status is forwarded', async () => {
++    mockGithubLatest('9.9.9');
++    const req = authedRequest(nodeId);
++    const forward = {
++      async forwardAuthorizedHttp(
++        _req: Request,
++        input: { method: string; path: string; body?: unknown }
++      ) {
++        if (input.path === '/api/system/info') {
++          return new Response(
++            JSON.stringify({
++              baseVersion: '1.0.0',
++              canSelfUpdate: true,
++              upgradeCapabilities: ['staged-package'],
++            }),
++            { status: 200, headers: { 'content-type': 'application/json' } }
++          );
++        }
++        if (input.path === '/api/system/upgrade/package' || input.method === 'PUT') {
++          return new Response('{}', { status: 200 });
++        }
++        if (input.method === 'POST' && input.path === '/api/system/upgrade') {
++          return new Response(
++            JSON.stringify({
++              state: 'downloading',
++              targetVersion: '9.9.9',
++              error: null,
++              startedAt: '2026-09-01T00:00:00.000Z',
++            }),
++            { status: 200, headers: { 'content-type': 'application/json' } }
++          );
++        }
++        return new Response(
++          JSON.stringify({
++            state: 'executing',
++            targetVersion: '9.9.9',
++            error: null,
++            startedAt: '2026-09-01T00:00:00.000Z',
++          }),
++          { status: 200, headers: { 'content-type': 'application/json' } }
++        );
++      },
++    };
++    // The job will try to download from GitHub; stub tarball + sums so it can finish.
++    const payload = new Uint8Array([1, 2, 3]);
++    const { createHash } = await import('node:crypto');
++    const hex = createHash('sha256').update(payload).digest('hex');
++    const latestFetch = globalThis.fetch;
++    globalThis.fetch = (async (input: RequestInfo | URL) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      if (url.includes('SHA256SUMS')) {
++        return new Response(`${hex}  tmex-cli-9.9.9.tgz\n`, { status: 200 });
++      }
++      if (url.includes('tmex-cli-')) {
++        return new Response(payload, { status: 200 });
++      }
++      return latestFetch(input);
++    }) as typeof fetch;
++
++    await handleMeshNodeUpgradeStart({
++      req,
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward,
++    });
++    await waitForRemoteUpgradeJob(nodeId);
++    const status = await handleMeshNodeUpgradeStatus({
++      req,
++      nodeId,
++      localNodeId,
++      userStore: enrolledStore(nodeId),
++      forward,
++    });
++    expect(status.status).toBe(200);
++    expect(await status.json()).toEqual({
++      state: 'executing',
++      targetVersion: '9.9.9',
++      error: null,
++      startedAt: '2026-09-01T00:00:00.000Z',
++    });
++  });
++});
++
+ function stubUserStore(): UserStore {
+   return { listCerts: () => [] } as unknown as UserStore;
+ }
+diff --git a/apps/gateway/src/system/upgrade-service.ts b/apps/gateway/src/system/upgrade-service.ts
+index e5e4c40b..69bd983d 100644
+--- a/apps/gateway/src/system/upgrade-service.ts
++++ b/apps/gateway/src/system/upgrade-service.ts
+@@ -4,6 +4,11 @@ import type { UserStore } from '../auth/user-store';
+ import { MESH_VIA_SELF } from '../mesh/mesh-deps';
+ import { jsonBody, jsonError } from '../mesh/session-middleware';
+ import { getSystemInfo } from './info-public';
++import {
++  consumeHandedOffJob,
++  getRemoteUpgradeJob,
++  startRemoteUpgradeJob,
++} from './remote-upgrade-job';
+ import { compareVersions } from './semver';
+ import { requireLatestUpgradeRelease } from './update-check';
+ 
+@@ -11,11 +16,18 @@ const RELEASE_VERSION_PATTERN = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
+ const REMOTE_UPGRADE_JSON_MAX_BYTES = 64 * 1024;
+ const UPGRADE_STATES = new Set<UpgradeState>(['idle', 'downloading', 'executing']);
+ 
++export type AuthorizedUpgradeForwardInput = {
++  nodeId: string;
++  method: string;
++  path: string;
++  query?: string;
++  body?: unknown;
++  rawBody?: ReadableStream<Uint8Array>;
++  headers?: Record<string, string>;
++};
++
+ export type AuthorizedUpgradeForward = {
+-  forwardAuthorizedHttp: (
+-    req: Request,
+-    input: { nodeId: string; method: string; path: string; body?: unknown }
+-  ) => Promise<Response>;
++  forwardAuthorizedHttp: (req: Request, input: AuthorizedUpgradeForwardInput) => Promise<Response>;
+ };
+ 
+ export function isLocalUpgradeNode(localNodeId: string, nodeId: string): boolean {
+@@ -107,6 +119,24 @@ export async function handleMeshNodeUpgradeStatus(opts: {
+   if (!readNodeSession(req, nodeId)) {
+     return jsonError('NODE_LOGIN_REQUIRED', 401, { nodeId });
+   }
++  consumeHandedOffJob(nodeId);
++  const job = getRemoteUpgradeJob(nodeId);
++  if (job?.state === 'running') {
++    return jsonBody({
++      state: 'downloading' as const,
++      targetVersion: job.targetVersion,
++      error: null,
++      startedAt: job.startedAt,
++    });
++  }
++  if (job?.state === 'failed') {
++    return jsonBody({
++      state: 'idle' as const,
++      targetVersion: null,
++      error: job.error,
++      startedAt: job.startedAt,
++    });
++  }
+   const upstream = await forward.forwardAuthorizedHttp(req, {
+     nodeId,
+     method: 'GET',
+@@ -121,10 +151,15 @@ export async function readLocalUpgradeStatus(): Promise<UpgradeStatus> {
+ }
+ 
+ export async function startLocalUpgradeAttempt(
+-  version: string
++  version: string,
++  opts?: { source?: 'release' | 'staged'; sha256?: string }
+ ): Promise<
+   | { ok: true; status: UpgradeStatus }
+-  | { ok: false; code: 'UPGRADE_NOT_ALLOWED' | 'UPGRADE_IN_PROGRESS'; status: UpgradeStatus }
++  | {
++      ok: false;
++      code: 'UPGRADE_NOT_ALLOWED' | 'UPGRADE_IN_PROGRESS' | 'PACKAGE_NOT_STAGED';
++      status: UpgradeStatus;
++    }
+ > {
+   const info = getSystemInfo();
+   if (!info.canSelfUpdate) {
+@@ -135,10 +170,10 @@ export async function startLocalUpgradeAttempt(
+     };
+   }
+   const { upgradeController } = await import('./upgrade');
+-  const started = upgradeController.start(version);
++  const started = upgradeController.tryStart(version, opts);
+   const status = upgradeController.status();
+-  if (!started) {
+-    return { ok: false, code: 'UPGRADE_IN_PROGRESS', status };
++  if (!started.ok) {
++    return { ok: false, code: started.code, status };
+   }
+   return { ok: true, status };
+ }
+@@ -220,6 +255,24 @@ async function startRemoteMeshUpgrade(
+     });
+   }
+ 
++  if (hasStagedPackageCapability(info.upgradeCapabilities)) {
++    const started = startRemoteUpgradeJob({
++      nodeId,
++      version: latestVersion,
++      req,
++      forward,
++    });
++    if (!started.ok) {
++      return jsonError('UPGRADE_IN_PROGRESS', 409, { nodeId });
++    }
++    return jsonBody({
++      state: 'downloading',
++      targetVersion: latestVersion,
++      error: null,
++      startedAt: started.snapshot.startedAt,
++    });
++  }
++
+   const started = await forward.forwardAuthorizedHttp(req, {
+     nodeId,
+     method: 'POST',
+@@ -229,6 +282,10 @@ async function startRemoteMeshUpgrade(
+   return mapForwardedUpgradeResponse(nodeId, started);
+ }
+ 
++function hasStagedPackageCapability(raw: unknown): boolean {
++  return Array.isArray(raw) && raw.includes('staged-package');
++}
++
+ function readNodeSession(req: Request, nodeId: string): string | null {
+   return parseCookies(req.headers.get('cookie')).get(nodeSessionCookieName(nodeId)) ?? null;
+ }
+diff --git a/apps/gateway/src/system/upgrade.test.ts b/apps/gateway/src/system/upgrade.test.ts
+index 21dcf79e..2dd5bc42 100644
+--- a/apps/gateway/src/system/upgrade.test.ts
++++ b/apps/gateway/src/system/upgrade.test.ts
+@@ -8,6 +8,7 @@ import { join } from 'node:path';
+ import { releaseTarballName, releaseTarballUrl } from '@tmex/shared';
+ import type { InstallInfo } from './install-info';
+ import {
++  STAGED_PACKAGE_MAX_BYTES,
+   UpgradeController,
+   assertExtractedCliPackage,
+   cmdlineOwnsInstallRuntime,
+@@ -525,6 +526,160 @@ describe('stageGithubRelease checksums', () => {
+   });
+ });
+ 
++describe('staged package', () => {
++  function makeInstall(): InstallInfo {
++    const dir = tempDir('tmex-upg-staged-');
++    return {
++      installedViaCli: true,
++      deployment: 'launchd',
++      installDir: dir,
++      serviceName: 'tmex',
++      cliVersion: '1.1.0',
++      bunPath: '/usr/bin/bun',
++    };
++  }
++
++  function bytesStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
++    return new ReadableStream({
++      start(controller) {
++        controller.enqueue(bytes);
++        controller.close();
++      },
++    });
++  }
++
++  async function settle(): Promise<void> {
++    await new Promise((resolve) => setTimeout(resolve, 20));
++  }
++
++  test('PUT happy path writes tarball, sidecar, and remembers the package', async () => {
++    const install = makeInstall();
++    const controller = new UpgradeController({ getInstallInfo: () => install });
++    const bytes = packFakeCliTarball('1.2.3');
++    const hex = sha256Hex(bytes);
++    const result = await controller.stagePackage('1.2.3', hex, bytesStream(bytes));
++    expect(result).toEqual({
++      ok: true,
++      version: '1.2.3',
++      sha256: hex,
++      bytes: bytes.byteLength,
++    });
++    const stagedPath = join(
++      install.installDir as string,
++      'staging',
++      'staged',
++      'tmex-cli-1.2.3.tgz'
++    );
++    expect(existsSync(stagedPath)).toBe(true);
++    expect(readFileSync(stagedPath)).toEqual(Buffer.from(bytes));
++    const sidecar = JSON.parse(
++      readFileSync(
++        join(install.installDir as string, 'staging', 'staged', 'tmex-cli-1.2.3.json'),
++        'utf8'
++      )
++    ) as { version: string; sha256: string; bytes: number };
++    expect(sidecar.version).toBe('1.2.3');
++    expect(sidecar.sha256).toBe(hex);
++    expect(sidecar.bytes).toBe(bytes.byteLength);
++  });
++
++  test('PUT sha256 mismatch deletes the part file and returns PACKAGE_SHA256_MISMATCH', async () => {
++    const install = makeInstall();
++    const controller = new UpgradeController({ getInstallInfo: () => install });
++    const bytes = packFakeCliTarball('1.2.3');
++    const result = await controller.stagePackage('1.2.3', '0'.repeat(64), bytesStream(bytes));
++    expect(result).toEqual({ ok: false, status: 400, code: 'PACKAGE_SHA256_MISMATCH' });
++    const stagedDir = join(install.installDir as string, 'staging', 'staged');
++    expect(existsSync(join(stagedDir, 'tmex-cli-1.2.3.tgz'))).toBe(false);
++    expect(existsSync(join(stagedDir, 'tmex-cli-1.2.3.tgz.part'))).toBe(false);
++  });
++
++  test('PUT over the size cap returns 413 and does not keep the part', async () => {
++    const install = makeInstall();
++    const controller = new UpgradeController({
++      getInstallInfo: () => install,
++      maxPackageBytes: 32,
++    });
++    const bytes = new Uint8Array(64).fill(7);
++    const result = await controller.stagePackage('1.2.3', sha256Hex(bytes), bytesStream(bytes));
++    expect(result).toEqual({ ok: false, status: 413, code: 'PACKAGE_TOO_LARGE' });
++    expect(
++      existsSync(join(install.installDir as string, 'staging', 'staged', 'tmex-cli-1.2.3.tgz'))
++    ).toBe(false);
++    expect(
++      existsSync(join(install.installDir as string, 'staging', 'staged', 'tmex-cli-1.2.3.tgz.part'))
++    ).toBe(false);
++  });
++
++  test('PUT while an upgrade is in progress returns UPGRADE_IN_PROGRESS', async () => {
++    const install = makeInstall();
++    const child = new EventEmitter() as EventEmitter & { unref: () => void };
++    child.unref = () => undefined;
++    const controller = new UpgradeController({
++      getInstallInfo: () => install,
++      stageRelease: async () => '/tmp/pkg/bin/tmex.js',
++      spawn: () => child as unknown as ChildProcess,
++    });
++    expect(controller.start('9.9.9')).toBe(true);
++    const bytes = new Uint8Array([1, 2, 3]);
++    const result = await controller.stagePackage('1.2.3', sha256Hex(bytes), bytesStream(bytes));
++    expect(result).toEqual({ ok: false, status: 409, code: 'UPGRADE_IN_PROGRESS' });
++    child.emit('spawn');
++    await settle();
++  });
++
++  test('POST staged extracts the staged tarball and continues to executing', async () => {
++    const install = makeInstall();
++    const child = new EventEmitter() as EventEmitter & { unref: () => void };
++    child.unref = () => undefined;
++    const controller = new UpgradeController({
++      getInstallInfo: () => install,
++      spawn: () => child as unknown as ChildProcess,
++    });
++    const bytes = packFakeCliTarball('1.2.3');
++    const hex = sha256Hex(bytes);
++    const staged = await controller.stagePackage('1.2.3', hex, bytesStream(bytes));
++    expect(staged.ok).toBe(true);
++    const started = controller.tryStart('1.2.3', { source: 'staged', sha256: hex });
++    expect(started).toEqual({ ok: true });
++    expect(controller.status().state).toBe('downloading');
++    await settle();
++    child.emit('spawn');
++    await settle();
++    expect(controller.status().state).toBe('executing');
++  });
++
++  test('POST staged without a staged package returns PACKAGE_NOT_STAGED and stays idle', async () => {
++    const controller = new UpgradeController({ getInstallInfo: () => makeInstall() });
++    const started = controller.tryStart('1.2.3', { source: 'staged' });
++    expect(started).toEqual({ ok: false, code: 'PACKAGE_NOT_STAGED' });
++    expect(controller.status().state).toBe('idle');
++  });
++
++  test('a new controller reloads the sidecar after a simulated restart', async () => {
++    const install = makeInstall();
++    const first = new UpgradeController({ getInstallInfo: () => install });
++    const bytes = packFakeCliTarball('2.0.0');
++    const hex = sha256Hex(bytes);
++    expect((await first.stagePackage('2.0.0', hex, bytesStream(bytes))).ok).toBe(true);
++    const child = new EventEmitter() as EventEmitter & { unref: () => void };
++    child.unref = () => undefined;
++    const second = new UpgradeController({
++      getInstallInfo: () => install,
++      spawn: () => child as unknown as ChildProcess,
++    });
++    const started = second.tryStart('2.0.0', { source: 'staged', sha256: hex });
++    expect(started.ok).toBe(true);
++    await settle();
++    child.emit('spawn');
++    await settle();
++  });
++
++  test('STAGED_PACKAGE_MAX_BYTES is 256 MiB', () => {
++    expect(STAGED_PACKAGE_MAX_BYTES).toBe(256 * 1024 * 1024);
++  });
++});
++
+ describe('cmdlineOwnsInstallRuntime', () => {
+   test('requires bun/node and an argv token equal to the runtime path', () => {
+     const dir = '/tmp/tmex-install-own';
+diff --git a/apps/gateway/src/system/upgrade.ts b/apps/gateway/src/system/upgrade.ts
+index e64425b7..f4f13c4b 100644
+--- a/apps/gateway/src/system/upgrade.ts
++++ b/apps/gateway/src/system/upgrade.ts
+@@ -1,16 +1,24 @@
+ import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
+ import { createHash } from 'node:crypto';
+-import { closeSync, existsSync, openSync, readFileSync, realpathSync } from 'node:fs';
+-import { mkdir, rm, writeFile } from 'node:fs/promises';
++import { closeSync, existsSync, openSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
++import { chmod, mkdir, open, rename, rm, writeFile } from 'node:fs/promises';
+ import { basename, dirname, join } from 'node:path';
+ import type { UpgradeState, UpgradeStatus } from '@tmex/shared';
+-import { releaseTarballName, releaseTarballUrl } from '@tmex/shared';
++import { releaseTarballName } from '@tmex/shared';
+ import { type InstallInfo, getInstallInfo } from './install-info';
+-import { compareVersions } from './semver';
++import { downloadVerifiedRelease, sha256Hex } from './release-download';
+ 
+-const CHECKSUMS_REQUIRED_SINCE = '1.1.4';
++export {
++  assertReleaseIntegrity,
++  fetchReleaseSha256Sums,
++  parseSha256Sums,
++  releaseSha256SumsUrl,
++  sha256Hex,
++} from './release-download';
+ 
+-const TARBALL_FETCH_TIMEOUT_MS = 120_000;
++export const STAGED_PACKAGE_MAX_BYTES = 256 * 1024 * 1024;
++const STAGED_PACKAGE_TTL_MS = 24 * 60 * 60 * 1000;
++const STAGED_PACKAGE_MAX_COUNT = 2;
+ 
+ function createTxnId(): string {
+   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+@@ -45,8 +53,34 @@ export type UpgradeControllerDeps = {
+   stageRelease?: (stageDir: string, version: string) => Promise<string>;
+   processCommandLine?: ProcessCommandLineFn;
+   processStartIdentity?: ProcessStartIdentityFn;
++  maxPackageBytes?: number;
++  now?: () => number;
+ };
+ 
++export type UpgradeStartOpts = {
++  source?: 'release' | 'staged';
++  sha256?: string;
++};
++
++export type UpgradeStartResult =
++  | { ok: true }
++  | { ok: false; code: 'UPGRADE_IN_PROGRESS' | 'PACKAGE_NOT_STAGED' };
++
++export type StagedPackageRecord = {
++  version: string;
++  sha256: string;
++  path: string;
++  bytes: number;
++  stagedAt: string;
++};
++
++export type StagePackageResult =
++  | { ok: true; version: string; sha256: string; bytes: number }
++  | { ok: false; status: 400; code: 'PACKAGE_SHA256_MISMATCH' | 'BAD_REQUEST' }
++  | { ok: false; status: 409; code: 'UPGRADE_IN_PROGRESS' }
++  | { ok: false; status: 413; code: 'PACKAGE_TOO_LARGE' }
++  | { ok: false; status: 500; code: 'STAGE_FAILED' };
++
+ /**
+  * 全局唯一升级状态机：idle / downloading / executing。
+  *
+@@ -98,6 +132,8 @@ export class UpgradeController {
+   private targetVersion: string | null = null;
+   private error: string | null = null;
+   private startedAt: string | null = null;
++  private readonly staged = new Map<string, StagedPackageRecord>();
++  private stagedLoaded = false;
+ 
+   constructor(private readonly deps: UpgradeControllerDeps = {}) {}
+ 
+@@ -114,18 +150,215 @@ export class UpgradeController {
+     return this.state !== 'idle';
+   }
+ 
++  resetForTests(): void {
++    this.state = 'idle';
++    this.targetVersion = null;
++    this.error = null;
++    this.startedAt = null;
++    this.pendingEarlyExit = null;
++    this.staged.clear();
++    this.stagedLoaded = false;
++  }
++
+   /** 进入升级流程；返回 false 表示已忙（并发触发）。下载/执行异步进行，不阻塞调用方。 */
+-  start(version: string): boolean {
+-    if (this.isBusy()) return false;
++  start(version: string, opts?: UpgradeStartOpts): boolean {
++    return this.tryStart(version, opts).ok;
++  }
++
++  tryStart(version: string, opts?: UpgradeStartOpts): UpgradeStartResult {
++    if (this.isBusy()) return { ok: false, code: 'UPGRADE_IN_PROGRESS' };
++    const source = opts?.source ?? 'release';
++    if (source === 'staged') {
++      const staged = this.requireStaged(version, opts?.sha256);
++      if (!staged) return { ok: false, code: 'PACKAGE_NOT_STAGED' };
++    }
+     this.state = 'downloading';
+     this.targetVersion = version;
+     this.error = null;
+     this.startedAt = new Date().toISOString();
+-    void this.run(version);
+-    return true;
++    void this.run(version, opts);
++    return { ok: true };
++  }
++
++  async stagePackage(
++    version: string,
++    sha256: string,
++    body: ReadableStream<Uint8Array> | null
++  ): Promise<StagePackageResult> {
++    if (this.isBusy()) return { ok: false, status: 409, code: 'UPGRADE_IN_PROGRESS' };
++    const expected = sha256.trim().toLowerCase();
++    if (!/^[0-9a-f]{64}$/.test(expected)) {
++      return { ok: false, status: 400, code: 'BAD_REQUEST' };
++    }
++    const install = (this.deps.getInstallInfo ?? getInstallInfo)();
++    const installDir = resolveUpgradeInstallDir(install);
++    if (!installDir) {
++      return { ok: false, status: 500, code: 'STAGE_FAILED' };
++    }
++    if (!body) return { ok: false, status: 400, code: 'BAD_REQUEST' };
++
++    const stagedDir = join(installDir, 'staging', 'staged');
++    await mkdir(stagedDir, { recursive: true, mode: 0o700 });
++    const finalPath = join(stagedDir, releaseTarballName(version));
++    const partPath = `${finalPath}.part`;
++    const sidecarPath = join(stagedDir, `tmex-cli-${version}.json`);
++    const maxBytes = this.deps.maxPackageBytes ?? STAGED_PACKAGE_MAX_BYTES;
++    const hash = createHash('sha256');
++    let bytes = 0;
++    const reader = body.getReader();
++    let fh: Awaited<ReturnType<typeof open>> | null = null;
++    try {
++      fh = await open(partPath, 'w', 0o600);
++      while (true) {
++        const { done, value } = await reader.read();
++        if (done) break;
++        if (!value?.byteLength) continue;
++        bytes += value.byteLength;
++        if (bytes > maxBytes) {
++          await reader.cancel().catch(() => {});
++          await fh.close().catch(() => {});
++          fh = null;
++          await rm(partPath, { force: true });
++          return { ok: false, status: 413, code: 'PACKAGE_TOO_LARGE' };
++        }
++        hash.update(value);
++        await fh.write(value);
++      }
++      await fh.close();
++      fh = null;
++    } catch {
++      await fh?.close().catch(() => {});
++      fh = null;
++      await rm(partPath, { force: true }).catch(() => {});
++      return { ok: false, status: 500, code: 'STAGE_FAILED' };
++    }
++
++    const digest = hash.digest('hex');
++    if (digest !== expected) {
++      await rm(partPath, { force: true }).catch(() => {});
++      return { ok: false, status: 400, code: 'PACKAGE_SHA256_MISMATCH' };
++    }
++
++    await rm(finalPath, { force: true }).catch(() => {});
++    await rename(partPath, finalPath);
++    await chmod(finalPath, 0o600).catch(() => {});
++    const record: StagedPackageRecord = {
++      version,
++      sha256: digest,
++      path: finalPath,
++      bytes,
++      stagedAt: new Date((this.deps.now ?? Date.now)()).toISOString(),
++    };
++    await writeFile(sidecarPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
++    this.loadStagedFromDisk(installDir);
++    this.staged.set(version, record);
++    await this.pruneStaged(installDir, version);
++    return { ok: true, version, sha256: digest, bytes };
++  }
++
++  private requireStaged(version: string, sha256?: string): StagedPackageRecord | null {
++    const install = (this.deps.getInstallInfo ?? getInstallInfo)();
++    const installDir = resolveUpgradeInstallDir(install);
++    if (!installDir) return null;
++    this.loadStagedFromDisk(installDir);
++    this.dropExpiredStaged(installDir);
++    const record = this.staged.get(version);
++    if (!record) return null;
++    if (!existsSync(record.path)) {
++      this.staged.delete(version);
++      return null;
++    }
++    const expected = sha256?.trim().toLowerCase();
++    if (expected && expected !== record.sha256) return null;
++    try {
++      const bytes = new Uint8Array(readFileSync(record.path));
++      if (sha256Hex(bytes) !== record.sha256) {
++        this.staged.delete(version);
++        return null;
++      }
++      if (expected && sha256Hex(bytes) !== expected) return null;
++    } catch {
++      this.staged.delete(version);
++      return null;
++    }
++    return record;
++  }
++
++  private loadStagedFromDisk(installDir: string): void {
++    if (this.stagedLoaded) return;
++    this.stagedLoaded = true;
++    const stagedDir = join(installDir, 'staging', 'staged');
++    if (!existsSync(stagedDir)) return;
++    let names: string[] = [];
++    try {
++      names = readdirSync(stagedDir);
++    } catch {
++      return;
++    }
++    for (const name of names) {
++      if (!name.endsWith('.json')) continue;
++      try {
++        const parsed = JSON.parse(
++          readFileSync(join(stagedDir, name), 'utf8')
++        ) as Partial<StagedPackageRecord>;
++        if (
++          typeof parsed.version !== 'string' ||
++          typeof parsed.sha256 !== 'string' ||
++          typeof parsed.path !== 'string' ||
++          typeof parsed.bytes !== 'number' ||
++          typeof parsed.stagedAt !== 'string'
++        ) {
++          continue;
++        }
++        if (!existsSync(parsed.path)) continue;
++        this.staged.set(parsed.version, {
++          version: parsed.version,
++          sha256: parsed.sha256.toLowerCase(),
++          path: parsed.path,
++          bytes: parsed.bytes,
++          stagedAt: parsed.stagedAt,
++        });
++      } catch {
++        // skip corrupt sidecar
++      }
++    }
++  }
++
++  private dropExpiredStaged(installDir: string): void {
++    const now = (this.deps.now ?? Date.now)();
++    for (const [version, record] of this.staged) {
++      const at = Date.parse(record.stagedAt);
++      if (!Number.isFinite(at) || now - at > STAGED_PACKAGE_TTL_MS) {
++        this.staged.delete(version);
++        void rm(record.path, { force: true }).catch(() => {});
++        void rm(join(installDir, 'staging', 'staged', `tmex-cli-${version}.json`), {
++          force: true,
++        }).catch(() => {});
++      }
++    }
+   }
+ 
+-  private async run(version: string): Promise<void> {
++  private async pruneStaged(installDir: string, keepVersion: string): Promise<void> {
++    this.dropExpiredStaged(installDir);
++    const records = [...this.staged.values()].sort(
++      (a, b) => Date.parse(b.stagedAt) - Date.parse(a.stagedAt)
++    );
++    const keep = new Set<string>([keepVersion]);
++    for (const record of records) {
++      if (keep.size >= STAGED_PACKAGE_MAX_COUNT) break;
++      keep.add(record.version);
++    }
++    for (const [version, record] of this.staged) {
++      if (keep.has(version)) continue;
++      this.staged.delete(version);
++      await rm(record.path, { force: true }).catch(() => {});
++      await rm(join(installDir, 'staging', 'staged', `tmex-cli-${version}.json`), {
++        force: true,
++      }).catch(() => {});
++    }
++  }
++
++  private async run(version: string, opts?: UpgradeStartOpts): Promise<void> {
+     const install = (this.deps.getInstallInfo ?? getInstallInfo)();
+     const installDir = resolveUpgradeInstallDir(install);
+     let stageDir: string | null = null;
+@@ -137,9 +370,17 @@ export class UpgradeController {
+ 
+       const txnId = createTxnId();
+       stageDir = join(installDir, 'staging', txnId);
+-      await mkdir(stageDir, { recursive: true });
+-      const stageRelease = this.deps.stageRelease ?? stageGithubRelease;
+-      const binPath = await stageRelease(stageDir, version);
++      await mkdir(stageDir, { recursive: true, mode: 0o700 });
++      const source = opts?.source ?? 'release';
++      let binPath: string;
++      if (source === 'staged') {
++        const staged = this.requireStaged(version, opts?.sha256);
++        if (!staged) throw new Error('PACKAGE_NOT_STAGED');
++        binPath = await extractCliTarball(staged.path, stageDir);
++      } else {
++        const stageRelease = this.deps.stageRelease ?? stageGithubRelease;
++        binPath = await stageRelease(stageDir, version);
++      }
+       await this.spawnUpgrade(binPath, installDir, version, txnId);
+       this.state = 'executing';
+       if (this.pendingEarlyExit) {
+@@ -328,22 +569,6 @@ export function assertExtractedCliPackage(packageRoot: string): void {
+   }
+ }
+ 
+-const SUM_LINE = /^([a-fA-F0-9]{64})\s+\*?(\S+)\s*$/;
+-
+-export function parseSha256Sums(text: string, fileName: string): string | null {
+-  const want = basename(fileName);
+-  for (const raw of text.split(/\r?\n/)) {
+-    const match = raw.trim().match(SUM_LINE);
+-    if (!match) continue;
+-    if (basename(match[2]) === want) return match[1].toLowerCase();
+-  }
+-  return null;
+-}
+-
+-export function sha256Hex(bytes: Uint8Array): string {
+-  return createHash('sha256').update(bytes).digest('hex');
+-}
+-
+ export function processCommandLine(pid: number): string | null {
+   if (!Number.isInteger(pid) || pid <= 0) return null;
+   if (process.platform === 'linux') {
+@@ -462,66 +687,19 @@ export function parsePidFileContents(raw: string): number | null {
+   return parsePidFileRecord(raw)?.pid ?? null;
+ }
+ 
+-export function assertReleaseIntegrity(
+-  version: string,
+-  bytes: Uint8Array,
+-  sums: { hex: string | null; missing: boolean }
+-): void {
+-  if (sums.missing || !sums.hex) {
+-    if (compareVersions(version, CHECKSUMS_REQUIRED_SINCE) >= 0) {
+-      throw new Error(
+-        `Release ${version} requires SHA256SUMS (HTTP 200, matching digest). Refusing to continue.`
+-      );
+-    }
+-    throw new Error('Release SHA256SUMS is missing; tarball integrity is unverified.');
+-  }
+-  if (sha256Hex(bytes) !== sums.hex) {
+-    throw new Error(`Release tarball sha256 mismatch for ${releaseTarballName(version)}.`);
+-  }
+-}
+-
+-export function releaseSha256SumsUrl(version: string): string {
+-  return releaseTarballUrl(version).replace(releaseTarballName(version), 'SHA256SUMS');
+-}
+-
+-export async function fetchReleaseSha256Sums(
+-  version: string,
+-  fileName: string,
+-  fetchFn: typeof fetch = fetch
+-): Promise<{ hex: string | null; missing: boolean }> {
+-  let response: Response;
+-  try {
+-    response = await fetchFn(releaseSha256SumsUrl(version), {
+-      redirect: 'follow',
+-      cache: 'no-store',
+-    });
+-  } catch (error) {
+-    const detail = error instanceof Error ? error.message : String(error);
+-    throw new Error(`SHA256SUMS network error: ${detail}`);
+-  }
+-  if (response.status === 404) return { hex: null, missing: true };
+-  if (!response.ok) {
+-    throw new Error(`SHA256SUMS HTTP ${response.status}`);
+-  }
+-  const hex = parseSha256Sums(await response.text(), fileName || releaseTarballName(version));
+-  if (!hex) {
+-    throw new Error(`SHA256SUMS does not list ${fileName}`);
+-  }
+-  return { hex, missing: false };
+-}
+-
+ /**
+  * 下载 GitHub Release tarball 并解压到 stageDir（npm pack 布局：package/）。
+  * 返回 CLI 入口路径 `<stageDir>/package/bin/tmex.js`。
+  */
+ export async function stageGithubRelease(stageDir: string, version: string): Promise<string> {
+-  const tarballPath = join(stageDir, releaseTarballName(version));
+-  await downloadReleaseTarball(releaseTarballUrl(version), tarballPath);
+-  const bytes = readFileSync(tarballPath);
+-  const sums = await fetchReleaseSha256Sums(version, releaseTarballName(version));
+-  assertReleaseIntegrity(version, bytes, sums);
+-  await extractTarball(tarballPath, stageDir);
++  const cached = await downloadVerifiedRelease(version, {
++    cacheDir: join(stageDir, '.release-cache'),
++  });
++  return extractCliTarball(cached.path, stageDir);
++}
+ 
++export async function extractCliTarball(tarballPath: string, stageDir: string): Promise<string> {
++  await extractTarball(tarballPath, stageDir);
+   const packageRoot = join(stageDir, 'package');
+   const binPath = join(packageRoot, 'bin', 'tmex.js');
+   if (!existsSync(binPath)) {
+@@ -531,18 +709,6 @@ export async function stageGithubRelease(stageDir: string, version: string): Pro
+   return binPath;
+ }
+ 
+-async function downloadReleaseTarball(url: string, destPath: string): Promise<void> {
+-  const res = await fetch(url, {
+-    cache: 'no-store',
+-    redirect: 'follow',
+-    signal: AbortSignal.timeout(TARBALL_FETCH_TIMEOUT_MS),
+-  });
+-  if (!res.ok) {
+-    throw new Error(`GitHub release tarball HTTP ${res.status}`);
+-  }
+-  await writeFile(destPath, new Uint8Array(await res.arrayBuffer()));
+-}
+-
+ function extractTarball(tarballPath: string, stageDir: string): Promise<void> {
+   return new Promise<void>((resolve, reject) => {
+     const child = spawn('tar', ['-xzf', tarballPath, '-C', stageDir], {
+diff --git a/packages/shared/src/contracts/system.ts b/packages/shared/src/contracts/system.ts
+index a6151317..527231d1 100644
+--- a/packages/shared/src/contracts/system.ts
++++ b/packages/shared/src/contracts/system.ts
+@@ -32,6 +32,11 @@ export interface SystemInfo {
+   managementMode?: 'none' | 'app' | 'companion-cli';
+   /** 更新权归属（可选）；managed 时为 app|companion */
+   updateOwner?: 'self' | 'app' | 'companion';
++  /**
++   * 本节点支持的升级能力。旧节点无此字段。
++   * `'staged-package'`：接受入口推送的 tarball（`PUT /api/system/upgrade/package`）并从暂存包升级。
++   */
++  upgradeCapabilities?: string[];
+ }
+ 
+ /** 检查更新结果 */
+@@ -62,6 +67,17 @@ export interface UpgradeStatus {
+ /** 触发升级请求体 */
+ export interface StartUpgradeRequest {
+   version: string;
++  /** 缺省 `'release'`：目标自行从 GitHub Releases 下载。`'staged'`：使用已推送的暂存包。 */
++  source?: 'release' | 'staged';
++  /** `source='staged'` 时可选，须与暂存包 sha256 一致 */
++  sha256?: string;
++}
++
++/** `PUT /api/system/upgrade/package` 成功响应 */
++export interface StagedUpgradePackageResponse {
++  version: string;
++  sha256: string;
++  bytes: number;
+ }
+ 
+ export interface RestartGatewayResponse {

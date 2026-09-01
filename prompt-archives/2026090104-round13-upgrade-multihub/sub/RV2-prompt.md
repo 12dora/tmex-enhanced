@@ -1,0 +1,11 @@
+# RV2 — Code review: remote upgrade via entry-pushed staged package (gateway backend)
+
+You are a strict but pragmatic code reviewer. Read-only. Output the full review as your FINAL MESSAGE.
+
+Repo: `/Users/konata/code/tmex-enhanced-wt-r13` (Bun monorepo). Diff under review: `/Users/konata/code/tmex-enhanced-wt-r13/prompt-archives/2026090104-round13-upgrade-multihub/sub/RV2-diff.patch` (commit `f35358fe`). Spec: `sub/G4-prompt.md`; author report: `sub/G4-result.md`.
+
+Context: the entry gateway now downloads the release tarball (`apps/gateway/src/system/release-download.ts`, verified against `SHA256SUMS`), pushes it to the target node over the peer link as a raw streamed body (`apps/gateway/src/mesh/forwarder.ts` `forwardAuthorizedHttp` with `rawBody`), and the target stages it (`PUT /api/system/upgrade/package`, `apps/gateway/src/system/upgrade.ts`) and upgrades from the staged file (`POST /api/system/upgrade {source:'staged'}`). Entry-side per-node background job: `apps/gateway/src/system/remote-upgrade-job.ts`, surfaced through `upgrade-service.ts` status. The target's crash-safe upgrader layout is `<installDir>/staging/<txnId>` (existing) — new staged files live in `<installDir>/staging/staged/`.
+
+Review for: security (path traversal via `version`/`sha256` params, size cap enforcement before/while streaming, sha verification before extraction/spawn, permission of staged dirs, that a staged package cannot be swapped between PUT and POST, that the release base URL override cannot be abused from a request), correctness (stream backpressure/abort handling on both ends, partial file cleanup, job lifecycle races: two starts, status after hand-off, failed-job retention, detached request abort semantics), interaction with the existing crash-safe upgrader (does `--apply-current-package` still find the right package/stage; does cleanup of `staging/` by the upgrader delete `staged/` or `release-cache/` prematurely? check `packages/app/src/lib/upgrade-*.ts` for any cleanup of `<installDir>/staging`), compatibility (old targets, managed builds), and test adequacy. Verify that the default `TMEX_RELEASE_BASE_URL` matches the repository the existing `update-check.ts` queries.
+
+Classify findings as **blocker / should-fix / nit** with file:line and a concrete failing scenario. If something is fine, say so briefly. Do not propose large refactors.

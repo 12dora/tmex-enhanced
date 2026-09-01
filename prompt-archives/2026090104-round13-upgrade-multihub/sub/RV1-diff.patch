@@ -1,0 +1,1250 @@
+commit 0e5614a737aeaed7b5d6fa3720f5a89dd63f6599
+Author: Konata <konata@KonatadeMacBook-Pro.local>
+Date:   Tue Sep 1 18:54:08 2026 +0800
+
+    feat(fe): 节点管理「全部升级」按钮、最新版/过旧节点置灰
+    
+    - 新增 upgrade-batch.ts：可升级性判定、普通节点(并发3)→远端 hub→本机 分组串行调度、成败汇总
+    - 行内升级按钮按 offline/loginRequired/tooOld(<1.1.0)/atLatest 置灰并给出原因
+    - 批量期间静音单节点 toast，结束只弹一条「成功 X，失败 Y」
+    - runNodeUpgrade 返回结论；i18n 三语补齐 nodes.upgrade 文案
+    
+    Claude-Session: https://claude.ai/code/session_01XhSLkyskLHdE1at75LomAV
+
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx
+index cece68f9..3f1d375e 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-management.test.tsx
+@@ -2,11 +2,12 @@
+ // 无 DOM 测试环境，用 react-dom/server 静态渲染（与 nodes-tab 测试同一套做法）。
+ 
+ import { beforeEach, describe, expect, test } from 'bun:test';
++import type { NodeRow } from '@/node/mesh-nodes';
+ import type { AuthModeResponse, MeshNode } from '@tmex/api-client/auth/index';
+ import type { UpgradeStatus } from '@tmex/shared';
+ import { encodeBase64url } from '@tmex/shared/auth';
+ import { installWindowStorage } from '@tmex/stores/test-utils';
+-import type { NodeUpgradeEntry } from './types';
++import type { NodeActionDeps, NodeUpgradeController, NodeUpgradeEntry } from './types';
+ import type {
+   UpgradeIo,
+   UpgradePollOutcome,
+@@ -25,6 +26,8 @@ const { canAutoSignAdmit, invalidCertificateKey, resetEnrollmentEngineForTest }
+   '@/node/enrollment-engine'
+ );
+ const { resolveHubPublicUrl } = await import('./enrollment-section');
++const { NodesTable } = await import('./nodes-table');
++const { IDLE_UPGRADE_ENTRY, IDLE_UPGRADE_BATCH } = await import('./types');
+ const { classifyPollFailure, isUpgradeBusy, runNodeUpgrade, upgradeErrorText, upgradePhaseText } =
+   await import('./use-node-upgrade');
+ const { rootKeyFromSeed } = await import('@tmex/shared/auth');
+@@ -208,6 +211,139 @@ describe('NodesManagement', () => {
+     expect(html).not.toContain('data-testid="nodes-table"');
+     expect(html).not.toContain('data-testid="nodes-add"');
+   });
++
++  test('「全部升级」紧挨在「添加」左边；latest 未知时禁用', () => {
++    setMeshNodesStateForTest({
++      entryNodeId: '0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e',
++      nodes: [meshNode({ id: '0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e', name: 'entry', loggedIn: true })],
++    });
++    const html = render(MODE);
++    expect(html).toContain('data-testid="nodes-upgrade-all"');
++    expect(html.indexOf('data-testid="nodes-refresh"')).toBeLessThan(
++      html.indexOf('data-testid="nodes-upgrade-all"')
++    );
++    expect(html.indexOf('data-testid="nodes-upgrade-all"')).toBeLessThan(
++      html.indexOf('data-testid="nodes-add"')
++    );
++    // 静态渲染跑不了 effect，latest 拿不到：按钮禁用并说明原因
++    const tag = buttonTag(html, 'nodes-upgrade-all');
++    expect(tag).toContain('disabled=""');
++    expect(tag).toContain('title="nodes.upgrade.releaseUnavailable"');
++  });
++});
++
++describe('节点表的升级按钮（注入升级控制器）', () => {
++  function nodeRow(overrides: Partial<NodeRow> & { id: string }): NodeRow {
++    return {
++      runtimeNodeId: overrides.id,
++      name: overrides.id,
++      publicKey: '',
++      fingerprint: 'ffffffffffffffff',
++      online: true,
++      reach: 'lan',
++      transport: null,
++      rttMs: null,
++      version: '1.1.9',
++      directCapable: false,
++      loggedIn: true,
++      inventory: null,
++      isSelf: false,
++      isHub: false,
++      lastSeenAt: null,
++      status: null,
++      certificate: null,
++      certSig: null,
++      ...overrides,
++    };
++  }
++
++  function controller(latestVersion: string | null): NodeUpgradeController {
++    return {
++      latest: latestVersion ? { latestVersion, changelog: null, publishedAt: null } : null,
++      entryOf: () => IDLE_UPGRADE_ENTRY,
++      start: () => undefined,
++      startAll: () => undefined,
++      batch: IDLE_UPGRADE_BATCH,
++      eligibleCount: () => 0,
++    };
++  }
++
++  function renderTable(rows: NodeRow[], latestVersion: string | null): string {
++    const deps: NodeActionDeps = {
++      hubApi: null,
++      hubOnline: true,
++      mode: {
++        ...MODE,
++        uid: 'user-1',
++        kdfParams: MODE.kdfParams as NonNullable<typeof MODE.kdfParams>,
++      },
++      api: {} as NodeActionDeps['api'],
++      prompt: { dialog: null } as unknown as NodeActionDeps['prompt'],
++      onChanged: () => undefined,
++      upgrade: controller(latestVersion),
++    };
++    return renderToStaticMarkup(
++      <MemoryRouter>
++        <NodesTable rows={rows} {...deps} />
++      </MemoryRouter>
++    );
++  }
++
++  test('已是最新版本：按钮禁用并说明原因', () => {
++    const html = renderTable(
++      [nodeRow({ id: 'aa', version: '1.2.0' }), nodeRow({ id: 'bb', version: '1.3.0' })],
++      '1.2.0'
++    );
++    for (const id of ['aa', 'bb']) {
++      const tag = buttonTag(html, `node-upgrade-${id}`);
++      expect(tag).toContain('disabled=""');
++      expect(tag).toContain('title="nodes.upgrade.atLatest"');
++    }
++  });
++
++  test('latest 未知或版本无法解析时保持可点：后端才是权威', () => {
++    const unknownLatest = renderTable([nodeRow({ id: 'aa', version: '1.2.0' })], null);
++    expect(buttonTag(unknownLatest, 'node-upgrade-aa')).not.toContain('disabled=""');
++    const devVersion = renderTable([nodeRow({ id: 'bb', version: '1.2.0_dev' })], '1.2.0');
++    expect(buttonTag(devVersion, 'node-upgrade-bb')).not.toContain('disabled=""');
++  });
++
++  test('版本低于远程升级门槛：禁用并提示在该机器上手动升级', () => {
++    const html = renderTable([nodeRow({ id: 'cc', version: '1.0.9' })], '1.2.0');
++    const tag = buttonTag(html, 'node-upgrade-cc');
++    expect(tag).toContain('disabled=""');
++    expect(tag).toContain('title="nodes.upgrade.tooOld"');
++  });
++
++  test('可升级的节点照常可点', () => {
++    const html = renderTable([nodeRow({ id: 'dd', version: '1.1.9' })], '1.2.0');
++    expect(buttonTag(html, 'node-upgrade-dd')).not.toContain('disabled=""');
++  });
++
++  test('批量升级进行中：整列升级按钮锁住，避免同一节点被点两次', () => {
++    const deps: NodeActionDeps = {
++      hubApi: null,
++      hubOnline: true,
++      mode: {
++        ...MODE,
++        uid: 'user-1',
++        kdfParams: MODE.kdfParams as NonNullable<typeof MODE.kdfParams>,
++      },
++      api: {} as NodeActionDeps['api'],
++      prompt: { dialog: null } as unknown as NodeActionDeps['prompt'],
++      onChanged: () => undefined,
++      upgrade: {
++        ...controller('1.2.0'),
++        batch: { running: true, total: 3, completed: 1 },
++      },
++    };
++    const html = renderToStaticMarkup(
++      <MemoryRouter>
++        <NodesTable rows={[nodeRow({ id: 'ee', version: '1.1.9' })]} {...deps} />
++      </MemoryRouter>
++    );
++    expect(buttonTag(html, 'node-upgrade-ee')).toContain('disabled=""');
++  });
+ });
+ 
+ describe('节点升级派生逻辑', () => {
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
+index a0584352..4a52f6ab 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-management.tsx
+@@ -13,17 +13,23 @@ import {
+   useEnrollmentEngine,
+   useEnrollmentEngineState,
+ } from '@/node/enrollment-engine';
+-import { mergeNodes, setEntryNodeId, useHubNode, useMeshNodes } from '@/node/mesh-nodes';
++import {
++  type NodeRow,
++  mergeNodes,
++  setEntryNodeId,
++  useHubNode,
++  useMeshNodes,
++} from '@/node/mesh-nodes';
+ import type { AuthApi, AuthKdfParamsJson, AuthModeResponse } from '@tmex/api-client/auth/index';
+ import { defaultAuthApi } from '@tmex/api-client/auth/index';
+ import { Button } from '@tmex/ui/button';
+ import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@tmex/ui/card';
+-import { Plus, RefreshCw, ShieldAlert } from 'lucide-react';
++import { CircleArrowUp, Loader2, Plus, RefreshCw, ShieldAlert } from 'lucide-react';
+ import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { EnrollmentSection } from './enrollment-section';
+ import { NodesTable } from './nodes-table';
+-import { PLACEHOLDER_KDF, type ResolvedMode } from './types';
++import { type NodeUpgradeController, PLACEHOLDER_KDF, type ResolvedMode } from './types';
+ import { useNodeUpgrade } from './use-node-upgrade';
+ 
+ export interface NodesManagementProps {
+@@ -126,6 +132,7 @@ export function NodesManagement({ mode: rawMode, api = defaultAuthApi }: NodesMa
+               }
+             />
+           </Button>
++          <UpgradeAllButton rows={rows} upgrade={upgrade} />
+           <Button
+             type="button"
+             size="sm"
+@@ -182,3 +189,51 @@ export function NodesManagement({ mode: rawMode, api = defaultAuthApi }: NodesMa
+     </Card>
+   );
+ }
++
++/**
++ * 「全部升级」：latest 未知、批量正在跑、没有可升级节点时禁用。
++ * 顺序、并发与汇总提示都在 `useNodeUpgrade` 里，这里只负责按钮态与进度文案。
++ */
++function UpgradeAllButton({
++  rows,
++  upgrade,
++}: {
++  rows: NodeRow[];
++  upgrade: NodeUpgradeController;
++}) {
++  const { t } = useTranslation();
++  const latestVersion = upgrade.latest?.latestVersion ?? null;
++  const { running, completed, total } = upgrade.batch;
++  const count = upgrade.eligibleCount(rows);
++
++  return (
++    <Button
++      type="button"
++      size="sm"
++      variant="outline"
++      disabled={!latestVersion || running || count === 0}
++      title={upgradeAllHint(t, latestVersion, count)}
++      onClick={() => upgrade.startAll(rows)}
++      data-testid="nodes-upgrade-all"
++    >
++      {running ? (
++        <Loader2 className="animate-spin motion-reduce:animate-none" />
++      ) : (
++        <CircleArrowUp />
++      )}
++      {running
++        ? t('nodes.upgrade.allProgress', { completed, total })
++        : t('nodes.upgrade.upgradeAll')}
++    </Button>
++  );
++}
++
++function upgradeAllHint(
++  t: (key: string, options?: Record<string, unknown>) => string,
++  latestVersion: string | null,
++  count: number
++): string {
++  if (!latestVersion) return t('nodes.upgrade.releaseUnavailable');
++  if (count === 0) return t('nodes.upgrade.allNone');
++  return t('nodes.upgrade.allHint', { count, version: latestVersion });
++}
+diff --git a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+index 3fdd9ab3..561e3c45 100644
+--- a/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
++++ b/apps/fe/src/pages/settings/nodes/management/nodes-table.tsx
+@@ -10,9 +10,12 @@ import { Input } from '@tmex/ui/input';
+ import { Download, Loader2, Pencil, ShieldAlert } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import type { NodeActionDeps } from './types';
++import { upgradeBlockReason } from './upgrade-batch';
+ import { useNodeRowActions } from './use-node-row-actions';
+ import { isUpgradeBusy, upgradePhaseText } from './use-node-upgrade';
+ 
++type Translate = (key: string, options?: Record<string, unknown>) => string;
++
+ export function NodesTable({ rows, ...deps }: { rows: NodeRow[] } & NodeActionDeps) {
+   const { t } = useTranslation();
+   return (
+@@ -141,14 +144,15 @@ function NodeRowView({ row, ...deps }: { row: NodeRow } & NodeActionDeps) {
+ }
+ 
+ /**
+- * 升级按钮：目标离线或（远端）未登录时禁用并说明原因；进行中显示阶段文案并锁住。
++ * 升级按钮：目标离线、（远端）未登录、版本过旧无法远程升级、已是最新时禁用并说明原因；
++ * 进行中显示阶段文案并锁住，批量升级期间整列一并锁住，避免同一节点被点两次。
+  * 本机同样可以升级——它会重启本机网关，当前访问随之中断，确认框里已经写明。
+  */
+ function UpgradeButton({ row, upgrade }: { row: NodeRow; upgrade: NodeActionDeps['upgrade'] }) {
+   const { t } = useTranslation();
+   const entry = upgrade.entryOf(row.id);
+   const busy = isUpgradeBusy(entry.phase);
+-  const blocked = upgradeBlockedHint(row, t);
++  const blocked = upgradeBlockedHint(row, upgrade.latest?.latestVersion ?? null, t);
+   const version = entry.targetVersion ?? upgrade.latest?.latestVersion ?? null;
+   const phaseText = upgradePhaseText(t, entry.phase);
+ 
+@@ -157,7 +161,7 @@ function UpgradeButton({ row, upgrade }: { row: NodeRow; upgrade: NodeActionDeps
+       type="button"
+       size="xs"
+       variant="outline"
+-      disabled={busy || blocked !== null}
++      disabled={busy || blocked !== null || upgrade.batch.running}
+       title={blocked ?? upgradeTitle(entry.error, version, t)}
+       onClick={() => upgrade.start(row)}
+       data-testid={`node-upgrade-${row.id}`}
+@@ -169,16 +173,21 @@ function UpgradeButton({ row, upgrade }: { row: NodeRow; upgrade: NodeActionDeps
+   );
+ }
+ 
+-function upgradeBlockedHint(row: NodeRow, t: (key: string) => string): string | null {
+-  if (!row.online) return t('nodes.upgrade.offline');
+-  if (!row.isSelf && !row.loggedIn) return t('nodes.upgrade.loginRequired');
+-  return null;
++export function upgradeBlockedHint(
++  row: NodeRow,
++  latestVersion: string | null,
++  t: Translate
++): string | null {
++  const reason = upgradeBlockReason(row, latestVersion);
++  if (!reason) return null;
++  if (reason === 'tooOld') return t('nodes.upgrade.tooOld', { version: row.version ?? '' });
++  return t(`nodes.upgrade.${reason}`);
+ }
+ 
+ function upgradeTitle(
+   error: string | null,
+   version: string | null,
+-  t: (key: string, options?: Record<string, unknown>) => string
++  t: Translate
+ ): string | undefined {
+   if (error) return error;
+   return version ? t('nodes.upgrade.hint', { version }) : undefined;
+diff --git a/apps/fe/src/pages/settings/nodes/management/types.ts b/apps/fe/src/pages/settings/nodes/management/types.ts
+index 614d2d95..6e31e566 100644
+--- a/apps/fe/src/pages/settings/nodes/management/types.ts
++++ b/apps/fe/src/pages/settings/nodes/management/types.ts
+@@ -46,13 +46,34 @@ export interface NodeUpgradeEntry {
+   error: string | null;
+ }
+ 
++/** 一次升级跑完的结论；批量升级据此统计成败。`cancelled` 既不算成功也不算失败。 */
++export type UpgradeRunOutcome = 'done' | 'failed' | 'timeout' | 'alreadyLatest' | 'cancelled';
++
++/** 批量升级的进度；`running` 为 `false` 时另外两个值无意义。 */
++export interface NodeUpgradeBatchState {
++  running: boolean;
++  total: number;
++  completed: number;
++}
++
+ /** 升级状态机对外的只读视图 + 触发入口。 */
+ export interface NodeUpgradeController {
+   latest: NodeUpgradeLatest | null;
+   entryOf: (nodeId: string) => NodeUpgradeEntry;
+   start: (row: NodeRow) => void;
++  /** 批量升级：内部按「普通节点 → 远端 hub → 本机」排序，逐组推进。 */
++  startAll: (rows: NodeRow[]) => void;
++  batch: NodeUpgradeBatchState;
++  /** 当前 latest 下可批量升级的节点数；latest 未知时为 0。 */
++  eligibleCount: (rows: NodeRow[]) => number;
+ }
+ 
++export const IDLE_UPGRADE_BATCH: NodeUpgradeBatchState = {
++  running: false,
++  total: 0,
++  completed: 0,
++};
++
+ export const IDLE_UPGRADE_ENTRY: NodeUpgradeEntry = {
+   phase: 'idle',
+   targetVersion: null,
+diff --git a/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts b/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts
+new file mode 100644
+index 00000000..f703382a
+--- /dev/null
++++ b/apps/fe/src/pages/settings/nodes/management/upgrade-batch.ts
+@@ -0,0 +1,129 @@
++// 批量升级的纯逻辑：可升级性判定、执行顺序与带并发上限的调度。
++//
++// 这里不碰网络、不碰 React：单次升级由调用方注入（`run`），便于单测断言调度顺序。
++// 顺序是硬约束——hub 一重启，经中继到达的节点全部失联；本机一重启，当前页面直接断开。
++// 因此：普通节点（并发 3）→ 远端 hub → 本机，前一组**完全收尾**后才开下一组。
++
++import type { NodeRow } from '@/node/mesh-nodes';
++import { compareSemver } from '@tmex/shared';
++import type { UpgradeRunOutcome } from './types';
++
++/** 首个网关暴露 `/api/system/upgrade` 与 `/api/system/info` 的版本；更早的版本只能在本机手动升级。 */
++export const MIN_REMOTE_UPGRADE_VERSION = '1.1.0';
++
++/** 普通节点的并发上限：再多也只是同时压满几台机器的下载带宽。 */
++export const BATCH_CONCURRENCY = 3;
++
++/** 行内升级按钮被禁用的原因；`null` 表示可以点。 */
++export type UpgradeBlockReason = 'offline' | 'loginRequired' | 'tooOld' | 'atLatest';
++
++/** 版本能解析且低于 `MIN_REMOTE_UPGRADE_VERSION`。无法解析（如 `1.1.0_dev`）不算，交给后端裁决。 */
++export function isTooOldForRemoteUpgrade(version: string | null): boolean {
++  if (!version) return false;
++  return compareSemver(version, MIN_REMOTE_UPGRADE_VERSION) === -1;
++}
++
++/** latest 未知或版本无法解析时一律返回 `false`：不拿猜测去禁用按钮。 */
++export function isAtLatest(version: string | null, latestVersion: string | null): boolean {
++  if (!version || !latestVersion) return false;
++  const cmp = compareSemver(version, latestVersion);
++  return cmp !== null && cmp >= 0;
++}
++
++export function upgradeBlockReason(
++  row: Pick<NodeRow, 'online' | 'loggedIn' | 'isSelf' | 'version'>,
++  latestVersion: string | null
++): UpgradeBlockReason | null {
++  if (!row.online) return 'offline';
++  if (!row.isSelf && !row.loggedIn) return 'loginRequired';
++  if (isTooOldForRemoteUpgrade(row.version)) return 'tooOld';
++  if (isAtLatest(row.version, latestVersion)) return 'atLatest';
++  return null;
++}
++
++/** 批量升级的候选：可点 + 版本可解析且**严格低于** latest。版本未知的节点不进批量。 */
++export function isBatchEligible(row: NodeRow, latestVersion: string | null): boolean {
++  if (!latestVersion || !row.version) return false;
++  if (upgradeBlockReason(row, latestVersion) !== null) return false;
++  return compareSemver(row.version, latestVersion) === -1;
++}
++
++export function eligibleUpgradeRows(rows: NodeRow[], latestVersion: string | null): NodeRow[] {
++  return rows.filter((row) => isBatchEligible(row, latestVersion));
++}
++
++/** 按「普通节点 → 远端 hub → 本机」切成三组；空组会被去掉。 */
++export function orderUpgradeGroups(rows: NodeRow[]): NodeRow[][] {
++  const others: NodeRow[] = [];
++  const hub: NodeRow[] = [];
++  const self: NodeRow[] = [];
++  for (const row of rows) {
++    if (row.isSelf) self.push(row);
++    else if (row.isHub) hub.push(row);
++    else others.push(row);
++  }
++  return [others, hub, self].filter((group) => group.length > 0);
++}
++
++export interface UpgradeBatchSummary {
++  succeeded: number;
++  failed: number;
++  failedNames: string[];
++  /** 组件卸载 / 页面离开：结论不完整，不该弹汇总 toast。 */
++  cancelled: boolean;
++}
++
++export interface UpgradeBatchParams {
++  rows: NodeRow[];
++  signal: AbortSignal;
++  concurrency?: number;
++  run: (row: NodeRow) => Promise<UpgradeRunOutcome>;
++  onProgress: (completed: number) => void;
++}
++
++function tally(summary: UpgradeBatchSummary, row: NodeRow, outcome: UpgradeRunOutcome) {
++  if (outcome === 'done' || outcome === 'alreadyLatest') {
++    summary.succeeded += 1;
++    return;
++  }
++  if (outcome === 'failed' || outcome === 'timeout') {
++    summary.failed += 1;
++    summary.failedNames.push(row.name);
++  }
++}
++
++async function runGroup(
++  group: NodeRow[],
++  p: UpgradeBatchParams,
++  summary: UpgradeBatchSummary,
++  progress: { completed: number }
++): Promise<void> {
++  let next = 0;
++  const limit = Math.min(p.concurrency ?? BATCH_CONCURRENCY, group.length);
++  const worker = async () => {
++    while (!p.signal.aborted) {
++      const row = group[next++];
++      if (!row) return;
++      tally(summary, row, await p.run(row));
++      progress.completed += 1;
++      p.onProgress(progress.completed);
++    }
++  };
++  await Promise.all(Array.from({ length: limit }, worker));
++}
++
++export async function runUpgradeBatch(p: UpgradeBatchParams): Promise<UpgradeBatchSummary> {
++  const summary: UpgradeBatchSummary = {
++    succeeded: 0,
++    failed: 0,
++    failedNames: [],
++    cancelled: false,
++  };
++  const progress = { completed: 0 };
++  for (const group of orderUpgradeGroups(p.rows)) {
++    if (p.signal.aborted) break;
++    await runGroup(group, p, summary, progress);
++  }
++  summary.cancelled = p.signal.aborted;
++  return summary;
++}
+diff --git a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.test.ts b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.test.ts
+new file mode 100644
+index 00000000..eeb6d873
+--- /dev/null
++++ b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.test.ts
+@@ -0,0 +1,409 @@
++// 批量升级：候选筛选、执行顺序（普通节点 → 远端 hub → 本机）、并发上限与汇总提示。
++// 全部走注入的 `run`，不碰网络也不碰计时器。
++
++import { describe, expect, test } from 'bun:test';
++import type { NodeRow } from '@/node/mesh-nodes';
++import type { UpgradeRunOutcome } from './types';
++import {
++  BATCH_CONCURRENCY,
++  MIN_REMOTE_UPGRADE_VERSION,
++  eligibleUpgradeRows,
++  isAtLatest,
++  isBatchEligible,
++  isTooOldForRemoteUpgrade,
++  orderUpgradeGroups,
++  runUpgradeBatch,
++  upgradeBlockReason,
++} from './upgrade-batch';
++import {
++  SILENT_UPGRADE_TOASTS,
++  type UpgradeToasts,
++  launchUpgradeBatch,
++  reportBatchSummary,
++} from './use-node-upgrade';
++
++const t = (key: string, options?: Record<string, unknown>) =>
++  options ? `${key}:${JSON.stringify(options)}` : key;
++
++function row(overrides: Partial<NodeRow> & { id: string }): NodeRow {
++  return {
++    runtimeNodeId: overrides.id,
++    name: overrides.id,
++    publicKey: '',
++    fingerprint: '',
++    online: true,
++    reach: 'lan',
++    transport: null,
++    rttMs: null,
++    version: '1.1.0',
++    directCapable: false,
++    loggedIn: true,
++    inventory: null,
++    isSelf: false,
++    isHub: false,
++    lastSeenAt: null,
++    status: null,
++    certificate: null,
++    certSig: null,
++    ...overrides,
++  };
++}
++
++interface Recorder {
++  toasts: UpgradeToasts;
++  log: Array<[keyof UpgradeToasts, string]>;
++}
++
++function recorder(): Recorder {
++  const log: Array<[keyof UpgradeToasts, string]> = [];
++  return {
++    log,
++    toasts: {
++      success: (m) => log.push(['success', m]),
++      info: (m) => log.push(['info', m]),
++      warning: (m) => log.push(['warning', m]),
++      error: (m) => log.push(['error', m]),
++    },
++  };
++}
++
++describe('远程升级的版本门槛', () => {
++  test('低于 MIN_REMOTE_UPGRADE_VERSION 的节点不能远程升级', () => {
++    expect(MIN_REMOTE_UPGRADE_VERSION).toBe('1.1.0');
++    expect(isTooOldForRemoteUpgrade('1.0.9')).toBe(true);
++    expect(isTooOldForRemoteUpgrade('0.9.0')).toBe(true);
++    expect(isTooOldForRemoteUpgrade('1.1.0')).toBe(false);
++    expect(isTooOldForRemoteUpgrade('1.2.0')).toBe(false);
++  });
++
++  test('版本未知或无法解析时不拦：后端才是权威', () => {
++    expect(isTooOldForRemoteUpgrade(null)).toBe(false);
++    expect(isTooOldForRemoteUpgrade('1.1.0_dev')).toBe(false);
++    expect(isTooOldForRemoteUpgrade('')).toBe(false);
++  });
++});
++
++describe('isAtLatest', () => {
++  test('等于或高于 latest 都算最新', () => {
++    expect(isAtLatest('1.2.0', '1.2.0')).toBe(true);
++    expect(isAtLatest('1.3.0', '1.2.0')).toBe(true);
++    expect(isAtLatest('1.1.9', '1.2.0')).toBe(false);
++  });
++
++  test('latest 未知或版本无法解析时一律 false', () => {
++    expect(isAtLatest('1.2.0', null)).toBe(false);
++    expect(isAtLatest(null, '1.2.0')).toBe(false);
++    expect(isAtLatest('1.2.0_dev', '1.2.0')).toBe(false);
++  });
++});
++
++describe('upgradeBlockReason', () => {
++  test('离线与未登录的判定优先于版本', () => {
++    expect(upgradeBlockReason(row({ id: 'a', online: false, version: '1.0.0' }), '1.2.0')).toBe(
++      'offline'
++    );
++    expect(upgradeBlockReason(row({ id: 'a', loggedIn: false, version: '1.0.0' }), '1.2.0')).toBe(
++      'loginRequired'
++    );
++    // 本机不需要「登录该节点」
++    expect(
++      upgradeBlockReason(row({ id: 'a', loggedIn: false, isSelf: true, version: '1.1.0' }), '1.2.0')
++    ).toBeNull();
++  });
++
++  test('版本过旧与已是最新分别给出原因', () => {
++    expect(upgradeBlockReason(row({ id: 'a', version: '1.0.9' }), '1.2.0')).toBe('tooOld');
++    expect(upgradeBlockReason(row({ id: 'a', version: '1.2.0' }), '1.2.0')).toBe('atLatest');
++    expect(upgradeBlockReason(row({ id: 'a', version: '1.3.0' }), '1.2.0')).toBe('atLatest');
++    expect(upgradeBlockReason(row({ id: 'a', version: '1.1.9' }), '1.2.0')).toBeNull();
++  });
++
++  test('latest 未知或版本无法解析时按钮保持可用', () => {
++    expect(upgradeBlockReason(row({ id: 'a', version: '1.1.9' }), null)).toBeNull();
++    expect(upgradeBlockReason(row({ id: 'a', version: null }), '1.2.0')).toBeNull();
++    expect(upgradeBlockReason(row({ id: 'a', version: '1.1.9_dev' }), '1.2.0')).toBeNull();
++  });
++});
++
++describe('批量候选', () => {
++  test('只收在线、已登录（或本机）、版本可解析且严格低于 latest 且不过旧的节点', () => {
++    const rows = [
++      row({ id: 'ok', version: '1.1.9' }),
++      row({ id: 'self', version: '1.1.9', isSelf: true, loggedIn: false }),
++      row({ id: 'latest', version: '1.2.0' }),
++      row({ id: 'old', version: '1.0.9' }),
++      row({ id: 'offline', version: '1.1.9', online: false }),
++      row({ id: 'anon', version: '1.1.9', loggedIn: false }),
++      row({ id: 'unknown', version: null }),
++      row({ id: 'dev', version: '1.1.9_dev' }),
++    ];
++    expect(eligibleUpgradeRows(rows, '1.2.0').map((item) => item.id)).toEqual(['ok', 'self']);
++  });
++
++  test('latest 未知时没有任何候选', () => {
++    expect(eligibleUpgradeRows([row({ id: 'a', version: '1.1.0' })], null)).toEqual([]);
++    expect(isBatchEligible(row({ id: 'a', version: '1.1.0' }), null)).toBe(false);
++  });
++});
++
++describe('orderUpgradeGroups', () => {
++  test('普通节点 → 远端 hub → 本机，空组不占位', () => {
++    const groups = orderUpgradeGroups([
++      row({ id: 'self', isSelf: true }),
++      row({ id: 'hub', isHub: true }),
++      row({ id: 'a' }),
++      row({ id: 'b' }),
++    ]);
++    expect(groups.map((group) => group.map((item) => item.id))).toEqual([
++      ['a', 'b'],
++      ['hub'],
++      ['self'],
++    ]);
++    expect(orderUpgradeGroups([row({ id: 'a' })])).toHaveLength(1);
++  });
++
++  test('本机同时是 hub 时归到最后一组，不会被排两次', () => {
++    const groups = orderUpgradeGroups([
++      row({ id: 'me', isSelf: true, isHub: true }),
++      row({ id: 'a' }),
++    ]);
++    expect(groups.map((group) => group.map((item) => item.id))).toEqual([['a'], ['me']]);
++  });
++});
++
++describe('runUpgradeBatch', () => {
++  /** 记录每个节点的 start / settle 顺序；`resolve` 手动放行，用来验证「上一组收尾才开下一组」。 */
++  function gate() {
++    const started: string[] = [];
++    const settled: string[] = [];
++    const release = new Map<string, () => void>();
++    const run = (node: NodeRow, outcome: UpgradeRunOutcome = 'done') => {
++      started.push(node.name);
++      return new Promise<UpgradeRunOutcome>((resolve) => {
++        release.set(node.name, () => {
++          settled.push(node.name);
++          resolve(outcome);
++        });
++      });
++    };
++    return { started, settled, release, run };
++  }
++
++  test('hub 与本机严格排在普通节点之后，且要等前一组全部收尾', async () => {
++    const g = gate();
++    const rows = [
++      row({ id: 'self', name: 'self', isSelf: true }),
++      row({ id: 'hub', name: 'hub', isHub: true }),
++      row({ id: 'a', name: 'a' }),
++      row({ id: 'b', name: 'b' }),
++    ];
++    const progress: number[] = [];
++    const controller = new AbortController();
++    const done = runUpgradeBatch({
++      rows,
++      signal: controller.signal,
++      run: (node) => g.run(node),
++      onProgress: (completed) => progress.push(completed),
++    });
++
++    await Promise.resolve();
++    // 普通节点两台同时开跑，hub / self 还没动
++    expect(g.started).toEqual(['a', 'b']);
++
++    g.release.get('a')?.();
++    await Promise.resolve();
++    expect(g.started).toEqual(['a', 'b']);
++
++    g.release.get('b')?.();
++    await flush();
++    expect(g.started).toEqual(['a', 'b', 'hub']);
++
++    g.release.get('hub')?.();
++    await flush();
++    expect(g.started).toEqual(['a', 'b', 'hub', 'self']);
++
++    g.release.get('self')?.();
++    const summary = await done;
++    expect(g.settled).toEqual(['a', 'b', 'hub', 'self']);
++    expect(summary).toEqual({ succeeded: 4, failed: 0, failedNames: [], cancelled: false });
++    expect(progress).toEqual([1, 2, 3, 4]);
++  });
++
++  test('普通节点并发上限为 3', async () => {
++    const g = gate();
++    const rows = ['a', 'b', 'c', 'd', 'e'].map((name) => row({ id: name, name }));
++    const controller = new AbortController();
++    const done = runUpgradeBatch({
++      rows,
++      signal: controller.signal,
++      run: (node) => g.run(node),
++      onProgress: () => undefined,
++    });
++
++    await flush();
++    expect(BATCH_CONCURRENCY).toBe(3);
++    expect(g.started).toEqual(['a', 'b', 'c']);
++
++    g.release.get('b')?.();
++    await flush();
++    expect(g.started).toEqual(['a', 'b', 'c', 'd']);
++
++    for (const name of ['a', 'c', 'd', 'e']) {
++      g.release.get(name)?.();
++      await flush();
++    }
++    await done;
++    expect(g.started).toHaveLength(5);
++  });
++
++  test('成败统计：done / alreadyLatest 计成功，failed / timeout 计失败，cancelled 两边都不算', async () => {
++    const outcomes: Record<string, UpgradeRunOutcome> = {
++      a: 'done',
++      b: 'alreadyLatest',
++      c: 'failed',
++      d: 'timeout',
++      e: 'cancelled',
++    };
++    const controller = new AbortController();
++    const summary = await runUpgradeBatch({
++      rows: Object.keys(outcomes).map((name) => row({ id: name, name })),
++      signal: controller.signal,
++      run: async (node) => outcomes[node.name] as UpgradeRunOutcome,
++      onProgress: () => undefined,
++    });
++    expect(summary).toEqual({
++      succeeded: 2,
++      failed: 2,
++      failedNames: ['c', 'd'],
++      cancelled: false,
++    });
++  });
++
++  test('中途取消：剩下的节点不再启动，结论标记为 cancelled', async () => {
++    const controller = new AbortController();
++    const started: string[] = [];
++    const summary = await runUpgradeBatch({
++      rows: ['a', 'b', 'c'].map((name) => row({ id: name, name })),
++      signal: controller.signal,
++      concurrency: 1,
++      run: async (node) => {
++        started.push(node.name);
++        if (node.name === 'a') controller.abort();
++        return 'done';
++      },
++      onProgress: () => undefined,
++    });
++    expect(started).toEqual(['a']);
++    expect(summary.cancelled).toBe(true);
++  });
++});
++
++describe('reportBatchSummary', () => {
++  test('全成功只弹一条 success', () => {
++    const rec = recorder();
++    reportBatchSummary(t, rec.toasts, {
++      succeeded: 3,
++      failed: 0,
++      failedNames: [],
++      cancelled: false,
++    });
++    expect(rec.log).toEqual([['success', 'nodes.upgrade.allDone:{"success":3,"failed":0}']]);
++  });
++
++  test('有失败时弹 warning 并附上失败节点名', () => {
++    const rec = recorder();
++    reportBatchSummary(t, rec.toasts, {
++      succeeded: 1,
++      failed: 2,
++      failedNames: ['a', 'b'],
++      cancelled: false,
++    });
++    expect(rec.log).toHaveLength(1);
++    expect(rec.log[0]?.[0]).toBe('warning');
++    expect(rec.log[0]?.[1]).toContain('nodes.upgrade.allDoneWithFailures');
++    expect(rec.log[0]?.[1]).toContain('"names":"anodes.upgrade.listSeparatorb"');
++  });
++
++  test('被取消时不弹任何 toast', () => {
++    const rec = recorder();
++    reportBatchSummary(t, rec.toasts, {
++      succeeded: 1,
++      failed: 1,
++      failedNames: ['a'],
++      cancelled: true,
++    });
++    expect(rec.log).toEqual([]);
++  });
++});
++
++describe('launchUpgradeBatch', () => {
++  const rows = [
++    row({ id: 'self', name: 'self', isSelf: true, version: '1.1.9' }),
++    row({ id: 'hub', name: 'hub', isHub: true, version: '1.1.9' }),
++    row({ id: 'a', name: 'a', version: '1.1.9' }),
++    row({ id: 'latest', name: 'latest', version: '1.2.0' }),
++    row({ id: 'old', name: 'old', version: '1.0.0' }),
++  ];
++
++  function launch(overrides: Partial<Parameters<typeof launchUpgradeBatch>[0]> = {}) {
++    const rec = recorder();
++    const controller = new AbortController();
++    const confirms: string[] = [];
++    const seen: Array<{ name: string; toasts: UpgradeToasts }> = [];
++    const starts: number[] = [];
++    const running = launchUpgradeBatch({
++      rows,
++      latestVersion: '1.2.0',
++      signal: controller.signal,
++      t,
++      toasts: rec.toasts,
++      confirm: (message) => {
++        confirms.push(message);
++        return true;
++      },
++      runOne: async (node, _version, toasts) => {
++        seen.push({ name: node.name, toasts });
++        return 'done';
++      },
++      onStart: (total) => starts.push(total),
++      onProgress: () => undefined,
++      ...overrides,
++    });
++    return { rec, controller, confirms, seen, starts, running };
++  }
++
++  test('一次确认列出候选数与目标版本，已最新与过旧的节点被排除', async () => {
++    const run = launch();
++    expect(run.confirms).toHaveLength(1);
++    expect(run.confirms[0]).toBe('nodes.upgrade.confirmAll:{"count":3,"version":"1.2.0"}');
++    expect(run.starts).toEqual([3]);
++    await run.running;
++    expect(run.seen.map((item) => item.name)).toEqual(['a', 'hub', 'self']);
++  });
++
++  test('批量期间每节点 toast 被静音，只留最后那条汇总', async () => {
++    const run = launch();
++    await run.running;
++    expect(run.seen.every((item) => item.toasts === SILENT_UPGRADE_TOASTS)).toBe(true);
++    expect(run.rec.log).toEqual([['success', 'nodes.upgrade.allDone:{"success":3,"failed":0}']]);
++  });
++
++  test('用户取消确认框：不启动，也不提示', () => {
++    const run = launch({ confirm: () => false });
++    expect(run.running).toBeNull();
++    expect(run.starts).toEqual([]);
++    expect(run.rec.log).toEqual([]);
++  });
++
++  test('latest 未知或没有候选：直接返回 null，不弹确认框', () => {
++    expect(launch({ latestVersion: null }).running).toBeNull();
++    const none = launch({ rows: [row({ id: 'latest', name: 'latest', version: '1.2.0' })] });
++    expect(none.running).toBeNull();
++    expect(none.confirms).toEqual([]);
++  });
++});
++
++/** 让已排好的 microtask 全部跑完（worker 池在 await 之间推进）。 */
++async function flush(): Promise<void> {
++  for (let i = 0; i < 8; i++) await Promise.resolve();
++}
+diff --git a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
+index 2c670341..2a631522 100644
+--- a/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
++++ b/apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts
+@@ -18,12 +18,23 @@ import { useCallback, useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { toast } from 'sonner';
+ import {
++  IDLE_UPGRADE_BATCH,
+   IDLE_UPGRADE_ENTRY,
++  type NodeUpgradeBatchState,
+   type NodeUpgradeController,
+   type NodeUpgradeEntry,
+   type NodeUpgradeLatest,
+   type NodeUpgradePhase,
++  type UpgradeRunOutcome,
+ } from './types';
++import {
++  MIN_REMOTE_UPGRADE_VERSION,
++  type UpgradeBatchSummary,
++  eligibleUpgradeRows,
++  runUpgradeBatch,
++} from './upgrade-batch';
++
++export { MIN_REMOTE_UPGRADE_VERSION };
+ 
+ const POLL_MS = 2000;
+ /** 下载 + 解包 + 重启 + 版本回传的总预算。 */
+@@ -338,12 +349,14 @@ function reportResult(p: UpgradeRunParams, version: string | null, result: Upgra
+ }
+ 
+ /** 一次升级的完整流程：POST → 轮询 → 结论。取消（组件卸载）后一律静默返回。 */
+-export async function runNodeUpgrade(p: UpgradeRunParams): Promise<void> {
++export async function runNodeUpgrade(p: UpgradeRunParams): Promise<UpgradeRunOutcome> {
+   p.patch({ phase: 'pending', targetVersion: p.targetVersion, error: null });
+   const started = await p.io.start(p.row.id, p.signal);
+-  if (started.kind === 'cancelled' || p.signal.aborted) return;
++  if (started.kind === 'cancelled' || p.signal.aborted) return 'cancelled';
+   const status = reportStart(p, started);
+-  if (!status && started.kind !== 'unconfirmed') return;
++  if (!status && started.kind !== 'unconfirmed') {
++    return started.kind === 'alreadyLatest' ? 'alreadyLatest' : 'failed';
++  }
+   const version = status?.targetVersion ?? p.targetVersion;
+   const result = await watchUpgrade({
+     nodeId: p.row.id,
+@@ -355,8 +368,68 @@ export async function runNodeUpgrade(p: UpgradeRunParams): Promise<void> {
+     describeError: (code) => upgradeErrorText(p.t, code),
+     phase: (phase) => p.patch({ phase }),
+   });
+-  if (result.kind === 'cancelled' || p.signal.aborted) return;
++  if (result.kind === 'cancelled' || p.signal.aborted) return 'cancelled';
+   reportResult(p, version, result);
++  return result.kind;
++}
++
++/** 批量升级期间用它顶掉每节点 toast：进度仍然逐行落到表格上，只是不再刷屏。 */
++export const SILENT_UPGRADE_TOASTS: UpgradeToasts = {
++  success: () => undefined,
++  info: () => undefined,
++  warning: () => undefined,
++  error: () => undefined,
++};
++
++/** 批量结束后的唯一一条 toast；被取消时不提示（结论不完整）。 */
++export function reportBatchSummary(
++  t: Translate,
++  toasts: UpgradeToasts,
++  summary: UpgradeBatchSummary
++): void {
++  if (summary.cancelled) return;
++  const counts = { success: summary.succeeded, failed: summary.failed };
++  if (summary.failed === 0) {
++    toasts.success(t('nodes.upgrade.allDone', counts));
++    return;
++  }
++  const names = summary.failedNames.join(t('nodes.upgrade.listSeparator'));
++  toasts.warning(t('nodes.upgrade.allDoneWithFailures', { ...counts, names }));
++}
++
++export interface UpgradeBatchLaunch {
++  rows: NodeRow[];
++  latestVersion: string | null;
++  signal: AbortSignal;
++  t: Translate;
++  toasts: UpgradeToasts;
++  confirm: (message: string) => boolean;
++  runOne: (row: NodeRow, version: string, toasts: UpgradeToasts) => Promise<UpgradeRunOutcome>;
++  onStart: (total: number) => void;
++  onProgress: (completed: number) => void;
++}
++
++/**
++ * 「全部升级」的完整决策链：latest 已知 → 筛候选 → 一次确认 → 按序执行 → 一条汇总 toast。
++ * 没启动（latest 未知 / 没有候选 / 用户取消）返回 `null`，调用方据此不进入 running 态。
++ */
++export function launchUpgradeBatch(p: UpgradeBatchLaunch): Promise<UpgradeBatchSummary> | null {
++  const version = p.latestVersion;
++  if (!version) return null;
++  const targets = eligibleUpgradeRows(p.rows, version);
++  if (targets.length === 0) return null;
++  if (!p.confirm(p.t('nodes.upgrade.confirmAll', { count: targets.length, version }))) return null;
++  p.onStart(targets.length);
++  return runUpgradeBatch({
++    rows: targets,
++    signal: p.signal,
++    // 批量期间每节点的 toast 全部吞掉，只保留行内阶段与最后那条汇总。
++    run: (row) => p.runOne(row, version, SILENT_UPGRADE_TOASTS),
++    onProgress: p.onProgress,
++  }).then((summary) => {
++    reportBatchSummary(p.t, p.toasts, summary);
++    return summary;
++  });
+ }
+ 
+ function confirmText(t: Translate, row: NodeRow, version: string | null): string {
+@@ -390,8 +463,10 @@ export function useNodeUpgrade(
+   const { t } = useTranslation();
+   const [latest, setLatest] = useState<NodeUpgradeLatest | null>(null);
+   const [entries, setEntries] = useState<Record<string, NodeUpgradeEntry>>({});
++  const [batch, setBatch] = useState<NodeUpgradeBatchState>(IDLE_UPGRADE_BATCH);
+   const abortRef = useRef<AbortController | null>(null);
+   const runningRef = useRef<Set<string>>(new Set());
++  const batchRunningRef = useRef(false);
+ 
+   useEffect(() => {
+     const controller = new AbortController();
+@@ -414,29 +489,45 @@ export function useNodeUpgrade(
+     };
+   }, []);
+ 
+-  const patch = useCallback((nodeId: string, entry: Partial<NodeUpgradeEntry>) => {
+-    if (abortRef.current?.signal.aborted !== false) return;
+-    setEntries((prev) => ({
+-      ...prev,
+-      [nodeId]: { ...(prev[nodeId] ?? IDLE_UPGRADE_ENTRY), ...entry },
+-    }));
+-  }, []);
++  /** 组件已卸载就不再改状态：升级流程比页面活得久，patch 到死组件上只会报 warning。 */
++  const alive = useCallback(() => abortRef.current?.signal.aborted === false, []);
++
++  const patch = useCallback(
++    (nodeId: string, entry: Partial<NodeUpgradeEntry>) => {
++      if (!alive()) return;
++      setEntries((prev) => ({
++        ...prev,
++        [nodeId]: { ...(prev[nodeId] ?? IDLE_UPGRADE_ENTRY), ...entry },
++      }));
++    },
++    [alive]
++  );
+ 
+   const run = useCallback(
+-    (row: NodeRow, targetVersion: string | null, signal: AbortSignal) =>
++    (row: NodeRow, targetVersion: string | null, signal: AbortSignal, toasts: UpgradeToasts) =>
+       runNodeUpgrade({
+         row,
+         targetVersion,
+         io,
+         signal,
+         t,
+-        toasts: toast,
++        toasts,
+         patch: (entry) => patch(row.id, entry),
+         onChanged,
+       }),
+     [io, onChanged, patch, t]
+   );
+ 
++  /** 同一个节点只能有一次升级在跑：行内按钮与批量共用这把锁。 */
++  const runOnce = useCallback(
++    (row: NodeRow, version: string | null, signal: AbortSignal, toasts: UpgradeToasts) => {
++      if (runningRef.current.has(row.id)) return Promise.resolve<UpgradeRunOutcome>('cancelled');
++      runningRef.current.add(row.id);
++      return run(row, version, signal, toasts).finally(() => runningRef.current.delete(row.id));
++    },
++    [run]
++  );
++
+   const start = useCallback(
+     (row: NodeRow) => {
+       const signal = abortRef.current?.signal;
+@@ -444,13 +535,46 @@ export function useNodeUpgrade(
+       if (runningRef.current.has(row.id)) return;
+       const version = latest?.latestVersion ?? null;
+       if (!globalThis.confirm?.(confirmText(t, row, version))) return;
+-      runningRef.current.add(row.id);
+-      void run(row, version, signal).finally(() => runningRef.current.delete(row.id));
++      void runOnce(row, version, signal, toast);
+     },
+-    [latest, run, t]
++    [latest, runOnce, t]
++  );
++
++  const startAll = useCallback(
++    (rows: NodeRow[]) => {
++      const signal = abortRef.current?.signal;
++      if (!signal || signal.aborted || batchRunningRef.current) return;
++      const running = launchUpgradeBatch({
++        rows,
++        latestVersion: latest?.latestVersion ?? null,
++        signal,
++        t,
++        toasts: toast,
++        confirm: (message) => globalThis.confirm?.(message) === true,
++        runOne: (row, version, toasts) => runOnce(row, version, signal, toasts),
++        onStart: (total) => {
++          batchRunningRef.current = true;
++          setBatch({ running: true, total, completed: 0 });
++        },
++        onProgress: (completed) => {
++          if (alive()) setBatch((prev) => ({ ...prev, completed }));
++        },
++      });
++      if (!running) return;
++      void running.finally(() => {
++        batchRunningRef.current = false;
++        if (alive()) setBatch(IDLE_UPGRADE_BATCH);
++      });
++    },
++    [alive, latest, runOnce, t]
+   );
+ 
+   const entryOf = useCallback((nodeId: string) => entries[nodeId] ?? IDLE_UPGRADE_ENTRY, [entries]);
+ 
+-  return { latest, entryOf, start };
++  const eligibleCount = useCallback(
++    (rows: NodeRow[]) => eligibleUpgradeRows(rows, latest?.latestVersion ?? null).length,
++    [latest]
++  );
++
++  return { latest, entryOf, start, startAll, batch, eligibleCount };
+ }
+diff --git a/packages/shared/src/i18n/locales/en_US.json b/packages/shared/src/i18n/locales/en_US.json
+index 0fec4e59..7913680a 100644
+--- a/packages/shared/src/i18n/locales/en_US.json
++++ b/packages/shared/src/i18n/locales/en_US.json
+@@ -2027,10 +2027,22 @@
+         "unreachable": "The node cannot be reached.",
+         "nodeGone": "The node has been removed from the network.",
+         "inProgress": "An upgrade is already running on this node.",
+-        "notAllowed": "This node does not support in-app updates.",
+-        "unsupported": "This node is too old for remote upgrades.",
++        "notAllowed": "This node's install cannot update itself (no service manager, or it runs in a container). Upgrade it manually.",
++        "unsupported": "This node is too old for remote upgrades. Run npx tmex-cli upgrade on that machine.",
+         "releaseUnavailable": "The latest version could not be resolved.",
+-        "timeout": "The result is unconfirmed. Refresh the node list and check the version."
++        "timeout": "The result is unconfirmed. Refresh the node list and check the version.",
++        "atLatest": "Already on the latest version.",
++        "tooOld": "This node ({{version}}) is too old for remote upgrades. Run npx tmex-cli upgrade on that machine.",
++        "upgradeAll": "Upgrade All",
++        "allHint_one": "Upgrade {{count}} node to {{version}}",
++        "allHint_other": "Upgrade {{count}} nodes to {{version}}",
++        "allNone": "No node needs an upgrade.",
++        "allProgress": "Upgrading {{completed}}/{{total}}",
++        "confirmAll_one": "Upgrade {{count}} node to {{version}}? The node restarts and its sessions drop.",
++        "confirmAll_other": "Upgrade {{count}} nodes to {{version}}? The nodes restart one by one and their sessions drop.",
++        "allDone": "All upgrades finished: {{success}} succeeded, {{failed}} failed.",
++        "allDoneWithFailures": "All upgrades finished: {{success}} succeeded, {{failed}} failed. Failed: {{names}}.",
++        "listSeparator": ", "
+       },
+       "badge": {
+         "direct": "Direct",
+diff --git a/packages/shared/src/i18n/locales/ja_JP.json b/packages/shared/src/i18n/locales/ja_JP.json
+index 30c5f302..5908b0ac 100644
+--- a/packages/shared/src/i18n/locales/ja_JP.json
++++ b/packages/shared/src/i18n/locales/ja_JP.json
+@@ -2027,10 +2027,20 @@
+         "unreachable": "ノードに接続できません。",
+         "nodeGone": "このノードはネットワークから削除されています。",
+         "inProgress": "このノードではアップグレードが実行中です。",
+-        "notAllowed": "このノードはアプリ内更新に対応していません。",
+-        "unsupported": "このノードはバージョンが古く、リモートアップグレードに対応していません。",
++        "notAllowed": "このノードのインストール形態では自己更新できません（サービスマネージャーがない、またはコンテナ内で動作）。手動でアップグレードしてください。",
++        "unsupported": "このノードはバージョンが古く、リモートアップグレードに対応していません。該当マシンで npx tmex-cli upgrade を実行してください。",
+         "releaseUnavailable": "最新バージョンを取得できません。",
+-        "timeout": "結果を確認できませんでした。ノード一覧を更新してバージョンをご確認ください。"
++        "timeout": "結果を確認できませんでした。ノード一覧を更新してバージョンをご確認ください。",
++        "atLatest": "すでに最新バージョンです。",
++        "tooOld": "このノード（{{version}}）はバージョンが古く、リモートアップグレードに対応していません。該当マシンで npx tmex-cli upgrade を実行してください。",
++        "upgradeAll": "すべてアップグレード",
++        "allHint": "{{count}} 個のノードを {{version}} にアップグレード",
++        "allNone": "アップグレードできるノードはありません。",
++        "allProgress": "アップグレード中 {{completed}}/{{total}}",
++        "confirmAll": "{{count}} 個のノードを {{version}} にアップグレードしますか？ノードが順に再起動し、セッションは切断されます。",
++        "allDone": "すべてのアップグレードが完了しました：成功 {{success}}、失敗 {{failed}}。",
++        "allDoneWithFailures": "すべてのアップグレードが完了しました：成功 {{success}}、失敗 {{failed}}。失敗：{{names}}。",
++        "listSeparator": "、"
+       },
+       "badge": {
+         "direct": "ダイレクト",
+diff --git a/packages/shared/src/i18n/locales/zh_CN.json b/packages/shared/src/i18n/locales/zh_CN.json
+index d20319d4..4bd7e8d3 100644
+--- a/packages/shared/src/i18n/locales/zh_CN.json
++++ b/packages/shared/src/i18n/locales/zh_CN.json
+@@ -2027,10 +2027,20 @@
+         "unreachable": "无法连接到该节点。",
+         "nodeGone": "该节点已从网络中移除。",
+         "inProgress": "该节点正在升级。",
+-        "notAllowed": "该节点不支持程序内更新。",
+-        "unsupported": "该节点版本过旧，不支持远程升级。",
++        "notAllowed": "该节点的安装方式无法自更新（无服务管理器或运行在容器中），须手动升级。",
++        "unsupported": "该节点版本过旧，不支持远程升级，请在该机器上执行 npx tmex-cli upgrade。",
+         "releaseUnavailable": "无法获取最新版本。",
+-        "timeout": "升级结果未确认，请刷新节点列表核对版本。"
++        "timeout": "升级结果未确认，请刷新节点列表核对版本。",
++        "atLatest": "已是最新版本。",
++        "tooOld": "该节点版本过旧（{{version}}），不支持远程升级，请在该机器上执行 npx tmex-cli upgrade。",
++        "upgradeAll": "全部升级",
++        "allHint": "升级 {{count}} 个节点到 {{version}}",
++        "allNone": "没有可升级的节点。",
++        "allProgress": "升级中 {{completed}}/{{total}}",
++        "confirmAll": "升级 {{count}} 个节点到 {{version}}？节点会依次重启，其上的会话随之中断。",
++        "allDone": "全部升级完成：成功 {{success}}，失败 {{failed}}。",
++        "allDoneWithFailures": "全部升级完成：成功 {{success}}，失败 {{failed}}。失败：{{names}}。",
++        "listSeparator": "、"
+       },
+       "badge": {
+         "direct": "直连",
