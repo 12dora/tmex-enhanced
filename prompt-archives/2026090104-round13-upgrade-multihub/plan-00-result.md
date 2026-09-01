@@ -43,3 +43,10 @@ gateway 3298 pass / fe 1205 / app 629 / shared 413 / api-client 140，0 fail；t
 - G7：`DELETE /api/system/upgrade`（仅 downloading 可取消；executing 409）、`DELETE /api/system/upgrade/package`、入口 `DELETE /api/mesh/nodes/:id/upgrade`（取消本地 job / 转发 / 旧目标 501）；所有取消路径清理 txn 目录、`.part`、暂存包、无 sidecar 缓存，崩溃半取消由启动 prune 修复；`UPGRADE_CANCELLED` 契约。
 - O3：挂载/新增节点回读升级状态续接轮询；每节点独立 AbortController；下载阶段停止按钮、安装阶段禁用；批量汇总「已取消」计数。
 - 实测 `sub/live-cancel.ts`：下载中刷新 → 行内恢复「Downloading」+ 停止按钮；停止 → `UPGRADE_CANCELLED`、入口缓存 `.part` 消失、目标 staged 为空、toast「已取消」；立即重发 → 200；完整推送后仅留已校验缓存。
+
+## v1.1.12 发版与生产验证（2026-09-02）
+
+- RV5 审查 5 个 blocker 全部修复（G7b/O3b）：PUT 落盘未 ACK 必删包、handoff 后透传目标结果、共享下载统一 waiter/abort、孤儿 sidecar 清理、`upgrade-cancel` 能力声明；FE pending 阶段停止在 POST 落定后必发 DELETE、cancelling 态、恢复期互斥与共享并发、404/405/501 统一「不支持中断」。
+- 门禁：gateway 3346 / fe 1244 / app 629 / shared 413 / api-client 140 全绿；tsc 基线不变。
+- 实测 `sub/live-cancel.ts` 复验通过；tag `v1.1.12`（main `a01ba423`）；本机 `tmex upgrade` → 1.1.12。
+- **生产「全部升级」真实推包**：jiefa-dns-1、jiefa-app、hub `tmex` 约 50 s 内升到 1.1.12，toast「成功 3，失败 1（docker-node：手动部署无 install-meta，不可自更新）」；docker-node 随后手动 `docker cp` 更新到 1.1.12。
