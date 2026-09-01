@@ -45,3 +45,7 @@ Do NOT touch `apps/gateway/**`, `packages/shared/**`, `apps/fe/**`.
 ## Result file
 
 `/Users/konata/code/tmex-enhanced-wt-r13/prompt-archives/2026090104-round13-upgrade-multihub/sub/G5-result.md` — commands/flags shipped, env keys written, wiring summary, test/tsc/build results. Write it, then exit.
+
+## Scheduling note (important)
+
+G2 and G3 are running concurrently with you. If `sub/G2-result.md` / `sub/G3-result.md` do not exist yet when you start: do parts **B (CLI)** and **C (docs)** first, then check for those two result files (re-check every 2 minutes, for up to 45 minutes) before doing part **A (runtime wiring)** so you code against the signatures they actually shipped. If they still have not appeared after 45 minutes, implement part A against the signatures named in `sub/G2-prompt.md` / `sub/G3-prompt.md` (`MeshRuntime.onNodeList`, `HubRuntime.applyReplicatedNodeList`, `HubRuntimeOptions.meshHubStore`) and say so in your result.
