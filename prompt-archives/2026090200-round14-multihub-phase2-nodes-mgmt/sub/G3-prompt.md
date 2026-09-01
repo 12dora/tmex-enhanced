@@ -1,0 +1,34 @@
+# Common rules for every coding agent on this worktree
+
+- Worktree: `/Users/konata/code/tmex-enhanced-wt-r14` (branch `feat/round14-multihub-phase2-nodes-mgmt`). Runtime is **Bun** (`bun`, `bunx`); Node only for `packages/app` CLI. If `bun` is missing from PATH, source `~/.zshrc` PATH.
+- **Other agents are editing this same worktree in parallel. Touch ONLY the files listed in your scope. Never run `git add/commit/stash/checkout/reset`.** The commander commits.
+- Read `AGENTS.md` at the repo root first and follow it (Chinese comments only where logic is non-obvious; no unnecessary comments; no TODOs, no stubs, no "simple version first").
+- **Never touch the production tmex**: do not read/write `~/Library/Application Support/tmex/`, do not curl port 9883, do not kill/restart launchd services, do not touch the tmux session named `tmex` or the default tmux socket. Tests must use temp dirs and free ports.
+- Never lint/format generated files (`packages/shared/src/i18n/resources.ts`, `types.ts`, `resources/fe-dist/*`, `dist/*`).
+- Look up library APIs in `node_modules` source before using them; do not guess.
+- TDD: write/extend tests alongside the implementation. Before finishing run, in the package you changed: `bun test <dir>` (in `apps/fe` use `bun test src/...`, never bare `bun test`), `bunx tsc --noEmit -p .` (error count must not exceed the baseline given in your task), `bunx biome check <changed files>` (fix with `--write`). macOS has no `timeout` command; strip ANSI from bun test output with `sed 's/\x1b\[[0-9;]*m//g'`.
+- When done, write a concise result report (what changed, file list, test/tsc numbers, anything left) to the absolute result path given in your task, **then exit**. Write the file only when finished.
+
+# G3 — Remote hub role switch API (`POST /api/hub/role`) with persisted transition
+
+Result file: `/Users/konata/code/tmex-enhanced-wt-r14/prompt-archives/2026090200-round14-multihub-phase2-nodes-mgmt/sub/G3-result.md`
+
+## Background
+Today promote/demote/standby are CLI-only (`packages/app/src/commands/hub.ts:1098-1205`: write `TMEX_HUB_MODE` / `TMEX_HUB_WRITER_EPOCH` into `app.env`, then restart via the service manager). The FE wants a「切换」button next to the 主 Hub / 备 Hub tag in the node table. Exploration with exact file/line refs: `prompt-archives/2026090200-round14-multihub-phase2-nodes-mgmt/sub/EX2-result.md` §3 (read first, verify against code). Signed hub authorization (`admit-hub`) was just implemented by task G2 — read `sub/G2-result.md` and `apps/gateway/src/hub/hub-authorization.ts` (merged `isAuthorizedHub`).
+
+## Contract (committed; read, do not edit): `packages/shared/src/contracts/hub-role.ts`
+`HubRoleRequest { mode, writerEpoch?, operationId }`, `HubRoleTransition { operationId, targetHubId, mode, writerEpoch, phase: accepted|persisting|restarting|complete|failed, error, startedAt, updatedAt }`, `HubRoleErrorCode`.
+
+## Requirements
+1. **Target hub endpoints** (new `apps/gateway/src/hub/hub-role-routes.ts`, registered from `hub-runtime.ts` route table with the same `withAuth` as `/api/hub/nodes/*`):
+   - `POST /api/hub/role` body `HubRoleRequest` → 202 `HubRoleTransition`. Validation: hub role installed (`HUB_NOT_HUB` 409), `operationId` UUID-ish (`INVALID_REQUEST` 400), idempotent (same operationId → return existing record 200), one in-flight transition at a time (`HUB_ROLE_BUSY` 409), `mode==='active'` requires `writerEpoch > max(env epoch, own mesh_hubs epoch, all known mesh_hubs epochs)` else `HUB_EPOCH_STALE` 409, self must be authorized (`isAuthorizedHub(self)` — self is always authorized by rule; but if a signed `retire-hub` exists for self → `HUB_NOT_AUTHORIZED`).
+   - `GET /api/hub/role/status?operationId=` → `HubRoleTransition` or 404; `GET /api/hub/role/status` (no id) → latest transition or 404.
+   - Sequence: persist transition `accepted` → `persisting`: atomically write `TMEX_HUB_MODE` (+ `TMEX_HUB_WRITER_EPOCH` for active) into `app.env` through the same env-patch facility the gateway already has (`patchHostEnv` used by tunnel `set_trust_proxy` in `apps/gateway/src/tunnel/manager.ts`; find its definition in `packages/app/src/runtime/**` and reuse — inject via HubRuntime deps, do not shell out); update own `mesh_hubs` row (mode/epoch) and the in-memory `UplinkServer.setMode()`/epoch so a demote stops accepting writes immediately; → `restarting`: schedule the existing self-restart (`RuntimeController.requestRestart()` / the path `POST /api/settings/restart` uses) ~1 s later so the 202 flushes; on next start, the hub reads env, and if the latest persisted transition is `restarting` and env matches → mark `complete` (else `failed` with reason). Persist transitions in a small table `hub_role_transitions` (managed migration) — `mesh_hubs.replaceAll()` would wipe anything stored there.
+   - Standalone gateway process (dev/tests, no `patchHostEnv`): return 409 `HUB_ROLE_UNSUPPORTED` with message.
+2. **Entry proxy**: the FE calls `/n/<hubNodeId>/api/hub/role` through the existing forwarder; nothing new needed except: when the target answers 404/405 the FE maps to `HUB_ROLE_UNSUPPORTED` (document in result). Also expose on the entry `GET /api/mesh/hubs` each hub's `roleTransition?: HubRoleTransition | null` **only for self** (cheap) — optional; skip if it complicates.
+3. **CLI parity**: `tmex hub promote/demote` keep working; make them write a `hub_role_transitions` row too if the DB is accessible (best effort) so UI and CLI agree. `tmex hub list` prints the latest transition phase if any.
+4. Tests: routes (validation matrix, idempotency, busy, stale epoch, env write + mesh_hubs update + restart scheduled through injected fakes, status read-back, startup completion/failed marking), migration applied; extend `multi-hub.integration.test.ts` if the harness can inject env patch/restart fakes (writer A demote + B promote via API → C/D switch to B; A returns → fenced). Baselines: `apps/gateway` full `bun test` green, tsc 0; `packages/app` 629 green, tsc 1 pre-existing.
+5. Docs: `docs/hub/2026090104-multi-hub-standby.md` add 「远程切换（UI）」 subsection describing the API sequence and the ordering rule (demote old writer first when reachable; otherwise rely on higher epoch fencing).
+
+## Scope — files you may edit
+`apps/gateway/src/hub/**` (new `hub-role-routes.ts`, `hub-role-transitions.ts`, edits to `hub-runtime.ts`, `uplink-server.ts` epoch setter), `apps/gateway/src/db/schema.ts` + `managed-migrations.ts`, `apps/gateway/src/mesh/mesh-runtime.ts` (dependency wiring only), `apps/gateway/src/mesh/integration/**`, `packages/app/src/runtime/assemble.ts` (inject env patcher/restart into hub runtime), `packages/app/src/commands/hub.ts` (+ tests), `docs/hub/2026090104-multi-hub-standby.md`. Do NOT touch `apps/gateway/src/mesh/uplink-pool.ts` (G3b), `apps/gateway/src/api/**`, `apps/gateway/src/system/**`, `apps/gateway/src/tunnel/**`, `apps/fe/**`, `packages/shared/src/contracts/**`.
