@@ -34,4 +34,7 @@
 
 ## 上线
 
-- 见本文件末尾追加。
+- release commit `be763ce0`，merge `bdb4f33b`，tag `v1.1.8`；GitHub Actions Release（run 33485755491）成功，资产 `tmex-cli-1.1.8.tgz` + `SHA256SUMS`。
+- 本机生产：`node "$HOME/Library/Application Support/tmex/current/cli/bin/tmex.js" upgrade --yes --lang zh-CN` → `upgrade committed 1.1.7 -> 1.1.8`，`/healthz` 版本 1.1.8，`current` → `versions/1.1.8`；升级前生产库三件套只读备份在 scratchpad `prod-backup-1.1.7/`。
+- 其余节点（Hub、jiefa-app、jiefa-dns-1）未升级，可在设置-节点管理用「升级」按钮逐台升级。
+- 注意：`gh` 默认解析到上游 `krhougs/tmex`，查 Release/Actions 要带 `-R 12dora/tmex-enhanced`。
