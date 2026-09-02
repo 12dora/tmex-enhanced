@@ -40,9 +40,16 @@
 - 前端：`establishSessionFromPassword` 之后若 `mode.passkeySecondFactor`：调 `passkeyLoginOptions(uid, delegation)` 拿本 origin 的 allowCredentials → WebAuthn get → 编码断言存入会话钥（`passkeyCredentialId` + `passkeySig`，随 delegation 一起持久化，属于签名不是秘密）→ `loginToNode` 携带 `passkey`。`NO_PASSKEY_FOR_ORIGIN` 时提示「本地址未注册通行密钥，请在已注册通行密钥的地址登录后为本地址添加」。服务端回 `PASSKEY_REQUIRED`（mode 快照过期）时执行同一仪式后重试一次；`PASSKEY_INVALID` 显示校验失败。账号安全面板通行密钥区加一句说明：注册后密码登录需通行密钥二次验证、仅在注册地址生效、移除全部通行密钥即关闭。
 - 移除最后一把通行密钥自动关闭二次验证（无新增开关、无新表）。
 
-## 任务 3：公网暴露安全排查（EX-B 报告后决定，指挥官判定，避免过度防御）
+## 任务 3：公网暴露安全排查（后端 G3 + G1 后续）
 
-待补：按 P0/P1 落地，P2 与"过度防御"项记录不做。
+EX-B 审计结论：组装后的生产 runtime 对 `/api/*`、`/ws`、`/n/:id/*`、文件、系统路由均有会话门禁；mesh 头在边缘被剥离、peer/uplink 靠证书签名；tmux/ssh 命令均为 argv/引号拼装；SQL 参数化。落地的"便宜且有效"项：
+
+- **JSON 请求体封顶**（1 MiB）：`apps/gateway/src/api/http.ts` `readJsonObjectBody` 与 `packages/app/src/runtime/http.ts` `readJsonBody`，未登录的登录/挑战/passkey/redeem/setup 都经这两处。
+- **代理 IP 取值顺序**：`client-ip.ts` 改为 `cf-connecting-ip` → `x-real-ip` → `x-forwarded-for` **最后一段**（nginx 追加真实客户端在末尾，首段可伪造，否则限流可绕）。
+- **挑战存储封顶**（4096，淘汰最旧）与**限流表封顶**（1 万 key、周期清理）。
+- **G1 后续（auth-routes.ts）**：`/api/auth/challenge` 按 IP 限速；`/api/auth/mode` 的 `rootPublicKey` 仅对已登录请求返回（未登录只需 kdfParams；公开根公钥 + KDF 参数等于把密码离线爆破的 oracle 送出去；CLI `hub-client` 只读 uid/kdfParams，前端消费方均已登录）。
+
+明确**不做**（过度防御或部署侧问题）：裸 `apps/gateway` 入口无门禁（生产只跑组装 runtime，属于部署约束，写进文档）；远端文件根 symlink 逃逸（单管理员、已登录）；standalone setup 路由（mesh 模式返回 not_standalone）；WS 入站帧大小（chunk 协议已限界）；uplink 挂起握手上限；WS Origin 白名单（SameSite=Lax 已挡跨站 WS）；HSTS（边缘配置）；CSRF token（JSON + Lax）。
 
 ## 任务 4：HTTPS 状态误报（后端 G2 + 前端 O2）
 
@@ -54,9 +61,11 @@
 - 在 `packages/app/src/runtime/tls-routes.ts` 的 GET 分支用 req 装饰；`assemble.ts` 传入公开地址。
 - 前端状态头显示「HTTPS：由反向代理提供（已确认 / 按配置地址推断）| 内置 | 关闭」；mode=none 但检测到反代 https 时提示切到「外部反向代理」并开启信任代理头。
 
-## 任务 5：窄屏终端宽度溢出（EX-D 报告后决定）
+## 任务 5：窄屏终端宽度溢出（后端 G4）
 
-待补。
+EX-D 结论：前端 fit（ghostty-terminal 自定义 FitAddon）按 DPR 取整、等字体就绪、零尺寸守卫都已到位；真因是网关的视口仲裁——每个可见浏览器终端上报 `terminal-viewport` claim，`apps/gateway/src/ws/viewport-policy.ts` `resolveWinner` 取**面积最大**者作为 tmux 窗口尺寸（`resize-window` 使 window-size=manual），其余客户端变 follower 平移显示。桌面标签页 160×48 与手机 42×60 同看一个 pane 时，手机拿到 160 列的 PTY，全屏 TUI 溢出。
+
+改法：仲裁改为**可见 claim 中列数最小者胜**（列数相同取行数小、再取 sessionId 小），最小客户端隐藏/断开后由次小者接管；owner/follower 协议与报文不变。这与 tmux 多客户端 `window-size smallest` 语义一致，任何客户端都不会溢出。不做：`refresh-client -C`（一个 control-mode 客户端服务所有标签页，做不到按标签页尺寸）、`window-size latest`（resize-window 已置 manual）。
 
 ## 验收
 
