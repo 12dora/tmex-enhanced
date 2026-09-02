@@ -46,3 +46,10 @@
 - `replicatedTo` 空数组 ≠ 未复制（round14 遗留，本轮实测再次确认 token 已到备 hub）。
 - 大规模 hub 下 `/api/hub/status` 快速轮询的 O(N²) 请求量与预算未做（当前 2 台 hub 无影响）。
 - 临时实例种子设备的 tmux session 名固定为 `tmex`，与生产会话同名，起临时实例前需处理（已记入记忆）。
+
+## 追加：v1.1.15 热修（节点管理误报「无法连接到 Hub」）
+
+- 现象：主 hub 切到 B 后，本机节点管理页显示「无法连接到 Hub，节点管理暂不可用」，但 hub 条显示 B 在线。
+- 根因：`useHubNode` 只对写者 hub 发 `/n/<hub>/api/hub/nodes`；浏览器从未登录过新写者 B，收到 401 `NODE_LOGIN_REQUIRED` 后拦截器只标记未登录并刷新列表，没有任何路径对 hub 机做静默节点登录（其它节点是在侧栏展开或进入 `/n/:id` 时才登录）。旧 hub 因早已有会话从未暴露。
+- 修复（`apps/fe/src/node/mesh-nodes.ts`）：`loadHubNodes` 对 401 先 `ensureNodeLogin(hub)` 再重试；写者仍不可用时按 `hubCandidateIds`（写者优先，其余在线 hub 兜底）退到其它 hub，管理动作随之发给实际应答的那台（备 hub 会转发写入）。单测 4 条。
+- 发版 v1.1.15（`0409de11`，merge `b3a97e47`），六节点全部升到 1.1.15；Playwright 对本机生产复验：401 → 对 B 静默登录 → 200，提示消失。
