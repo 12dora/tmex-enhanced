@@ -318,12 +318,40 @@ async function forward(): Promise<void> {
   const list = await api(A, 'GET', '/api/hub/enrollments');
   log(`A enrollments list → ${list.status} ${list.text.slice(0, 300)}`);
 }
+async function upgradeNodes(): Promise<void> {
+  await login(B);
+  const targets = (await nodesOf(B)).filter((n) => n.version !== '1.1.14' && n.id !== B.nodeId);
+  log(`targets: ${JSON.stringify(targets.map((n) => ({ name: n.name, v: n.version })))}`);
+  for (const n of targets) {
+    await loginVia(B, { name: n.name, url: '', nodeId: n.id });
+    const r = await api(B, 'POST', `/api/mesh/nodes/${n.id}/upgrade`, {});
+    log(`${n.name} POST upgrade → ${r.status} ${r.text.slice(0, 200)}`);
+  }
+  const deadline = Date.now() + 8 * 60_000;
+  const pending = new Set(targets.map((n) => n.id));
+  while (pending.size > 0 && Date.now() < deadline) {
+    await sleep(8000);
+    for (const id of [...pending]) {
+      const r = await api(B, 'GET', `/api/mesh/nodes/${id}/upgrade`);
+      const body = r.json as { phase?: string; state?: string; error?: string | null; targetVersion?: string } | null;
+      const phase = body?.phase ?? body?.state ?? `http${r.status}`;
+      const name = targets.find((t) => t.id === id)?.name;
+      if (r.status !== 200 || ['idle', 'committed', 'done', 'complete', 'failed', 'cancelled'].includes(String(phase))) {
+        log(`${name} → ${r.status} ${r.text.slice(0, 220)}`);
+        pending.delete(id);
+      }
+    }
+  }
+  const after = await nodesOf(B);
+  log(`versions now: ${JSON.stringify(after.map((n) => ({ name: n.name, v: n.version, online: n.online })))}`);
+}
 async function main(): Promise<void> {
   if (PART === 'STATUS') await status();
   else if (PART === 'ADMIT') await admit();
   else if (PART === 'ROLE') await role(A, B);
   else if (PART === 'ROLLBACK') await role(B, A);
   else if (PART === 'FORWARD') await forward();
+  else if (PART === 'UPGRADE') await upgradeNodes();
   else throw new Error(`unknown part ${PART}`);
   log('DONE');
 }

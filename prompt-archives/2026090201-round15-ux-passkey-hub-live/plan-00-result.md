@@ -34,4 +34,15 @@
 
 ## 门禁与发版
 
-（终态数字与发版记录见文末追加。）
+- 终态数字：gateway **3543** pass（1 个 RTC 时序 flake 隔离复跑过）/ fe **1514** / shared 430 / panels 747 / ui 54 / api-client 140 / stores 419 / app 644（构建后）；tsc gateway/fe/shared/panels/ui 0；`bun run lint`（biome + 复杂度门禁）通过。
+- 修正了 main 上自 1.1.13 起确定性失败的多 hub 集成用例（夹具「不打版本戳」已无法构造旧节点，改为显式 1.1.12；生产门禁本身无回归）。
+- 发版 **v1.1.14**：`chore(release): 1.1.14`（`2aae51a2`），合并 main（`112ec762`），tag 触发 Release CI 成功（`tmex-cli-1.1.14.tgz` 22.5 MB + SHA256SUMS）。打包产物临时实例烟测通过（healthz/首页 200、迁移含 `access_mode`）。
+- 上线：本机生产 `tmex upgrade` → 1.1.14；B `tmex upgrade`（在线）→ 1.1.14；A scp 包 + `upgrade --apply-current-package` → 1.1.14；jiefa-app / jiefa-dns-1 经入口 B 推包（`POST /api/mesh/nodes/:id/upgrade`，需先建节点会话）→ 1.1.14；docker-node 手动部署（`UPGRADE_NOT_ALLOWED`）用 `docker cp` 覆盖 `/opt/tmex` 重启 → 1.1.14。六节点全部 1.1.14，全部挂在主 hub B（epoch 4），A 为备。
+- A 升级重启后直接挂到已知主 B（`starting fenced: higher writerEpoch=4`），未再出现挂自己的 55 s 空窗。
+
+## 遗留
+
+- 海外测试机 2 未开通：基于延迟的 hub 优选只观察到本机对 B 约 62 ms、对 A 探测超时（本机网络对 43.248 裸 IP 不通），待机器就绪后再验证。
+- `replicatedTo` 空数组 ≠ 未复制（round14 遗留，本轮实测再次确认 token 已到备 hub）。
+- 大规模 hub 下 `/api/hub/status` 快速轮询的 O(N²) 请求量与预算未做（当前 2 台 hub 无影响）。
+- 临时实例种子设备的 tmux session 名固定为 `tmex`，与生产会话同名，起临时实例前需处理（已记入记忆）。
