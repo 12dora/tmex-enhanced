@@ -37,12 +37,13 @@
 | 项目 | 结果 |
 |---|---|
 | `packages/ghostty-terminal && bun test` | `278 pass / 0 fail`（基线 272，新增 6） |
+| `packages/ghostty-terminal && bun test --randomize` | seed `3091478608`，`278 pass / 0 fail` |
 | `packages/terminal-ui && bun test` | `379 pass / 0 fail` |
 | `packages/panels && bun test` | `786 pass / 0 fail`（并行任务已新增其他测试） |
 | 三个包 `bunx tsc --noEmit -p .` | 均为 `0 error` |
 | `bunx biome check` | 全部改动文件通过 |
 | `git diff --check` | 通过 |
-| `bun scripts/complexity/gate.ts` | 本任务文件无违规；全局门禁当前仍被并行 `ws-client` 任务的 3 条违规阻塞，待最终收口重跑 |
+| `bun scripts/complexity/gate.ts` | `ok (1243 files, 11640 functions)` |
 
 ## 渲染桥基准
 
