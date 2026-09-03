@@ -306,3 +306,68 @@ leave cpu-features as an external require」——它断言 `dist/runtime/server
 5. **CA 指纹与多中继**：r3 仍然只有一个 CA 指纹后缀，语义是「表里每一台都必须出示指纹相符的
    CA」。当前 join-material 只发一台，问题不显；将来真要扇出到多台自签中继，需要把指纹也做成
    每条一个（届时要再改一次格式）。
+
+---
+
+## 六、hub join 接线（f10eef2f 之后的追加改动）
+
+第一条 findings 里发现的「hub 加入路径同样缺回放期 passkey 验签器」已按指挥官要求补上。
+
+### 改了什么
+
+`packages/app/src/commands/hub.ts` 的 `commitVerifiedJoin`，两处调用点（其余一律未动）：
+
+```ts
+// 预检：原来完全不传验签器
+const verifyPasskeyAssertion = makeReplayPasskeyVerifier(records);
+const preview = await verifyKeyLogChain(records, input.expectedRootPublicKey, undefined, {
+  verifyPasskeyAssertion,
+});
+...
+// 提交：原来用 ctx.userKeys（LocalAuthContext 建的那个，没有验签器）
+const committed = await joinUserKeyService(ctx, records).commitJoin({ ... });
+```
+
+加一行 import（`../lib/keylog-passkey-replay`）。`keylog-passkey-replay.ts` **一字未改**——
+r2 那版写的时候就是按「加入路径通用」设计的（只依赖 records 与 `LocalAuthContext`，不含任何
+relay 概念），hub 直接复用即可，不需要再抽公共 helper。
+
+`hub-join-verify.ts` 也没动：改动只有 6 行，`hub.ts` 从 1242 → **1248 行**，仍在 allowlist 的
+`fileLines: 1298` 之内（余量 50 行），不需要搬代码。
+
+注意 hub 的预检**没有**像 r3 那样去掉 `expectedHeadHash`——hub 路径本来就只传两个参数
+（`verifyKeyLogChain(records, expectedRootPublicKey)`），锚点校验一直是靠
+`commitJoin(anchorHash)`，没有第 3 条那个缺陷。
+
+### 测试（`packages/app/src/commands/join.test.ts` 新增 describe「hub join with passkey-signed records」）
+
+1. **replays a chain whose revoke-node is signed by a passkey**：hub 上先 root 签一条
+   `add-passkey`（真 ES256 认证器 + `verifyRegistration` 造 payload），再用**这把 passkey**
+   签一条 `revoke-node`（吊销 hub 自己那个自承认节点，签名用 `authenticator.assert` +
+   `encodePasskeyAssertionSig`，经带 `makeVerifyPasskeyAssertion` 的 `UserKeyService.apply`
+   落到 hub 库里，确保是条真记录）。之后才生成 join 串（用最终 head 当锚），假 hub 把整条链与
+   `node_certs`（含 `revoked_log_seq`）回给 `performHubJoin`。断言：加入成功、记录数一致、
+   **吊销真的被回放进来了**（加入方的 `node_certs` 里有 `revokedLogSeq != null`，而不是靠跳过
+   passkey 记录蒙混）。
+2. **an unverifiable passkey signature still rejects the chain**：同样的链，但断言签的是另一条
+   挑战 → `key log rejected`。证明新验签器不是「一律放行」。
+
+**反向验证**（临时改回后跑，确认测试真的能抓住这个 bug）：
+
+- 两处都改回原样 → `JoinError: key log rejected: unknown_signer`，用例 fail。
+- 只把 `commitJoin` 改回 `ctx.userKeys` → 同样 `unknown_signer`，用例 fail。
+
+即两个调用点缺一不可，随后已完整还原（`git diff` 只剩上述 6 行 + 1 行 import）。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `packages/app: bun test src/commands` | **211 pass / 0 fail**（14 files） |
+| `packages/app: bun test`（全量） | 798 pass / 1 fail（仍是 `build-runtime.test.ts` 那条环境性失败，见第三节） |
+| `packages/app: bunx tsc --noEmit` | 0 error |
+| `bunx biome check`（hub.ts / hub-join-verify.ts / join.test.ts / keylog-passkey-replay.ts） | 干净 |
+| `bun run lint`（仓库全量） | 只剩 1 个错误，在别的 agent 的在制文件 `apps/gateway/src/mesh/integration/stream-failover.integration.test.ts`（format），非本次改动 |
+| `bun scripts/complexity/gate.ts` | `hub.ts` / `hub-join-verify.ts` / `keylog-passkey-replay.ts` 均无告警（其余超限项仍是别人的文件） |
+
+第一节末尾「留给指挥官」的那条 hub 待办到此关闭。
