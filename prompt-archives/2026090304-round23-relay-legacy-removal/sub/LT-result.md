@@ -288,3 +288,106 @@ touch $L/proceed-cleanup        # 主驱动收到后 kill 全部 PID + tmux -L t
   （驱动从 `test.env` 读出来显式传给 helper）；不然节点身份私钥解不开。
 - `test.env` 的 `TMEX_DEFAULT_LANGUAGE=en_US` 让界面默认英文，截图脚本会先进「设置→通用」
   切成简体中文再截。
+
+---
+
+## 七、F4 复核（commit `3e5f0406`，前端产物已按该提交重建）
+
+复核驱动 `<live>/live-f4.ts`（3 实例精简版）+ 截图脚本 `<live>/shots-f4.ts`，
+产物 `<live>/shots-f4/`（16 张，desktop 1280×800 / mobile 390×844 各 8 张，@2x），
+日志 `<live>/run-f4.log`、`<live>/shots-f4.log`。
+
+**与 §二 的拓扑差别**：为了让运营者页出现「已吊销 N」，本次让 **R2（`relay,node`，19996）同时充当中继与
+运营者 UI** —— A（`node`，19994）带口令接入 R2，B（`node`，19995）经 r3 加入后被吊销。
+端口、`tmex-live` socket、白名单 env 与 §一 完全一致。
+
+### 7.1 后端断言（9/9 PASS）
+
+| 断言 | 证据 |
+|---|---|
+| F4.1 R2 设中继口令 | 200 |
+| F4.2 A 带口令接入 R2 | 200，`tenantId=5fe71c4eb5aab607ce58398665b7b6c3` |
+| F4.3 A 上线 | `{online:true, attached:true}` |
+| F4.4/F4.5 enrollment + r3 join | 201 / `runRelayJoin` 返回 `kind:relay` |
+| F4.6 承认 B | `nodesOnline: 2` |
+| F4.7 经中继远程调用 | `GET /n/<B>/api/devices` 200（让「中转流量」有非零读数） |
+| **F4.8 吊销后管理面口径** | `{"nodes":1,"nodesRevoked":1,"nodesOnline":1}` —— `nodes` 已不含 revoked，且新增 `nodesRevoked` 字段（`relay-admin-routes.ts` 的改动生效） |
+| F4.9 备注 + 单独配额 | `label:"上海 A 机"`、`quota:{maxNodes:8,maxStreams:32,bandwidthBytesPerSec:524288}` |
+
+### 7.2 §3.2 布局问题：**两条全部修复**
+
+1. **「操作」列可达** ✅。两张宽表现在都是 `position: sticky; right: 0`，脚本量到的实测数据：
+
+   | 表 | 视口 | 滚动容器 clientWidth / scrollWidth | `scrollLeft` | 末列 rect | 末列内容 |
+   |---|---|---|---|---|---|
+   | `nodes-table` | 1280 | 846 / 876 | 0 | 1013–1219（视口内） | `升级 更多 移除` |
+   | `relay-tenants-table` | 1280 | 846 / 1055 | 0 | 1013–1219（视口内） | `编辑 踢出 删除` |
+   | `nodes-table` | 390 | 316 / 876 | 0 | 147–353（视口内） | `升级 更多 移除` |
+   | `relay-tenants-table` | 390 | 316 / 1055 | 0 | 147–353（视口内） | `编辑 踢出 删除` |
+
+   即**未滚动时操作按钮已完整可见**（`desktop-tenant-01-nodes.png` 里 `升级/更多/移除` 三个按钮完整、
+   被裁的改成了低价值的「公钥指纹」列 `d6920d3291205…`）。滚动容器还加了细滚动条样式
+   （`[&::-webkit-scrollbar]:h-1.5` + `scrollbar-width:thin`），有了可见的滚动提示。
+
+2. **移动端深链标签滚入视口** ✅。`?tab=relay` 打开后实测
+   `settings-tab-relay` 的 rect = `{left:290, right:369, viewportWidth:390, fullyVisible:true}`
+   （桌面同样 `fullyVisible:true`）。`mobile-operator-01-header-cards.png` 里「中继」高亮标签就在右侧可见。
+
+### 7.3 §3.3 文案问题：5 条修复，1 条仍开
+
+| LT 编号 | 状态 | 复核证据 |
+|---|---|---|
+| §3.3-1 术语冲突（中继=relay vs 规范里中继(Hub)=hub） | ❌ **仍开** | `/Users/konata/code/tmex-copy-guidelines.md` 第 22 行仍是「中继（Hub）\| 中心节点 / 服务器」，mtime 还是 8-31。**需要指挥官改这份规范文件**（它在仓库外，我未动） |
+| §3.3-2 reauth 说明文不对题 | ✅ 修复 | 新增 `relay.tenant.dialog.reauthNotice`，界面为「中继口令已变更，重新输入以恢复接入。」（`desktop-tenant-03-reauth-dialog.png`） |
+| §3.3-3 代/代次/世代 不统一 | ✅ 修复 | 新增 `relay.admin.epochValue`「第 {{epoch}} 代」；运营者页改为「口令 第 1 代」「令牌下限 第 0 代」，租户表列头由「令牌代次」→「令牌」值「第 1 代」，与链路条「元数据密钥第 3 代」一致 |
+| §3.3-4 接入密码字段过于技术 | ✅ 修复 | 「当前密码（本机账号密码）」+「接入必须用密码签名，通行密钥无法代签。」（「根密钥」「接入证明」已去掉） |
+| §3.3-5 口令模式说明重复标签 | ✅ 修复 | 「保留现有租户 / 新口令只对新接入生效。」「作废旧令牌 / 所有租户须重新输入口令。」（并把「需」改成「须」） |
+| §3.3-6 发送/接收永远相等 | ✅ 修复 | 「总量」卡合成单项「中转流量 5.19 KB」（`relay.admin.totals.traffic`） |
+| §3.3-7 HTTPS 卡片写死 Hub | ✅ 修复 | 「只有本机作为上级时才需要 HTTPS；节点经上级访问，无需配置。」 |
+
+§3.4（运营者节点数含已吊销）也已修复：租户表「节点」列现在是 `1 / 1` + `已吊销 1` 徽标，
+后端 `nodes` 不再计入 revoked（见 7.1 的 F4.8）。
+
+### 7.4 新发现：sticky 操作列在移动端把表格挤到几乎不可用
+
+固定操作列在桌面是净收益，但在 390 宽下它占掉滚动窗口的三分之二：
+
+- `nodes-table`：滚动容器 316 px，sticky 操作列约 206 px → 只剩 **约 110 px** 显示其余 8 列，
+  实际只看得到「名称 self 当前」，状态 / 版本 / 最近在线 / 支持直连 / 登录状态 / 公钥指纹全部要横向拖
+  （`mobile-tenant-01-nodes.png`）。
+- `relay-tenants-table`：同样只剩「编号 5fe71c4eb5aa…」和三个按钮，备注 / 接入时间 / 节点 / 流量 / 配额
+  全部看不到（`mobile-operator-02-tenant-table.png`），而这张表 `scrollWidth` 有 1055 px。
+
+建议：`sm` 以下不要 sticky（整行一起横滚），或者窄屏把行改成卡片式、操作收进「⋯」菜单。
+不阻塞发版，但移动端这两张表现在的可读性比 F4 之前更差。
+
+### 7.5 截图清单（`<live>/shots-f4/`，desktop-/mobile- 各一份）
+
+| 文件 | 内容 |
+|---|---|
+| `tenant-01-nodes.png` | 节点页：中继链路条 + 节点表（sticky 操作列） |
+| `tenant-02-enroll-dialog.png` | 追加中继对话框（新密码标签/说明） |
+| `tenant-03-reauth-dialog.png` | 重新输入中继口令（新说明、地址锁定） |
+| `operator-01-header-cards.png` | 运营者头部三卡（单一「中转流量」、「第 N 代」）+ 租户表首行 |
+| `operator-02-tenant-table.png` | 租户表（`1 / 1` + `已吊销 1`、sticky 操作列） |
+| `operator-03-password-dialog.png` | 修改接入口令（新单选说明） |
+| `operator-04-tenant-editor.png` | 租户编辑对话框 |
+
+### 7.6 收尾复核
+
+`proceed-cleanup` 后：19994/19995/19996 全部释放、`pgrep -f tmex-r23/…/server.ts` 为空、
+`tmux -L tmex-live ls` → `no server running`、默认 socket 仍是
+`tmex: 3 windows (created Wed Aug 26 00:26:54 2026) (attached)`（逐字未变）、
+生产 runtime（`~/Library/Application Support/tmex/current/runtime/server.js`，监听 9883）全程未触碰、
+仓库无 `tmex.db` 残留。
+
+### 7.7 复跑
+
+```bash
+export PATH="$HOME/.bun/bin:$PATH"
+L=/private/tmp/claude-501/-Users-konata-code-tmex-enhanced/f9d3700c-64d1-49ea-b5c9-799106d674d3/scratchpad/live
+cd /Users/konata/code/tmex-r23
+rm -rf $L/R2 $L/A $L/B $L/proceed-cleanup && bun $L/live-f4.ts   # 起 3 实例并挂起
+cd apps/fe && bun $L/shots-f4.ts                                  # 截图 + 表格/标签位置量测
+touch $L/proceed-cleanup                                          # 拆
+```
