@@ -120,3 +120,12 @@ chunk 彻底失败时原生 `<dialog>` 兜底、toast 门面排队到 Toaster �
 - 文件树目录行的填充行（loading/empty/show more）右键不再有原生菜单（目录菜单未一并提到根）。
 - 用户已拍板（见 plan-prompt.md 追问）：下一轮删 legacy 状态流（先补 canonical v1.1 尺寸语义，最低入网 1.1.22）、只替换 `tailwind-merge`、删三个仅测试引用的路由、删旧 7 个 bench、档案不压缩、行复用维持现状、字号生效时机接受。
 - 节点：本机 / hub B / docker-node 已 1.1.22；其余节点用户手动升级。
+
+## 九、门禁补记（2026-09-03 晚）
+
+用户拍板只加 CI 与首屏预算：`.github/workflows/ci.yml`（lint / bundle-budget / unit-tests 三个 job），
+`apps/fe/scripts/check-bundle-budget.ts`（入口 JS gzip ≤300 KB、CSS ≤30 KB），复杂度门禁文件上限 900→600
+（37 个 600–900 行存量入 allowlist 只降不升，未入册文件超 90% 提醒）。CI 首次跑绿用了 7 轮，全是 Linux 与
+单进程测试的环境差异：`mock.module` 进程级泄漏（含它的文件各自独立进程）、gateway 跨文件共享 sqlite/端口
+（按目录分进程 + 重跑一次）、runner 无 ICE 候选（`TMEX_SKIP_RTC_TESTS`）、`/proc/<pid>/cmdline` 竞态、
+`bun install` 偶发失败、`AudioContext` 不存在、两条靠泄漏 mock 才通过的顺序依赖测试。
