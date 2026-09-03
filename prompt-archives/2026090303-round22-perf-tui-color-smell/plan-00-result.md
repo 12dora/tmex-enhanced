@@ -85,7 +85,12 @@ mesh 轮询 store、设置页表单原语 ×4 + 危险确认框 ×4、微信/Tel
 codex 三路审查（backend / frontend / libs）。libs 提出 5 项、修 4 项（显式 `pongTimeoutMs` 不随协商放大、
 faint 缓存封顶、共享 scratch 随所属实例释放、合帧冷却表随 discard 清理）；
 第 4 项（自定义 scheduler 下跨 pane leading-edge）仅注入 scheduler 的测试路径可触发，不修。
-（backend / frontend 审查结果见下文补记。）
+backend 提出 7 项（无 HIGH）全部修复（C5）：背压只丢终端帧才发 SourceGap、cold 输出 dirty 只在 screen 基线后清、
+DC 放弃态的真实重连唤醒、unescape scratch 按分派深度租用、`canLoadNative` 显式接线、PID 数字串兼容、
+合帧冷却表封顶。frontend 提出 11 项（无 HIGH）全部修复（OP1/OP2）：懒弹层触发器交接（焦点/悬停/ARIA）、
+chunk 彻底失败时原生 `<dialog>` 兜底、toast 门面排队到 Toaster 就绪、高亮 worker 取消协议、
+侧面板等 rest 语言包、`loadRest` 失败不伪装成功且切语言先载包、CRLF 围栏、字号草稿卸载时提交、
+惯性到边界即停、文件树右键改受控根菜单放行原生菜单、占位触发键按弹层族区分。
 
 ## 七、验收
 
@@ -93,13 +98,24 @@ faint 缓存封顶、共享 scratch 随所属实例释放、合帧冷却表随 d
 |---|---|
 | shared 533 / ws-client 408 / ghostty 329 / terminal-ui 398 / stores 440 / panels 889 / ui 77 / theme 52 / api-client 175 / notifications 15 / fe 1769 | 全绿 |
 | app 690 | 仅既有 cpu-features 一条 |
-| gateway | 见补记 |
+| gateway 4050 | 全量并行 4 条负载 flake，隔离复跑全过 |
+| fe e2e | 106 pass / 7 fail / 1 skip；7 条失败与 main 同规格对照逐条一致（mobile-terminal-interactions ×2、terminal-mouse-recovery opencode ×3、viewport-policy 77/128），无回归 |
+| multi-hub 集成 | 修复前 16 次 4 败（25%），修复后 16/16 + 8/8 |
 | `bun run lint` | biome + complexity gate 全绿 |
 | 首屏 entry gzip | 345,670 → 282,345 B |
 
+## 七点五、multi-hub failover 竞态（C6）
+
+本分支 multi-hub 集成测试约 25% 失败（main 0/9）。回退实验（各 8–16 次）只能把范围缩到「RTC 懒加载 / uplink
+重构」，最后由 codex 读日志定位：既有的 peer relay 换链竞态——旧链路只发一次 `link.quiesce`，HTTP 响应仍在
+飞时旧 ACK 已满足关链条件，响应 END 排在异步发送队列尾部被 `relay-rst` 吞掉（150 字节恰是
+`/api/auth/challenge` 的 JSON 长度）。本轮把 `await rtc.ready()` 从启动移走后，`dialDc()` 在确认 native
+可用前就发 `rtc.wake`，对端反向建第二条 relay，触发换链，把这个窗口放大到 25%。
+修法：`dialDc()` 先等 `rtc.ready()`；退役链路出现新流即废弃先前 quiesce，最后一个流结束后重发。两条确定性
+回归测试修前必败。
+
 ## 八、遗留
 
-- multi-hub 集成测试 `A down → 重挂 B → 中继` 在本分支约 1/4 概率失败（main 0/9），见补记。
 - `readRow()` 在 `reuseReportedDirty` 时不逐 cell 比对，正确性押在「无输出」前提上（EX2 建议二）。
 - 文件树目录行的填充行（loading/empty/show more）右键不再有原生菜单（目录菜单未一并提到根）。
 - legacy 状态流下线（1,742 行）需先定最低可入网版本；`tailwind-merge` / `react-router` 替换属产品决策。
