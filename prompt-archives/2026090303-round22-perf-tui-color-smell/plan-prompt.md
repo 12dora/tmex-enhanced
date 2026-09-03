@@ -17,3 +17,15 @@
 5. codex（gpt-5.6-sol,  high)担任code reviewer, codex存在过度防御的问题, 你应该自行判断问题是否修复
 6. 你担任指挥官和planner, 激进并行
 7. 为避免压缩轮数太多影响会话质量, 请你在适当时候为分工的agent开新会话, 而不是无限继续用老会话
+
+## 2026-09-03 追问：详细说明待决策项，并用提问工具问我
+
+用户拍板（逐条）：
+1. legacy 状态流：**下一轮做**——先补 canonical v1.1 尺寸语义（区分「补发尺寸」与「尺寸变更」），再删 legacy；最低可入网版本定为 **1.1.22**。
+2. 首屏体积：**只做 `tailwind-merge` 替换**（194 处 `cn()`，需逐页目测）；`react-router` 不换。
+3. 三个只有测试引用的路由（`/api/tmux/tree`、`/api/settings/theme`、`POST /api/hub/nodes/:id/revoke`）：**全删**。
+4. 无 script 的 bench：**删旧 7 个**，只保留本轮新增 4 个（render-bridge 除外，它有 bench 目录）。
+5. prompt-archives 的 diff/patch：**不压缩**，保持可 grep。
+6. 位移复用对内核报脏的行：**维持现状**，不加逐 cell 比对。
+7. 终端字号/行高改「松手/停顿 250 ms 生效」：**接受**。
+8. 节点升级：本机、hub B、docker-node 由 Claude 升到 1.1.22；hub A、jiefa-app、jiefa-dns-1、home 由用户手动升级完成。

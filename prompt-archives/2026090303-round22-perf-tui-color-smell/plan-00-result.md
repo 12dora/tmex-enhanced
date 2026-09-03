@@ -118,4 +118,5 @@ chunk 彻底失败时原生 `<dialog>` 兜底、toast 门面排队到 Toaster �
 
 - `readRow()` 在 `reuseReportedDirty` 时不逐 cell 比对，正确性押在「无输出」前提上（EX2 建议二）。
 - 文件树目录行的填充行（loading/empty/show more）右键不再有原生菜单（目录菜单未一并提到根）。
-- legacy 状态流下线（1,742 行）需先定最低可入网版本；`tailwind-merge` / `react-router` 替换属产品决策。
+- 用户已拍板（见 plan-prompt.md 追问）：下一轮删 legacy 状态流（先补 canonical v1.1 尺寸语义，最低入网 1.1.22）、只替换 `tailwind-merge`、删三个仅测试引用的路由、删旧 7 个 bench、档案不压缩、行复用维持现状、字号生效时机接受。
+- 节点：本机 / hub B / docker-node 已 1.1.22；其余节点用户手动升级。
