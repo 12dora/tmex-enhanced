@@ -38,3 +38,17 @@
 7. 多中继：本轮做「可换 + 列表 + 有序 failover」，同时连所有中继留下轮（记录预留 mode 字段）。成员表本地权威，中继注册表是可重建缓存。
 8. 吊销即换租户密钥，按剩余节点 X25519 封装；根钥轮换同样换钥。
 9. 设计摘要（含 Claude 自定的常规细节：协议 relay/v1、join 串 v3、`tmex relay enroll|leave|passwd`、`TMEX_RELAY_ADMIN_TOKEN`、版本门 1.1.23、FE 隐藏 hub 专属功能、进程内 1×2×2 集成测试）已由用户确认「开工」。
+
+## 2026-09-04 接手 prompt（用户原文）
+
+继续开发, 请你分批commit并在最后push替换本机tmex, Think in English, Send English prompt.
+任务：
+1. 接手下列工作: 接手入口：prompt-archives/2026090304-round23-relay-legacy-removal/HANDOFF.md（worktree /Users/konata/code/tmex-r23，分支 feat/round23-relay-legacy-removal
+注:
+1. opus5(high)子代理担任编码
+2. codex（gpt-5.6-luna,  xhigh)探索代码
+3. codex（gpt-5.6-sol,  high)担任code reviewer, codex存在过度防御的问题, 你应该自行判断问题是否修复
+4. 你担任指挥官和planner, 激进并行
+5. 为避免压缩轮数太多影响会话质量, 请你在适当时候为分工的agent开新会话, 而不是无限继续用老会话
+
+（本次分工变化：全部编码任务改由 Opus 子代理执行，不再使用 cursor/grok。）
