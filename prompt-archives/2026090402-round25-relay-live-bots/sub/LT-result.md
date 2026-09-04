@@ -193,15 +193,75 @@ bun <live>/live25.ts --skip-clone # 复用已有克隆，全程约 3 分钟
 
 ```
 bun migrate-prod.ts status                      # /api/auth/mode + /api/mesh/nodes(id/name/online/version) + /api/mesh/hubs + /api/mesh/relay/status
-bun migrate-prod.ts enroll --url <中继> --yes    # runbook 阶段 2 全套，打印 TENANT ID
+bun migrate-prod.ts enroll --url <中继> --yes    # runbook 阶段 2 全套，打印 TENANT ID；readmitRequired>0 时自动先跑 readmit
+bun migrate-prod.ts readmit --yes               # [G7] 按当前 root epoch 重签全部 admit-node（修 member-epoch_mismatch）
+bun migrate-prod.ts leave --yes                 # 中继 → hub 回滚（等价前端「离开中继」）
 bun migrate-prod.ts revoke --ids <hex,…> --yes  # 逐条 revoke-node + meta-key rotate
 bun migrate-prod.ts rotate --yes                # 只做 meta-key rotate
 bun migrate-prod.ts verify --names a,b,c        # 每台 online 节点：/n/<id>/api/devices 反代 + canonical WS HELLO
 ```
-每个子命令都支持 `--dry-run`（完全离线：不派生根钥、不开会话、不发任何请求，只打印将要发起的调用）。改状态的三个子命令真实执行必须显式加 `--yes`；`revoke` 默认拒绝吊销仍在线的 id（要覆盖得加 `--allow-online`）。
+
+`leave`：`POST /api/mesh/relay/leave/prepare` → 根钥签返回的空中继表 `set-relays` → `POST /api/auth/keylog?hub=sync` → 轮询到 `/api/mesh/relay/status` 的 `mode !== 'relay'` 且 `/api/mesh/hubs` 的 `attached` 非空，然后把两个响应都打印出来。超时会把最后一次读数打出来再退出。
+
+`readmit`（G7 契约）：`GET /api/mesh/relay/readmit/prepare` → `{rootEpoch, entries:[{nodeId,name,admitSeq,admitRootEpoch,authorization_bytes,certificate_bytes,cert_sig}]}`；逐条 `authorization_sig = rootKey.sign(authorization_bytes)` → `encodeAdmitNodePayload(...)` → 以 `readmit-node` 类型在当前 head 上根签 → `?hub=sync` 顺序提交，逐条打印 PASS/FAIL，任一条失败即中止。G7 落地前 shared 的 `KeyLogType` 还没有 `readmit-node`，脚本有前置检查会给出人话提示并退出，**不会发出畸形记录**；G7 合入后无需改脚本。
+每个子命令都支持 `--dry-run`（完全离线：不派生根钥、不开会话、不发任何请求，只打印将要发起的调用）。改状态的五个子命令（enroll / readmit / leave / revoke / rotate）真实执行必须显式加 `--yes`；`revoke` 默认拒绝吊销仍在线的 id（要覆盖得加 `--allow-online`）。
 
 环境变量：`MESH_PASSWORD`（账户密码，只在内存里派生根钥，绝不打印/落盘，用完清零）、`TMEX_TOTP`（账户开了 TOTP 时的 6 位码）、`RELAY_PASSWORD`（`enroll` 用的中继租户口令）。
 
 必须在入口机本机直连 `127.0.0.1` 跑：只有这样才满足 `isTrustedLocalClient`，通行密钥二次验证才豁免；脚本刻意不设置 `x-forwarded-for` / `x-real-ip` / `cf-connecting-ip`（设了就会要求 passkey）。`status` 会把版本低于 `MIN_RELAY_RECORD_VERSION`（1.1.23）或版本未知的节点单独标出来——这些正是会让 `set-relays` / `meta-key` 撞 `KEYLOG_TYPE_UNSUPPORTED_BY_NODES` 版本门的机器。
 
-自检：`tsc` 零错误（`<live>/tsconfig.check.json`）；五个子命令的 `--dry-run` 与三个「缺 `--yes`」「缺 `MESH_PASSWORD`」的守卫路径，对着一个计数监听器跑下来 `TOTAL_HITS=0`（确认一个请求都没发）。本次会话没有对生产实例执行过任何非 `--dry-run` 的调用。
+自检：`tsc` 零错误（`<live>/tsconfig.check.json`）；七个子命令的 `--dry-run` 与六条「缺 `--yes`」/「缺 `MESH_PASSWORD`」守卫路径，对着一个计数监听器跑下来 `TOTAL_HITS=0`（确认一个请求都没发）。本次会话没有对生产实例执行过任何非 `--dry-run` 的调用。
+
+## 七、根轮换后迁移（`--rotated`，复现现网故障 + 验证 G7）
+
+现网踩到的缺口：账户根已经轮换过（`rotate-root-keep`，epoch 到了 4），但全部 `admit-node` 记录还停在 epoch 1；中继的 `verifyRelayMemberProof` 硬性要求 `record.root_epoch === 租户当前 epoch`，于是 `relay.auth` 一律 `member-epoch_mismatch`，入口切到中继模式后**永远挂不上**。G7（后端 `readmit-node` 记录 + `GET /api/mesh/relay/readmit/prepare` + enroll 的 `readmitRequired` + status 的 `readmitPending`）与 F6（前端）落地后，用 `bun live25.ts --rotated` 完整复现并验证了修法。
+
+跑法：`bun <live>/live25.ts --rotated`（四台：H1 写者 / E 入口 / N1 口令加入 / N2 token 加入；跳过 A、N3、N4）。日志 `<live>/run8-rotated.log`，**39/39 全绿**。
+
+> 注意 `--skip-clone` 会复用旧的仓库克隆。第一次跑（`run6`）就因为克隆是 G7 落地前的快照，`readmitRequired` 缺失、`/api/mesh/relay/readmit/prepare` 回 405。**验证新落地的后端一定要重新克隆。**
+
+### PASS/FAIL
+
+| # | 断言 | 结果 | 证据 |
+|---|---|---|---|
+| R1.1 | E 用**旧**根签 `rotate-root-keep{root_public_key:新根, kdf_params:新盐, totp:null}` → `?hub=sync` | PASS | `HTTP 200 {"ok":true,"seq":6,"hubAck":true}` |
+| R1.2 | `/api/auth/mode` 的 `rootEpoch` +1 | PASS | `1 → 2` |
+| R1.3 | E 能用**新**密码登录（驱动切到新根钥） | PASS | `uid=9c8ccd65… nodeId=653ef72f…` |
+| R1.4 | 改密后其余节点照常在线（不动会话与证书） | PASS | mac / tmex / docker-node / jiefa-app 四台全 online |
+| R1.5 | 全部未吊销证书的 `admit-node` 仍停在旧 epoch（病灶本身） | PASS | 未吊销证书=4，全部由 epoch 1 的 `admit-node` 承认；新 rootEpoch=2 |
+| 3a / 3b | H1 `tmex hub leave` → `POST /api/setup/relay {role:'relay'}` | PASS | 与第二节同；relay health 200、`GET /` 404、`users=0` |
+| R2.1 | E（新根）`POST /api/mesh/relay/enroll` → 200 + tenantId | PASS | `tenantId=460585d3…` |
+| R2.2 | **[G7]** enroll 响应带 `readmitRequired` = 未吊销证书数 | PASS | `readmitRequired=4`，未吊销证书=4 |
+| R2.3 | **[G7]** `GET /api/mesh/relay/readmit/prepare` 列出全部陈旧成员 | PASS | `rootEpoch=2`，4 条：`tmex@epoch1, mac@epoch1, docker-node@epoch1, jiefa-app@epoch1` |
+| R2.4 | **[G7]** `/api/mesh/relay/status` 的 `readmitPending` 与之一致 | PASS | `readmitPending=4` |
+| R3.1 | **对照**：不 readmit，直接签 `set-relays` | PASS（记录成功落账） | `seq=7 hubAck:true localApply:true` |
+| R3.2 | **【复现现网故障】** 跳过 readmit 时中继拒绝 `relay.auth` | PASS | `mode=relay attached=false`；E 的 uplink 日志 `err=member-epoch_mismatch`；`relay_nodes(本租户)=0`（一个成员都没登记上） |
+| R4.1 | **[G7]** 逐条 `readmit-node` 落账（root signer，用新根重签 `authorization_bytes`，证书原样） | PASS | 4/4，`admitSeq=2/3/4/5`，`epoch 1→2`，全 HTTP 200 |
+| R4.2 | readmit 之后 E **立刻**挂上中继 | PASS | `mode=relay attached=true online=true` |
+| R4.3 | `readmitPending` 归零 | PASS | `readmitPending=0` |
+| R4.4 | 按新 `root_epoch` 重封的密封包上传成功 | PASS | `root_epoch=2 {"ok":true,"results":[{"ok":true,"status":200}]}` |
+| R4.5 | 中继注册表把成员标为 `admitted` | PASS | 4/4 `admitted`（H1/E/N1/N2 的旧身份） |
+| 3d.1–3d.5 | N1 `hub leave` → `relay join` → E 经中继看到它（新 node id）→ `/n/<id>/api/devices` 反代 200 → canonical `WS /n/<id>/ws` HELLO→HELLO_S2C | PASS | `old=dd06d70767ae new=874250353e3f`；`serverVersion=1.1.26_dev capabilities=["canonical-state-v1","canonical-state-v1.1"]` |
+
+### 现网 runbook 的增补
+
+第三节阶段 2（入口挂中继）在**改过密的账号**上要插一步，顺序不能反：
+
+```
+POST /api/mesh/relay/enroll …                      → { tenantId, payload, readmitRequired: N }
+若 N > 0：
+  GET  /api/mesh/relay/readmit/prepare             → { rootEpoch, entries:[…] }
+  每条 entry（顺序、逐条取 head）：
+    authorization_sig = 当前根.sign(authorization_bytes)      # 证书与授权字节原样不动
+    payload = encodeAdmitNodePayload({authorization_bytes, authorization_sig, certificate_bytes, cert_sig})
+    根签 'readmit-node' → POST /api/auth/keylog?hub=sync
+然后才签 set-relays → POST /api/auth/keylog?hub=sync
+```
+`migrate-prod.ts enroll --yes` 已经内置这一条件分支（`readmitRequired > 0` 时自动先跑 readmit 再写 `set-relays`）；也可以单独 `migrate-prod.ts readmit --yes`。G7 落地后 `migrate-prod.ts readmit --dry-run` 已确认打印「shared 的 KeyLogType **已**包含 'readmit-node'（G7 已落地）」。
+
+### 补充发现
+
+1. **顺序颠倒是可恢复的，但要等重连。** 先写 `set-relays` 再补 readmit 也能救回来：`readmit-node` 在中继模式下走本地优先落账（不需要先挂上中继），下一次 `relay.auth` 会带上新 epoch 的成员证明，节点随即挂上（R4.2 就是从 R3.2 的卡死状态恢复过来的）。所以**现网 mac 现在的状态可以直接用 `readmit` 修，不必先 `leave` 回 hub 模式**——`leave` 只是想在修复上线前退回已知良好状态时才需要。
+2. **可观测性缺口（建议修）**：挂不上的时候 `/api/mesh/relay/status` 的 `relays[].lastError` 恒为 `null`——它只在 `attached?.publicUrl === row.url` 时才填，而挂不上正是 `attached` 为空的时候。真正的原因（`member-epoch_mismatch`）只出现在**节点自己**的 uplink 日志里（`[uplink] candidate failed hub=… err=member-epoch_mismatch`），中继侧一行都不打。运维在网页上只能看到「离线」，看不到为什么。建议把最近一次连接失败的 reason 也带进 `relays[].lastError`（或单开一个 `lastConnectError` 字段）。
+3. **改密之后节点侧的密码加入要用新密码**：`tmex relay join --tenant … --password` 用旧密码派生的根钥对不上租户当前根公钥，中继回 `401 RELAY_BAD_PROOF`（演练里踩到过一次）。现网迁移时若中途改过密，务必把新密码发给各机器。
+4. `readmit/prepare` 的 `name` 对入口自己那台会退化成 node id（`nodeDisplayName` 在 `nodes` / `peer_cache` 里都找不到 self 的名字），不影响功能，只影响可读性。
