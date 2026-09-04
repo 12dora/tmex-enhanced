@@ -1,0 +1,8 @@
+# R2 — frontend review (apps/fe, packages/api-client, packages/panels, packages/stores)
+Diff file: /private/tmp/claude-501/-Users-konata-code-tmex-enhanced/f162c75c-ae5d-41f6-8245-2e3de8d399e8/scratchpad/sub/R2-diff.patch
+Context of the change set:
+1. LoginPage: username never prefilled; `resolveLoginUid` falls back to `mode.uid` when the input is empty / `mode.username` is null / equals uid; `loginPreflight` extracted.
+2. PWA: `StandaloneLanding` auto-opens the mobile sidebar Sheet and then releases focus that lands inside it (focusin listener + blur) so the close button is not focused on cold start; close button uses focus-visible ring.
+3. i18n bootstrap: `resolveInitialLanguage` (localStorage cache `tmex.site.language` → `navigator.languages`), site store writes the cache on success and does not downgrade the language on load failure.
+4. api-client `ApiError` with status/code/error/nodeId/reason; `fetchDevices` throws it; fe `node-session-recovery` re-logs-in once on `NODE_LOGIN_REQUIRED` and refetches, `markLoggedOut` only for credential-class failures; panels device panel shows three error kinds + retry.
+Pay special attention to: any way the focus-release logic can close the sheet, blur a user-initiated focus, or leak the listener; correctness of the language priority (a stale cache must not beat a newer server value; remote-node runtimes must not touch the global language); loops in the re-login path (concurrent queries, repeated 401 after a successful re-login); `ApiError` shape compatibility with existing callers of `parseApiError`/`readCodedError`; i18n key parity across zh_CN/en_US/ja_JP for the added `device.*` keys.

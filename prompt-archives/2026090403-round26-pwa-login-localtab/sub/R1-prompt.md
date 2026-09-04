@@ -1,0 +1,7 @@
+# R1 — backend review (apps/gateway, packages/shared contracts, packages/app, scripts)
+Diff file: /private/tmp/claude-501/-Users-konata-code-tmex-enhanced/f162c75c-ae5d-41f6-8245-2e3de8d399e8/scratchpad/sub/R1-diff.patch
+Context of the change set:
+1. `/api/auth/mode` returns `username: null` when the stored username equals the uid or looks like a UUID / 32-hex id (nodes joined via `relay join`/`hub join` store the key-log genesis uid as username).
+2. Forwarder: when a target node answers 401 and the entry rewrites it to `NODE_LOGIN_REQUIRED` (via_mismatch / missing auth), the entry now appends a `Set-Cookie` expiring `tmex_s_<targetNodeId>`; 503 `NODE_UNREACHABLE` bodies carry a whitelisted `reason`; `relayListToNodeList` filters members whose status is not `admitted`; `relay-wiring` snapshots an explicit dial context; `acceptRelay` logs a safe reason on handshake failure.
+3. Tests/CI: relay-hardening test keeps readers and cancels them; `scripts/ci/unit-tests.ts` retries gateway failures per file; `native-datachannel.ts` dynamic import without `.ts`.
+Pay special attention to: cookie attribute parity between the login `Set-Cookie` and the clearing one (Path/SameSite/Secure/HttpOnly/cookie name), whether the clearing header could be attached to responses on public auth paths where it must not, whether filtering non-admitted members from `node.list` could hide nodes that the pending-approval UI or the readmit flow still needs, whether `reason` could leak anything, and whether the per-file CI retry changes exit-code semantics.
