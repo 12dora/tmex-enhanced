@@ -48,7 +48,7 @@ e2e：全量 109 pass / 2 fail / 1 skip（7.5 分钟），mesh 项目 12/12。
 
 ## 三、发版
 
-分支以 merge commit 并入 main，tag `v1.1.24` 推送 origin 触发 `release.yml` 构建 GitHub Release；本机随后 `tmex upgrade`（结果见记忆文件与末尾追加）。
+分支以 merge commit 并入 main，tag `v1.1.24` 推送 origin 触发 `release.yml` 构建 GitHub Release；本机 2026-09-04 12:33 用 `node ~/Library/Application\ Support/tmex/current/cli/bin/tmex.js upgrade --yes --lang zh-CN` 从 GitHub Release 升到 **1.1.24**：healthz 1.1.24、`current → versions/1.1.24`、迁移 44 条（0041–0043 已应用，`relay_tenants.kdf_params_json/sealed_pack`、`peer_cache.version` 在库）、tmux `tmex` 会话未动。升级后日志立即出现新格式拒绝 `canonical-state-v1.1 required: node 8a810928… version 1.1.22 < 1.1.23`（docker-node 仍是 1.1.22），需用户升级远端节点。
 
 ## 四、e2e 基线对照
 
