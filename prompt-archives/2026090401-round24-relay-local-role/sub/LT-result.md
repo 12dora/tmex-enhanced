@@ -326,3 +326,74 @@ bun $L/live24.ts --skip-clone   # 复跑：复用克隆，只重置 inst/ 与各
 - 端口占用 19992–19999、19961–19967，启动前会逐个 `canBind` 预检，占用即拒绝启动。
 - 驱动自己 import 的是**真仓库**的 `packages/shared/src/{auth,relay,ws-borsh}`（只读），
   实例跑的是各自的克隆。
+
+---
+
+## 复测（G7 后）
+
+指挥官修完 §三.1 与 §三.2 两个问题后按要求只复跑**场景 4（中继负例）**与**场景 7（Hub 口令加入）**。
+
+- 被测 commit：`d2be4c99`（含修复 `1f4d0917`「Hub 密码加入后由加入方用根钥自签 admit-node 并在重启前推到 Hub；
+  中继密码加入错误映射为稳定 setup 错误码」）；工作区干净，克隆是当次重新做的（未复用旧克隆）。
+- 驱动新增 `--retest` 模式：只起 R / A / H / C / N 五个实例（B、S 及场景 3/5/6/8 跳过），
+  但保留场景 4 的前置 1、2（中继要有一个带密封包的真租户）。日志 `<live>/run4-retest.log`。
+- 并发环境规避：本轮实测端口 19992–19999 / 19961–19967、tmux socket `tmex-live24`；
+  e2e 套件占用的 9665 / 9885 与 socket `tmex-e2e` 全程未发过请求、未执行任何写操作
+  （只在收尾做过一次只读 `tmux -L tmex-e2e ls` 确认互不干扰）。前端未用到（两个场景都是 API/DB 层）。
+
+**结论：22 条断言全 PASS。两个问题都已确认修复。**
+
+### A. 场景 4：中继负例的错误码（4/4 PASS，含新增的 4.4）
+
+| 断言 | 复测前 | 复测后（证据） |
+|---|---|---|
+| 4.1 口令错 | `500 internal_error` | **`HTTP 401 {"code":"relay_password_invalid","message":"relay password join failed: HTTP 401 RELAY_BAD_PROOF"}`**；N 的库 `users=0`、`node_identity.user_id=''` |
+| 4.2 未知租户编号 | `500 internal_error` | **`HTTP 404 {"code":"relay_tenant_unknown","message":"relay tenant kdf failed: HTTP 404 RELAY_TENANT_NOT_FOUND"}`** |
+| 4.3 密封包被篡改（假中继 19992 投喂翻位密文） | `500 internal_error` | **`HTTP 409 {"code":"relay_pack_invalid","message":"pack authentication failed"}`**；`users=0`；驱动内 `openRelayPack()` 同样抛 `pack authentication failed` |
+| 4.4 中继不可达（本轮新增：假中继停掉后再打同一地址） | — | **`HTTP 502 {"code":"relay_unreachable","message":"Unable to connect. Is the computer able to access the url?"}`** |
+
+四个码都在前端 `KNOWN_ERROR_CODES` 的映射范围内（`relay_password_invalid` / `relay_tenant_unknown` /
+`relay_pack_invalid` / `relay_unreachable` / `local_user_exists` / `relay_not_authorized` / `join_failed`），
+不会再退化成「未知错误 + 英文内部串」。未覆盖到的三个码（`local_user_exists`、`relay_not_authorized`、
+`join_failed`）本轮没有构造对应场景，仅由代码路径确认（`relay-join-routes.ts` 的 `RELAY_JOIN_ERROR_STATUS`）。
+
+### B. 场景 7：Hub 口令加入（9/9 PASS，原 FAIL 项转绿）
+
+| 断言 | 结果 | 证据 |
+|---|---|---|
+| 7.1 / 7.1b `POST /api/setup/hub` + 重启 | PASS | `{"fingerprint":"ca0dd370…","restarting":true}`；env `{TMEX_HUB_PUBLIC_URL:"http://127.0.0.1:19997", TMEX_ROLES:"hub,node"}`；`/api/local/status.role=hub,node` |
+| 7.2 C `POST /api/setup/join {method:'password'}` | PASS | 200 `{"hubUrl":"http://127.0.0.1:19997","username":"hubadmin","restarting":true}` |
+| 7.2b H 的节点清单里出现 C | PASS | `[{5ce4073f,"tmex",enrolled},{16a87d7f,"C",enrolled}]`；C 的 env `{TMEX_ROLES:"node", TMEX_HUB_URL:"http://127.0.0.1:19997"}` |
+| **7.2c C 的 uplink 接上 H** | **PASS（原 FAIL）** | `online=true`；H 库 `node_certs(C)=1`；C 的 `server.log`：`[uplink] try hub=http://127.0.0.1:19997 …` → **`[uplink] online hub=127.0.0.1:19997 after_ms=30`**（复测前是 `err=unknown-cert`） |
+| 7.2d 自签的 `admit-node` 落到 Hub 密钥日志 | PASS | H 库 `user_key_log` 里 `type='admit-node'` 的 seq = `[2,3]`（2 是 Hub 自己 bootstrap 的、3 是 C 的）；`node_certs(C).admit_record_seq=3`。**本轮不再需要人工补签**（驱动在自承认已生效时改为核对链上记录，避免重复 admit 污染密钥日志） |
+| 7.3 错口令走 `/api/setup/join` | PASS | `HTTP 400 {"code":"join_failed","message":"password enrollment failed: invalid_proof"}`；N 的库 `users=0` |
+| 7.3b 直连 `/api/hub/enrollments/by-password` 两次错口令 | PASS | 两次都 `HTTP 401 {"error":"invalid_proof"}` |
+| 7.4 限流 | PASS | 失败序列 `[400,401,401,401,401,401,401,401,401,401]` → 第 11 次用**正确**口令 `HTTP 429 {"error":"rate_limited"}` |
+
+时序上值得记一笔：C 重启后 **30 ms** 就 `online`，说明 admit-node 是在重启**之前**由加入方推上去的
+（`packages/app/src/lib/hub-password-self-admit.ts` 的 `publishHubJoinSelfAdmit`），
+不存在「重启后先被拒一次再靠退避重连」的窗口。
+
+### C. §三.3 / §三.4 两条观察
+
+本轮未复测（不在指定范围）：`leave → relay` 的幽灵租户、Hub 节点清单看不出「未承认」。
+后者在 3.1 修好之后严重性下降（新加入的节点不会再卡在未承认态），但对**存量**用 1.1.24 之前
+口令加入过的节点仍有意义，是否处理由指挥官决定。
+
+### D. 复测后的安全复核
+
+- 默认 tmux socket：`tmex: 3 windows (created Wed Aug 26 00:26:54 2026) (attached)` —— 与首轮开跑前逐字一致。
+- `tmux -L tmex-live24 ls` → `no server running`。
+- e2e 的 `tmex-e2e` socket 与 9665 / 9885 端口原样在跑，未被触碰。
+- 19992–19999、19961–19967 全部释放；`pgrep -fl "scratchpad/live/r24"` 为空。
+- 生产 `127.0.0.1:9883`（pid 83665）仍在监听，全程未触碰。
+- 仓库 `git status` 干净（除本文件的本次追加与指挥官自己的 `plan-00-result.md`），
+  无 `test.env.local`、无 `tmex.db` 残留。
+
+复跑命令：
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+L=/private/tmp/claude-501/-Users-konata-code-tmex-enhanced/c1f43d39-77fb-4832-b1c4-2ca4e9c12e4e/scratchpad/live/r24
+cd /Users/konata/code/tmex-r24 && bun $L/live24.ts --retest    # 只跑场景 1、2、4、7
+```
