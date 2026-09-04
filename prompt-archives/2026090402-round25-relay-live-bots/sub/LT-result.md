@@ -199,18 +199,27 @@ bun migrate-prod.ts leave --yes                 # 中继 → hub 回滚（等价
 bun migrate-prod.ts revoke --ids <hex,…> --yes  # 逐条 revoke-node + meta-key rotate
 bun migrate-prod.ts rotate --yes                # 只做 meta-key rotate
 bun migrate-prod.ts verify --names a,b,c        # 每台 online 节点：/n/<id>/api/devices 反代 + canonical WS HELLO
+bun migrate-prod.ts upgrade --names a,b --yes   # 远程升级（复刻网页「节点管理 → 升级」），逐台打印进度
 ```
+
+`upgrade`：复刻 `apps/fe/src/pages/settings/nodes/management/use-node-upgrade.ts` 的真实调用链 ——
+经入口给目标建会话（`/n/<id>/api/auth/challenge` + login；入口的 `readNodeSession` 要求 cookie 里有 `tmex_s_<id>`，缺了直接 401 `NODE_LOGIN_REQUIRED`）→ `GET /n/<id>/api/system/info` 看 `canSelfUpdate` / `upgradeCapabilities` → `POST /api/mesh/nodes/<id>/upgrade`（body 固定 `{}`）→ 每 2s 轮询 `GET /api/mesh/nodes/<id>/upgrade`，判定链与前端 `watchUpgrade`/`settleIdle` 逐条对齐（非 idle → 记住「见过活动」；5xx/网络异常 → 当「重启中」继续等；idle 带 error → 失败；idle 且见过活动 → 比对 `/api/mesh/nodes` 的 version；6 分钟预算耗尽只报「未确认」不猜结论）。POST 从不重发（目标可能已经开始，重发只会撞 `UPGRADE_IN_PROGRESS`）。
+
+两条要点：
+
+- **版本不可指定。** 入口的 `handleMeshNodeUpgradeStart` 固定调用 `requireLatestUpgradeRelease()`（GitHub latest），POST body 里的 `version` 会被忽略。`--version` 只作**期望值**：与 latest 不符就拒跑，跑完拿它核对。
+- **推包路径是自动选的。** 目标 `/api/system/info` 的 `upgradeCapabilities` 含 `staged-package` 时，入口自己下载一次 release，经 `/api/system/upgrade/package` 推给目标 —— **访问不了 github.com 的机器（jiefa-dns-1）走这条**；不含时入口只转发 `POST /api/system/upgrade {version}`，由目标自行下载（jiefa-app 走这条）。脚本会把每台走哪条打印出来。`canSelfUpdate=false`（手工部署、无 install-meta）直接判失败，与网页一致。中途要停用 `DELETE /api/mesh/nodes/<id>/upgrade`（网页的「停止升级」；脚本不实现）。
 
 `leave`：`POST /api/mesh/relay/leave/prepare` → 根钥签返回的空中继表 `set-relays` → `POST /api/auth/keylog?hub=sync` → 轮询到 `/api/mesh/relay/status` 的 `mode !== 'relay'` 且 `/api/mesh/hubs` 的 `attached` 非空，然后把两个响应都打印出来。超时会把最后一次读数打出来再退出。
 
 `readmit`（G7 契约）：`GET /api/mesh/relay/readmit/prepare` → `{rootEpoch, entries:[{nodeId,name,admitSeq,admitRootEpoch,authorization_bytes,certificate_bytes,cert_sig}]}`；逐条 `authorization_sig = rootKey.sign(authorization_bytes)` → `encodeAdmitNodePayload(...)` → 以 `readmit-node` 类型在当前 head 上根签 → `?hub=sync` 顺序提交，逐条打印 PASS/FAIL，任一条失败即中止。G7 落地前 shared 的 `KeyLogType` 还没有 `readmit-node`，脚本有前置检查会给出人话提示并退出，**不会发出畸形记录**；G7 合入后无需改脚本。
-每个子命令都支持 `--dry-run`（完全离线：不派生根钥、不开会话、不发任何请求，只打印将要发起的调用）。改状态的五个子命令（enroll / readmit / leave / revoke / rotate）真实执行必须显式加 `--yes`；`revoke` 默认拒绝吊销仍在线的 id（要覆盖得加 `--allow-online`）。
+每个子命令都支持 `--dry-run`（完全离线：不派生根钥、不开会话、不发任何请求，只打印将要发起的调用）。改状态的六个子命令（enroll / readmit / leave / revoke / rotate / upgrade）真实执行必须显式加 `--yes`；`revoke` 默认拒绝吊销仍在线的 id（要覆盖得加 `--allow-online`）。
 
 环境变量：`MESH_PASSWORD`（账户密码，只在内存里派生根钥，绝不打印/落盘，用完清零）、`TMEX_TOTP`（账户开了 TOTP 时的 6 位码）、`RELAY_PASSWORD`（`enroll` 用的中继租户口令）。
 
 必须在入口机本机直连 `127.0.0.1` 跑：只有这样才满足 `isTrustedLocalClient`，通行密钥二次验证才豁免；脚本刻意不设置 `x-forwarded-for` / `x-real-ip` / `cf-connecting-ip`（设了就会要求 passkey）。`status` 会把版本低于 `MIN_RELAY_RECORD_VERSION`（1.1.23）或版本未知的节点单独标出来——这些正是会让 `set-relays` / `meta-key` 撞 `KEYLOG_TYPE_UNSUPPORTED_BY_NODES` 版本门的机器。
 
-自检：`tsc` 零错误（`<live>/tsconfig.check.json`）；七个子命令的 `--dry-run` 与六条「缺 `--yes`」/「缺 `MESH_PASSWORD`」守卫路径，对着一个计数监听器跑下来 `TOTAL_HITS=0`（确认一个请求都没发）。本次会话没有对生产实例执行过任何非 `--dry-run` 的调用。
+自检：`tsc` 零错误（`<live>/tsconfig.check.json`）；八个子命令的 `--dry-run` 与七条「缺 `--yes`」/「缺 `--names`」/「缺 `MESH_PASSWORD`」守卫路径，对着一个计数监听器跑下来 `TOTAL_HITS=0`（确认一个请求都没发）。本次会话没有对生产实例执行过任何非 `--dry-run` 的调用。
 
 ## 七、根轮换后迁移（`--rotated`，复现现网故障 + 验证 G7）
 

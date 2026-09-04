@@ -34,7 +34,7 @@ gateway 4312/0、app 908/0、shared 689/0、stores 418/0、ws-client 398/0、pan
 
 ## 五、遗留
 
-1. 中继模式下入口节点名显示 `self`（`selfName()` 只在 hub 角色回落站点名）；未挂载中继行无错误原因 —— G9 / 1.1.27。
-2. jiefa 两台的 sshd 在多次连接后拒绝握手（疑 fail2ban），本轮最终未用 ssh 迁移它们。
+1. ~~中继模式入口名 `self` / 未挂载错误原因~~ 已由 G9 随 1.1.27 修复并上线（全部 6 节点 1.1.27；jiefa 两台经入口 `POST /api/mesh/nodes/:id/upgrade` 远程升级，驱动 `sub/migrate-prod.ts upgrade`）。
+2. jiefa 两台的 sshd 在多次连接后拒绝握手（疑 fail2ban），本轮后半段全部经入口 API 操作它们。
 3. R1-#3/#4 未修（见上）；`packages/panels` 15 个环境性失败仍在；CI 工作流（非 Release）在 main 上一直失败，未查。
 4. 指令层只在托管 bot 的本机执行，远端节点需在各自节点配置 bot；`registerMessagingRuntime` 未做真实 Telegram/微信打通实测。
