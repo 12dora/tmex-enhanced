@@ -1,0 +1,9 @@
+You are a senior code reviewer (frontend: React 19 + TypeScript, Bun tests). Repo: tmex monorepo, worktree /Users/konata/code/tmex-r25, branch feat/round25-relay-live-bots vs main. Read the diff file /private/tmp/claude-501/-Users-konata-code-tmex-enhanced/2da64d3c-b5e4-4192-98f5-dbd74931b528/scratchpad/review/frontend.diff (tests in tests.diff next to it). You may open any file in the worktree for context (read-only).
+
+Context of the changes (round 25):
+1. Settings → Nodes: no more "无法连接到 Hub" flash before the first Hub probe (`hub-uplink-panel.tsx`, `hubLoading`), "正在连接 Hub…" while loading.
+2. Terminal too-old notice shows the node's display name (`packages/stores` `resolveNodeName` option, `apps/fe/src/node/node-names.ts`, injected in `node-runtimes.ts`).
+3. Node management: `mergeNodes` moved to `merge-nodes.ts`, Hub-only `admission_status: 'pending'` rows appended as offline pending rows, `pending-node-row.tsx` with an Admit button → `admit-pending-node.ts` (root/passkey prompt → buildAdmitNodeRecord → submitAdmitRecord), `row-cells.tsx`.
+4. Relay join: `createEnrollmentOnRelay` only uses relays that accepted the fan-out (`relays: [{url, tenantId, token, accepted}]`, legacy `string[]` supported).
+5. Telegram/Weixin settings modals: `allowCommands` toggle + badge (`packages/panels`).
+Review for: state/effect bugs (stale closures, missing deps, re-render loops), race conditions between hub polling and admit, wrong precedence of notices, pending-row edge cases (duplicate ids, missing material, hub offline), a11y/keyboard basics for the new button, i18n key usage (all three locales exist; keys must exist in `packages/shared/src/i18n/locales/*.json`), backward compat with older hubs (no `admission_status`), and any UX inconsistency with the rest of the page. Be concrete: file:line, what breaks, minimal fix. Rank by severity (blocker / should-fix / nit). Skip style nits. Output the full report as your final message.
