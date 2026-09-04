@@ -1,0 +1,11 @@
+1. **阻断 — 配额类型冲突导致前端无法构建，并使旧响应的带宽回退失效。**  
+   [connection-details.test.tsx:51](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/connection-details.test.tsx:51)、[relay-ui.test.tsx:203](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/relay/relay-ui.test.tsx:203)、[tenant-api.ts:323](/Users/konata/code/tmex-r27/packages/api-client/src/relay/tenant-api.ts:323)  
+   `RelayQuotaUsage.bandwidthBytesPerSec` 当前为必填，但本次新增的三个 fixture 均缺少该字段，`bun x tsc -p apps/fe/tsconfig.json` 会报 TS2741/TS2345。更严重的是，normalizer 把缺失值补成 `0`，而 [relay-quota.ts:28](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/relay/relay-quota.ts:28) 会优先采用任何数值，因此注释和测试所声称的 `max(bytesInPerSec, bytesOutPerSec)` 兼容回退实际上永远不会执行，旧响应会显示 `0 B/s`。最小修复：若要兼容缺少合计字段的响应，将该字段改为可选并在 normalizer 中保留缺失状态；否则补齐所有 fixture，并删除不可达的兼容分支及相关描述。
+
+2. **高 — 较早发出的轮询响应可以覆盖已经成功的切换结果。**  
+   [mesh-relay.ts:124](/Users/konata/code/tmex-r27/apps/fe/src/node/mesh-relay.ts:124)、[mesh-relay.ts:164](/Users/konata/code/tmex-r27/apps/fe/src/node/mesh-relay.ts:164)  
+   `/status` 轮询和 `/switch` 都会无条件写入同一 store。若旧 `/status` 在切换前开始、在 `/switch` 成功后才返回，它会把 attached 中继改回旧值；随后 [relay-uplink-panel.tsx:68](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/uplink/relay-uplink-panel.tsx:68) 触发的刷新又会因 `inFlight` 而复用该旧请求，不会真正补拉，错误高亮可能持续 30 秒。最小修复：给状态提交增加递增 generation/revision；切换成功时推进 generation，轮询仅在 generation 未变化时提交成功或错误结果。补一个 deferred `/status` 在 `/switch` 后返回的交错测试。
+
+3. **中 — 切换进行中仍可关闭并重新打开对话框，旧操作完成后会清掉新目标。**  
+   [relay-switch-dialog.tsx:46](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/relay/relay-switch-dialog.tsx:46)、[relay-switch-dialog.tsx:56](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/relay/relay-switch-dialog.tsx:56)、[use-relay-switch.ts:44](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/relay/use-relay-switch.ts:44)  
+   `busy` 只禁用了确认按钮，Cancel/Escape 仍会 `dismiss()`，而 `request()` 也不检查 `busy`。用户可在 A 的请求未结束时关闭对话框并选择 B；A 成功后 [use-relay-switch.ts:53](/Users/konata/code/tmex-r27/apps/fe/src/pages/settings/nodes/relay/use-relay-switch.ts:53) 无条件 `setTarget(null)`，会直接关闭 B 的确认框。最小修复：busy 时禁止 `dismiss`、`request` 和关闭事件，并禁用 Cancel；或者按操作 ID/起始 URL 条件清理 target。补真实控制器交互测试，而不是只测试对话框文案映射。
