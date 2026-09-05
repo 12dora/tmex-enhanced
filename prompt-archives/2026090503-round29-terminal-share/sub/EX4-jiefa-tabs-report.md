@@ -53,3 +53,7 @@ tmux ls -F '#{session_name} #{session_created} #{session_windows}'; cat ~/.local
 - 机制：内核 OOM 只杀 pane 内最大的进程（tsgo 10.9/10.0 GB、next-server 12.5 GB），但 systemd 对 scope 的默认 `OOMPolicy=stop`（`DefaultOOMPolicy=stop`）会在检测到单元内发生 OOM 击杀后**停止整个 scope**：向 pane 内全部进程（bash、claude、docker…）发 SIGTERM，超时 SIGKILL。shell 退出 → tmux `remain-on-exit off` 销毁窗口。tmex 未发送任何关闭命令、未杀任何进程。
 - 7 天内 `Started tmux-spawn` 48 次；非 OOM 的 pane 结束（09-03 09:37 / 16:29 / 20:32）无异常记录，应为用户正常关闭。
 - 处置建议（jiefa-app 本机）：`~/.config/systemd/user.conf.d/oom.conf` 写 `[Manager]\nDefaultOOMPolicy=continue` 后 `systemctl --user daemon-reexec`（新建的 pane 生效），这样 OOM 只杀超限的那个子进程、pane 与 claude 存活；同时限制 tsgo/tsc/next 的内存（`NODE_OPTIONS=--max-old-space-size`）或加内存/减并发。tmex 侧：T11 增加窗口销毁日志；可选后续：tmex 会话 `remain-on-exit on` + 「进程已退出/重开」UI，让死掉的 pane 留在 tab 里而不是消失。
+
+## 处置执行（2026-09-06 00:4x，窗口 @48）
+- jiefa-app：写入 `~/.config/systemd/user.conf.d/oom.conf`（`[Manager] DefaultOOMPolicy=continue`），`systemctl --user daemon-reexec`；验证 `DefaultOOMPolicy=continue`、tmex active、新建 pane 与现有 5 个 pane 的 scope 均 `OOMPolicy=continue`。
+- 用户追问「其他机器也会这样，能否防止」→ T12：Linux 托管安装/升级时自动写入同名 drop-in 并重载；网关启动自检告警。可选后续：`remain-on-exit` + 死 pane UI。
