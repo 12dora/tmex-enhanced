@@ -1,4 +1,4 @@
-import * as ts from "/Users/konata/code/tmex-enhanced-wt-tabs/node_modules/typescript/lib/typescript.js";
+import * as ts from "typescript";
 import { readdirSync, statSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
