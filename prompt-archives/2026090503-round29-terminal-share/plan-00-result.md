@@ -120,3 +120,11 @@ cd apps/fe && TMEX_E2E_MESH=1 TMEX_E2E_MESH_ONLY=1 bun run scripts/run-e2e.ts te
    `SHARE_LOGIN_MAX_CONCURRENT` 提到 4–8。
 6. 折叠的远端在线分节与未登录分节仍以「至少开过一台设备」为显示门槛，是「节点不出现」的另一类原因。
 7. 发版 1.1.34 与本地 tarball 升级本机为收尾步骤，按 `docs/release/2026041300-cli-release-process.md` 执行。
+
+## 补充（2026-09-06 凌晨，DOC 归档之后的增量）
+
+- **T10b**：`peer-manager.ts` 1937 → 589 行，拆出 state / dialer / live-registry / link-drain / link-waiters / status-sync 六模块，零测试改动，KI-7 关闭（`c1da9c7c`）。
+- **jiefa-app tab 自动关闭**（用户追加任务）：EX4 探索 + 三轮远端只读取证（经本机生产 tmex 网页在 jiefa-app 新建窗口执行、文件 API 拉回）。真因：tmux 3.6 每 pane 一个 `tmux-spawn-*.scope`，pane 内子进程（tsgo 10 GB / next-server 12.5 GB）被内核 OOM 杀后，systemd 默认 `OOMPolicy=stop` 停掉整个 scope，bash 一起被杀 → 窗口消失；三次事件与 OOM 时间一一对应；tmex 七天内无 CLOSE_WINDOW/CLOSE_PANE 帧。处置：jiefa-app 已写 `DefaultOOMPolicy=continue` 并验证；文档 `docs/terminal/2026090601-pane-oom-policy.md`；报告 `sub/EX4-jiefa-tabs-report.md`。教训：用户否定「按键重放」假设是对的——`free -m` 即时值不能否定瞬时 OOM，systemd 的 scope 生命周期日志才是决定性证据。
+- **T11**（`104ceaa7`）：断线期间缓冲 >10 s 的终端输入不再重放并提示（ws-client / canonical / forwarder）；`tmex-park` 焦点盾从快照与事件过滤并修复其误清活动窗口；kill-window/kill-pane 与 `%window-close` 打带原因日志；Linux 启动自检 `KillMode=process`。
+- **T12**（`52dc7e11`）：Linux 托管安装/升级自动写 `~/.config/systemd/user.conf.d/tmex-oom.conf`（尊重用户已有显式配置、幂等、卸载按字节比对清理），启动自检 `DefaultOOMPolicy=stop` 告警。
+- 发版 1.1.34：CHANGELOG 面向用户改写（分享、设置分享 tab、下载进度、节点首屏、连接更快、失败码翻译、OOM 连坐、过期输入、焦点盾、监听器泄漏）。
