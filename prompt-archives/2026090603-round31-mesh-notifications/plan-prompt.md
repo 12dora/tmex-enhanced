@@ -15,3 +15,7 @@
 
 ## 背景
 审计报告 `sub/EX6-notifications-mesh-report.md`（round30 EX6）：通知完全按机器各自处理，无跨节点汇聚；唯一例外为远程 agent 会话事件走发起机通道。分支 `feat/round31-mesh-notifications`，worktree `/Users/konata/code/tmex-r31`，基于 round30 `9181dc32`。
+
+## 追加 prompt（2026-09-06，分享密码）
+
+追加任务: 1. 你应该允许设置-分享-进行中的分享查看密码或修改密码(修改密码允许下线全部分享session或不变 2. 你的分享链接应该允许自动填充密码(可选项目),勾选后用户复制的链接打开后自动在输入框填写好密码
