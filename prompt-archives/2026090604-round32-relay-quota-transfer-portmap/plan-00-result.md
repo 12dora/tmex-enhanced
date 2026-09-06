@@ -68,7 +68,10 @@ codex gpt-6-astra high 五路（端口映射 / 中继 / 前端 / 引擎 / 节点
 - 终态回归：八包 tsc 0、`bun run lint` 通过；gateway 5073 pass / 10 基线失败，fe 2843、shared 826、app 978、api-client 282、panels 1070、transfer 60 均 0 fail。
 - `chore(release)` `fe8dfe98`，tag `v1.1.37`，合并 `eec69391` 推到 main；GitHub Actions Release 成功（`tmex-cli-1.1.37.tgz` + `SHA256SUMS`）；本机经 `tmex upgrade` 1.1.36 → 1.1.37，healthz ok。
 
-## 五、遗留 / 注意
+## 五、追加 1.1.38
+- 传输弹窗发送按钮显示目标节点名（`devices.transfer.sendTo`）；节点无启用文件根目录时虚拟根 `fs-root` 默认浏览 `/`（`files/file-root.ts` `resolveFileRoot` 唯一上游，list / grant / 目标解析共用；有真实根目录后即 404）。hub 拓扑实测：两侧默认 `/`、按钮「Send to mesh-node-b / Send to tmex」、经虚拟根传输一致。tag `v1.1.38`，本机已升级。
+
+## 六、遗留 / 注意
 - `maxFileBytes` 不适用于端口映射（无声明大小），带宽配额是唯一控制；已写入文档。
 - 最大租户数的「N+1 enroll → 409」只有单测 / 集成覆盖，未做四进程实测。
 - SSH 目标目录在远端 realpath 检查与 rsync 之间仍有 TOCTOU 窗口（本地无）。
