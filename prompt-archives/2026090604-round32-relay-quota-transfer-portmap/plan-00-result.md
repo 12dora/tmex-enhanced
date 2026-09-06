@@ -50,9 +50,9 @@ codex gpt-6-astra high 五路（端口映射 / 中继 / 前端 / 引擎 / 节点
 - 实测（中继拓扑 R 19851 / A 19852 / B 19853，B 经 A 为 relay；hub 拓扑 19771/19772）：
   - 文件传输 A→B（两种拓扑）：60 MB + 3 MB + 目录（含空目录）全部 sha256 一致、空目录创建、`skip` 生效、`../` 越界 `outside_roots`、grant 一次性（第二个任务 `grant_invalid`）。
   - 中继限额：`PATCH /api/relay/config {limits}` / 400 / 指标 totals / CLI `relay limits` 均正确；总带宽 2 MiB/s 下 20 MB 传输 10 s、中继计量 2.10 MB/s；`maxFileBytes` 10 MiB → 节点间条目 `quota_file_size`、上传 init 413 `too_large`（带 maxBytes）、5 MB 放行。
-  - 端口映射：探测（空闲 / 保留 / 占用 409）、创建、100 B 往返、暂停拒连 / 继续、删除后 B 放行记录同步清理、端口释放均正确；≥ 20 MiB 大流量暴露 Bun pause 问题（见上），P3 重做后结果见下。
+  - 端口映射（P3 重做后，中继拓扑）：探测（空闲 / 保留 / 占用 409）、创建、100 B / 5 / 20 / 50 MiB 全双工往返（50 MiB 195 MB/s）、半双工「发完 FIN 再读响应」、8 并发 × 2 MiB、暂停拒连 / 继续、删除后 B 放行记录同步清理、端口释放全部正确；P3 自测 200 MiB 往返与慢消费者下 pending 峰值 1.5 MiB。中继总带宽 2 MiB/s 下 10 MiB echo 往返（中继转发 20 MiB）9 s，中继计量 2.3 MB/s，配额对隧道流量生效。
   - UI 截图核对：菜单、双栏弹窗（列表正确聚合 API 创建的任务）、端口映射弹窗。
-- Playwright：见下。
+- Playwright：非 mesh 受影响用例（devices / files-context-menu / settings-files / sidebar-device-disclosure）8/8；mesh 项目（login / notify / passkey / share）17/17。
 
 ## 四、遗留 / 注意
 - `maxFileBytes` 不适用于端口映射（无声明大小），带宽配额是唯一控制；已写入文档。
