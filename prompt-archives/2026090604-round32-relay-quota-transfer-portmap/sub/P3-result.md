@@ -126,3 +126,99 @@ Extra live runs on a second mapping: **200 MiB round trip ok=True (272 MB/s)** a
    implements that interface would need updating; nothing does today.
 5. The commander's uncommitted watermark experiment in `pump.ts` was taken over and replaced — the
    `setTimeout`-deferred resume it needed for Bun sockets is unnecessary on `node:net`.
+
+---
+
+# P3 (follow-up) — R2 review fixes
+
+Both findings in `sub/R2-portmap-review.md` are addressed. Scope stayed inside
+`apps/gateway/src/portmap/**`, the portmap integration test and the doc. No git operations.
+
+## P1 — connections/budget slots retained after peer loss
+
+The reviewer was right, and the measurements are worse than the report assumed: on Bun 1.3.14 the
+`node:net` shim gives **no event at all** in either path, and the `_handle`-gone check alone is not
+enough. Measured (scripts under `…/scratchpad/p3/`, `soerr.ts`, `bunrst.ts`, `live-probe.ts`):
+
+| scenario | `end` | `close` | `_handle` | `_handle.readyState` | kernel `SO_ERROR` |
+| --- | --- | --- | --- | --- | --- |
+| paused socket, peer RST (python `SO_LINGER{1,0}`) | — | — | present | 1 | **54 = ECONNRESET** |
+| paused socket, peer `Bun.Socket.terminate()` | — | — | **gone** | – | – |
+| peer FIN then RST | only the FIN's | — | present | 1 | **54** |
+| our own FFI `shutdown(SHUT_WR)` (healthy half-close) | – | – | present | 1 | 0 |
+| healthy idle socket | – | – | present | 1 | 0 |
+
+So `_handle` loss and kernel `SO_ERROR` are complementary — each path is invisible to the other
+check — and neither false-positives on a healthy or legitimately half-closed socket.
+
+**New `apps/gateway/src/portmap/socket-liveness.ts`**: one shared 1 s interval (`unref`ed) over all
+live portmap sockets, registered by `attachPumpSocketHandlers`, unregistered on `close`. A socket is
+declared lost when `_handle` is missing, `_handle.readyState !== 1`, or `getsockopt(fd, SOL_SOCKET,
+SO_ERROR) != 0`. `SO_ERROR` is one-shot (reading clears it), so it is only read inside the scan and a
+non-zero value ends the connection immediately. Already-`destroyed` sockets are just unwatched — a
+`close` event is guaranteed for those, and the normal path must stay normal. Confirmed loss routes
+through **`pump.destroy('portmap-peer-gone')` + `socket.destroy()` + `disposePumpSocketData()`**
+(`losePeer()`), because `onClose()` alone is swallowed by the `localFin` / `streamEnded` guards. The
+`end`-with-no-handle branch now routes through the same helper instead of relying on a `close` that
+may never arrive. With no FFI available it degrades to the handle checks — never worse than before.
+
+**New `apps/gateway/src/portmap/libc.ts`**: the `bun:ffi` dlopen dance (macOS `libSystem.B.dylib`,
+Linux glibc/musl candidates) extracted out of `half-close.ts` so both it and the liveness monitor
+share one loader instead of duplicating the candidate list. `half-close.ts` behaviour is unchanged.
+
+**New `apps/gateway/src/portmap/socket-liveness.test.ts`** (6 tests, real pump + in-memory mux with a
+consumer that never reads, so the pump is genuinely paused at its high-water mark):
+
+- healthy connection is not mistaken for a dead one (scan is a no-op);
+- a socket we half-closed ourselves stays alive across a scan;
+- **paused socket, real RST** — the client is aborted with a genuine `SO_LINGER{1,0}` + `close`
+  (set through the shared `openLibc` `setsockopt`, so no python dependency): asserts nothing was
+  disposed before the scan (proving no event fired) and that the scan destroys the socket, releases
+  the slot and RSTs the mux stream;
+- **half-closed then handle loss** — client half-closes via FFI (our side reaches
+  `localFin`/`streamEnded`, where `onClose()` would be suppressed), then `_handle` is removed the way
+  the reviewer simulated it; the scan still reclaims everything;
+- the shared 1 s poller does the same without an explicit scan (timer wiring);
+- the watch is removed once the socket closes (no leak in the monitor itself).
+
+## P2 — payload integrity in the integration test
+
+`ramp()` (repeating every 256 bytes, identical across all eight connections) is gone. New
+`pseudoRandom(size, seed)` — xorshift32 written 4 bytes at a time — gives every connection its own
+seed **and** its own length; each connection is verified against its own FNV-1a hash and its own
+received-byte count, so an aligned block substitution or a swapped response between connections now
+fails. Seeds/lengths: 1 MiB+8192 (`0x12345678`), 56 MiB+7777 (`0xc0ffee`), 32 MiB+999 slow-target
+(`0x51070001`), 2 MiB+321 cold-dial (`0xc01dd1a1`), and the eight concurrent connections at
+`5 MiB + i*512 KiB + i*37` with seeds `0x51ed0000 + i`. The aggregate counter assertion is now the
+sum of the individual lengths rather than `8 × size`.
+
+## Verification
+
+- `bun test apps/gateway/src/portmap apps/gateway/src/mesh/integration/portmap.integration.test.ts apps/gateway/src/runtime.test.ts`
+  → **75 pass / 0 fail** (12 files).
+- Full `apps/gateway` suite → **5065 pass / 10 fail** (5075 across 461 files, 222 s). The 10 are
+  exactly the documented baseline (9 `mesh phase-2 integration` + the flaky DataChannel 8 MiB test);
+  the relay-integration flake seen in the previous run did not recur.
+- `bunx tsc --noEmit -p apps/gateway` → 0 errors. `bunx biome check` on all touched files → clean.
+  `bun scripts/complexity/gate.ts` → ok.
+- **Live re-run** on a freshly booted hub harness (19771/19772, torn down afterwards, nothing left):
+  the whole `pm-test.sh` matrix again `ok=True` (100 B / 5 / 20 / 50 MiB, half-duplex, 8 concurrent,
+  pause/resume, delete + export cleanup, port freed; counters `bytesIn == bytesOut == 98567244`).
+- **Live proof of the P1 fix**: a target on B that accepts and never reads, a client that pushes
+  10.9 MiB through the mapping (only 2.23 MB reaches the stream — backpressure holding) and then
+  aborts with `SO_LINGER{1,0}`:
+
+  | t after RST | `activeConnections` |
+  | --- | --- |
+  | 0.2 s | **1** (no socket event fired — the leak the reviewer described) |
+  | 1.5 s | **0** (reclaimed by the 1 s liveness poll) |
+  | 3.0 s | 0 |
+
+## Notes
+
+1. The liveness poll is one `getsockopt` per live portmap socket per second (≤ 48 per peer link) —
+   negligible, and it stops entirely when no mapping has connections.
+2. `client.destroy()` on a `node:net` peer sends a FIN, not an RST, so our socket correctly stays in
+   half-close until the target side finishes; that is not a leak and the monitor leaves it alone.
+3. `docs/mesh/2026090604-port-mapping.md` gained a 连接监活 subsection with the measurement table and
+   the reason `onClose()` is insufficient.
