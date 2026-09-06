@@ -44,3 +44,11 @@
 （指挥官评估：mesh-internal tmux RPC 仅凭 peer 身份放行 → 可向任意节点窗格注入按键；其它为信息泄露 / 入口会话截获 / 资源消耗）
 
 其他问题都不重要,如何减缓问题1,同时要最小程度减少用户体验降级
+
+## 2026-09-06 追加 prompt（安全准则扫描）
+
+我要求哪怕攻击者攻破任意节点的shell权限,都不能危害或控制其他节点,结合这一点准则,扫描其他安全风险,但不要过度防御
+（指挥官发现：入口推包升级只按入口给的 sha256 校验，无独立信任锚；通知汇聚声明可自签）
+
+很多节点不能访问github或者根本就是内网节点,所以你不能这么修
+（改为发行签名：CI 私钥签 SHA256SUMS，公钥内置，节点离线验签；签名密钥 id r1，公钥 x3aihYJPAJ6OafKJ/W5QHGX1IA4n61WD650sQaMl3OY=，私钥 seed 存 GitHub secret TMEX_RELEASE_SIGNING_KEY，本地备份 ~/.config/tmex-release/signing-key.json）
