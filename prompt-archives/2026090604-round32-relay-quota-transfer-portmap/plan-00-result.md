@@ -71,7 +71,15 @@ codex gpt-6-astra high 五路（端口映射 / 中继 / 前端 / 引擎 / 节点
 ## 五、追加 1.1.38
 - 传输弹窗发送按钮显示目标节点名（`devices.transfer.sendTo`）；节点无启用文件根目录时虚拟根 `fs-root` 默认浏览 `/`（`files/file-root.ts` `resolveFileRoot` 唯一上游，list / grant / 目标解析共用；有真实根目录后即 404）。hub 拓扑实测：两侧默认 `/`、按钮「Send to mesh-node-b / Send to tmex」、经虚拟根传输一致。tag `v1.1.38`，本机已升级。
 
-## 六、遗留 / 注意
+## 六、追加 1.1.39（安全准则：攻破任一节点不得危害其它节点）
+- 评估（用户提问）：mesh-internal tmux RPC 仅凭 peer 身份放行可注入按键（最严重）；通知汇聚声明可自签（泄露 / 伪造）；入口推包升级只按入口给的 sha256 校验（无独立信任锚，内网节点不能出网）；入口会话截获为架构固有（入口须可信）。
+- G1 窗格 grant：目标节点 `POST /api/agent/pane-grants`（用户会话）签发，绑定 fromNodeId / 设备 / 窗格 / tmux server epoch，滑动 7 天硬顶 30 天；发起节点创建会话时用浏览器 cookie 换取并加密持久化，RPC 携带；吊销在 revoke-node 投影事务内清 grant 并关链路；替换即吊销旧 grant；旧目标 404 退化；用户请求时静默补签。迁移 0051 / 0053。
+- G2 发行签名：CI 用 Ed25519（key id r1，私钥 seed 在 GitHub secret `TMEX_RELEASE_SIGNING_KEY` 与 `~/code/key/tmex-release-signing-ed25519-r1.json`）签 `SHA256SUMS` → `SHA256SUMS.sig`，公钥内置 `packages/shared/src/release/release-signing.ts`；入口下载与推包离线验签，节点应用前须有已验签 manifest；远程发起的升级一律要求 ≥ 1.1.39 且已验签（封堵降级到未签名旧版）；`RELEASE_SIGNING_SINCE = 1.1.39`。
+- G3 通知汇聚：声明改为用户根钥 / passkey 签名的 key-log 记录 `notification-sink`（版本门槛 1.1.39，未知版本成员 fail-closed），转发方只信记录，投递前复核并在撤销时清队列；顺带修了 hubSync 预览重复验 passkey 断言导致计数器前进的既有缺陷。迁移 0052。
+- M1 移动端键盘：触屏点光标所在行（±1 行）才弹键盘，回滚历史时不触发；快捷栏仅在键盘弹出时显示「隐藏键盘」。
+- 审查：`sub/R1-pane-grant-sink-review.md`（7 条）、`sub/R1-release-signing-review.md`（4 条）全部修复。
+
+## 七、遗留 / 注意
 - `maxFileBytes` 不适用于端口映射（无声明大小），带宽配额是唯一控制；已写入文档。
 - 最大租户数的「N+1 enroll → 409」只有单测 / 集成覆盖，未做四进程实测。
 - SSH 目标目录在远端 realpath 检查与 rsync 之间仍有 TOCTOU 窗口（本地无）。
