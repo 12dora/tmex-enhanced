@@ -37,7 +37,16 @@
 - 端口映射弹窗（聚合列表 2 s 轮询、探测门控的创建表单、暂停 / 继续 / 删除、放行记录待清理与重试、创建失败先核对再回滚）。
 - i18n 三语；`formatEta`。
 
-### 6. 其它
+### 6. 非标端口（N1 / N2，追加任务）
+- 结论（EX4）：URL 规范化、uplink 签名、`r3.` join 串、分享 / 站点地址、HTTPS 监听（默认 9443）、ACME dns-01 均已支持非默认端口，令牌格式与规范化语义不改。
+- `packages/shared/src/net/port-candidates.ts`：`SUGGESTED_HIGH_PORTS = [2053, 2083, 2087, 2096, 8443, 13443, 23443, 31443]`（Cloudflare 代理接受的 HTTPS 端口 + 避开临时端口范围的 IANA 未分配端口）、`pickSuggestedPort(Avoiding)`、`probeAddressPorts`（显式端口只确认；无端口 443 优先 800 ms 宽限，候选 150 ms 交错并发，败者中止；回环地址不扫候选）。
+- 服务端探测：`POST /api/setup/precheck` 增 `resolvedUrl / triedPorts / probed`；新 `POST /api/mesh/relay/resolve`（`relay-resolve-route.ts`，proof-material 之前调用；hairpin 用 `relayProbeDialUrl` 按主机名放宽）；`GET /api/tls` 的 `https.publicUrl` 带端口。
+- CLI：`relay enroll / reauth / join`、`hub join` 无端口自动探测（`hub-join-probe.ts`）；`tmex init` 增「公网 HTTPS 端口」（443 / 建议 / 自定义，`--public-port`）；hub 公网地址校验；`fetchPinnedHubCa` 超时；死参数 `--url` 清理。
+- 前端：`port-picker.tsx`（标准 443 / 建议 / 自定义，只改写端口）、`address-probe.ts`（票据式过期守卫）接入四个 setup 表单，`use-relay-actions` 先 resolve 再 proof-material；HTTPS 卡片「对外地址」。接入向导为 standalone 只有 `/api/setup/*`，加入中继表单经 precheck 探（同一监听同样有 `/healthz`）。
+- 文档 `docs/deployment/2026090605-nonstandard-ports.md`。
+- 实测：本机局域网 IP 上只在 13443 起 HTTPS（`/healthz` + `/api/relay/health`），`probeAddressPorts('https://<ip>')` hub / relay 均在 0.77 s 内解析到 `:13443`（尝试序列 443 → 2053 … → 13443）；显式 `:13443` 即时确认；全无响应 1.06 s 返回并列出 9 个候选。
+
+### 7. 其它
 - 打包迁移清单漏加 0049 已修，并加守卫测试（清单 = drizzle journal = 目录）。
 - 实测 harness `apps/fe/tests/helpers/relay-boot.ts`（relay,node + 两个租户节点，从源码拉起）+ `docs/testing/2026090604-relay-live-harness.md`。
 

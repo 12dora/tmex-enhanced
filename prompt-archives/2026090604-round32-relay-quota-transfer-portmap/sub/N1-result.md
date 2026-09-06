@@ -191,3 +191,99 @@ constant went into `commands/hub-join-probe.ts`, leaving `commands/hub.ts` at 12
 4. Out of scope and still open from EX4 §8: portmap reserved ports should include `tls_port`, and
    `GET /api/system/addresses` should surface the HTTPS port for the mobile QR candidate.
 5. The doc names 1.1.37 as the first version carrying this; adjust if the release number moves.
+
+---
+
+# N1 review round 2 — R1-ports-review findings 1, 2, 3 (backend), 6
+
+Fixed on top of 8051bc32. `apps/fe` untouched (N2 owns findings 3/4/5 front-end halves).
+
+## 1 — explicit `:443` erased before discovery (P2)
+
+`canonicalHubUrl` / `normalizeRelayUrl` strip `:443`, so any path that normalised *before* asking
+"did the user write a port?" turned an explicit 443 into "no port" and swept the candidate table.
+
+- `packages/app/src/commands/relay.ts`: new `resolveRelayEnrollUrl()` validates with
+  `requireRelayUrl(urlRaw)` (unchanged error text), probes the **raw** input, then normalises the
+  selected URL. `enroll` and `reauth` both go through it.
+- `packages/app/src/lib/relay-password-join.ts`: `resolveJoinRelayPort()` now takes the raw
+  `input.relayUrl`, validates it with `parseJoinRelayUrl` first (so `invalid_url` still fires
+  before any network call), probes the raw string, and normalises the result.
+- `packages/app/src/commands/hub-join-probe.ts`: already received the raw CLI positional; the
+  invariant is now documented so it is not "fixed" into a normalised value later.
+- Shared `parseProbeTarget` was already correct — it reads the port from the pre-canonical
+  authority (`readExplicitPort(withScheme)`), which is why `https://h:443` is reported as
+  `explicitPort: 443` with `base: 'https://h'`.
+
+New tests: `relay.test.ts` "an explicit :443 is confirmed as written and never swept" (asserts the
+single `443/api/relay/health` call), `relay-password-join.test.ts` "显式 :443 只确认一次…",
+`probe-address.test.ts` "an explicit :443 is treated as explicit and never swept",
+plus the pre-existing shared test on `parseProbeTarget('https://relay.example.com:443')`.
+
+## 2 — hairpin attributed loopback health to the wrong public port (P2)
+
+`relayProbeDialUrl` (hostname-based rewrite) is **deleted**. `resolveRelayAddress` now:
+
+- uses plain `resolveRelayDialUrl` for candidate dialling again, i.e. **exact authority matching** —
+  only a candidate equal to the configured public URL takes the loopback shortcut, so a loopback
+  answer can never be credited to another candidate port;
+- short-circuits the one case the sweep cannot decide: when this machine has the `relay` role and
+  the input's hostname equals `TMEX_RELAY_PUBLIC_URL`'s hostname **and carries no explicit port**,
+  the address is already known — it probes exactly `TMEX_RELAY_PUBLIC_URL` (`ports: []`, so no
+  candidate table) through the loopback and reports that canonical URL with `explicit: false`.
+
+Tests (`relay-resolve-route.test.ts`, public URL `https://relay.example.com:13443`, loopback-only
+fetch): portless self-address → `https://relay.example.com:13443` / `triedPorts: [13443]` and only
+one request, to `127.0.0.1:19663`; explicit correct self port → same, `explicit: true`; explicit
+**wrong** self port (`:2053`) → not rewritten to loopback, stays unresolved; another host → normal
+sweep; `relay: false` → never short-circuits.
+
+## 3 (backend half) — precheck can select a service that is not a relay (P2)
+
+- `PrecheckKind = 'hub' | 'relay'` in `packages/app/src/runtime/setup-service.ts`;
+  `precheckHubUrl(url, deps, kind = 'hub')` uses it for **both** the port sweep and the
+  confirmation: hub ⇒ `GET /healthz` + `status === 'ok'`, relay ⇒ `GET /api/relay/health` +
+  `ok === true`. `isSelf` stays `false` for relay (the relay health body has no `startedAt`), and
+  the error string is now `healthz status …` / `relay health status …`.
+- `POST /api/setup/precheck` reads `kind` (`readPrecheckKind`): absent/empty ⇒ `hub`, anything
+  other than `hub`/`relay` ⇒ `400 invalid_body`.
+- Contract: `SetupPrecheckRequest { url, kind? }` added in `packages/api-client/src/local/types.ts`
+  next to the `SetupPrecheckKind` type; `SetupApi.precheck(url, kind?)` was already extended by N2.
+
+Tests: `setup-service.test.ts` — relay kind probes+confirms on `/api/relay/health` and resolves the
+13443 candidate; a Hub answering `/healthz` on a candidate port is **refused** under `kind:'relay'`.
+`setup-routes.test.ts` — route passes `kind` through (both requests hit `/api/relay/health`), and an
+unknown kind is 400.
+
+## 6 — HTTPS card substituted the internal listener port (P2)
+
+`packages/app/src/runtime/tls-routes.ts` `builtinPublicUrl` now returns the configured public URL
+**verbatim** when one exists (NAT/port-forwarding means the public port often differs from
+`tlsPort`); only when no external address is known does it derive
+`https://<acme domain | public SAN>[:listenerPort]`.
+
+Tests: configured `https://box.example.com:13443` with listener on 9443 → reports `:13443`;
+no configured URL → `https://box.example.com:13443` derived from SAN + listener port; derived 443
+drops the port; the PUT/renew cases now expect the verbatim configured URL.
+
+## Docs
+
+`docs/deployment/2026090605-nonstandard-ports.md`: documented the `kind` parameter and why the
+predicate must match the target, the "explicit port is judged from the original input" rule, the
+`relay,node` self-address short-circuit, and a new "HTTPS 卡片上的对外地址" section explaining that
+the configured public URL wins over the listener port.
+
+## Gates (round 2)
+
+- `bunx tsc --noEmit`: 0 errors in `packages/shared`, `packages/api-client`, `packages/app`,
+  `apps/gateway`.
+- `bun test`: `packages/shared` 826/0, `packages/api-client` 282/0, `packages/app` 978/0
+  (+9 new), `apps/gateway` 10 failures — exactly the known baseline set (9 "mesh phase-2
+  integration" + 1 flaky DataChannel 8 MiB), nothing new; `relay-resolve-route.test.ts` 10/0
+  on its own.
+- `bunx biome check` clean over `packages/app/src`, `packages/api-client/src`,
+  `apps/gateway/src/mesh`, `packages/shared/src/net` (512 files).
+- `bun scripts/complexity/gate.ts`: the only violation is
+  `apps/fe/.../become-relay-form.tsx BecomeRelayForm: 125 lines > 120` — N2's file, being edited
+  concurrently; nothing in my scope.
+- No git operations.
