@@ -52,3 +52,7 @@
 
 很多节点不能访问github或者根本就是内网节点,所以你不能这么修
 （改为发行签名：CI 私钥签 SHA256SUMS，公钥内置，节点离线验签；签名密钥 id r1，公钥 x3aihYJPAJ6OafKJ/W5QHGX1IA4n61WD650sQaMl3OY=，私钥 seed 存 GitHub secret TMEX_RELEASE_SIGNING_KEY，本地备份 ~/.config/tmex-release/signing-key.json）
+
+## 2026-09-06 追加 prompt（PWA 键盘触发区域）
+
+追加任务: 目前PWA应用在终端内点击任意处会弹出键盘, 请你把触发区域改为输入框区域
