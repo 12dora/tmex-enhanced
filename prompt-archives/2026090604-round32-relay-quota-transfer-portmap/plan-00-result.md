@@ -79,6 +79,8 @@ codex gpt-6-astra high 五路（端口映射 / 中继 / 前端 / 引擎 / 节点
 - M1 移动端键盘：触屏点光标所在行（±1 行）才弹键盘，回滚历史时不触发；快捷栏仅在键盘弹出时显示「隐藏键盘」。
 - 审查：`sub/R1-pane-grant-sink-review.md`（7 条）、`sub/R1-release-signing-review.md`（4 条）全部修复。
 
+- 1.1.39 验证与上线：八包 tsc 0、lint 通过；gateway 5199 pass / 10 基线失败，其余包全部 0 fail；mesh e2e 17/17、设备页 / 移动端终端 / 文件用例 16/16；tag `v1.1.39`，Actions 签名步骤输出 `tmex-release-sig v1 r1 …` 并上传 `SHA256SUMS.sig`；本机由 1.1.38 CLI 升级到 1.1.39（此次升级仍由旧 CLI 执行，新验签路径从下一次升级起生效），healthz ok，`agent_pane_grants` 表与 server_epoch 列已迁移。
+
 ## 七、遗留 / 注意
 - `maxFileBytes` 不适用于端口映射（无声明大小），带宽配额是唯一控制；已写入文档。
 - 最大租户数的「N+1 enroll → 409」只有单测 / 集成覆盖，未做四进程实测。
