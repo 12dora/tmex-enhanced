@@ -63,7 +63,12 @@ codex gpt-6-astra high 五路（端口映射 / 中继 / 前端 / 引擎 / 节点
   - UI 截图核对：菜单、双栏弹窗（列表正确聚合 API 创建的任务）、端口映射弹窗。
 - Playwright：非 mesh 受影响用例（devices / files-context-menu / settings-files / sidebar-device-disclosure）8/8；mesh 项目（login / notify / passkey / share）17/17。
 
-## 四、遗留 / 注意
+## 四、发版与上线
+- 非标端口审查（`sub/R1-ports-review.md`）6 条 P2 全部修复（显式 `:443` 按原始输入判定、hairpin 精确匹配 + 自地址短路、precheck `kind`、提交路径内探测、受控自定义端口、HTTPS 卡片优先配置地址）。
+- 终态回归：八包 tsc 0、`bun run lint` 通过；gateway 5073 pass / 10 基线失败，fe 2843、shared 826、app 978、api-client 282、panels 1070、transfer 60 均 0 fail。
+- `chore(release)` `fe8dfe98`，tag `v1.1.37`，合并 `eec69391` 推到 main；GitHub Actions Release 成功（`tmex-cli-1.1.37.tgz` + `SHA256SUMS`）；本机经 `tmex upgrade` 1.1.36 → 1.1.37，healthz ok。
+
+## 五、遗留 / 注意
 - `maxFileBytes` 不适用于端口映射（无声明大小），带宽配额是唯一控制；已写入文档。
 - 最大租户数的「N+1 enroll → 409」只有单测 / 集成覆盖，未做四进程实测。
 - SSH 目标目录在远端 realpath 检查与 rsync 之间仍有 TOCTOU 窗口（本地无）。
